@@ -35,14 +35,16 @@ pub struct TokenAuth {
 #[async_trait]
 impl AuthN for TokenAuth {
     async fn check(&self, req: &RequestMeta) -> Result<(), DataplaneError> {
-        let found = req
-            .headers
-            .iter()
-            .any(|(k, v)| k.eq_ignore_ascii_case("authorization") && *v == format!("Bearer {}", self.expected));
+        let found = req.headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("authorization") && *v == format!("Bearer {}", self.expected)
+        });
         if found {
             Ok(())
         } else {
-            Err(DataplaneError::new(ErrorCode::InvalidArgument, "missing or invalid bearer token"))
+            Err(DataplaneError::new(
+                ErrorCode::InvalidArgument,
+                "missing or invalid bearer token",
+            ))
         }
     }
 }

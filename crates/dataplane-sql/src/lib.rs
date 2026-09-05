@@ -22,9 +22,12 @@ where
     F: FnOnce() -> Result<R, DataplaneError> + Send + 'static,
     R: Send + 'static,
 {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| DataplaneError::new(ErrorCode::QueryFailed, format!("blocking task panicked: {e}")))?
+    tokio::task::spawn_blocking(f).await.map_err(|e| {
+        DataplaneError::new(
+            ErrorCode::QueryFailed,
+            format!("blocking task panicked: {e}"),
+        )
+    })?
 }
 
 /// 将 `SqlValue` 转换为 rusqlite 参数值。
@@ -51,9 +54,10 @@ fn from_value_ref(v: ValueRef<'_>) -> SqlValue {
 
 fn map_execute_error(e: rusqlite::Error) -> DataplaneError {
     match e {
-        rusqlite::Error::MultipleStatement => {
-            DataplaneError::new(ErrorCode::InvalidArgument, "multiple SQL statements are not allowed")
-        }
+        rusqlite::Error::MultipleStatement => DataplaneError::new(
+            ErrorCode::InvalidArgument,
+            "multiple SQL statements are not allowed",
+        ),
         other => DataplaneError::new(ErrorCode::QueryFailed, other.to_string()),
     }
 }
@@ -66,7 +70,9 @@ pub struct SqliteRelationalStore {
 impl SqliteRelationalStore {
     /// 打开或创建 sqlite 数据库文件。
     pub fn new(path: impl AsRef<Path>) -> Result<Self, DataplaneError> {
-        let conn = Connection::open(path).map_err(|e| DataplaneError::new(ErrorCode::QueryFailed, format!("open sqlite: {e}")))?;
+        let conn = Connection::open(path).map_err(|e| {
+            DataplaneError::new(ErrorCode::QueryFailed, format!("open sqlite: {e}"))
+        })?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -80,9 +86,9 @@ impl RelationalStore for SqliteRelationalStore {
         let sql = sql.to_string();
         let params: Vec<rusqlite::types::Value> = params.iter().map(to_rusqlite_value).collect();
         blocking(move || {
-            let conn = conn
-                .lock()
-                .map_err(|_| DataplaneError::new(ErrorCode::QueryFailed, "sqlite connection lock poisoned"))?;
+            let conn = conn.lock().map_err(|_| {
+                DataplaneError::new(ErrorCode::QueryFailed, "sqlite connection lock poisoned")
+            })?;
             let mut stmt = conn.prepare(&sql).map_err(map_execute_error)?;
             let column_count = stmt.column_count();
             let columns: Vec<String> = (0..column_count)

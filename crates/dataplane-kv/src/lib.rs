@@ -39,9 +39,12 @@ where
     F: FnOnce() -> Result<R, DataplaneError> + Send + 'static,
     R: Send + 'static,
 {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| DataplaneError::new(ErrorCode::QueryFailed, format!("blocking task panicked: {e}")))?
+    tokio::task::spawn_blocking(f).await.map_err(|e| {
+        DataplaneError::new(
+            ErrorCode::QueryFailed,
+            format!("blocking task panicked: {e}"),
+        )
+    })?
 }
 
 /// redb 本地引擎。
@@ -55,7 +58,9 @@ impl RedbKvStore {
         let db = Database::create(path).map_err(|e| dp_err("open redb", e))?;
         let write_txn = db.begin_write().map_err(|e| dp_err("begin write txn", e))?;
         {
-            let _table = write_txn.open_table(TABLE).map_err(|e| dp_err("open kv table", e))?;
+            let _table = write_txn
+                .open_table(TABLE)
+                .map_err(|e| dp_err("open kv table", e))?;
         }
         write_txn.commit().map_err(|e| dp_err("commit init", e))?;
         Ok(Self { db: Arc::new(db) })
@@ -69,8 +74,13 @@ impl KvStore for RedbKvStore {
         let key = key.to_vec();
         blocking(move || {
             let read_txn = db.begin_read().map_err(|e| dp_err("begin read txn", e))?;
-            let table = read_txn.open_table(TABLE).map_err(|e| dp_err("open kv table", e))?;
-            match table.get(key.as_slice()).map_err(|e| dp_err("get key", e))? {
+            let table = read_txn
+                .open_table(TABLE)
+                .map_err(|e| dp_err("open kv table", e))?;
+            match table
+                .get(key.as_slice())
+                .map_err(|e| dp_err("get key", e))?
+            {
                 Some(v) => Ok(v.value().to_vec()),
                 None => Err(DataplaneError::new(ErrorCode::NotFound, "key not found")),
             }
@@ -85,7 +95,9 @@ impl KvStore for RedbKvStore {
         blocking(move || {
             let write_txn = db.begin_write().map_err(|e| dp_err("begin write txn", e))?;
             {
-                let mut table = write_txn.open_table(TABLE).map_err(|e| dp_err("open kv table", e))?;
+                let mut table = write_txn
+                    .open_table(TABLE)
+                    .map_err(|e| dp_err("open kv table", e))?;
                 table
                     .insert(key.as_slice(), value.as_slice())
                     .map_err(|e| dp_err("set key", e))?;
@@ -103,8 +115,13 @@ impl KvStore for RedbKvStore {
             let write_txn = db.begin_write().map_err(|e| dp_err("begin write txn", e))?;
             let removed;
             {
-                let mut table = write_txn.open_table(TABLE).map_err(|e| dp_err("open kv table", e))?;
-                removed = table.remove(key.as_slice()).map_err(|e| dp_err("delete key", e))?.is_some();
+                let mut table = write_txn
+                    .open_table(TABLE)
+                    .map_err(|e| dp_err("open kv table", e))?;
+                removed = table
+                    .remove(key.as_slice())
+                    .map_err(|e| dp_err("delete key", e))?
+                    .is_some();
             }
             write_txn.commit().map_err(|e| dp_err("commit delete", e))?;
             if removed {
@@ -121,7 +138,9 @@ impl KvStore for RedbKvStore {
         let key = key.to_vec();
         blocking(move || {
             let read_txn = db.begin_read().map_err(|e| dp_err("begin read txn", e))?;
-            let table = read_txn.open_table(TABLE).map_err(|e| dp_err("open kv table", e))?;
+            let table = read_txn
+                .open_table(TABLE)
+                .map_err(|e| dp_err("open kv table", e))?;
             let found = table
                 .get(key.as_slice())
                 .map_err(|e| dp_err("get key", e))?
@@ -136,9 +155,14 @@ impl KvStore for RedbKvStore {
         let prefix = prefix.to_vec();
         blocking(move || {
             let read_txn = db.begin_read().map_err(|e| dp_err("begin read txn", e))?;
-            let table = read_txn.open_table(TABLE).map_err(|e| dp_err("open kv table", e))?;
+            let table = read_txn
+                .open_table(TABLE)
+                .map_err(|e| dp_err("open kv table", e))?;
             let mut out = Vec::new();
-            for item in table.range(prefix.as_slice()..).map_err(|e| dp_err("scan range", e))? {
+            for item in table
+                .range(prefix.as_slice()..)
+                .map_err(|e| dp_err("scan range", e))?
+            {
                 let (k, v) = item.map_err(|e| dp_err("scan item", e))?;
                 let key: &[u8] = &k.value();
                 if !key.starts_with(prefix.as_slice()) {

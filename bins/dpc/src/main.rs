@@ -46,7 +46,12 @@ struct DpcError {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     if let Err(e) = run(&cli) {
-        eprintln!("url={} reason={} code={}", e.url, e.reason, ErrorCode::Unavailable.as_str());
+        eprintln!(
+            "url={} reason={} code={}",
+            e.url,
+            e.reason,
+            ErrorCode::Unavailable.as_str()
+        );
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
@@ -63,7 +68,10 @@ fn run(cli: &Cli) -> Result<(), DpcError> {
 
 fn fetch_health(base: &str) -> Result<String, DpcError> {
     let url = format!("{base}/health");
-    let resp = ureq::get(&url).call().map_err(|e| DpcError { url: url.clone(), reason: ureq_err_str(e) })?;
+    let resp = ureq::get(&url).call().map_err(|e| DpcError {
+        url: url.clone(),
+        reason: ureq_err_str(e),
+    })?;
     let text = resp.into_string().map_err(|e| DpcError {
         url: url.clone(),
         reason: format!("read body: {e}"),
@@ -87,10 +95,16 @@ fn cmd_health(cli: &Cli) -> Result<(), DpcError> {
     let t1 = std::thread::spawn(move || fetch_health(&sql_url));
     let t2 = std::thread::spawn(move || fetch_health(&prom_url));
     let r1 = t1.join().unwrap_or_else(|_| {
-        Err(DpcError { url: cli.sql_url.clone(), reason: "health thread panicked".to_string() })
+        Err(DpcError {
+            url: cli.sql_url.clone(),
+            reason: "health thread panicked".to_string(),
+        })
     });
     let r2 = t2.join().unwrap_or_else(|_| {
-        Err(DpcError { url: cli.prom_url.clone(), reason: "health thread panicked".to_string() })
+        Err(DpcError {
+            url: cli.prom_url.clone(),
+            reason: "health thread panicked".to_string(),
+        })
     });
     match (r1, r2) {
         (Ok(a), Ok(b)) => {
@@ -109,7 +123,10 @@ fn cmd_sql(base: &str, stmt: &str) -> Result<(), DpcError> {
     let resp = ureq::post(&url)
         .set("Content-Type", "application/json")
         .send_string(&body)
-        .map_err(|e| DpcError { url: url.clone(), reason: ureq_err_str(e) })?;
+        .map_err(|e| DpcError {
+            url: url.clone(),
+            reason: ureq_err_str(e),
+        })?;
     let text = resp.into_string().map_err(|e| DpcError {
         url,
         reason: format!("read body: {e}"),
@@ -123,7 +140,10 @@ fn cmd_query(base: &str, expr: &str, time: Option<&str>) -> Result<(), DpcError>
     if let Some(t) = time {
         url.push_str(&format!("&time={}", urlencoding::encode(t)));
     }
-    let resp = ureq::get(&url).call().map_err(|e| DpcError { url: url.clone(), reason: ureq_err_str(e) })?;
+    let resp = ureq::get(&url).call().map_err(|e| DpcError {
+        url: url.clone(),
+        reason: ureq_err_str(e),
+    })?;
     let text = resp.into_string().map_err(|e| DpcError {
         url,
         reason: format!("read body: {e}"),

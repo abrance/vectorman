@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use dataplane_ts::{TimeSeriesStore, TsinkTimeSeriesStore, TsPoint};
+use dataplane_ts::{TimeSeriesStore, TsPoint, TsinkTimeSeriesStore};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,11 +26,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("instant: {r:?}");
 
     let r = store
-        .query_range("cpu_usage", 1_699_999_000_000_000, 1_700_001_000_000_000, 60)
+        .query_range(
+            "cpu_usage",
+            1_699_999_000_000_000,
+            1_700_001_000_000_000,
+            60,
+        )
         .await?;
     println!("range: {r:?}");
 
-    let err = store.query_instant("nosuchfn()", Some(0)).await.unwrap_err();
+    let err = store
+        .query_instant("nosuchfn()", Some(0))
+        .await
+        .unwrap_err();
     println!("unknown-fn code: {}", err.code.as_str());
 
     let _ = std::fs::remove_dir_all(&dir);

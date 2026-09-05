@@ -40,7 +40,9 @@ pub fn is_absolute_poison(path: &Path) -> bool {
 pub fn resolve_data_paths(data_path: &str) -> Result<DataPaths, DataplaneError> {
     let root = PathBuf::from(data_path);
     if root.as_os_str().is_empty() {
-        return Err(DataplaneError::config_invalid("data_path must not be empty"));
+        return Err(DataplaneError::config_invalid(
+            "data_path must not be empty",
+        ));
     }
     if root.exists() && root.is_file() {
         // 单文件模式：仅允许 sqlite。
@@ -100,12 +102,18 @@ impl DataPaths {
         }
         if let Some(parent) = self.kv.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                DataplaneError::config_invalid(format!("cannot create dir {}: {e}", parent.display()))
+                DataplaneError::config_invalid(format!(
+                    "cannot create dir {}: {e}",
+                    parent.display()
+                ))
             })?;
         }
         if let Some(parent) = self.sql.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                DataplaneError::config_invalid(format!("cannot create dir {}: {e}", parent.display()))
+                DataplaneError::config_invalid(format!(
+                    "cannot create dir {}: {e}",
+                    parent.display()
+                ))
             })?;
         }
         Ok(())
