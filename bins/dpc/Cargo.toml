@@ -1,0 +1,12 @@
+[package]
+name = "dpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dataplane-core.workspace = true
+clap = { version = "4", features = ["derive"] }
+serde_json = { workspace = true }
+ureq = "2"
+urlencoding = "2"

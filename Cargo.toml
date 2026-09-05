@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dataplane-core",
+    "crates/dataplane-file",
+    "crates/dataplane-ts",
+    "crates/dataplane-log",
+    "crates/dataplane-kv",
+    "crates/dataplane-sql",
+    "crates/dataplane-adapter-postgres",
+    "crates/dataplane-adapter-mysql",
+    "crates/dataplane-adapter-redis",
+    "crates/dataplane-adapter-elasticsearch",
+    "crates/dataplane-adapter-doris",
+    "crates/dataplane-adapter-influxdb",
+    "crates/dataplane-adapter-victoriametrics",
+    "bins/apiserver",
+    "bins/dpc",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+dataplane-core = { path = "crates/dataplane-core" }
+dataplane-file = { path = "crates/dataplane-file" }
+dataplane-ts = { path = "crates/dataplane-ts" }
+dataplane-log = { path = "crates/dataplane-log" }
+dataplane-kv = { path = "crates/dataplane-kv" }
+dataplane-sql = { path = "crates/dataplane-sql" }
+
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
