@@ -11,9 +11,7 @@ use async_trait::async_trait;
 use dataplane_core::{DataplaneError, ErrorCode};
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, RangeQuery, TermQuery};
-use tantivy::schema::{
-    Field, IndexRecordOption, TantivyDocument, TextFieldIndexing, TextOptions, Value,
-};
+use tantivy::schema::{Field, IndexRecordOption, TantivyDocument, TextFieldIndexing, Value};
 use tantivy::tokenizer::{TokenStream, Tokenizer};
 use tantivy::{Index, IndexReader, IndexWriter, Term};
 use tantivy_jieba::JiebaTokenizer;
@@ -98,8 +96,8 @@ fn build_schema() -> tantivy::schema::Schema {
     let ts_opts = NumericOptions::from(INDEXED).set_stored().set_fast();
     b.add_i64_field(FIELD_TIMESTAMP, ts_opts);
     b.add_text_field(FIELD_LEVEL, STRING | STORED);
-    let message_opts = TextOptions::from(TEXT | STORED)
-        .set_indexing_options(TextFieldIndexing::default().set_tokenizer("jieba"));
+    let message_opts =
+        (TEXT | STORED).set_indexing_options(TextFieldIndexing::default().set_tokenizer("jieba"));
     b.add_text_field(FIELD_MESSAGE, message_opts);
     b.add_text_field(FIELD_LABELS_JSON, STORED);
     b.add_text_field(FIELD_ID, STORED);
@@ -108,7 +106,6 @@ fn build_schema() -> tantivy::schema::Schema {
 
 /// tantivy+jieba 本地引擎。
 pub struct TantivyLogStore {
-    index: Index,
     writer: Arc<Mutex<IndexWriter<TantivyDocument>>>,
     reader: IndexReader,
     fields: LogFields,
@@ -143,7 +140,6 @@ impl TantivyLogStore {
         let reader = index.reader().map_err(dp_err)?;
 
         Ok(Self {
-            index,
             writer: Arc::new(Mutex::new(writer)),
             reader,
             fields,

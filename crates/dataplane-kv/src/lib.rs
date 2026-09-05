@@ -164,7 +164,7 @@ impl KvStore for RedbKvStore {
                 .map_err(|e| dp_err("scan range", e))?
             {
                 let (k, v) = item.map_err(|e| dp_err("scan item", e))?;
-                let key: &[u8] = &k.value();
+                let key: &[u8] = k.value();
                 if !key.starts_with(prefix.as_slice()) {
                     break;
                 }

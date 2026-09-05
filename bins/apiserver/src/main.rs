@@ -31,10 +31,13 @@ struct Args {
 
 #[derive(Clone)]
 struct AppState {
+    #[expect(dead_code)]
     file: Arc<dyn FileStore>,
+    #[expect(dead_code)]
     kv: Arc<dyn KvStore>,
     sql: Arc<dyn RelationalStore>,
     ts: Arc<dyn TimeSeriesStore>,
+    #[expect(dead_code)]
     log: Arc<dyn LogStore>,
     auth: Arc<dyn AuthN>,
 }

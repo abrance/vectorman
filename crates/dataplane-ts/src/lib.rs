@@ -133,7 +133,7 @@ fn promql_value_to_result(v: PromqlValue) -> Result<PromResult, DataplaneError> 
                 .map(|s| PromSeries {
                     metric: s.labels.into_iter().map(|l| (l.name, l.value)).collect(),
                     value: None,
-                    values: Some(s.samples.into_iter().map(|(t, v)| (t, v)).collect()),
+                    values: Some(s.samples.into_iter().collect()),
                 })
                 .collect(),
         }),
