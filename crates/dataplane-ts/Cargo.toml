@@ -1,0 +1,11 @@
+[package]
+name = "dataplane-ts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dataplane-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tsink = "0.10"

@@ -1,0 +1,10 @@
+[package]
+name = "dataplane-adapter-elasticsearch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dataplane-core.workspace = true
+dataplane-log.workspace = true
+async-trait.workspace = true

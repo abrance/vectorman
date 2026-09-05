@@ -1,0 +1,18 @@
+[package]
+name = "apiserver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dataplane-core.workspace = true
+dataplane-file.workspace = true
+dataplane-kv.workspace = true
+dataplane-sql.workspace = true
+dataplane-ts.workspace = true
+dataplane-log.workspace = true
+tokio.workspace = true
+clap = { version = "4", features = ["derive"] }
+axum = "0.8"
+serde = { workspace = true }
+serde_json = { workspace = true }
