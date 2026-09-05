@@ -32,19 +32,6 @@ impl ErrorCode {
             ErrorCode::Unavailable => "unavailable",
         }
     }
-
-    pub fn from_str(s: &str) -> Option<ErrorCode> {
-        match s {
-            "not_found" => Some(ErrorCode::NotFound),
-            "invalid_argument" => Some(ErrorCode::InvalidArgument),
-            "query_failed" => Some(ErrorCode::QueryFailed),
-            "unimplemented" => Some(ErrorCode::Unimplemented),
-            "engine_init_failed" => Some(ErrorCode::EngineInitFailed),
-            "config_invalid" => Some(ErrorCode::ConfigInvalid),
-            "unavailable" => Some(ErrorCode::Unavailable),
-            _ => None,
-        }
-    }
 }
 
 /// 统一错误类型。`code` 是稳定机器可读标识，`message` 供展示。

@@ -61,10 +61,20 @@ pub trait TimeSeriesStore: Send + Sync {
     async fn write(&self, point: TsPoint) -> Result<(), DataplaneError>;
 
     /// instant 查询：`expr` 为 PromQL 子集表达式，`eval_time` 缺省为当前时间。
-    async fn query_instant(&self, expr: &str, eval_time: Option<i64>) -> Result<PromResult, DataplaneError>;
+    async fn query_instant(
+        &self,
+        expr: &str,
+        eval_time: Option<i64>,
+    ) -> Result<PromResult, DataplaneError>;
 
     /// range 查询：`start`/`end` 为 Unix 微秒，`step` 为秒。
-    async fn query_range(&self, expr: &str, start: i64, end: i64, step: i64) -> Result<PromResult, DataplaneError>;
+    async fn query_range(
+        &self,
+        expr: &str,
+        start: i64,
+        end: i64,
+        step: i64,
+    ) -> Result<PromResult, DataplaneError>;
 }
 
 async fn blocking<F, R>(f: F) -> Result<R, DataplaneError>
@@ -72,19 +82,24 @@ where
     F: FnOnce() -> Result<R, DataplaneError> + Send + 'static,
     R: Send + 'static,
 {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| DataplaneError::new(ErrorCode::QueryFailed, format!("blocking task panicked: {e}")))?
+    tokio::task::spawn_blocking(f).await.map_err(|e| {
+        DataplaneError::new(
+            ErrorCode::QueryFailed,
+            format!("blocking task panicked: {e}"),
+        )
+    })?
 }
 
 fn map_promql_error(e: PromqlError) -> DataplaneError {
     match e {
-        PromqlError::UnknownFunction(name) => {
-            DataplaneError::new(ErrorCode::Unimplemented, format!("function not supported: {name}"))
-        }
-        PromqlError::Parse(msg) => {
-            DataplaneError::new(ErrorCode::InvalidArgument, format!("promql parse error: {msg}"))
-        }
+        PromqlError::UnknownFunction(name) => DataplaneError::new(
+            ErrorCode::Unimplemented,
+            format!("function not supported: {name}"),
+        ),
+        PromqlError::Parse(msg) => DataplaneError::new(
+            ErrorCode::InvalidArgument,
+            format!("promql parse error: {msg}"),
+        ),
         other => DataplaneError::new(ErrorCode::QueryFailed, other.to_string()),
     }
 }
@@ -118,7 +133,7 @@ fn promql_value_to_result(v: PromqlValue) -> Result<PromResult, DataplaneError> 
                 .map(|s| PromSeries {
                     metric: s.labels.into_iter().map(|l| (l.name, l.value)).collect(),
                     value: None,
-                    values: Some(s.samples.into_iter().map(|(t, v)| (t, v)).collect()),
+                    values: Some(s.samples.into_iter().collect()),
                 })
                 .collect(),
         }),
@@ -143,8 +158,7 @@ impl TsinkTimeSeriesStore {
             .with_timestamp_precision(TimestampPrecision::Microseconds)
             .build()
             .map_err(|e| DataplaneError::new(ErrorCode::QueryFailed, format!("init tsink: {e}")))?;
-        let engine =
-            Engine::with_precision(storage.clone(), TimestampPrecision::Microseconds);
+        let engine = Engine::with_precision(storage.clone(), TimestampPrecision::Microseconds);
         Ok(Self {
             storage,
             engine: Arc::new(engine),
@@ -167,15 +181,19 @@ impl TimeSeriesStore for TsinkTimeSeriesStore {
                 labels,
                 DataPoint::new(point.timestamp, Value::F64(point.field_value)),
             );
-            storage
-                .insert_rows(&[row])
-                .map_err(|e| DataplaneError::new(ErrorCode::QueryFailed, format!("tsink write: {e}")))?;
+            storage.insert_rows(&[row]).map_err(|e| {
+                DataplaneError::new(ErrorCode::QueryFailed, format!("tsink write: {e}"))
+            })?;
             Ok(())
         })
         .await
     }
 
-    async fn query_instant(&self, expr: &str, eval_time: Option<i64>) -> Result<PromResult, DataplaneError> {
+    async fn query_instant(
+        &self,
+        expr: &str,
+        eval_time: Option<i64>,
+    ) -> Result<PromResult, DataplaneError> {
         let engine = self.engine.clone();
         let expr = expr.to_string();
         blocking(move || {
@@ -191,13 +209,19 @@ impl TimeSeriesStore for TsinkTimeSeriesStore {
         .await
     }
 
-    async fn query_range(&self, expr: &str, start: i64, end: i64, step: i64) -> Result<PromResult, DataplaneError> {
+    async fn query_range(
+        &self,
+        expr: &str,
+        start: i64,
+        end: i64,
+        step: i64,
+    ) -> Result<PromResult, DataplaneError> {
         let engine = self.engine.clone();
         let expr = expr.to_string();
         blocking(move || {
-            let step_us = step
-                .checked_mul(1_000_000)
-                .ok_or_else(|| DataplaneError::new(ErrorCode::InvalidArgument, "step overflow in microseconds"))?;
+            let step_us = step.checked_mul(1_000_000).ok_or_else(|| {
+                DataplaneError::new(ErrorCode::InvalidArgument, "step overflow in microseconds")
+            })?;
             let result = engine
                 .range_query(&expr, start, end, step_us)
                 .map_err(map_promql_error)?;

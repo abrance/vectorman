@@ -11,9 +11,9 @@ use async_trait::async_trait;
 use dataplane_core::{DataplaneError, ErrorCode};
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, RangeQuery, TermQuery};
-use tantivy::schema::{IndexRecordOption, Field, TextOptions, TextFieldIndexing, TantivyDocument, Value};
-use tantivy::{Index, IndexReader, IndexWriter, Term};
+use tantivy::schema::{Field, IndexRecordOption, TantivyDocument, TextFieldIndexing, Value};
 use tantivy::tokenizer::{TokenStream, Tokenizer};
+use tantivy::{Index, IndexReader, IndexWriter, Term};
 use tantivy_jieba::JiebaTokenizer;
 use uuid::Uuid;
 
@@ -69,9 +69,12 @@ where
     F: FnOnce() -> Result<R, DataplaneError> + Send + 'static,
     R: Send + 'static,
 {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| DataplaneError::new(ErrorCode::QueryFailed, format!("blocking task panicked: {e}")))?
+    tokio::task::spawn_blocking(f).await.map_err(|e| {
+        DataplaneError::new(
+            ErrorCode::QueryFailed,
+            format!("blocking task panicked: {e}"),
+        )
+    })?
 }
 
 fn dp_err(e: impl std::fmt::Display) -> DataplaneError {
@@ -93,8 +96,8 @@ fn build_schema() -> tantivy::schema::Schema {
     let ts_opts = NumericOptions::from(INDEXED).set_stored().set_fast();
     b.add_i64_field(FIELD_TIMESTAMP, ts_opts);
     b.add_text_field(FIELD_LEVEL, STRING | STORED);
-    let message_opts = TextOptions::from(TEXT | STORED)
-        .set_indexing_options(TextFieldIndexing::default().set_tokenizer("jieba"));
+    let message_opts =
+        (TEXT | STORED).set_indexing_options(TextFieldIndexing::default().set_tokenizer("jieba"));
     b.add_text_field(FIELD_MESSAGE, message_opts);
     b.add_text_field(FIELD_LABELS_JSON, STORED);
     b.add_text_field(FIELD_ID, STORED);
@@ -103,7 +106,6 @@ fn build_schema() -> tantivy::schema::Schema {
 
 /// tantivy+jieba 本地引擎。
 pub struct TantivyLogStore {
-    index: Index,
     writer: Arc<Mutex<IndexWriter<TantivyDocument>>>,
     reader: IndexReader,
     fields: LogFields,
@@ -121,25 +123,23 @@ impl TantivyLogStore {
             }
             Err(e) => return Err(dp_err(e)),
         };
-        index
-            .tokenizers()
-            .register("jieba", JiebaTokenizer::new());
+        index.tokenizers().register("jieba", JiebaTokenizer::new());
 
         let fields = LogFields {
             timestamp: index.schema().get_field(FIELD_TIMESTAMP).map_err(dp_err)?,
             level: index.schema().get_field(FIELD_LEVEL).map_err(dp_err)?,
             message: index.schema().get_field(FIELD_MESSAGE).map_err(dp_err)?,
-            labels_json: index.schema().get_field(FIELD_LABELS_JSON).map_err(dp_err)?,
+            labels_json: index
+                .schema()
+                .get_field(FIELD_LABELS_JSON)
+                .map_err(dp_err)?,
             id: index.schema().get_field(FIELD_ID).map_err(dp_err)?,
         };
 
-        let writer: IndexWriter<TantivyDocument> = index
-            .writer(50_000_000)
-            .map_err(dp_err)?;
+        let writer: IndexWriter<TantivyDocument> = index.writer(50_000_000).map_err(dp_err)?;
         let reader = index.reader().map_err(dp_err)?;
 
         Ok(Self {
-            index,
             writer: Arc::new(Mutex::new(writer)),
             reader,
             fields,
@@ -158,12 +158,13 @@ impl LogStore for TantivyLogStore {
         } else {
             record.id.clone()
         };
-        let labels_json = serde_json::to_string(&record.labels)
-            .map_err(|e| DataplaneError::new(ErrorCode::QueryFailed, format!("serialize labels: {e}")))?;
+        let labels_json = serde_json::to_string(&record.labels).map_err(|e| {
+            DataplaneError::new(ErrorCode::QueryFailed, format!("serialize labels: {e}"))
+        })?;
         blocking(move || {
-            let mut guard = writer
-                .lock()
-                .map_err(|_| DataplaneError::new(ErrorCode::QueryFailed, "log writer lock poisoned"))?;
+            let mut guard = writer.lock().map_err(|_| {
+                DataplaneError::new(ErrorCode::QueryFailed, "log writer lock poisoned")
+            })?;
             let mut doc = TantivyDocument::new();
             doc.add_i64(fields.timestamp, record.timestamp);
             doc.add_text(fields.level, &record.level);
@@ -183,15 +184,15 @@ impl LogStore for TantivyLogStore {
         let mut tokenizer = self.tokenizer.clone();
         blocking(move || {
             let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
-            let lower = Term::from_field_i64(
-                fields.timestamp,
-                filter.from_ts.unwrap_or(i64::MIN),
-            );
+            let lower = Term::from_field_i64(fields.timestamp, filter.from_ts.unwrap_or(i64::MIN));
             let upper = Term::from_field_i64(fields.timestamp, filter.to_ts.unwrap_or(i64::MAX));
-            clauses.push((Occur::Must, Box::new(RangeQuery::new(
-                std::ops::Bound::Included(lower),
-                std::ops::Bound::Included(upper),
-            ))));
+            clauses.push((
+                Occur::Must,
+                Box::new(RangeQuery::new(
+                    std::ops::Bound::Included(lower),
+                    std::ops::Bound::Included(upper),
+                )),
+            ));
             if let Some(level) = &filter.level {
                 let tq = TermQuery::new(
                     Term::from_field_text(fields.level, level),
@@ -218,7 +219,10 @@ impl LogStore for TantivyLogStore {
             let mut out = Vec::with_capacity(top_docs.len());
             for (_score, doc_addr) in top_docs {
                 let doc = searcher.doc::<TantivyDocument>(doc_addr).map_err(dp_err)?;
-                let timestamp = doc.get_first(fields.timestamp).and_then(|v| v.as_i64()).unwrap_or(0);
+                let timestamp = doc
+                    .get_first(fields.timestamp)
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
                 let level = doc
                     .get_first(fields.level)
                     .and_then(|v| v.as_str())

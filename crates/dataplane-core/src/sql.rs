@@ -30,7 +30,10 @@ pub fn json_to_sql_value(v: serde_json::Value) -> Result<SqlValue, DataplaneErro
             } else if let Some(f) = n.as_f64() {
                 Ok(SqlValue::Real(f))
             } else {
-                Err(DataplaneError::new(ErrorCode::InvalidArgument, "unsupported number parameter"))
+                Err(DataplaneError::new(
+                    ErrorCode::InvalidArgument,
+                    "unsupported number parameter",
+                ))
             }
         }
         serde_json::Value::String(s) => Ok(SqlValue::Text(s)),
@@ -43,18 +46,28 @@ pub fn json_to_sql_value(v: serde_json::Value) -> Result<SqlValue, DataplaneErro
 }
 
 /// 将请求参数数组转为 `SqlValue` 列表。支持 `{"b64":"..."}` 形式的 blob。
-pub fn json_params_to_sql_values(params: &[serde_json::Value]) -> Result<Vec<SqlValue>, DataplaneError> {
+pub fn json_params_to_sql_values(
+    params: &[serde_json::Value],
+) -> Result<Vec<SqlValue>, DataplaneError> {
     params
         .iter()
         .map(|v| match v {
             serde_json::Value::Object(map) if map.len() == 1 && map.contains_key("b64") => {
                 let b64 = map["b64"].as_str().ok_or_else(|| {
-                    DataplaneError::new(ErrorCode::InvalidArgument, "blob b64 field must be a string")
+                    DataplaneError::new(
+                        ErrorCode::InvalidArgument,
+                        "blob b64 field must be a string",
+                    )
                 })?;
                 use base64::Engine;
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(b64)
-                    .map_err(|e| DataplaneError::new(ErrorCode::InvalidArgument, format!("invalid base64: {e}")))?;
+                    .map_err(|e| {
+                        DataplaneError::new(
+                            ErrorCode::InvalidArgument,
+                            format!("invalid base64: {e}"),
+                        )
+                    })?;
                 Ok(SqlValue::Blob(bytes))
             }
             serde_json::Value::Object(_) => Err(DataplaneError::new(

@@ -21,11 +21,21 @@ impl TimeSeriesStore for VictoriaMetricsStore {
         Err(unimplemented_store())
     }
 
-    async fn query_instant(&self, _expr: &str, _eval_time: Option<i64>) -> Result<PromResult, DataplaneError> {
+    async fn query_instant(
+        &self,
+        _expr: &str,
+        _eval_time: Option<i64>,
+    ) -> Result<PromResult, DataplaneError> {
         Err(unimplemented_store())
     }
 
-    async fn query_range(&self, _expr: &str, _start: i64, _end: i64, _step: i64) -> Result<PromResult, DataplaneError> {
+    async fn query_range(
+        &self,
+        _expr: &str,
+        _start: i64,
+        _end: i64,
+        _step: i64,
+    ) -> Result<PromResult, DataplaneError> {
         Err(unimplemented_store())
     }
 }

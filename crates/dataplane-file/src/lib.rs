@@ -33,7 +33,12 @@ pub struct Object {
 #[async_trait]
 pub trait FileStore: Send + Sync {
     /// 按相对路径写入字节内容，保存 content-type 与 size。
-    async fn put(&self, path: &str, bytes: Vec<u8>, content_type: Option<&str>) -> Result<(), DataplaneError>;
+    async fn put(
+        &self,
+        path: &str,
+        bytes: Vec<u8>,
+        content_type: Option<&str>,
+    ) -> Result<(), DataplaneError>;
 
     /// 读取对象完整正文与元信息。缺失返回 `not_found`。
     async fn get(&self, path: &str) -> Result<Object, DataplaneError>;
@@ -86,8 +91,9 @@ fn io_err(e: std::io::Error) -> DataplaneError {
 fn read_meta(abs: &Path, bytes_len: u64) -> Result<ObjectMeta, DataplaneError> {
     let mp = meta_path(abs);
     match std::fs::read_to_string(&mp) {
-        Ok(s) => serde_json::from_str(&s)
-            .map_err(|e| DataplaneError::new(ErrorCode::QueryFailed, format!("invalid meta file: {e}"))),
+        Ok(s) => serde_json::from_str(&s).map_err(|e| {
+            DataplaneError::new(ErrorCode::QueryFailed, format!("invalid meta file: {e}"))
+        }),
         Err(_) => Ok(ObjectMeta {
             content_type: DEFAULT_CONTENT_TYPE.to_string(),
             size: bytes_len,
@@ -95,7 +101,12 @@ fn read_meta(abs: &Path, bytes_len: u64) -> Result<ObjectMeta, DataplaneError> {
     }
 }
 
-fn walk(base: &Path, dir: &Path, prefix: &str, out: &mut Vec<String>) -> Result<(), DataplaneError> {
+fn walk(
+    base: &Path,
+    dir: &Path,
+    prefix: &str,
+    out: &mut Vec<String>,
+) -> Result<(), DataplaneError> {
     for entry in std::fs::read_dir(dir).map_err(io_err)? {
         let entry = entry.map_err(io_err)?;
         let path = entry.path();
@@ -120,21 +131,32 @@ where
     F: FnOnce() -> Result<R, DataplaneError> + Send + 'static,
     R: Send + 'static,
 {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| DataplaneError::new(ErrorCode::QueryFailed, format!("blocking task panicked: {e}")))?
+    tokio::task::spawn_blocking(f).await.map_err(|e| {
+        DataplaneError::new(
+            ErrorCode::QueryFailed,
+            format!("blocking task panicked: {e}"),
+        )
+    })?
 }
 
 #[async_trait]
 impl FileStore for DirFileStore {
-    async fn put(&self, path: &str, bytes: Vec<u8>, content_type: Option<&str>) -> Result<(), DataplaneError> {
+    async fn put(
+        &self,
+        path: &str,
+        bytes: Vec<u8>,
+        content_type: Option<&str>,
+    ) -> Result<(), DataplaneError> {
         let root = self.root.clone();
         let path = path.to_string();
         let content_type = content_type.map(str::to_string);
         blocking(move || {
             let rel = validate_object_path(&path)?;
             if rel.as_os_str().is_empty() {
-                return Err(DataplaneError::new(ErrorCode::InvalidArgument, "object path must not be empty"));
+                return Err(DataplaneError::new(
+                    ErrorCode::InvalidArgument,
+                    "object path must not be empty",
+                ));
             }
             let abs = root.join(rel);
             if let Some(parent) = abs.parent() {
@@ -147,9 +169,12 @@ impl FileStore for DirFileStore {
                 size: bytes.len() as u64,
             };
             let mp = meta_path(&abs);
-            std::fs::write(&mp, serde_json::to_string(&meta).map_err(|e| {
-                DataplaneError::new(ErrorCode::QueryFailed, format!("serialize meta: {e}"))
-            })?)
+            std::fs::write(
+                &mp,
+                serde_json::to_string(&meta).map_err(|e| {
+                    DataplaneError::new(ErrorCode::QueryFailed, format!("serialize meta: {e}"))
+                })?,
+            )
             .map_err(io_err)?;
             Ok(())
         })
@@ -163,7 +188,10 @@ impl FileStore for DirFileStore {
             let abs = {
                 let rel = validate_object_path(&path)?;
                 if rel.as_os_str().is_empty() {
-                    return Err(DataplaneError::new(ErrorCode::InvalidArgument, "object path must not be empty"));
+                    return Err(DataplaneError::new(
+                        ErrorCode::InvalidArgument,
+                        "object path must not be empty",
+                    ));
                 }
                 root.join(rel)
             };
@@ -181,7 +209,10 @@ impl FileStore for DirFileStore {
             let abs = {
                 let rel = validate_object_path(&path)?;
                 if rel.as_os_str().is_empty() {
-                    return Err(DataplaneError::new(ErrorCode::InvalidArgument, "object path must not be empty"));
+                    return Err(DataplaneError::new(
+                        ErrorCode::InvalidArgument,
+                        "object path must not be empty",
+                    ));
                 }
                 root.join(rel)
             };
@@ -198,7 +229,10 @@ impl FileStore for DirFileStore {
             let abs = {
                 let rel = validate_object_path(&path)?;
                 if rel.as_os_str().is_empty() {
-                    return Err(DataplaneError::new(ErrorCode::InvalidArgument, "object path must not be empty"));
+                    return Err(DataplaneError::new(
+                        ErrorCode::InvalidArgument,
+                        "object path must not be empty",
+                    ));
                 }
                 root.join(rel)
             };
