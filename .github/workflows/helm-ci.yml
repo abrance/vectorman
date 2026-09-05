@@ -1,0 +1,17 @@
+name: Helm CI
+
+on:
+  pull_request:
+    paths: ['charts/**']
+  push:
+    branches: [main]
+    paths: ['charts/**']
+
+jobs:
+  helm-ci:
+    uses: abrance/yoc/.github/workflows/helm-ci.yml@v1.0.0
+    with:
+      working-directory: charts
+      run-lint: true
+      run-template: true
+      run-unit: true
