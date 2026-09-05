@@ -1,0 +1,10 @@
+[package]
+name = "dataplane-adapter-redis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dataplane-core.workspace = true
+dataplane-kv.workspace = true
+async-trait.workspace = true
