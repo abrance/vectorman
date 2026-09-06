@@ -5,22 +5,25 @@ Updated: 2026-09-06
 
 ## Description
 
-vectorman 控制台 v1 只交付分层骨架：五个原子能力接口与内存实现、三个后端协议适配器、React 装配入口。业务页面列为后续范围。依赖方向只允许向下：页面 -> 业务模块 -> 原子能力 / 领域适配器接口 <- 适配器实现。
+vectorman 前端 v1 交付分层骨架与多包工作区：`@vectorman/primitives` 提供五个原子能力接口与内存实现，`@vectorman/adapters` 提供 HTTP 与后端协议适配器，`@vectorman/console` 与 `@vectorman/job` 各自装配并独立 `dev`/`build`。业务页面列为后续范围。
 
-技术栈：React + Vite + TypeScript，源码目录 `frontend/`。
+依赖方向只允许向下：应用页面 -> 业务模块 -> 原子能力 / 领域适配器接口 <- 适配器实现。库包不依赖应用包。
+
+技术栈：React + Vite + TypeScript，npm workspaces 根目录 `frontend/`。
 
 ## Architecture
 
-分层自上而下：装配入口 -> 页面 -> 业务模块 -> 原子能力接口 -> 适配器实现 -> 开发期反代 -> 后端 HTTP。
+分层自上而下：应用装配入口 -> 页面 -> 业务模块 -> 原子能力接口 -> 适配器实现 -> 开发期反代 -> 后端 HTTP。
 
 ```mermaid
 graph TD
-    ROOT["composition root frontend/src/main.tsx"]
-    subgraph pages ["页面层 v1 空目录"]
-        PAGE["pages/"]
+    subgraph apps ["应用包各自编译"]
+        CONSOLE["@vectorman/console"]
+        JOB["@vectorman/job"]
     end
-    subgraph features ["业务模块层 v1 空目录"]
-        FEAT["features/"]
+    subgraph libs ["库包"]
+        PRIM["@vectorman/primitives"]
+        ADAPT["@vectorman/adapters"]
     end
     subgraph primitives ["原子能力接口"]
         HTTP["HttpClient"]
@@ -29,14 +32,14 @@ graph TD
         QS["QueryStore"]
         NOTE["Notifier"]
     end
-    subgraph adapters ["适配器"]
+    subgraph adapters ["适配器实现"]
         FETCH["FetchHttpClient"]
         GSE["GseAdminAdapter"]
         SQLA["SqlHttpAdapter"]
         PROMA["PromQueryAdapter"]
         MEM["内存实现 Auth Query Notifier Mapper"]
     end
-    subgraph proxy ["Vite 反代"]
+    subgraph proxy ["各应用 Vite 反代"]
         PGSE["/api/gse"]
         PSQL["/api/sql"]
         PPROM["/api/prom"]
@@ -46,28 +49,21 @@ graph TD
         SQLH["apiserver SQL 127.0.0.1:8081"]
         PROMH["apiserver Prom 127.0.0.1:9090"]
     end
-    ROOT --> PAGE
-    ROOT --> FEAT
-    ROOT --> HTTP
-    ROOT --> AUTH
-    ROOT --> QS
-    ROOT --> NOTE
-    PAGE --> FEAT
-    FEAT --> HTTP
-    FEAT --> AUTH
-    FEAT --> QS
-    FEAT --> NOTE
-    FEAT --> GSE
-    FEAT --> SQLA
-    FEAT --> PROMA
-    HTTP --> FETCH
-    MAP --> MEM
-    AUTH --> MEM
-    QS --> MEM
-    NOTE --> MEM
-    GSE --> HTTP
-    SQLA --> HTTP
-    PROMA --> HTTP
+    CONSOLE --> PRIM
+    CONSOLE --> ADAPT
+    JOB --> PRIM
+    JOB --> ADAPT
+    ADAPT --> PRIM
+    PRIM --> HTTP
+    PRIM --> MAP
+    PRIM --> AUTH
+    PRIM --> QS
+    PRIM --> NOTE
+    ADAPT --> FETCH
+    ADAPT --> GSE
+    ADAPT --> SQLA
+    ADAPT --> PROMA
+    ADAPT --> MEM
     FETCH --> PGSE
     FETCH --> PSQL
     FETCH --> PPROM
@@ -76,12 +72,12 @@ graph TD
     PPROM --> PROMH
 ```
 
-依赖规则：
+包依赖规则：
 
-- `primitives/` 零运行时依赖，不从 `react` 导入类型。
-- `adapters/` 依赖 `primitives/`；`FetchHttpClient` 是唯一调用浏览器 `fetch` 的模块。
-- `features/` 与 `pages/` 只依赖接口与适配器对外类型，不 import `fetch`。
-- 装配入口是唯一 `new` 具体实现的地方。
+- `@vectorman/primitives` 零运行时依赖，不从 `react` 导入类型，不依赖 adapters 与 apps。
+- `@vectorman/adapters` 只依赖 `@vectorman/primitives`；`FetchHttpClient` 是唯一调用浏览器 `fetch` 的模块。
+- 应用包依赖两个库包；页面与业务模块只依赖接口与适配器对外类型，不 import `fetch`。
+- 每个应用的装配入口是该应用内唯一 `new` 具体实现的地方。两个应用各自持有独立的内存会话、QueryStore、Notifier 实例。
 
 ## Components and Interfaces
 
@@ -89,39 +85,69 @@ graph TD
 
 ```text
 frontend/
-  package.json
-  vite.config.ts
-  tsconfig.json
-  index.html
-  src/
-    main.tsx                 # 装配入口
-    app/App.tsx              # 装配成功确认页
-    primitives/
-      error.ts               # AppError
-      http.ts                # HttpClient, HttpRequest, HttpResponse, RequestContext
-      mapper.ts              # ErrorMapper
-      session.ts             # AuthSession, Session
-      query.ts               # QueryStore, QueryState
-      notifier.ts            # Notifier, Notice
-      index.ts
-    adapters/
-      memory/
+  package.json                 # workspaces: packages/*, apps/*
+  package-lock.json
+  packages/
+    primitives/                # @vectorman/primitives
+      package.json
+      src/
+        error.ts
+        http.ts
+        mapper.ts
         session.ts
         query.ts
         notifier.ts
-        mapper.ts
-      http/
-        fetch-client.ts
-      gse/
-        admin.ts             # GseAdminAdapter + DTO
-      dataplane/
-        sql.ts
-        prom.ts
-    features/                # v1 空，保留 .gitkeep
-    pages/                   # v1 空，保留 .gitkeep
-  src/primitives/*.test.ts
-  src/adapters/**/*.test.ts
+        memory/
+          session.ts
+          query.ts
+          notifier.ts
+          mapper.ts
+        index.ts
+      src/*.test.ts
+    adapters/                  # @vectorman/adapters
+      package.json
+      src/
+        http/fetch-client.ts
+        gse/admin.ts
+        dataplane/sql.ts
+        dataplane/prom.ts
+        index.ts
+      src/**/*.test.ts
+  apps/
+    console/                   # @vectorman/console
+      package.json
+      vite.config.ts
+      tsconfig.json
+      index.html
+      src/
+        main.tsx
+        app/App.tsx
+        features/.gitkeep
+        pages/.gitkeep
+    job/                       # @vectorman/job
+      package.json
+      vite.config.ts
+      tsconfig.json
+      index.html
+      src/
+        main.tsx
+        app/App.tsx
+        features/.gitkeep
+        pages/.gitkeep
 ```
+
+根 `package.json` scripts：
+
+| script | 作用 |
+| --- | --- |
+| `npm run test -w @vectorman/primitives` | 原子能力单元测试 |
+| `npm run test -w @vectorman/adapters` | 适配器单元测试 |
+| `npm run dev -w @vectorman/console` | 控制台开发服务器 |
+| `npm run build -w @vectorman/console` | 控制台独立产物 |
+| `npm run dev -w @vectorman/job` | 作业应用开发服务器 |
+| `npm run build -w @vectorman/job` | 作业应用独立产物 |
+
+应用包通过 workspace 协议依赖库包，例如 `"@vectorman/primitives": "*"`。Vite 用 `resolve.dedupe` 保证 React 单实例。库包以 TypeScript 源码被应用直接引用（`exports` 指向 `src/index.ts`），v1 不为库包单独产出 dist。
 
 ### 错误契约
 
@@ -201,7 +227,7 @@ interface AuthSession {
 }
 ```
 
-v1：`MemoryAuthSession`，模块内变量保存；刷新页面后为 `null`。不写 `localStorage`。
+v1：`MemoryAuthSession` 保存在实例字段，不使用模块级单例，这样 console 与 job 同时运行时会话互不影响。刷新页面后为 `null`。不写 `localStorage`。
 
 ### QueryStore
 
@@ -225,7 +251,7 @@ interface QueryStore {
 }
 ```
 
-`MemoryQueryStore`：`Map<string, QueryRecord>` + 按 key 的 listener 集合。`get` 对未知 key 返回 `{status:"idle"}`。
+`MemoryQueryStore`：实例内 `Map<string, QueryRecord>` + 按 key 的 listener 集合。`get` 对未知 key 返回 `{status:"idle"}`。
 
 ### Notifier
 
@@ -246,11 +272,11 @@ interface Notifier {
 }
 ```
 
-`MemoryNotifier`：内存队列，上限 50 条，超出丢弃最早一条。`error` 使用 `error.message`。v1 装配入口不渲染 Toast。
+`MemoryNotifier`：实例内内存队列，上限 50 条，超出丢弃最早一条。`error` 使用 `error.message`。v1 装配入口不渲染 Toast。
 
 ### 后端适配器
 
-三个适配器均注入 `HttpClient`。URL 只用相对前缀。
+三个适配器均注入 `HttpClient`。URL 只用相对前缀。位于 `@vectorman/adapters`。
 
 `GseAdminAdapter` 前缀 `/api/gse`：
 
@@ -287,7 +313,7 @@ DTO 与 `crates/gse-server-core/src/ledger.rs` 字段同名：`Host`、`AccessPo
 - 路径：`GET /api/prom/api/v1/query`、`GET /api/prom/api/v1/query_range`
 - 当 `status === "error"`，适配器抛出经 `ErrorMapper` 映射的 `AppError`
 
-Vite 反代剥掉前端前缀，后端收到原路径：
+每个应用自己的 `vite.config.ts` 配置相同反代，剥掉前端前缀，后端收到原路径：
 
 | 浏览器路径 | target | rewrite |
 | --- | --- | --- |
@@ -295,18 +321,22 @@ Vite 反代剥掉前端前缀，后端收到原路径：
 | `/api/sql/v1/sql` | `http://127.0.0.1:8081` | `/v1/sql` |
 | `/api/prom/api/v1/query` | `http://127.0.0.1:9090` | `/api/v1/query` |
 
-`vite.config.ts`：`server.allowedHosts` 含 `.monkeycode-ai.online`。
+每个应用 `server.allowedHosts` 含 `.monkeycode-ai.online`。
 
 ### 装配入口
 
-`main.tsx` 一次性构造：
+每个应用的 `main.tsx` 各自一次性构造：
 
 1. `MemoryAuthSession`、`JsonErrorMapper`、`MemoryQueryStore`、`MemoryNotifier`
 2. `FetchHttpClient({ session, mapper })`
 3. 三个后端适配器
-4. 通过 React Context 把上述实例交给 `App`
+4. 通过 React Context 把上述实例交给该应用的 `App`
 
-`App.tsx` 渲染一行静态确认文案（例如“console composition ready”），证明装配成功。不调用后端。
+`@vectorman/console` 的 `App.tsx` 渲染 “console composition ready”。
+`@vectorman/job` 的 `App.tsx` 渲染 “job composition ready”。
+均不调用后端。后续业务页面写入各自 `pages/` 与 `features/`。
+
+后续新增应用（例如 cmdb）：在 `apps/` 下新建包，依赖两个库包，复制装配入口模式，独立 `build`。
 
 ## Data Models
 
@@ -323,13 +353,15 @@ Vite 反代剥掉前端前缀，后端收到原路径：
 
 ## Correctness Properties
 
-- 依赖单向：`primitives` 不 import `adapters`、`react`、`features`、`pages`。
-- `FetchHttpClient` 是唯一 `fetch` 调用点。
+- `@vectorman/primitives` 不 import `@vectorman/adapters`、`react`、任一应用包。
+- `FetchHttpClient` 是唯一 `fetch` 调用点，位于 `@vectorman/adapters`。
 - 适配器 URL 以 `/api/gse`、`/api/sql`、`/api/prom` 开头。
 - `AuthSession.get()` 在 `clear()` 之后返回 `null`。
 - `QueryStore` 同一 key 的状态为 idle/loading/success/error 四者之一。
 - `Notifier` 订阅者收到的 `error` 级 `message` 等于传入 `AppError.message`。
 - 适配器测试零真实网络。
+- `npm run build -w @vectorman/job` 不读取 console 的 dist。
+- 内存实现按实例隔离，两个应用运行时不共享 Session / QueryStore / Notifier。
 
 ## Error Handling
 
@@ -344,14 +376,11 @@ Vite 反代剥掉前端前缀，后端收到原路径：
 
 ## Test Strategy
 
-测试框架：Vitest。不启动 gse-server / apiserver。
+测试框架：Vitest，挂在对应库包内。不启动 gse-server / apiserver。
 
-1. `JsonErrorMapper`：后端 `code`、Prom `errorType`、AbortError、非法 JSON。
-2. `MemoryAuthSession`：set/get/clear。
-3. `MemoryQueryStore`：状态迁移与 subscribe 通知。
-4. `MemoryNotifier`：三级提示、error 用 `message`、subscribe、队列上限。
-5. `FetchHttpClient`：用 stub `fetch` 断言 timeout abort、Bearer、trace 头、reject 形状。
-6. 三个适配器：注入假 `HttpClient`，断言 method、url、body。
+1. `@vectorman/primitives`：`JsonErrorMapper`、`MemoryAuthSession`、`MemoryQueryStore`、`MemoryNotifier`。
+2. `@vectorman/adapters`：`FetchHttpClient` 用 stub `fetch`；三个适配器注入假 `HttpClient` 断言 method、url、body。
+3. 应用包 v1 不强制页面测试；装配入口可用静态渲染确认文案（可选）。
 
 ## References
 
