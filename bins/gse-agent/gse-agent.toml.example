@@ -1,0 +1,12 @@
+# gse-agent 配置示例
+#
+# 默认值：server_addr="127.0.0.1:7100"，agent_id="agent-1"，心跳周期 30s。
+# 配置缺失或 TOML 非法时进程退出码 1，stderr 含 config_invalid 与路径。
+# 环境变量覆盖（GSE_ 前缀）：
+#   GSE_AGENT_CONFIG / GSE_AGENT_SERVER / GSE_AGENT_ID / GSE_AGENT_TOKEN / GSE_AGENT_HEARTBEAT
+
+server_addr = "127.0.0.1:7100"
+agent_id = "agent-1"
+token = ""
+
+heartbeat_interval_secs = 30

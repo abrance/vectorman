@@ -1,0 +1,16 @@
+# gse-server 配置示例
+#
+# 默认值：listen="0.0.0.0:7100"，auth_enabled=true，心跳周期 30s，超时窗口 90s。
+# 配置缺失或 TOML 非法时进程退出码 1，stderr 含 config_invalid 与路径。
+# 环境变量覆盖（GSE_ 前缀）：
+#   GSE_SERVER_CONFIG / GSE_SERVER_LISTEN / GSE_SERVER_AUTH / GSE_SERVER_HEARTBEAT_TIMEOUT
+
+listen = "0.0.0.0:7100"
+auth_enabled = true
+heartbeat_interval_secs = 30
+heartbeat_timeout_secs = 90
+
+# agent-id → token 静态认证表
+[agents]
+# web-01 = "token-a"
+# web-02 = "token-b"
