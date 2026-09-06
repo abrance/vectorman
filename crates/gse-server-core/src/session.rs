@@ -120,6 +120,13 @@ impl SessionRegistry {
     }
 }
 
+pub fn now_micros() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -298,11 +305,4 @@ mod tests {
         assert!(a > 0);
         assert!(b >= a);
     }
-}
-
-pub fn now_micros() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0)
 }
