@@ -58,3 +58,114 @@ pub fn load_config(path: &str) -> Result<AgentConfig, String> {
     }
     Ok(cfg)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 串行化环境变量测试，避免并行用例互相覆盖。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_env_clean<R>(body: impl FnOnce() -> R) -> R {
+        let _guard = ENV_LOCK.lock().unwrap();
+        for key in [
+            "GSE_AGENT_SERVER",
+            "GSE_AGENT_ID",
+            "GSE_AGENT_TOKEN",
+            "GSE_AGENT_HEARTBEAT",
+        ] {
+            std::env::remove_var(key);
+        }
+        let r = body();
+        for key in [
+            "GSE_AGENT_SERVER",
+            "GSE_AGENT_ID",
+            "GSE_AGENT_TOKEN",
+            "GSE_AGENT_HEARTBEAT",
+        ] {
+            std::env::remove_var(key);
+        }
+        r
+    }
+
+    fn write_tmp(dir: &std::path::Path, name: &str, content: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, content).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn load_full_toml() {
+        with_env_clean(|| {
+            let dir = std::env::temp_dir().join(format!("gse-agent-cfg-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = write_tmp(
+                &dir,
+                "full.toml",
+                r#"
+server_addr = "10.0.0.2:7100"
+agent_id = "web-02"
+token = "tok-b"
+heartbeat_interval_secs = 10
+"#,
+            );
+            let cfg = load_config(&path).expect("parse full toml");
+            assert_eq!(cfg.server_addr, "10.0.0.2:7100");
+            assert_eq!(cfg.agent_id, "web-02");
+            assert_eq!(cfg.token, "tok-b");
+            assert_eq!(cfg.heartbeat_interval_secs, 10);
+        });
+    }
+
+    #[test]
+    fn load_absent_fields_fall_back_to_defaults() {
+        with_env_clean(|| {
+            let dir = std::env::temp_dir().join(format!("gse-agent-cfg-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = write_tmp(&dir, "minimal.toml", "# empty config\n");
+            let cfg = load_config(&path).expect("parse minimal toml");
+            assert_eq!(cfg.server_addr, "127.0.0.1:7100");
+            assert_eq!(cfg.agent_id, "agent-1");
+            assert!(cfg.token.is_empty());
+            assert_eq!(cfg.heartbeat_interval_secs, 30);
+        });
+    }
+
+    #[test]
+    fn env_overrides_all_fields() {
+        with_env_clean(|| {
+            let dir = std::env::temp_dir().join(format!("gse-agent-cfg-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = write_tmp(&dir, "env.toml", "# empty config\n");
+            std::env::set_var("GSE_AGENT_SERVER", "10.1.0.9:7100");
+            std::env::set_var("GSE_AGENT_ID", "env-agent");
+            std::env::set_var("GSE_AGENT_TOKEN", "env-tok");
+            std::env::set_var("GSE_AGENT_HEARTBEAT", "7");
+            let cfg = load_config(&path).expect("parse");
+            assert_eq!(cfg.server_addr, "10.1.0.9:7100");
+            assert_eq!(cfg.agent_id, "env-agent");
+            assert_eq!(cfg.token, "env-tok");
+            assert_eq!(cfg.heartbeat_interval_secs, 7);
+        });
+    }
+
+    #[test]
+    fn malformed_toml_returns_error() {
+        with_env_clean(|| {
+            let dir = std::env::temp_dir().join(format!("gse-agent-cfg-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = write_tmp(&dir, "bad.toml", "server_addr = [\n");
+            let err = load_config(&path).expect_err("should fail");
+            assert!(err.contains("parse"), "{err}");
+            assert!(err.contains(&path), "{err}");
+        });
+    }
+
+    #[test]
+    fn missing_file_returns_error() {
+        with_env_clean(|| {
+            let err = load_config("/nonexistent/gse-agent.toml").expect_err("should fail");
+            assert!(err.contains("cannot read"), "{err}");
+        });
+    }
+}

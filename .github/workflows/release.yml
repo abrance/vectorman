@@ -1,0 +1,57 @@
+name: release-package
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build release binaries
+        run: cargo build --release --workspace
+
+      - name: Assemble package tree and tar.gz
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          REL="${VERSION#v}"
+          ROOT="vectorman-${REL}-linux-x86_64"
+
+          rm -rf "$ROOT"
+          for c in apiserver dpc gse-server gse-agent; do
+            mkdir -p "$ROOT/$c/bin" "$ROOT/$c/conf"
+            cp "target/release/$c" "$ROOT/$c/bin/"
+          done
+
+          cp config.toml.example "$ROOT/apiserver/conf/config.toml.example"
+          cp bins/gse-server/gse-server.toml.example "$ROOT/gse-server/conf/gse-server.toml.example"
+          cp bins/gse-agent/gse-agent.toml.example "$ROOT/gse-agent/conf/gse-agent.toml.example"
+          cp README.md "$ROOT/README.md"
+
+          strip "$ROOT"/*/bin/* || true
+
+          tar -czf "$ROOT.tar.gz" "$ROOT"
+          ls -lh "$ROOT.tar.gz"
+
+          echo "PKG_TARBALL=$ROOT.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Create or update GitHub release with package
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$PKG_TARBALL" \
+            --title "$GITHUB_REF_NAME" --generate-notes \
+            || gh release upload "$GITHUB_REF_NAME" "$PKG_TARBALL" --clobber

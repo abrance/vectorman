@@ -131,9 +131,7 @@ async fn handle_conn(end: End, registry: Arc<SessionRegistry>, cfg: Arc<ServerCo
                 let cfg = cfg_auth.clone();
                 async move {
                     let reply = handle_auth(&req, &end, &registry, &cfg).await;
-                    if !reply.ok {
-                        let _ = end.close().await;
-                    }
+                    // 认证失败不回 close：让 reply（拒绝原因）送达 agent，由 agent 侧决定停止重连。
                     serde_json::to_vec(&reply)
                         .map(Bytes::from)
                         .map_err(|e| Error::Remote(e.to_string()))
