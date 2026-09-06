@@ -1,0 +1,9 @@
+[package]
+name = "gse-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gse-server-core = { path = "../../crates/gse-server-core" }
+tokio.workspace = true
