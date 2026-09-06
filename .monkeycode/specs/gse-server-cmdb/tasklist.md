@@ -42,4 +42,4 @@
 ## 5. 收尾
 
 - [x] 5.1 同步 `docs/gse能力介绍.md` 与 `docs/vectorman概述.md` 中 GSE 章节（台账 + HTTP 管理端口）
-- [ ] 5.2 提交并创建 MR 到 main
+- [x] 5.2 提交并创建 MR 到 main
