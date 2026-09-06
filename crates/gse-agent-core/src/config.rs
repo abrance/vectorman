@@ -68,11 +68,21 @@ mod tests {
 
     fn with_env_clean<R>(body: impl FnOnce() -> R) -> R {
         let _guard = ENV_LOCK.lock().unwrap();
-        for key in ["GSE_AGENT_SERVER", "GSE_AGENT_ID", "GSE_AGENT_TOKEN", "GSE_AGENT_HEARTBEAT"] {
+        for key in [
+            "GSE_AGENT_SERVER",
+            "GSE_AGENT_ID",
+            "GSE_AGENT_TOKEN",
+            "GSE_AGENT_HEARTBEAT",
+        ] {
             std::env::remove_var(key);
         }
         let r = body();
-        for key in ["GSE_AGENT_SERVER", "GSE_AGENT_ID", "GSE_AGENT_TOKEN", "GSE_AGENT_HEARTBEAT"] {
+        for key in [
+            "GSE_AGENT_SERVER",
+            "GSE_AGENT_ID",
+            "GSE_AGENT_TOKEN",
+            "GSE_AGENT_HEARTBEAT",
+        ] {
             std::env::remove_var(key);
         }
         r

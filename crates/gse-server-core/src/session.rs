@@ -138,9 +138,7 @@ mod tests {
             let (end, _drivers) = listener.accept().await.expect("accept");
             end
         });
-        let (client, _client_drivers) = dial(addr, DialOptions::default())
-            .await
-            .expect("dial");
+        let (client, _client_drivers) = dial(addr, DialOptions::default()).await.expect("dial");
         let server_end = server_task.await.expect("accept task");
         (server_end, client)
     }
@@ -253,9 +251,17 @@ mod tests {
 
         let sessions = registry.list().await;
         let s1 = sessions.iter().find(|s| s.agent_id == "web-01").unwrap();
-        assert_eq!(s1.state, SessionState::Online, "recently touched stays online");
+        assert_eq!(
+            s1.state,
+            SessionState::Online,
+            "recently touched stays online"
+        );
         let s2 = sessions.iter().find(|s| s.agent_id == "web-02").unwrap();
-        assert_eq!(s2.state, SessionState::Checking, "idle session moves to checking");
+        assert_eq!(
+            s2.state,
+            SessionState::Checking,
+            "idle session moves to checking"
+        );
 
         registry.touch("web-01", 5_150).await;
         registry.advance_all(5_200, 100).await;
@@ -263,7 +269,11 @@ mod tests {
         let s1 = registry.get("web-01").await.unwrap();
         assert_eq!(s1.state, SessionState::Online, "touched again stays online");
         let s2 = registry.get("web-02").await.unwrap();
-        assert_eq!(s2.state, SessionState::Offline, "idle session moves to offline");
+        assert_eq!(
+            s2.state,
+            SessionState::Offline,
+            "idle session moves to offline"
+        );
     }
 
     #[tokio::test]

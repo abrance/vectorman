@@ -274,8 +274,7 @@ async fn e2e_agent_reconnects_after_disconnect() {
         loop {
             let sessions = server.sessions().await;
             if let Some(s) = sessions.iter().find(|s| s.agent_id == "web-01") {
-                if s.state == SessionState::Online && s.connected_at_micros > original_connected
-                {
+                if s.state == SessionState::Online && s.connected_at_micros > original_connected {
                     return;
                 }
             }

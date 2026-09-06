@@ -166,7 +166,10 @@ web-02 = "tok-b"
             std::fs::create_dir_all(&dir).unwrap();
             let path = write_tmp(&dir, "bad.toml", "listen = {\n");
             let err = load_config(&path).expect_err("should fail");
-            assert!(err.contains("config_invalid") || err.contains("parse"), "{err}");
+            assert!(
+                err.contains("config_invalid") || err.contains("parse"),
+                "{err}"
+            );
             assert!(err.contains(&path), "{err}");
         });
     }
