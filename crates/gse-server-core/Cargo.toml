@@ -11,6 +11,11 @@ tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml = "0.8"
+dataplane-core.workspace = true
+dataplane-sql.workspace = true
+axum = "0.8"
 
 [dev-dependencies]
 gse-agent-core = { path = "../gse-agent-core" }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

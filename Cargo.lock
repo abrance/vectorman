@@ -979,13 +979,18 @@ dependencies = [
 name = "gse-server-core"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "dataplane-core",
+ "dataplane-sql",
  "geminio",
  "gse-agent-core",
  "gse-proto",
+ "http-body-util",
  "serde",
  "serde_json",
  "tokio",
  "toml",
+ "tower",
 ]
 
 [[package]]

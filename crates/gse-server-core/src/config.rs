@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 /// GSE Server 配置，支持 TOML 文件 + `GSE_` 前缀环境变量覆盖。
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ServerConfig {
@@ -9,9 +7,15 @@ pub struct ServerConfig {
     /// 是否启用认证；关闭后任何 agent 可直接接入。
     #[serde(default = "default_true")]
     pub auth_enabled: bool,
-    /// agent-id → token 静态表，对应 TOML `[agents]` 段。
-    #[serde(default)]
-    pub agents: HashMap<String, String>,
+    /// 台账 sqlite 数据库路径。
+    #[serde(default = "default_db")]
+    pub db: String,
+    /// 是否启用 HTTP 管理端口。
+    #[serde(default = "default_true")]
+    pub http_enabled: bool,
+    /// HTTP 管理端口监听地址，默认仅回环。
+    #[serde(default = "default_http_listen")]
+    pub http_listen: String,
     /// agent 期望心跳周期（秒）。
     #[serde(default = "default_interval")]
     pub heartbeat_interval_secs: u64,
@@ -25,7 +29,9 @@ impl Default for ServerConfig {
         Self {
             listen: default_listen(),
             auth_enabled: true,
-            agents: HashMap::new(),
+            db: default_db(),
+            http_enabled: true,
+            http_listen: default_http_listen(),
             heartbeat_interval_secs: default_interval(),
             heartbeat_timeout_secs: default_timeout(),
         }
@@ -38,6 +44,14 @@ fn default_listen() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_db() -> String {
+    "gse-server.db".to_string()
+}
+
+fn default_http_listen() -> String {
+    "127.0.0.1:7101".to_string()
 }
 
 fn default_interval() -> u64 {
@@ -57,6 +71,14 @@ pub fn load_config(path: &str) -> Result<ServerConfig, String> {
     }
     if let Ok(v) = std::env::var("GSE_SERVER_AUTH") {
         cfg.auth_enabled = v == "1" || v.eq_ignore_ascii_case("true");
+    }
+    if let Ok(v) = std::env::var("GSE_SERVER_DB") {
+        cfg.db = v;
+    }
+    if let Ok(v) = std::env::var("GSE_SERVER_HTTP_LISTEN") {
+        // 设置即启用 HTTP 管理端口。
+        cfg.http_enabled = true;
+        cfg.http_listen = v;
     }
     if let Ok(v) = std::env::var("GSE_SERVER_HEARTBEAT_TIMEOUT") {
         if let Ok(secs) = v.parse() {
@@ -78,6 +100,8 @@ mod tests {
         for key in [
             "GSE_SERVER_LISTEN",
             "GSE_SERVER_AUTH",
+            "GSE_SERVER_DB",
+            "GSE_SERVER_HTTP_LISTEN",
             "GSE_SERVER_HEARTBEAT_TIMEOUT",
         ] {
             std::env::remove_var(key);
@@ -86,6 +110,8 @@ mod tests {
         for key in [
             "GSE_SERVER_LISTEN",
             "GSE_SERVER_AUTH",
+            "GSE_SERVER_DB",
+            "GSE_SERVER_HTTP_LISTEN",
             "GSE_SERVER_HEARTBEAT_TIMEOUT",
         ] {
             std::env::remove_var(key);
@@ -110,6 +136,9 @@ mod tests {
                 r#"
 listen = "127.0.0.1:7777"
 auth_enabled = false
+db = "/tmp/ledger.db"
+http_enabled = true
+http_listen = "127.0.0.1:9999"
 heartbeat_interval_secs = 10
 heartbeat_timeout_secs = 30
 
@@ -121,10 +150,11 @@ web-02 = "tok-b"
             let cfg = load_config(&path).expect("parse full toml");
             assert_eq!(cfg.listen, "127.0.0.1:7777");
             assert!(!cfg.auth_enabled);
+            assert_eq!(cfg.db, "/tmp/ledger.db");
+            assert!(cfg.http_enabled);
+            assert_eq!(cfg.http_listen, "127.0.0.1:9999");
             assert_eq!(cfg.heartbeat_interval_secs, 10);
             assert_eq!(cfg.heartbeat_timeout_secs, 30);
-            assert_eq!(*cfg.agents.get("web-01").unwrap(), "tok-a");
-            assert_eq!(*cfg.agents.get("web-02").unwrap(), "tok-b");
         });
     }
 
@@ -137,9 +167,32 @@ web-02 = "tok-b"
             let cfg = load_config(&path).expect("parse minimal toml");
             assert_eq!(cfg.listen, "0.0.0.0:7100");
             assert!(cfg.auth_enabled);
-            assert!(cfg.agents.is_empty());
+            assert_eq!(cfg.db, "gse-server.db");
+            assert!(cfg.http_enabled);
+            assert_eq!(cfg.http_listen, "127.0.0.1:7101");
             assert_eq!(cfg.heartbeat_interval_secs, 30);
             assert_eq!(cfg.heartbeat_timeout_secs, 90);
+        });
+    }
+
+    #[test]
+    fn legacy_agents_section_is_ignored() {
+        with_env_clean(|| {
+            let dir = std::env::temp_dir().join(format!("gse-server-cfg-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = write_tmp(
+                &dir,
+                "legacy.toml",
+                r#"
+listen = "0.0.0.0:7100"
+auth_enabled = true
+
+[agents]
+web-01 = "tok-a"
+"#,
+            );
+            let cfg = load_config(&path).expect("parse legacy toml");
+            assert_eq!(cfg.db, "gse-server.db");
         });
     }
 
@@ -151,10 +204,15 @@ web-02 = "tok-b"
             let path = write_tmp(&dir, "env.toml", "listen = \"0.0.0.0:7100\"\n");
             std::env::set_var("GSE_SERVER_LISTEN", "0.0.0.0:9999");
             std::env::set_var("GSE_SERVER_AUTH", "false");
+            std::env::set_var("GSE_SERVER_DB", "/tmp/ledger.db");
+            std::env::set_var("GSE_SERVER_HTTP_LISTEN", "0.0.0.0:7777");
             std::env::set_var("GSE_SERVER_HEARTBEAT_TIMEOUT", "45");
             let cfg = load_config(&path).expect("parse");
             assert_eq!(cfg.listen, "0.0.0.0:9999");
             assert!(!cfg.auth_enabled);
+            assert_eq!(cfg.db, "/tmp/ledger.db");
+            assert!(cfg.http_enabled);
+            assert_eq!(cfg.http_listen, "0.0.0.0:7777");
             assert_eq!(cfg.heartbeat_timeout_secs, 45);
         });
     }

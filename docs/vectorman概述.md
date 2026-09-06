@@ -82,17 +82,18 @@ job-manage
 
 组件化拆分，至少含 Server 与 Agent 两个二进制；服务端即使拆多个进程，也优先共用同一二进制通过子命令区分。传输层基于 geminio-rs（singchia/geminio 的 Rust 移植）反向隧道，单连接承载双向 RPC。
 
-**已实现（v0.1 最小闭环）：**
+**已实现（v0.1 最小闭环 + 台账）：**
 
 - `bins/gse-server` + `crates/gse-server-core`：geminio `EndListener` 监听、Agent 主动外连接入
-  - 认证：agent-id + token（配置 `[agents]` 静态表），失败关闭连接
-  - 心跳与存活：heartbeat handler 刷新 last_seen，90s 超时窗口内无消息判离线（Online→Checking→Offline）
+  - 认证：查库认证——agent-id + token 对预登记的 `agents` 台账表校验（配置 `[agents]` 静态表已废弃），失败拒绝且 Agent 停止重连
+  - 心跳与存活：heartbeat handler 刷新 last_seen 并回写台账 `last_heartbeat_at`，超时窗口内无消息判离线（Online→Checking→Offline）并同步置台账 `offline`
   - 会话管理：内存注册表，agent-id 至多一个活跃会话
   - 信令下发：`send_command` 经下行 `exec` RPC，RPC 返回即回执；目标离线返回 `unavailable`
+  - 资产台账（CMDB）：sqlite 持久化 hosts / access_points / agents / agent_configs 四表，启动自动建表并自登记接入点；提供 HTTP 管理端口（默认 `127.0.0.1:7101`）与同进程 `Ledger` API 做增删改查，删除 Agent 级联清理配置与会话
 - `bins/gse-agent` + `crates/gse-agent-core`：dial 外连、指数退避重连（1–60s）、认证失败停止重连并以非零退出码结束、周期心跳、`exec` handler（ping/pong 验证链路）
 - `crates/gse-proto`：两端共享 DTO（auth / heartbeat / command / receipt / error）
-- 配置：TOML 文件 + `GSE_` 前缀环境变量覆盖；缺失或非法输出 `config_invalid` 并以退出码 1 结束
-- 集成测试覆盖认证、心跳、ping/pong、未知指令、未登记 agent 与认证失败场景
+- 配置：TOML 文件 + `GSE_` 前缀环境变量覆盖；`db`/`http_enabled`/`http_listen` 支持 `GSE_SERVER_DB`/`GSE_SERVER_HTTP_LISTEN` 覆盖；缺失或非法输出 `config_invalid` 并以退出码 1 结束
+- 集成测试覆盖认证（含未登记与 auth 关闭直通）、心跳、ping/pong、未知指令、台帐状态回写（online/heartbeat/offline）、HTTP 管理 CRUD、删除级联、自登记幂等
 
 **规划中模块：**
 

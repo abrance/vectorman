@@ -1,16 +1,26 @@
 # gse-server 配置示例
 #
-# 默认值：listen="0.0.0.0:7100"，auth_enabled=true，心跳周期 30s，超时窗口 90s。
+# 默认值：listen="0.0.0.0:7100"，auth_enabled=true，db="gse-server.db"，
+# http_enabled=true，http_listen="127.0.0.1:7101"，心跳周期 30s，超时窗口 90s。
 # 配置缺失或 TOML 非法时进程退出码 1，stderr 含 config_invalid 与路径。
 # 环境变量覆盖（GSE_ 前缀）：
-#   GSE_SERVER_CONFIG / GSE_SERVER_LISTEN / GSE_SERVER_AUTH / GSE_SERVER_HEARTBEAT_TIMEOUT
+#   GSE_SERVER_CONFIG / GSE_SERVER_LISTEN / GSE_SERVER_AUTH / GSE_SERVER_DB
+#   GSE_SERVER_HTTP_LISTEN / GSE_SERVER_HEARTBEAT_TIMEOUT
 
 listen = "0.0.0.0:7100"
 auth_enabled = true
 heartbeat_interval_secs = 30
 heartbeat_timeout_secs = 90
 
-# agent-id → token 静态认证表
-[agents]
-# web-01 = "token-a"
-# web-02 = "token-b"
+# 台账 sqlite 数据库路径（默认 gse-server.db，可被 GSE_SERVER_DB 覆盖）。
+# db = "gse-server.db"
+
+# HTTP 管理端口：默认为本机回环 127.0.0.1:7101，仅内网/受控环境使用。
+http_enabled = true
+# http_listen = "127.0.0.1:7101"
+
+# Agent 认证凭据改为预登记进 agents 台账表，不再使用静态 [agents] 段。
+# 登记示例：
+#   curl -X POST http://127.0.0.1:7101/agents \
+#     -H 'content-type: application/json' \
+#     -d '{"agent_id":"web-01","host_id":"h-1","token":"<token>"}'

@@ -21,7 +21,9 @@ v0.1 实现了最小闭环：连接建立 → 身份认证 → 心跳保活 → 
 ## 3. 功能清单
 
 - **Agent 主动外连与自动重连**：Agent 启动即 dial Server；断线后按指数退避 1s→60s 自动重连，重连成功后重新认证并恢复心跳。
-- **身份认证**：agent-id + token；Server 维护 `[agents]` 静态 token 表。认证失败 Agent 停止重连并以非零退出码结束。
+- **身份认证（查库）**：agent-id + token；认证数据源为预登记的 `agents` 台账表（配置 `[agents]` 静态表已废弃），未登记或 token 不匹配即拒绝，认证失败 Agent 停止重连并以非零退出码结束。
+- **资产台账（CMDB）**：sqlite 持久化 hosts / access_points / agents / agent_configs 四张表，以自然键幂等 upsert；支持通过 HTTP 管理端口或同进程 `Ledger` API 预登记与查询。
+- **运行状态回写**：认证成功将 agents 表置 `online` 并记录最后心跳；心跳持续推进 `last_heartbeat_at`；liveness 超时将会话与台账同步置 `offline`。
 - **心跳保活与存活检测**：Agent 每 30s 一次 `heartbeat`（可配置）；Server 在超时窗口（默认 90s）内无任何消息则将会话按 Online→Checking→Offline 推进。
 - **会话管理**：内存注册表，key 为 agent-id，保证同一 agent-id 至多一个活跃会话；支持列表、按 id 查询、在线状态查询。
 - **信令双向上下行**：上层模块通过 `send_command` 下发指令（下行 `exec` RPC），Agent 产生回执经上行通道返回，`Send` 与应答通过指令 id 关联。
@@ -40,7 +42,22 @@ v0.1 实现了最小闭环：连接建立 → 身份认证 → 心跳保活 → 
 | Agent → Server | `heartbeat` | `Heartbeat` | 空 Bytes |
 | Server → Agent | `exec` | `Command` | `Receipt` |
 
-### 4.2 gse-server-core 进程内 API
+### 4.2 HTTP 管理接口（运维登记入口）
+
+独立 HTTP 管理端口（默认 `127.0.0.1:7101`，仅内网/回环），提供四表增删改查，JSON 载荷，必填字段缺失返回 400：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/health` | 存活探测 |
+| GET / POST | `/hosts`、`/hosts/{host_id}` | 主机列表/登记、查询/删除 |
+| GET / POST | `/access-points`、`/access-points/{id}` | 接入点列表/登记、查询/删除 |
+| GET / POST | `/agents`、`/agents/{agent_id}` | Agent 列表/预登记、查询（含运行状态）/删除 |
+| GET / POST | `/agent-configs`、`/agent-configs/{agent_id}` | 运行时配置列表/保存、查询 |
+
+- 预登记 Agent：`POST /agents {"agent_id","host_id","token",...}`，服务端强制初始状态 `unknown`。
+- 删除 Agent 级联清理其运行时配置与活跃会话，节点即刻不可操作。
+
+### 4.3 gse-server-core 进程内 API
 
 同进程 API，v1 无网络协议，供上层模块直接调用（`crates/gse-server-core/src/server.rs`、`session.rs`）：
 
@@ -69,7 +86,7 @@ SessionState::{Online, Checking, Offline, Closed}
 
 `send_command` 行为：目标无会话或状态非 Online 时返回 `GseError{code:"unavailable"}`；RPC 超时（60s）同样返回 `unavailable`；序列化错误返回 `GseError{code:"rpc_error"}`。
 
-### 4.3 gse-agent-core 编程接口
+### 4.4 gse-agent-core 编程接口
 
 ```rust
 run(cfg: AgentConfig) -> Result<(), String>   // 认证失败 Err，调用方非零退出
@@ -79,7 +96,7 @@ AgentConfig { server_addr, agent_id, token, heartbeat_interval_secs }
 
 `AgentError::AuthFailed` 表示认证被拒（停止重连）；`ConnError` 触发指数退避重连。
 
-### 4.4 DTO（crates/gse-proto）
+### 4.5 DTO（crates/gse-proto）
 
 | 类型 | 字段 | 说明 |
 | --- | --- | --- |
@@ -90,7 +107,7 @@ AgentConfig { server_addr, agent_id, token, heartbeat_interval_secs }
 | `Receipt` | `command_id`, `ok`, `message` | 上行回执，`command_id` 关联原指令 |
 | `GseError` | `code`, `message` | 错误载荷，与 `DataplaneError` 互相转换 |
 
-### 4.5 CLI 与配置接口
+### 4.6 CLI 与配置接口
 
 ```bash
 # 配置路径由环境变量指定，未设置时默认读取当前目录 gse-server.toml / gse-agent.toml
@@ -108,7 +125,9 @@ GSE_AGENT_CONFIG=/path/gse-agent.toml ./gse-agent
 | --- | --- | --- |
 | `listen` | `0.0.0.0:7100` | `GSE_SERVER_LISTEN` |
 | `auth_enabled` | `true` | `GSE_SERVER_AUTH` |
-| `agents`（[agents] 表） | 空 | - |
+| `db` | `gse-server.db` | `GSE_SERVER_DB` |
+| `http_enabled` | `true` | 见 `GSE_SERVER_HTTP_LISTEN` |
+| `http_listen` | `127.0.0.1:7101` | `GSE_SERVER_HTTP_LISTEN` |
 | `heartbeat_interval_secs` | `30` | - |
 | `heartbeat_timeout_secs` | `90` | `GSE_SERVER_HEARTBEAT_TIMEOUT` |
 
@@ -118,9 +137,12 @@ auth_enabled = true
 heartbeat_interval_secs = 30
 heartbeat_timeout_secs = 90
 
-[agents]
-web-01 = "token-a"
+# db = "gse-server.db"
+# http_enabled = true
+# http_listen = "127.0.0.1:7101"
 ```
+
+> Agent 认证凭据改为预登记进 `agents` 台账表，不再使用静态 `[agents]` 段（旧配置可解析但不会用于认证）。
 
 ### gse-agent（crates/gse-agent-core/src/config.rs）
 
@@ -148,10 +170,12 @@ Online / Checking → Closed（连接关闭或会话被移除）
 | 场景 | 行为 |
 | --- | --- |
 | 认证失败 / agent-id 未登记 | Server 回 `AuthReply{ok:false}`；Agent 退出码 1，不重连 |
+| 台账数据库打开/建表失败 | gse-server 启动失败，退出码 1，stderr 含原因 |
 | Agent 连不上 Server | 指数退避重连 1–60s，持续失败期间不执行任务 |
 | 指令目标离线或无会话 | `send_command` 返回 `GseError{code:"unavailable"}` |
 | 未知指令（非 ping） | Agent 回 `Receipt{ok:false, message:"unknown command: <name>"}` |
 | RPC 超时（60s） | `GseError{code:"unavailable"}` |
+| 心跳回写失败 | 仅记日志，不影响认证与会话 |
 | 配置文件缺失或非法 | 退出码 1，stderr 含 `config_invalid` 与路径 |
 
 ## 8. 运行部署
@@ -160,6 +184,15 @@ Online / Checking → Closed（连接关闭或会话被移除）
 cargo build --release -p gse-server -p gse-agent
 GSE_SERVER_CONFIG=./gse-server.toml ./target/release/gse-server
 GSE_AGENT_CONFIG=./gse-agent.toml ./target/release/gse-agent
+
+# Server 启动后先经 HTTP 管理端口预登记主机与 Agent（含 token），再启动 Agent 即可纳管
+curl -X POST http://127.0.0.1:7101/hosts \
+  -H 'content-type: application/json' \
+  -d '{"host_id":"web-01","inner_ip":"10.0.0.11","os_type":"linux"}'
+curl -X POST http://127.0.0.1:7101/agents \
+  -H 'content-type: application/json' \
+  -d '{"agent_id":"web-01","host_id":"web-01","token":"<client-gen-token>","version":"0.1.0"}'
+curl http://127.0.0.1:7101/agents   # 查看运行状态（status / last_heartbeat_at）
 ```
 
 配置示例见 `bins/gse-server/gse-server.toml.example` 与 `bins/gse-agent/gse-agent.toml.example`。tag `v*` 触发 CI 打包发布，安装包按组件统一目录布局（每组件一个子目录，内部 `bin/` + `conf/`）分发。
@@ -167,7 +200,9 @@ GSE_AGENT_CONFIG=./gse-agent.toml ./target/release/gse-agent
 ## 9. 测试覆盖
 
 - 单元测试：DTO 序列化往返与错误码互转（gse-proto）；会话状态机、唯一性、touch/advance_all（gse-server-core）；配置解析与环境变量覆盖（server/agent）。
-- 集成测试（`crates/gse-server-core/tests/e2e.rs`）：auth 成功/拒绝/未登记、心跳、ping/pong、未知指令、离线下发 `unavailable`、同 agent-id 唯一会话、断线自动重连恢复。
+- 台账测试（ledger.rs）：建表幂等、四表增删改查、upsert 覆盖、`check_auth` 三态、状态流转。
+- HTTP 路由测试（http.rs）：`/health`、四表 CRUD、必填校验（400/404/201）、删除 Agent 级联清理。
+- 集成测试（`crates/gse-server-core/tests/e2e.rs`）：auth 成功/拒绝/未登记/auth 关闭直通、心跳、ping/pong、未知指令、离线下发 `unavailable`、同 agent-id 唯一会话、断线自动重连恢复、liveness 置台账离线、HTTP 删除级联清台账与会话、自登记接入点幂等。
 
 ## 10. 规划中的扩展
 
