@@ -1,0 +1,13 @@
+[package]
+name = "gse-agent-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gse-proto = { path = "../gse-proto" }
+geminio.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml = "0.8"

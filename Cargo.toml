@@ -16,6 +16,11 @@ members = [
     "crates/dataplane-adapter-victoriametrics",
     "bins/apiserver",
     "bins/dpc",
+    "bins/gse-server",
+    "bins/gse-agent",
+    "crates/gse-proto",
+    "crates/gse-server-core",
+    "crates/gse-agent-core",
 ]
 
 [workspace.package]
@@ -30,6 +35,12 @@ dataplane-ts = { path = "crates/dataplane-ts" }
 dataplane-log = { path = "crates/dataplane-log" }
 dataplane-kv = { path = "crates/dataplane-kv" }
 dataplane-sql = { path = "crates/dataplane-sql" }
+
+gse-proto = { path = "crates/gse-proto" }
+gse-server-core = { path = "crates/gse-server-core" }
+gse-agent-core = { path = "crates/gse-agent-core" }
+
+geminio = { git = "https://github.com/singchia/geminio-rs", rev = "ff4363f814398b36c6ddf37b3d9042eb0b1dd802" }
 
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
