@@ -8,7 +8,6 @@ use gse_server_core::{
     http_router, AdminState, Agent, AgentConfig as LedgerAgentConfig, Server, ServerConfig,
     SessionState,
 };
-use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 fn tmp_db(name: &str) -> String {
