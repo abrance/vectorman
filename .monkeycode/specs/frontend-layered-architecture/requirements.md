@@ -117,9 +117,10 @@ vectorman 前端采用分层架构，并以 npm workspaces 拆成可独立编译
 
 1. THE `@vectorman/console` SHALL 提供 React 装配入口，将五个原子能力的具体实现与三个后端适配器注入到运行时。
 2. THE `@vectorman/job` SHALL 提供独立的 React 装配入口，将同一套原子能力与适配器注入到该应用运行时。
-3. THE v1 各应用包 SHALL 将业务页面与领域模块列为后续范围。
-4. THE 页面层与业务模块层 SHALL 在每个应用包源码目录中保留对应位置，供后续功能写入。
-5. THE 每个应用的装配入口 SHALL 在该应用开发服务器启动后可被浏览器打开，用于确认分层装配成功。
+3. THE `@vectorman/node` SHALL 提供独立的 React 装配入口；其台账页面范围由 `gse-node-app` 规格定义。
+4. THE `@vectorman/console` 与 `@vectorman/job` SHALL 将业务页面与领域模块列为后续范围。
+5. THE 页面层与业务模块层 SHALL 在每个应用包源码目录中保留对应位置，供后续功能写入。
+6. THE 每个应用的装配入口 SHALL 在该应用开发服务器启动后可被浏览器打开，用于确认分层装配成功。
 
 ### Requirement 9: 技术栈与工作区目录
 
@@ -151,9 +152,10 @@ vectorman 前端采用分层架构，并以 npm workspaces 拆成可独立编译
 
 1. THE `frontend/` SHALL 使用 npm workspaces，成员包含 `packages/*` 与 `apps/*`。
 2. THE workspace SHALL 提供库包 `@vectorman/primitives` 与 `@vectorman/adapters`。
-3. THE workspace SHALL 提供应用包 `@vectorman/console` 与 `@vectorman/job`。
+3. THE workspace SHALL 提供应用包 `@vectorman/console`、`@vectorman/job` 与 `@vectorman/node`。
 4. THE `@vectorman/adapters` SHALL 依赖 `@vectorman/primitives`。
 5. THE 应用包 SHALL 依赖 `@vectorman/primitives` 与 `@vectorman/adapters`。
 6. THE `@vectorman/primitives` SHALL 不依赖 `@vectorman/adapters` 与任一应用包。
 7. WHEN 执行针对 `@vectorman/console` 的构建命令，THE 构建系统 SHALL 产出控制台应用的独立产物。
 8. WHEN 执行针对 `@vectorman/job` 的构建命令，THE 构建系统 SHALL 产出作业应用的独立产物，且该命令不要求先构建控制台应用产物。
+9. WHEN 执行针对 `@vectorman/node` 的构建命令，THE 构建系统 SHALL 产出节点应用的独立产物，且该命令不要求先构建控制台或作业应用产物。

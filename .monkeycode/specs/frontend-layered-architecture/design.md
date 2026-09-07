@@ -5,7 +5,7 @@ Updated: 2026-09-06
 
 ## Description
 
-vectorman 前端 v1 交付分层骨架与多包工作区：`@vectorman/primitives` 提供五个原子能力接口与内存实现，`@vectorman/adapters` 提供 HTTP 与后端协议适配器，`@vectorman/console` 与 `@vectorman/job` 各自装配并独立 `dev`/`build`。业务页面列为后续范围。
+vectorman 前端 v1 交付分层骨架与多包工作区：`@vectorman/primitives` 提供五个原子能力接口与内存实现，`@vectorman/adapters` 提供 HTTP 与后端协议适配器，`@vectorman/console`、`@vectorman/job` 与 `@vectorman/node` 各自装配并独立 `dev`/`build`。console 与 job 的业务页面列为后续范围；node 的台账页面见 `gse-node-app` 规格。
 
 依赖方向只允许向下：应用页面 -> 业务模块 -> 原子能力 / 领域适配器接口 <- 适配器实现。库包不依赖应用包。
 
@@ -20,6 +20,7 @@ graph TD
     subgraph apps ["应用包各自编译"]
         CONSOLE["@vectorman/console"]
         JOB["@vectorman/job"]
+        NODE["@vectorman/node"]
     end
     subgraph libs ["库包"]
         PRIM["@vectorman/primitives"]
@@ -53,6 +54,8 @@ graph TD
     CONSOLE --> ADAPT
     JOB --> PRIM
     JOB --> ADAPT
+    NODE --> PRIM
+    NODE --> ADAPT
     ADAPT --> PRIM
     PRIM --> HTTP
     PRIM --> MAP
@@ -134,6 +137,7 @@ frontend/
         app/App.tsx
         features/.gitkeep
         pages/.gitkeep
+    node/                      # @vectorman/node，台账页见 gse-node-app
 ```
 
 根 `package.json` scripts：
@@ -146,6 +150,8 @@ frontend/
 | `npm run build -w @vectorman/console` | 控制台独立产物 |
 | `npm run dev -w @vectorman/job` | 作业应用开发服务器 |
 | `npm run build -w @vectorman/job` | 作业应用独立产物 |
+| `npm run dev -w @vectorman/node` | 节点应用开发服务器 |
+| `npm run build -w @vectorman/node` | 节点应用独立产物 |
 
 应用包通过 workspace 协议依赖库包，例如 `"@vectorman/primitives": "*"`。Vite 用 `resolve.dedupe` 保证 React 单实例。库包以 TypeScript 源码被应用直接引用（`exports` 指向 `src/index.ts`），v1 不为库包单独产出 dist。
 
@@ -334,9 +340,9 @@ DTO 与 `crates/gse-server-core/src/ledger.rs` 字段同名：`Host`、`AccessPo
 
 `@vectorman/console` 的 `App.tsx` 渲染 “console composition ready”。
 `@vectorman/job` 的 `App.tsx` 渲染 “job composition ready”。
-均不调用后端。后续业务页面写入各自 `pages/` 与 `features/`。
+两者 v1 不调用后端。后续业务页面写入各自 `pages/` 与 `features/`。
 
-后续新增应用（例如 cmdb）：在 `apps/` 下新建包，依赖两个库包，复制装配入口模式，独立 `build`。
+`@vectorman/node` 的页面与抽屉见 `.monkeycode/specs/gse-node-app/design.md`。
 
 ## Data Models
 
