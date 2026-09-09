@@ -37,3 +37,9 @@ Entries discovered by the Agent during task execution should follow this format:
 - Category: Environment Configuration
 - Instructions:
   - The sandbox background terminal shell does not have cargo/rustc on PATH (`cargo: not found`). Compile/build/test commands that must run in a managed background terminal shall use the absolute path `/root/.cargo/bin/cargo` explicitly.
+
+[User Instruction Summary]
+- Date: 2026-09-07
+- Context: User corrected the node app preview flow after a Vite-only `npm run dev` deploy
+- Instructions:
+  - Deploy the frontend by building first (`npm run build -w @vectorman/node`), then start/mount the backend (gse-server), then serve the built assets with reverse proxy to GSE HTTP. Do not treat `vite --host` dev server as the deploy path.

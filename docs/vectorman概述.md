@@ -89,11 +89,11 @@ job-manage
   - 心跳与存活：heartbeat handler 刷新 last_seen 并回写台账 `last_heartbeat_at`，超时窗口内无消息判离线（Online→Checking→Offline）并同步置台账 `offline`
   - 会话管理：内存注册表，agent-id 至多一个活跃会话
   - 信令下发：`send_command` 经下行 `exec` RPC，RPC 返回即回执；目标离线返回 `unavailable`
-  - 资产台账（CMDB）：sqlite 持久化 hosts / access_points / agents / agent_configs 四表，启动自动建表并自登记接入点；提供 HTTP 管理端口（默认 `127.0.0.1:7101`）与同进程 `Ledger` API 做增删改查，删除 Agent 级联清理配置与会话
+  - 资产台账（CMDB）：sqlite 持久化 hosts / access_points / agents / agent_configs 四表，启动自动建表并自登记接入点；提供 HTTP 管理端口（默认 `127.0.0.1:7101`）与同进程 `Ledger` API 做增删改查，删除 Agent 级联清理配置与会话；台账 API 统一挂在 `/api/gse` 前缀，配置 `http_web_dir` 时同一端口可托管前端 dist（SPA 回退 index.html）
 - `bins/gse-agent` + `crates/gse-agent-core`：dial 外连、指数退避重连（1–60s）、认证失败停止重连并以非零退出码结束、周期心跳、`exec` handler（ping/pong 验证链路）
 - `crates/gse-proto`：两端共享 DTO（auth / heartbeat / command / receipt / error）
-- 配置：TOML 文件 + `GSE_` 前缀环境变量覆盖；`db`/`http_enabled`/`http_listen` 支持 `GSE_SERVER_DB`/`GSE_SERVER_HTTP_LISTEN` 覆盖；缺失或非法输出 `config_invalid` 并以退出码 1 结束
-- 集成测试覆盖认证（含未登记与 auth 关闭直通）、心跳、ping/pong、未知指令、台帐状态回写（online/heartbeat/offline）、HTTP 管理 CRUD、删除级联、自登记幂等
+- 配置：TOML 文件 + `GSE_` 前缀环境变量覆盖；`db`/`http_enabled`/`http_listen`/`http_web_dir` 支持 `GSE_SERVER_DB`/`GSE_SERVER_HTTP_LISTEN`/`GSE_SERVER_HTTP_WEB_DIR` 覆盖；缺失或非法输出 `config_invalid` 并以退出码 1 结束
+- 集成测试覆盖认证（含未登记与 auth 关闭直通）、心跳、ping/pong、未知指令、台帐状态回写（online/heartbeat/offline）、HTTP 管理 CRUD、删除级联、自登记幂等、静态 web 托管与 SPA 回退
 
 **规划中模块：**
 

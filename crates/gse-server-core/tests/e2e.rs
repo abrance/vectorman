@@ -24,6 +24,7 @@ fn server_config(db: &str, auth_enabled: bool, timeout_secs: u64) -> ServerConfi
         db: db.to_string(),
         http_enabled: false,
         http_listen: "127.0.0.1:0".to_string(),
+        http_web_dir: None,
         heartbeat_interval_secs: 1,
         heartbeat_timeout_secs: timeout_secs,
     }
@@ -489,17 +490,20 @@ async fn e2e_http_delete_agent_clears_ledger_and_session() {
     let handle = tokio::spawn(run_agent(agent_cfg));
     wait_online(&server, "web-01").await;
 
-    let app = http_router(AdminState {
-        ledger: server.ledger.clone(),
-        registry: Some(server.registry.clone()),
-    })
+    let app = http_router(
+        AdminState {
+            ledger: server.ledger.clone(),
+            registry: Some(server.registry.clone()),
+        },
+        None,
+    )
     .into_service();
     let resp = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("DELETE")
-                .uri("/agents/web-01")
+                .uri("/api/gse/agents/web-01")
                 .body(Body::empty())
                 .expect("request"),
         )

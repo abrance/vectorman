@@ -32,8 +32,8 @@ graph TD
     end
     PRIM["@vectorman/primitives"]
     ADAPT["@vectorman/adapters GseAdminAdapter"]
-    PROXY["Vite /api/gse"]
-    GSE["gse-server 127.0.0.1:7101"]
+    PROXY["Vite /api/gse 直通"]
+    GSE["gse-server 127.0.0.1:7101 /api/gse/*"]
     MAIN --> TOAST
     MAIN --> NAV
     NAV --> HOSTS
@@ -63,6 +63,8 @@ graph TD
 ```
 
 工作区应用包：`@vectorman/console`、`@vectorman/job` 保持装配入口占位；`@vectorman/node` 是本期唯一带业务页面的应用。
+
+生产托管：`node` 的 dist 构建产物放入 gse-server 的 `http_web_dir` 指定目录，同一 HTTP 端口由 `ServeDir` 托管（SPA 回退 `index.html`），页面与 `/api/gse` API 同源同端口，无需额外网关。开发态则经 Vite proxy 直通。
 
 ## Components and Interfaces
 
@@ -95,7 +97,7 @@ frontend/apps/node/                 # @vectorman/node
 
 依赖：`react`、`react-dom`、`react-router-dom`、`antd`、`@ant-design/icons`、`@vectorman/primitives`、`@vectorman/adapters`。
 
-`vite.config.ts`：`server.allowedHosts = ['.monkeycode-ai.online']`；`/api/gse` rewrite 去掉前缀，target `http://127.0.0.1:7101`。
+`vite.config.ts`：`server.allowedHosts = ['.monkeycode-ai.online']`；`/api/gse` proxy 直通后端前缀（不 rewrite），target `http://127.0.0.1:7101`。gse-server 侧台账 API 原生挂在 `/api/gse` 前缀（见 `crates/gse-server-core/src/http.rs`），前端包路径与后端一致，两端共同演进。
 
 ### 装配入口
 
