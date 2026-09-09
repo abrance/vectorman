@@ -1,4 +1,9 @@
-//! HTTP 管理端口：以 axum 暴露台账四表的增删改查，供运维预登记与查询。
+//! HTTP 端口：以 axum 暴露台账四表的增删改查，供运维预登记与查询。
+//!
+//! 台账 API 统一挂在 `/api/gse` 前缀下（与前端 `@vectorman/*` 的
+//! `GseAdminAdapter` 前缀一致）；根路径仅保留 `/health`。可选的
+//! `web_dir` 使同一端口同时托管前端 dist：`ServeDir` 找不到文件时回退
+//! `index.html`，满足 SPA 客户端路由。
 //!
 //! 该模块仅操作 `Ledger` 与可选的会话注册表；v1 管理接口不鉴权，
 //! 默认仅监听回环地址。
@@ -12,6 +17,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use gse_proto::GseError;
 use serde_json::json;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::ledger::{ledger_stamp, AccessPoint, Agent, AgentConfig, Host, Ledger};
 use crate::session::SessionRegistry;
@@ -57,10 +63,9 @@ fn from_json_err(e: axum::extract::rejection::JsonRejection) -> Response {
     )
 }
 
-/// 构造台账管理路由，状态为 `AdminState`。
-pub fn router(admin: AdminState) -> Router {
+/// 台账 CRUD 子路由（相对路径），统一挂到 `/api/gse` 前缀下。
+fn ledger_routes(admin: AdminState) -> Router {
     Router::new()
-        .route("/health", get(health))
         .route("/hosts", get(list_hosts).post(create_host))
         .route("/hosts/{host_id}", get(get_host).delete(delete_host))
         .route(
@@ -81,9 +86,29 @@ pub fn router(admin: AdminState) -> Router {
         .with_state(admin)
 }
 
+/// 构造 HTTP 服务路由：台账 API 挂在 `/api/gse` 前缀，根路径保留 `/health`。
+/// 提供 `web_dir` 时同一端口托管该目录下的前端 dist，未命中的路径回退
+/// `index.html`（SPA 客户端路由），已存在的静态资源（JS/CSS/字体）正常返回。
+pub fn router(admin: AdminState, web_dir: Option<&std::path::Path>) -> Router {
+    let api = Router::new()
+        .route("/health", get(health))
+        .nest("/api/gse", ledger_routes(admin));
+    match web_dir {
+        Some(dir) => {
+            let index = dir.join("index.html");
+            api.fallback_service(ServeDir::new(dir).fallback(ServeFile::new(index)))
+        }
+        None => api,
+    }
+}
+
 /// 绑定并托管 HTTP 管理端口；成功后持续运行直至底层错误。
-pub async fn serve(admin: AdminState, listen: &str) -> Result<(), GseError> {
-    let app = router(admin);
+pub async fn serve(
+    admin: AdminState,
+    listen: &str,
+    web_dir: Option<String>,
+) -> Result<(), GseError> {
+    let app = router(admin, web_dir.as_deref().map(std::path::Path::new));
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .map_err(|e| GseError::new("query_failed", format!("bind http {listen}: {e}")))?;
@@ -91,6 +116,13 @@ pub async fn serve(admin: AdminState, listen: &str) -> Result<(), GseError> {
         .local_addr()
         .map_err(|e| GseError::new("query_failed", e.to_string()))?;
     println!("gse-server: http management listening on {addr}");
+    if let Some(dir) = web_dir {
+        if std::path::Path::new(&dir).join("index.html").exists() {
+            println!("gse-server: serving web dist from {dir} on {addr}");
+        } else {
+            eprintln!("gse-server: web_dir {dir} missing index.html; static UI disabled");
+        }
+    }
     axum::serve(listener, app)
         .await
         .map_err(|e| GseError::new("query_failed", e.to_string()))
@@ -339,10 +371,13 @@ mod tests {
         let db = test_db(name);
         let ledger = Arc::new(Ledger::new(&db).expect("open"));
         ledger.init().await.expect("init");
-        let app = router(AdminState {
-            ledger: ledger.clone(),
-            registry: None,
-        });
+        let app = router(
+            AdminState {
+                ledger: ledger.clone(),
+                registry: None,
+            },
+            None,
+        );
         (app, ledger)
     }
 
@@ -382,7 +417,7 @@ mod tests {
         // 缺 inner_ip -> 400
         let (status, body) = send(
             &mut app,
-            req("POST", "/hosts", Some(r#"{"host_id":"h-1"}"#)),
+            req("POST", "/api/gse/hosts", Some(r#"{"host_id":"h-1"}"#)),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -393,7 +428,7 @@ mod tests {
             &mut app,
             req(
                 "POST",
-                "/hosts",
+                "/api/gse/hosts",
                 Some(r#"{"host_id":"h-1","inner_ip":"10.0.0.1","hostname":"web-1"}"#),
             ),
         )
@@ -402,21 +437,21 @@ mod tests {
         assert!(body.contains("10.0.0.1"), "{body}");
 
         // 列表 -> 200
-        let (status, body) = send(&mut app, req("GET", "/hosts", None)).await;
+        let (status, body) = send(&mut app, req("GET", "/api/gse/hosts", None)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("h-1"), "{body}");
 
         // 查询单个 -> 200，缺失 -> 404
-        let (status, body) = send(&mut app, req("GET", "/hosts/h-1", None)).await;
+        let (status, body) = send(&mut app, req("GET", "/api/gse/hosts/h-1", None)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("web-1"), "{body}");
-        let (status, _) = send(&mut app, req("GET", "/hosts/ghost", None)).await;
+        let (status, _) = send(&mut app, req("GET", "/api/gse/hosts/ghost", None)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
         // 删除 -> 200，删除后再查询 404
-        let (status, _) = send(&mut app, req("DELETE", "/hosts/h-1", None)).await;
+        let (status, _) = send(&mut app, req("DELETE", "/api/gse/hosts/h-1", None)).await;
         assert_eq!(status, StatusCode::OK);
-        let (status, _) = send(&mut app, req("GET", "/hosts/h-1", None)).await;
+        let (status, _) = send(&mut app, req("GET", "/api/gse/hosts/h-1", None)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
@@ -429,7 +464,7 @@ mod tests {
             &mut app,
             req(
                 "POST",
-                "/agents",
+                "/api/gse/agents",
                 Some(r#"{"agent_id":"a-1","host_id":"h-1"}"#),
             ),
         )
@@ -442,7 +477,7 @@ mod tests {
             &mut app,
             req(
                 "POST",
-                "/agents",
+                "/api/gse/agents",
                 Some(r#"{"agent_id":"a-1","host_id":"h-1","token":"tok-a","version":"0.1.0"}"#),
             ),
         )
@@ -452,20 +487,20 @@ mod tests {
         assert!(body.contains("\"status\":\"unknown\""), "{body}");
 
         // 列表 -> 200 含 token
-        let (status, body) = send(&mut app, req("GET", "/agents", None)).await;
+        let (status, body) = send(&mut app, req("GET", "/api/gse/agents", None)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("tok-a"), "{body}");
 
         // 查询 -> 200；缺失 -> 404
-        let (status, body) = send(&mut app, req("GET", "/agents/a-1", None)).await;
+        let (status, body) = send(&mut app, req("GET", "/api/gse/agents/a-1", None)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("tok-a"), "{body}");
-        let (status, _) = send(&mut app, req("GET", "/agents/ghost", None)).await;
+        let (status, _) = send(&mut app, req("GET", "/api/gse/agents/ghost", None)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
-        let (status, _) = send(&mut app, req("DELETE", "/agents/a-1", None)).await;
+        let (status, _) = send(&mut app, req("DELETE", "/api/gse/agents/a-1", None)).await;
         assert_eq!(status, StatusCode::OK);
-        let (status, _) = send(&mut app, req("GET", "/agents/a-1", None)).await;
+        let (status, _) = send(&mut app, req("GET", "/api/gse/agents/a-1", None)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
@@ -477,35 +512,39 @@ mod tests {
             &mut app,
             req(
                 "POST",
-                "/access-points",
+                "/api/gse/access-points",
                 Some(r#"{"id":"ap-1","name":"main","server_ip":"192.168.1.1","rpc_port":7100}"#),
             ),
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
-        let (status, body) = send(&mut app, req("GET", "/access-points", None)).await;
+        let (status, body) = send(&mut app, req("GET", "/api/gse/access-points", None)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("ap-1"), "{body}");
-        let (status, _) = send(&mut app, req("GET", "/access-points/ghost", None)).await;
+        let (status, _) = send(&mut app, req("GET", "/api/gse/access-points/ghost", None)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
         let (status, body) = send(
             &mut app,
             req(
                 "POST",
-                "/agent-configs",
+                "/api/gse/agent-configs",
                 Some(r#"{"agent_id":"a-1","host_id":"h-1","cpu_limit_percent":50}"#),
             ),
         )
         .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         assert!(body.contains("\"log_level\":\"info\""), "{body}");
-        let (status, body) = send(&mut app, req("GET", "/agent-configs/a-1", None)).await;
+        let (status, body) = send(&mut app, req("GET", "/api/gse/agent-configs/a-1", None)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("50"), "{body}");
         let (status, body) = send(
             &mut app,
-            req("POST", "/agent-configs", Some(r#"{"host_id":"h-1"}"#)),
+            req(
+                "POST",
+                "/api/gse/agent-configs",
+                Some(r#"{"host_id":"h-1"}"#),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -519,7 +558,7 @@ mod tests {
             &mut app,
             req(
                 "POST",
-                "/hosts",
+                "/api/gse/hosts",
                 Some(r#"{"host_id":"h-1","inner_ip":"10.0.0.1"}"#),
             ),
         )
@@ -528,7 +567,7 @@ mod tests {
             &mut app,
             req(
                 "POST",
-                "/agents",
+                "/api/gse/agents",
                 Some(r#"{"agent_id":"a-1","host_id":"h-1","token":"tok-a"}"#),
             ),
         )
@@ -537,13 +576,13 @@ mod tests {
             &mut app,
             req(
                 "POST",
-                "/agent-configs",
+                "/api/gse/agent-configs",
                 Some(r#"{"agent_id":"a-1","host_id":"h-1","cpu_limit_percent":50}"#),
             ),
         )
         .await;
 
-        let (status, _) = send(&mut app, req("DELETE", "/agents/a-1", None)).await;
+        let (status, _) = send(&mut app, req("DELETE", "/api/gse/agents/a-1", None)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(ledger.get_agent("a-1").await.expect("get").is_none());
         assert!(
@@ -552,5 +591,41 @@ mod tests {
         );
         // host 不随 agent 删除而消失。
         assert!(ledger.get_host("h-1").await.expect("get").is_some());
+    }
+
+    #[tokio::test]
+    async fn web_dir_serves_static_and_spa_fallback() {
+        let dir = std::env::temp_dir().join(format!("gse-http-web-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(dir.join("index.html"), "<html>spa-root</html>").unwrap();
+        std::fs::write(dir.join("assets/app.js"), "console.log(1)").unwrap();
+
+        let db = test_db("web-dir");
+        let ledger = Arc::new(Ledger::new(&db).expect("open"));
+        ledger.init().await.expect("init");
+        let mut app = router(
+            AdminState {
+                ledger: ledger.clone(),
+                registry: None,
+            },
+            Some(&dir),
+        );
+
+        // 静态资源按原路径命中。
+        let (status, body) = send(&mut app, req("GET", "/assets/app.js", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, "console.log(1)");
+
+        // SPA 客户端路由（如 /hosts 页面）回退 index.html。
+        let (status, body) = send(&mut app, req("GET", "/hosts", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("spa-root"), "{body}");
+
+        // API 前缀仍优先于静态回退。
+        let (status, body) = send(&mut app, req("GET", "/api/gse/agents", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("["), "{body}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

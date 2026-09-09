@@ -83,8 +83,9 @@ impl Server {
                 registry: Some(self.registry.clone()),
             };
             let listen = self.cfg.http_listen.clone();
+            let web_dir = self.cfg.http_web_dir.clone();
             tokio::spawn(async move {
-                if let Err(e) = http::serve(admin, &listen).await {
+                if let Err(e) = http::serve(admin, &listen, web_dir).await {
                     eprintln!("gse-server: http management failed: {:?}", e);
                 }
             });

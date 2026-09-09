@@ -16,6 +16,10 @@ pub struct ServerConfig {
     /// HTTP 管理端口监听地址，默认仅回环。
     #[serde(default = "default_http_listen")]
     pub http_listen: String,
+    /// 静态前端目录；配置后同一 HTTP 管理端口同时托管该目录的 dist（SPA 回退 index.html）。
+    /// 目录不存在或未配置则不托管静态页面，管理端口仅暴露 API。
+    #[serde(default)]
+    pub http_web_dir: Option<String>,
     /// agent 期望心跳周期（秒）。
     #[serde(default = "default_interval")]
     pub heartbeat_interval_secs: u64,
@@ -32,6 +36,7 @@ impl Default for ServerConfig {
             db: default_db(),
             http_enabled: true,
             http_listen: default_http_listen(),
+            http_web_dir: None,
             heartbeat_interval_secs: default_interval(),
             heartbeat_timeout_secs: default_timeout(),
         }
@@ -80,6 +85,10 @@ pub fn load_config(path: &str) -> Result<ServerConfig, String> {
         cfg.http_enabled = true;
         cfg.http_listen = v;
     }
+    if let Ok(v) = std::env::var("GSE_SERVER_HTTP_WEB_DIR") {
+        // 显式设空串可关闭静态托管。
+        cfg.http_web_dir = if v.is_empty() { None } else { Some(v) };
+    }
     if let Ok(v) = std::env::var("GSE_SERVER_HEARTBEAT_TIMEOUT") {
         if let Ok(secs) = v.parse() {
             cfg.heartbeat_timeout_secs = secs;
@@ -102,6 +111,7 @@ mod tests {
             "GSE_SERVER_AUTH",
             "GSE_SERVER_DB",
             "GSE_SERVER_HTTP_LISTEN",
+            "GSE_SERVER_HTTP_WEB_DIR",
             "GSE_SERVER_HEARTBEAT_TIMEOUT",
         ] {
             std::env::remove_var(key);
@@ -112,6 +122,7 @@ mod tests {
             "GSE_SERVER_AUTH",
             "GSE_SERVER_DB",
             "GSE_SERVER_HTTP_LISTEN",
+            "GSE_SERVER_HTTP_WEB_DIR",
             "GSE_SERVER_HEARTBEAT_TIMEOUT",
         ] {
             std::env::remove_var(key);
@@ -139,6 +150,7 @@ auth_enabled = false
 db = "/tmp/ledger.db"
 http_enabled = true
 http_listen = "127.0.0.1:9999"
+http_web_dir = "web"
 heartbeat_interval_secs = 10
 heartbeat_timeout_secs = 30
 
@@ -153,6 +165,7 @@ web-02 = "tok-b"
             assert_eq!(cfg.db, "/tmp/ledger.db");
             assert!(cfg.http_enabled);
             assert_eq!(cfg.http_listen, "127.0.0.1:9999");
+            assert_eq!(cfg.http_web_dir.as_deref(), Some("web"));
             assert_eq!(cfg.heartbeat_interval_secs, 10);
             assert_eq!(cfg.heartbeat_timeout_secs, 30);
         });
@@ -170,6 +183,7 @@ web-02 = "tok-b"
             assert_eq!(cfg.db, "gse-server.db");
             assert!(cfg.http_enabled);
             assert_eq!(cfg.http_listen, "127.0.0.1:7101");
+            assert!(cfg.http_web_dir.is_none());
             assert_eq!(cfg.heartbeat_interval_secs, 30);
             assert_eq!(cfg.heartbeat_timeout_secs, 90);
         });
@@ -206,6 +220,7 @@ web-01 = "tok-a"
             std::env::set_var("GSE_SERVER_AUTH", "false");
             std::env::set_var("GSE_SERVER_DB", "/tmp/ledger.db");
             std::env::set_var("GSE_SERVER_HTTP_LISTEN", "0.0.0.0:7777");
+            std::env::set_var("GSE_SERVER_HTTP_WEB_DIR", "/srv/web");
             std::env::set_var("GSE_SERVER_HEARTBEAT_TIMEOUT", "45");
             let cfg = load_config(&path).expect("parse");
             assert_eq!(cfg.listen, "0.0.0.0:9999");
@@ -213,6 +228,7 @@ web-01 = "tok-a"
             assert_eq!(cfg.db, "/tmp/ledger.db");
             assert!(cfg.http_enabled);
             assert_eq!(cfg.http_listen, "0.0.0.0:7777");
+            assert_eq!(cfg.http_web_dir.as_deref(), Some("/srv/web"));
             assert_eq!(cfg.heartbeat_timeout_secs, 45);
         });
     }

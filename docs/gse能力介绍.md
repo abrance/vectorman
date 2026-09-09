@@ -44,17 +44,18 @@ v0.1 实现了最小闭环：连接建立 → 身份认证 → 心跳保活 → 
 
 ### 4.2 HTTP 管理接口（运维登记入口）
 
-独立 HTTP 管理端口（默认 `127.0.0.1:7101`，仅内网/回环），提供四表增删改查，JSON 载荷，必填字段缺失返回 400：
+独立 HTTP 端口（默认 `127.0.0.1:7101`，仅内网/回环），提供四表增删改查，JSON 载荷，必填字段缺失返回 400。台账 API 统一挂在 `/api/gse` 前缀下（与前端 `@vectorman/*` 的 `GseAdminAdapter` 一致）；根路径仅保留 `/health`：
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/health` | 存活探测 |
-| GET / POST | `/hosts`、`/hosts/{host_id}` | 主机列表/登记、查询/删除 |
-| GET / POST | `/access-points`、`/access-points/{id}` | 接入点列表/登记、查询/删除 |
-| GET / POST | `/agents`、`/agents/{agent_id}` | Agent 列表/预登记、查询（含运行状态）/删除 |
-| GET / POST | `/agent-configs`、`/agent-configs/{agent_id}` | 运行时配置列表/保存、查询 |
+| GET / POST | `/api/gse/hosts`、`/api/gse/hosts/{host_id}` | 主机列表/登记、查询/删除 |
+| GET / POST | `/api/gse/access-points`、`/api/gse/access-points/{id}` | 接入点列表/登记、查询/删除 |
+| GET / POST | `/api/gse/agents`、`/api/gse/agents/{agent_id}` | Agent 列表/预登记、查询（含运行状态）/删除 |
+| GET / POST | `/api/gse/agent-configs`、`/api/gse/agent-configs/{agent_id}` | 运行时配置列表/保存、查询 |
 
-- 预登记 Agent：`POST /agents {"agent_id","host_id","token",...}`，服务端强制初始状态 `unknown`。
+- 配置 `http_web_dir` 指向前端 dist 目录时，同一端口同时托管静态页面（`ServeDir` + SPA 回退 `index.html`），页面与 API 同源。
+- 预登记 Agent：`POST /api/gse/agents {"agent_id","host_id","token",...}`，服务端强制初始状态 `unknown`。
 - 删除 Agent 级联清理其运行时配置与活跃会话，节点即刻不可操作。
 
 ### 4.3 gse-server-core 进程内 API
@@ -128,6 +129,7 @@ GSE_AGENT_CONFIG=/path/gse-agent.toml ./gse-agent
 | `db` | `gse-server.db` | `GSE_SERVER_DB` |
 | `http_enabled` | `true` | 见 `GSE_SERVER_HTTP_LISTEN` |
 | `http_listen` | `127.0.0.1:7101` | `GSE_SERVER_HTTP_LISTEN` |
+| `http_web_dir` | 空（不托管） | `GSE_SERVER_HTTP_WEB_DIR`（显式空串关闭） |
 | `heartbeat_interval_secs` | `30` | - |
 | `heartbeat_timeout_secs` | `90` | `GSE_SERVER_HEARTBEAT_TIMEOUT` |
 
@@ -140,6 +142,9 @@ heartbeat_timeout_secs = 90
 # db = "gse-server.db"
 # http_enabled = true
 # http_listen = "127.0.0.1:7101"
+
+# 同时托管前端 dist（SPA 回退 index.html）；未配置则仅暴露 API。
+# http_web_dir = "/opt/vectorman/gse-server/web"
 ```
 
 > Agent 认证凭据改为预登记进 `agents` 台账表，不再使用静态 `[agents]` 段（旧配置可解析但不会用于认证）。
@@ -185,14 +190,15 @@ cargo build --release -p gse-server -p gse-agent
 GSE_SERVER_CONFIG=./gse-server.toml ./target/release/gse-server
 GSE_AGENT_CONFIG=./gse-agent.toml ./target/release/gse-agent
 
-# Server 启动后先经 HTTP 管理端口预登记主机与 Agent（含 token），再启动 Agent 即可纳管
-curl -X POST http://127.0.0.1:7101/hosts \
+# Server 启动后先经 HTTP 端口预登记主机与 Agent（含 token），再启动 Agent 即可纳管
+# 台账 API 挂在 /api/gse 前缀下
+curl -X POST http://127.0.0.1:7101/api/gse/hosts \
   -H 'content-type: application/json' \
   -d '{"host_id":"web-01","inner_ip":"10.0.0.11","os_type":"linux"}'
-curl -X POST http://127.0.0.1:7101/agents \
+curl -X POST http://127.0.0.1:7101/api/gse/agents \
   -H 'content-type: application/json' \
   -d '{"agent_id":"web-01","host_id":"web-01","token":"<client-gen-token>","version":"0.1.0"}'
-curl http://127.0.0.1:7101/agents   # 查看运行状态（status / last_heartbeat_at）
+curl http://127.0.0.1:7101/api/gse/agents   # 查看运行状态（status / last_heartbeat_at）
 ```
 
 配置示例见 `bins/gse-server/gse-server.toml.example` 与 `bins/gse-agent/gse-agent.toml.example`。tag `v*` 触发 CI 打包发布，安装包按组件统一目录布局（每组件一个子目录，内部 `bin/` + `conf/`）分发。
@@ -201,7 +207,7 @@ curl http://127.0.0.1:7101/agents   # 查看运行状态（status / last_heartbe
 
 - 单元测试：DTO 序列化往返与错误码互转（gse-proto）；会话状态机、唯一性、touch/advance_all（gse-server-core）；配置解析与环境变量覆盖（server/agent）。
 - 台账测试（ledger.rs）：建表幂等、四表增删改查、upsert 覆盖、`check_auth` 三态、状态流转。
-- HTTP 路由测试（http.rs）：`/health`、四表 CRUD、必填校验（400/404/201）、删除 Agent 级联清理。
+- HTTP 路由测试（http.rs）：`/health`、`/api/gse` 前缀下四表 CRUD、必填校验（400/404/201）、删除 Agent 级联清理、`http_web_dir` 静态托管与 SPA 回退。
 - 集成测试（`crates/gse-server-core/tests/e2e.rs`）：auth 成功/拒绝/未登记/auth 关闭直通、心跳、ping/pong、未知指令、离线下发 `unavailable`、同 agent-id 唯一会话、断线自动重连恢复、liveness 置台账离线、HTTP 删除级联清台账与会话、自登记接入点幂等。
 
 ## 10. 规划中的扩展

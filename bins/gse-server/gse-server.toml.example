@@ -5,7 +5,7 @@
 # 配置缺失或 TOML 非法时进程退出码 1，stderr 含 config_invalid 与路径。
 # 环境变量覆盖（GSE_ 前缀）：
 #   GSE_SERVER_CONFIG / GSE_SERVER_LISTEN / GSE_SERVER_AUTH / GSE_SERVER_DB
-#   GSE_SERVER_HTTP_LISTEN / GSE_SERVER_HEARTBEAT_TIMEOUT
+#   GSE_SERVER_HTTP_LISTEN / GSE_SERVER_HTTP_WEB_DIR / GSE_SERVER_HEARTBEAT_TIMEOUT
 
 listen = "0.0.0.0:7100"
 auth_enabled = true
@@ -15,12 +15,18 @@ heartbeat_timeout_secs = 90
 # 台账 sqlite 数据库路径（默认 gse-server.db，可被 GSE_SERVER_DB 覆盖）。
 # db = "gse-server.db"
 
-# HTTP 管理端口：默认为本机回环 127.0.0.1:7101，仅内网/受控环境使用。
+# HTTP 端口：默认为本机回环 127.0.0.1:7101，仅内网/受控环境使用。
+# 台账 API 统一挂在 /api/gse 前缀下；根路径仅保留 /health。
 http_enabled = true
 # http_listen = "127.0.0.1:7101"
 
+# 静态前端目录：配置后同一 HTTP 端口同时托管该目录下的前端 dist，
+# SPA 客户端路由回退到 index.html（页面与 API 同源同端口）。
+# 目录需含 index.html；未配置或不含 index.html 时仅暴露 API。
+# web_dir = "/opt/vectorman/gse-server/web"
+
 # Agent 认证凭据改为预登记进 agents 台账表，不再使用静态 [agents] 段。
 # 登记示例：
-#   curl -X POST http://127.0.0.1:7101/agents \
+#   curl -X POST http://127.0.0.1:7101/api/gse/agents \
 #     -H 'content-type: application/json' \
 #     -d '{"agent_id":"web-01","host_id":"h-1","token":"<token>"}'

@@ -1,0 +1,13 @@
+{
+  "name": "vectorman-frontend",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "test": "npm run test -w @vectorman/primitives && npm run test -w @vectorman/adapters && npm run test -w @vectorman/node",
+    "dev:node": "npm run dev -w @vectorman/node",
+    "build:node": "npm run build -w @vectorman/node"
+  }
+}
