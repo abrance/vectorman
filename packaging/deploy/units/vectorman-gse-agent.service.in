@@ -1,0 +1,15 @@
+[Unit]
+Description=Vectorman GSE Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@INSTALL_ROOT@
+Environment=GSE_AGENT_CONFIG=@INSTALL_ROOT@/conf/gse-agent.toml
+ExecStart=@INSTALL_ROOT@/bin/gse-agent
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

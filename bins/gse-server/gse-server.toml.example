@@ -23,7 +23,8 @@ http_enabled = true
 # 静态前端目录：配置后同一 HTTP 端口同时托管该目录下的前端 dist，
 # SPA 客户端路由回退到 index.html（页面与 API 同源同端口）。
 # 目录需含 index.html；未配置或不含 index.html 时仅暴露 API。
-# web_dir = "/opt/vectorman/gse-server/web"
+# 相对路径相对进程工作目录；安装包布局下为组件目录（unit 已设 WorkingDirectory）。
+# http_web_dir = "web"
 
 # Agent 认证凭据改为预登记进 agents 台账表，不再使用静态 [agents] 段。
 # 登记示例：
