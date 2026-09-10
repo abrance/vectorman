@@ -101,7 +101,10 @@ impl TemplateInput {
         if timeout == 0 || timeout > cfg.job_max_timeout_secs {
             return Err(GseError::new(
                 "invalid_argument",
-                format!("timeout_secs must be within 1..={}", cfg.job_max_timeout_secs),
+                format!(
+                    "timeout_secs must be within 1..={}",
+                    cfg.job_max_timeout_secs
+                ),
             ));
         }
         validate_placeholders(self)?;
@@ -195,7 +198,10 @@ pub fn expand(
     if timeout == 0 || timeout > cfg.job_max_timeout_secs {
         return Err(GseError::new(
             "invalid_argument",
-            format!("timeout_secs must be within 1..={}", cfg.job_max_timeout_secs),
+            format!(
+                "timeout_secs must be within 1..={}",
+                cfg.job_max_timeout_secs
+            ),
         ));
     }
 
@@ -225,9 +231,9 @@ fn collect_placeholders(text: &str, names: &mut BTreeSet<String>) -> Result<(), 
     while i < bytes.len() {
         if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
             let start = i + 2;
-            let rel = text[start..].find('}').ok_or_else(|| {
-                GseError::new("invalid_argument", "unterminated placeholder")
-            })?;
+            let rel = text[start..]
+                .find('}')
+                .ok_or_else(|| GseError::new("invalid_argument", "unterminated placeholder"))?;
             let name = &text[start..start + rel];
             if !is_valid_name(name) {
                 return Err(GseError::new(
@@ -251,9 +257,9 @@ fn substitute(text: &str, vars: &BTreeMap<String, String>) -> Result<String, Gse
     while i < bytes.len() {
         if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
             let start = i + 2;
-            let rel = text[start..].find('}').ok_or_else(|| {
-                GseError::new("invalid_argument", "unterminated placeholder")
-            })?;
+            let rel = text[start..]
+                .find('}')
+                .ok_or_else(|| GseError::new("invalid_argument", "unterminated placeholder"))?;
             let name = &text[start..start + rel];
             let value = vars.get(name).ok_or_else(|| {
                 GseError::new("invalid_argument", format!("missing variable {name}"))

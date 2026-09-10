@@ -1070,11 +1070,7 @@ mod tests {
     async fn job_rerun_requires_in_process_server() {
         let (mut app, ledger) = app_ledger("rerun-503").await;
         insert_job(&ledger, "job-src").await;
-        let (status, body) = send(
-            &mut app,
-            req("POST", "/api/gse/jobs/job-src/rerun", None),
-        )
-        .await;
+        let (status, body) = send(&mut app, req("POST", "/api/gse/jobs/job-src/rerun", None)).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     }
 
@@ -1084,11 +1080,7 @@ mod tests {
         insert_job(&ledger, "job-src").await;
 
         // 空请求体：以来源作业参数提交，目标 Agent 离线 -> 409。
-        let (status, body) = send(
-            &mut app,
-            req("POST", "/api/gse/jobs/job-src/rerun", None),
-        )
-        .await;
+        let (status, body) = send(&mut app, req("POST", "/api/gse/jobs/job-src/rerun", None)).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert!(body.contains("unavailable"), "{body}");
 
@@ -1097,7 +1089,11 @@ mod tests {
         let payload = format!(r#"{{"script":"{long}"}}"#);
         let (status, body) = send(
             &mut app,
-            req("POST", "/api/gse/jobs/job-src/rerun", Some(payload.as_str())),
+            req(
+                "POST",
+                "/api/gse/jobs/job-src/rerun",
+                Some(payload.as_str()),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -1188,16 +1184,28 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body.contains("collect"), "{body}");
 
-        let (status, body) = send(&mut app, req("GET", "/api/gse/job-templates?name=coll", None)).await;
+        let (status, body) = send(
+            &mut app,
+            req("GET", "/api/gse/job-templates?name=coll", None),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body.contains("collect"), "{body}");
-        let (status, body) = send(&mut app, req("GET", "/api/gse/job-templates?name=nomatch", None)).await;
+        let (status, body) = send(
+            &mut app,
+            req("GET", "/api/gse/job-templates?name=nomatch", None),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body, "[]");
 
         let (status, body) = send(
             &mut app,
-            req("GET", &format!("/api/gse/job-templates/{template_id}"), None),
+            req(
+                "GET",
+                &format!("/api/gse/job-templates/{template_id}"),
+                None,
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -1218,22 +1226,26 @@ mod tests {
 
         let (status, _) = send(
             &mut app,
-            req("DELETE", &format!("/api/gse/job-templates/{template_id}"), None),
+            req(
+                "DELETE",
+                &format!("/api/gse/job-templates/{template_id}"),
+                None,
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
 
         let (status, _) = send(
             &mut app,
-            req("GET", &format!("/api/gse/job-templates/{template_id}"), None),
+            req(
+                "GET",
+                &format!("/api/gse/job-templates/{template_id}"),
+                None,
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        let (status, _) = send(
-            &mut app,
-            req("GET", "/api/gse/job-templates/ghost", None),
-        )
-        .await;
+        let (status, _) = send(&mut app, req("GET", "/api/gse/job-templates/ghost", None)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
@@ -1243,7 +1255,11 @@ mod tests {
 
         let (status, body) = send(
             &mut app,
-            req("POST", "/api/gse/job-templates", Some(r#"{"script":"echo hi"}"#)),
+            req(
+                "POST",
+                "/api/gse/job-templates",
+                Some(r#"{"script":"echo hi"}"#),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -1251,7 +1267,11 @@ mod tests {
 
         let (status, body) = send(
             &mut app,
-            req("POST", "/api/gse/job-templates", Some(r#"{"name":"x","script":""}"#)),
+            req(
+                "POST",
+                "/api/gse/job-templates",
+                Some(r#"{"name":"x","script":""}"#),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -1288,8 +1308,11 @@ mod tests {
         // 无进程内 Server -> 503。
         let (mut app, _ledger) = app_ledger("tpl-submit-503").await;
         let tpl_body = TEMPLATE_BODY;
-        let (_, created_body) =
-            send(&mut app, req("POST", "/api/gse/job-templates", Some(tpl_body))).await;
+        let (_, created_body) = send(
+            &mut app,
+            req("POST", "/api/gse/job-templates", Some(tpl_body)),
+        )
+        .await;
         let template_id = created_body
             .split("\"template_id\":\"")
             .nth(1)
@@ -1309,8 +1332,11 @@ mod tests {
 
         // 有 Server 但缺 agent_id / 缺变量 -> 400；变量齐全但 agent 离线 -> 409。
         let (mut app, _ledger) = app_with_jobs("tpl-submit-vars").await;
-        let (_, created_body) =
-            send(&mut app, req("POST", "/api/gse/job-templates", Some(tpl_body))).await;
+        let (_, created_body) = send(
+            &mut app,
+            req("POST", "/api/gse/job-templates", Some(tpl_body)),
+        )
+        .await;
         let template_id = created_body
             .split("\"template_id\":\"")
             .nth(1)

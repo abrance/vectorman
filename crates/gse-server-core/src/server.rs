@@ -245,7 +245,10 @@ pub async fn submit_job_with_source(
     if timeout == 0 || timeout > cfg.job_max_timeout_secs {
         return Err(GseError::new(
             "invalid_argument",
-            format!("timeout_secs must be within 1..={}", cfg.job_max_timeout_secs),
+            format!(
+                "timeout_secs must be within 1..={}",
+                cfg.job_max_timeout_secs
+            ),
         ));
     }
     match registry.get(&req.agent_id).await {
@@ -307,7 +310,15 @@ pub async fn submit_rerun(
     req: RerunRequest,
 ) -> Result<JobRecord, GseError> {
     let submit = build_rerun_submit(source, req);
-    submit_job_with_source(ledger, registry, cfg, submit, None, Some(source.job_id.clone())).await
+    submit_job_with_source(
+        ledger,
+        registry,
+        cfg,
+        submit,
+        None,
+        Some(source.job_id.clone()),
+    )
+    .await
 }
 
 /// 调用 Agent 的 `job_exec` 并按受理结果流转状态：
@@ -333,7 +344,9 @@ async fn dispatch_job(
     match tokio::time::timeout(rpc_timeout, session.end.call("job_exec", Bytes::from(body))).await {
         Ok(Ok(resp)) => match serde_json::from_slice::<JobAck>(&resp) {
             Ok(ack) if ack.accepted => {
-                ledger.mark_running(&job_id, &now_micros().to_string()).await?;
+                ledger
+                    .mark_running(&job_id, &now_micros().to_string())
+                    .await?;
             }
             Ok(ack) => {
                 let reason = ack.reason.unwrap_or_else(|| "rejected".to_string());
@@ -367,14 +380,20 @@ pub async fn handle_job_result(ledger: &Ledger, conn_agent_id: &str, result: Job
                 return;
             }
             if let Err(e) = ledger.finish_job(&result, &now_micros().to_string()).await {
-                eprintln!("gse-server: finish_job {} failed: {}", result.job_id, e.message);
+                eprintln!(
+                    "gse-server: finish_job {} failed: {}",
+                    result.job_id, e.message
+                );
             }
         }
         Ok(None) => {
             eprintln!("gse-server: job_result for unknown job {}", result.job_id);
         }
         Err(e) => {
-            eprintln!("gse-server: get_job {} failed: {}", result.job_id, e.message);
+            eprintln!(
+                "gse-server: get_job {} failed: {}",
+                result.job_id, e.message
+            );
         }
     }
 }

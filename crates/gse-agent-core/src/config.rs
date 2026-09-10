@@ -55,11 +55,7 @@ fn default_interval() -> u64 {
 }
 
 fn default_interpreters() -> Vec<String> {
-    vec![
-        "bash".to_string(),
-        "sh".to_string(),
-        "python3".to_string(),
-    ]
+    vec!["bash".to_string(), "sh".to_string(), "python3".to_string()]
 }
 
 fn default_job_interpreter() -> String {

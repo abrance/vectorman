@@ -49,7 +49,10 @@ pub fn build_rerun_submit(source: &JobRecord, req: RerunRequest) -> JobSubmit {
 
     JobSubmit {
         agent_id,
-        interpreter: Some(req.interpreter.unwrap_or_else(|| source.interpreter.clone())),
+        interpreter: Some(
+            req.interpreter
+                .unwrap_or_else(|| source.interpreter.clone()),
+        ),
         script: req.script.unwrap_or_else(|| source.script.clone()),
         args: req.args.unwrap_or_else(|| source.args.clone()),
         env: req.env.unwrap_or_else(|| source.env.clone()),

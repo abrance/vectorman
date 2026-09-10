@@ -599,10 +599,7 @@ impl Ledger {
                     .as_deref()
                     .map(text)
                     .unwrap_or(SqlValue::Null),
-                job.rerun_of
-                    .as_deref()
-                    .map(text)
-                    .unwrap_or(SqlValue::Null),
+                job.rerun_of.as_deref().map(text).unwrap_or(SqlValue::Null),
                 SqlValue::Integer(job.timeout_secs as i64),
                 text(&job.created_at),
                 text(&job.created_at),
@@ -644,7 +641,11 @@ impl Ledger {
         sql.push_str(" ORDER BY created_at DESC LIMIT ?");
         params.push(SqlValue::Integer(limit.unwrap_or(200).clamp(1, 1000)));
         let res = self.execute(&sql, &params).await?;
-        Ok(res.rows.iter().map(|row| row_to_job(&res.columns, row)).collect())
+        Ok(res
+            .rows
+            .iter()
+            .map(|row| row_to_job(&res.columns, row))
+            .collect())
     }
 
     /// 标记受理成功进入运行态；已终态作业不变。
@@ -687,11 +688,7 @@ impl Ledger {
                 bool_int(result.stdout_truncated),
                 SqlValue::Text(result.stderr.clone()),
                 bool_int(result.stderr_truncated),
-                result
-                    .error
-                    .as_deref()
-                    .map(text)
-                    .unwrap_or(SqlValue::Null),
+                result.error.as_deref().map(text).unwrap_or(SqlValue::Null),
                 started_at,
                 text(finished_at),
                 text(finished_at),
@@ -1022,7 +1019,8 @@ fn row_to_agent_config(columns: &[String], row: &[SqlValue]) -> AgentConfig {
 
 fn row_to_job(columns: &[String], row: &[SqlValue]) -> JobRecord {
     let status = JobStatus::parse(&field_text(columns, row, "status")).unwrap_or(JobStatus::Lost);
-    let args: Vec<String> = serde_json::from_str(&field_text(columns, row, "args")).unwrap_or_default();
+    let args: Vec<String> =
+        serde_json::from_str(&field_text(columns, row, "args")).unwrap_or_default();
     let env: BTreeMap<String, String> =
         serde_json::from_str(&field_text(columns, row, "env")).unwrap_or_default();
     JobRecord {
@@ -1335,8 +1333,14 @@ mod tests {
     #[tokio::test]
     async fn jobs_crud_roundtrip_and_filters() {
         let ledger = fresh_ledger("jobs-crud").await;
-        ledger.insert_job(&new_job("j-1", "a-1")).await.expect("insert 1");
-        ledger.insert_job(&new_job("j-2", "a-2")).await.expect("insert 2");
+        ledger
+            .insert_job(&new_job("j-1", "a-1"))
+            .await
+            .expect("insert 1");
+        ledger
+            .insert_job(&new_job("j-2", "a-2"))
+            .await
+            .expect("insert 2");
 
         let got = ledger.get_job("j-1").await.expect("get").expect("exists");
         assert_eq!(got.status, JobStatus::Pending);
@@ -1346,7 +1350,10 @@ mod tests {
         assert_eq!(got.working_dir.as_deref(), Some("/tmp"));
         assert_eq!(got.timeout_secs, 300);
 
-        assert_eq!(ledger.list_jobs(None, None, None).await.expect("all").len(), 2);
+        assert_eq!(
+            ledger.list_jobs(None, None, None).await.expect("all").len(),
+            2
+        );
         assert_eq!(
             ledger
                 .list_jobs(Some("a-1"), None, None)
@@ -1373,7 +1380,10 @@ mod tests {
     #[tokio::test]
     async fn mark_running_then_finish_persists_result() {
         let ledger = fresh_ledger("jobs-run").await;
-        ledger.insert_job(&new_job("j-1", "a-1")).await.expect("insert");
+        ledger
+            .insert_job(&new_job("j-1", "a-1"))
+            .await
+            .expect("insert");
 
         ledger.mark_running("j-1", "1500").await.expect("running");
         let running = ledger.get_job("j-1").await.expect("get").expect("exists");
@@ -1396,7 +1406,10 @@ mod tests {
     #[tokio::test]
     async fn terminal_job_is_immutable() {
         let ledger = fresh_ledger("jobs-immutable").await;
-        ledger.insert_job(&new_job("j-1", "a-1")).await.expect("insert");
+        ledger
+            .insert_job(&new_job("j-1", "a-1"))
+            .await
+            .expect("insert");
         ledger
             .finish_job(&job_result("j-1", JobStatus::Succeeded), "2000")
             .await
@@ -1419,7 +1432,10 @@ mod tests {
     #[tokio::test]
     async fn mark_rejected_records_reason() {
         let ledger = fresh_ledger("jobs-reject").await;
-        ledger.insert_job(&new_job("j-1", "a-1")).await.expect("insert");
+        ledger
+            .insert_job(&new_job("j-1", "a-1"))
+            .await
+            .expect("insert");
         ledger.mark_rejected("j-1", "busy").await.expect("reject");
         let rejected = ledger.get_job("j-1").await.expect("get").expect("exists");
         assert_eq!(rejected.status, JobStatus::Rejected);
@@ -1429,17 +1445,33 @@ mod tests {
     #[tokio::test]
     async fn mark_lost_by_agent_only_affects_that_agent() {
         let ledger = fresh_ledger("jobs-lost-agent").await;
-        ledger.insert_job(&new_job("j-1", "a-1")).await.expect("insert 1");
-        ledger.insert_job(&new_job("j-2", "a-2")).await.expect("insert 2");
+        ledger
+            .insert_job(&new_job("j-1", "a-1"))
+            .await
+            .expect("insert 1");
+        ledger
+            .insert_job(&new_job("j-2", "a-2"))
+            .await
+            .expect("insert 2");
         ledger.mark_running("j-2", "10").await.expect("running");
 
         ledger.mark_lost_by_agent("a-1").await.expect("lost");
         assert_eq!(
-            ledger.get_job("j-1").await.expect("get").expect("exists").status,
+            ledger
+                .get_job("j-1")
+                .await
+                .expect("get")
+                .expect("exists")
+                .status,
             JobStatus::Lost
         );
         assert_eq!(
-            ledger.get_job("j-2").await.expect("get").expect("exists").status,
+            ledger
+                .get_job("j-2")
+                .await
+                .expect("get")
+                .expect("exists")
+                .status,
             JobStatus::Running
         );
     }
@@ -1447,8 +1479,14 @@ mod tests {
     #[tokio::test]
     async fn startup_recovery_marks_inflight_lost_only() {
         let ledger = fresh_ledger("jobs-recovery").await;
-        ledger.insert_job(&new_job("j-1", "a-1")).await.expect("insert 1");
-        ledger.insert_job(&new_job("j-2", "a-2")).await.expect("insert 2");
+        ledger
+            .insert_job(&new_job("j-1", "a-1"))
+            .await
+            .expect("insert 1");
+        ledger
+            .insert_job(&new_job("j-2", "a-2"))
+            .await
+            .expect("insert 2");
         ledger
             .finish_job(&job_result("j-2", JobStatus::Succeeded), "5")
             .await
@@ -1459,11 +1497,21 @@ mod tests {
             .await
             .expect("recovery");
         assert_eq!(
-            ledger.get_job("j-1").await.expect("get").expect("exists").status,
+            ledger
+                .get_job("j-1")
+                .await
+                .expect("get")
+                .expect("exists")
+                .status,
             JobStatus::Lost
         );
         assert_eq!(
-            ledger.get_job("j-2").await.expect("get").expect("exists").status,
+            ledger
+                .get_job("j-2")
+                .await
+                .expect("get")
+                .expect("exists")
+                .status,
             JobStatus::Succeeded
         );
     }
@@ -1531,14 +1579,13 @@ mod tests {
         assert_eq!(after.description, None);
         assert_eq!(after.updated_at, "200");
 
-        assert_eq!(ledger.list_templates(None, None).await.expect("list").len(), 1);
+        assert_eq!(
+            ledger.list_templates(None, None).await.expect("list").len(),
+            1
+        );
         assert!(ledger.delete_template("tpl-1").await.expect("delete"));
         assert!(!ledger.delete_template("tpl-1").await.expect("re-delete"));
-        assert!(ledger
-            .get_template("tpl-1")
-            .await
-            .expect("get")
-            .is_none());
+        assert!(ledger.get_template("tpl-1").await.expect("get").is_none());
     }
 
     #[tokio::test]
@@ -1587,7 +1634,11 @@ mod tests {
             .expect("filter");
         assert_eq!(deploy.len(), 2);
         assert_eq!(
-            ledger.list_templates(None, Some(1)).await.expect("limit").len(),
+            ledger
+                .list_templates(None, Some(1))
+                .await
+                .expect("limit")
+                .len(),
             1
         );
     }

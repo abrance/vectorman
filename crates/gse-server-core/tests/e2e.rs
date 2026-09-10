@@ -613,7 +613,12 @@ async fn malformed_connection_does_not_kill_server() {
     assert_eq!(receipt.message.as_deref(), Some("pong"));
 }
 
-fn job_submit(agent_id: &str, interpreter: Option<&str>, script: &str, timeout_secs: Option<u64>) -> JobSubmit {
+fn job_submit(
+    agent_id: &str,
+    interpreter: Option<&str>,
+    script: &str,
+    timeout_secs: Option<u64>,
+) -> JobSubmit {
     JobSubmit {
         agent_id: agent_id.to_string(),
         interpreter: interpreter.map(str::to_string),
@@ -697,8 +702,10 @@ async fn e2e_job_lifecycle_success_failure_timeout() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_job_rejected_when_interpreter_not_allowed() {
-    let mut cfg = AgentConfig::default();
-    cfg.allowed_interpreters = vec!["bash".to_string()];
+    let cfg = AgentConfig {
+        allowed_interpreters: vec!["bash".to_string()],
+        ..Default::default()
+    };
     let server = spawn_server_and_agent(&tmp_db("job-reject"), cfg).await;
 
     let job = server
@@ -708,7 +715,10 @@ async fn e2e_job_rejected_when_interpreter_not_allowed() {
     let job = wait_terminal(&server, &job.job_id).await;
     assert_eq!(job.status, JobStatus::Rejected, "{job:?}");
     assert!(
-        job.error.as_deref().unwrap_or_default().contains("interpreter"),
+        job.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("interpreter"),
         "{job:?}"
     );
 }

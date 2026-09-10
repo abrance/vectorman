@@ -166,12 +166,17 @@ async fn run_job(cfg: &JobConfig, exec: JobExec) -> JobResult {
     let err_task = tokio::spawn(read_capped(stderr, exec.stderr_limit_bytes as usize));
 
     let timeout = Duration::from_secs(exec.timeout_secs.max(1));
-    let (status, exit_code, signal, mut error) = match tokio::time::timeout(timeout, child.wait()).await
-    {
-        Ok(Ok(es)) => finish_from_exit(&es),
-        Ok(Err(e)) => (JobStatus::Failed, None, None, Some(format!("wait failed: {e}"))),
-        Err(_) => terminate(&mut child).await,
-    };
+    let (status, exit_code, signal, mut error) =
+        match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(Ok(es)) => finish_from_exit(&es),
+            Ok(Err(e)) => (
+                JobStatus::Failed,
+                None,
+                None,
+                Some(format!("wait failed: {e}")),
+            ),
+            Err(_) => terminate(&mut child).await,
+        };
 
     let (stdout, stdout_truncated) = join_capped(out_task).await;
     let (stderr, stderr_truncated) = join_capped(err_task).await;
@@ -190,7 +195,9 @@ async fn run_job(cfg: &JobConfig, exec: JobExec) -> JobResult {
 
 /// 超时处理：先向整个进程组发 SIGTERM，宽限 5s 后 SIGKILL。
 /// 发送给进程组（负 pid）以覆盖脚本派生的子进程，避免其持有管道导致读取阻塞。
-async fn terminate(child: &mut tokio::process::Child) -> (JobStatus, Option<i32>, Option<i32>, Option<String>) {
+async fn terminate(
+    child: &mut tokio::process::Child,
+) -> (JobStatus, Option<i32>, Option<i32>, Option<String>) {
     if let Some(pid) = child.id() {
         kill_group(pid, libc::SIGTERM);
     }
@@ -232,7 +239,9 @@ async fn join_capped(task: tokio::task::JoinHandle<(String, bool)>) -> (String, 
     }
 }
 
-fn finish_from_exit(es: &std::process::ExitStatus) -> (JobStatus, Option<i32>, Option<i32>, Option<String>) {
+fn finish_from_exit(
+    es: &std::process::ExitStatus,
+) -> (JobStatus, Option<i32>, Option<i32>, Option<String>) {
     if let Some(code) = es.code() {
         let status = if code == 0 {
             JobStatus::Succeeded
