@@ -5,17 +5,18 @@ Updated: 2026-09-10
 
 ## Description
 
-在既有 GSE 会话通道（认证、心跳、双向 RPC）之上，新增「异步作业」协议层：Server 受理作业提交、落库并下发内联脚本；Agent 以指定解释器执行脚本、采集输出与退出码；Agent 完成后经回传通道写回结果；发起方轮询查询。
+在既有 GSE 会话通道（认证、心跳、双向 RPC）之上，新增「异步作业」协议层：Server 受理作业提交、落库并下发内联脚本；Agent 以指定解释器执行脚本、采集输出与退出码；Agent 完成后经回传通道写回结果；发起方轮询查询。配套交付 `@vectorman/job` 作业平台前端。
 
 v1 范围：
 
-- 异步提交 + 轮询查询，无服务端推送、无前端页面。
+- 异步提交 + 轮询查询，无服务端推送。
 - 脚本内联下发，解释器白名单 bash / sh / python3。
 - 完整结果采集（退出码、信号、stdout、stderr、截断标记、起止时间）。
 - 以执行超时作为唯一终止手段，不提供取消接口。
 - 作业记录持久化到 sqlite `jobs` 表，Server 重启与 Agent 离线均有一致归宿。
+- 作业平台前端 `@vectorman/job`：提交表单、列表跟踪、结果查看。
 
-非目标（后续版本候选）：作业取消、实时流式输出、作业重试、cron 定时、作业依赖编排、Agent 端脚本库。
+非目标（后续版本候选）：作业取消、实时流式输出、作业重试、cron 定时、作业依赖编排、Agent 端脚本库、多用户与权限控制。
 
 ## Architecture
 
@@ -231,6 +232,215 @@ gse-agent（`crates/gse-agent-core/src/config.rs`）：
 
 Server 与 Agent 各自维护输出上限：Server 在下发时带上限，Agent 以此为准并以自身配置取较小值执行，双重约束。
 
+## 作业平台前端（@vectorman/job）
+
+### 定位与分层
+
+`@vectorman/job` 复用 `@vectorman/primitives` 与 `@vectorman/adapters`，不新建数据层。页面只调业务 hooks；hooks 只调 `GseJobAdapter`（作业）与 `GseAdminAdapter`（取在线 Agent）；Ant Design 留在页面层。装配入口 `main.tsx` 独立构造内存会话、QueryStore 与 Notifier，不与 `node` / `console` 共享实例。
+
+```mermaid
+graph TD
+    subgraph app ["@vectorman/job"]
+        MAIN["main.tsx 装配入口"]
+        TOAST["ToastHost 订阅 Notifier"]
+        NAV["导航：作业"]
+        LIST["JobsPage 列表 + 轮询"]
+        SUBMIT["SubmitDrawer 提交表单"]
+        DETAIL["DetailDrawer 结果查看"]
+        TABS["Tabs 概览/stdout/stderr/脚本"]
+    end
+    subgraph features ["features/jobs"]
+        UJ["useJobs 列表轮询"]
+        UD["useJobDetail 终态轮询"]
+        UA["useOnlineAgents"]
+    end
+    PRIM["@vectorman/primitives"]
+    JOBADAPT["GseJobAdapter"]
+    ADMINADAPT["GseAdminAdapter"]
+    PROXY["Vite /api/gse 直通"]
+    GSE["gse-server 127.0.0.1:7101"]
+    MAIN --> TOAST
+    MAIN --> NAV
+    NAV --> LIST
+    LIST --> SUBMIT
+    LIST --> DETAIL
+    DETAIL --> TABS
+    LIST --> UJ
+    DETAIL --> UD
+    SUBMIT --> UA
+    UJ --> JOBADAPT
+    UD --> JOBADAPT
+    UA --> ADMINADAPT
+    UJ --> PRIM
+    UD --> PRIM
+    UA --> PRIM
+    JOBADAPT --> PROXY
+    ADMINADAPT --> PROXY
+    PROXY --> GSE
+```
+
+### 目录
+
+```text
+frontend/apps/job/
+  package.json
+  vite.config.ts
+  tsconfig.json
+  index.html
+  src/
+    main.tsx
+    app/App.tsx                      # Layout + 导航 + ToastHost + Outlet
+    app/ToastHost.tsx
+    features/jobs/
+      use-jobs.ts                    # 列表 + 轮询
+      use-job-detail.ts              # 详情 + 终态轮询
+      use-online-agents.ts           # 在线 Agent 选项
+    pages/
+      jobs-page.tsx
+    ui/
+      job-submit-drawer.tsx
+      job-detail-drawer.tsx
+      job-status-tag.tsx
+      job-output.tsx                 # 等宽输出 + 截断提示
+```
+
+依赖：`react`、`react-dom`、`react-router-dom`、`antd`、`@ant-design/icons`、`@vectorman/primitives`、`@vectorman/adapters`。
+
+### 适配器新增
+
+`@vectorman/adapters/src/gse/jobs.ts` 新增 `GseJobAdapter`，前缀 `/api/gse`，与 `GseAdminAdapter` 并列导出：
+
+| 方法 | HTTP | 路径 |
+| --- | --- | --- |
+| `submitJob(req)` | POST | `/api/gse/jobs` |
+| `listJobs(filter)` | GET | `/api/gse/jobs?agent_id=&status=&limit=` |
+| `getJob(jobId)` | GET | `/api/gse/jobs/{job_id}` |
+
+```ts
+type JobStatus =
+  | "pending" | "dispatched" | "running"
+  | "succeeded" | "failed" | "timeout" | "rejected" | "lost"
+
+type Job = {
+  job_id: string
+  agent_id: string
+  interpreter: string
+  script: string
+  args: string[]
+  env: Record<string, string>
+  working_dir?: string | null
+  timeout_secs: number
+  status: JobStatus
+  exit_code?: number | null
+  signal?: number | null
+  stdout?: string | null
+  stdout_truncated: boolean
+  stderr?: string | null
+  stderr_truncated: boolean
+  error?: string | null
+  created_at: string
+  dispatched_at?: string | null
+  started_at?: string | null
+  finished_at?: string | null
+  updated_at: string
+}
+
+type JobSubmitRequest = {
+  agent_id: string
+  interpreter?: string
+  script: string
+  args?: string[]
+  env?: Record<string, string>
+  working_dir?: string
+  timeout_secs?: number
+}
+```
+
+`useOnlineAgents` 复用既有 `GseAdminAdapter.listAgents()`，过滤 `status === "online"` 作为提交表单的 Agent 选项。
+
+### Vite 反代与部署
+
+`vite.config.ts` 与 `node` 一致：`/api/gse` 直通 `http://127.0.0.1:7101`（gse-server 路由原生带 `/api/gse` 前缀，不 rewrite）；`server.allowedHosts = ['.monkeycode-ai.online']`。
+
+gse-server 的 `http_web_dir` 一次只托管一个前端产物，`node` 与 `job` 二选一。前端产物采用独立静态服务托管，或后续合并为统一前端入口；本期按独立静态服务设计，开发态经 Vite proxy 直通。
+
+### 路由
+
+| path | 页面 |
+| --- | --- |
+| `/` | 重定向 `/jobs` |
+| `/jobs` | 作业列表 + 提交抽屉 + 详情抽屉 |
+
+抽屉开关用页面本地 state，不进 URL（与 `node` 一致）。刷新回到列表、抽屉关闭。
+
+### 轮询策略
+
+- `useJobs`：挂载即 `listJobs`；当返回列表存在非终态作业时 `setInterval(5000)` 持续刷新，全部到达终态后清除定时器；手动刷新或提交成功后重新开始轮询。轮询失败只 `Notifier.warning`，保留上一份成功数据并继续轮询。
+- `useJobDetail`：打开详情即 `getJob`；作业非终态时 `setInterval(3000)` 刷新，到达终态清除定时器；关闭抽屉清除定时器。
+- 两个 hook 在组件卸载时清除各自定时器。
+
+### 页面交互
+
+工具栏：提交作业、手动刷新、Agent 过滤（Select，来源 `useOnlineAgents`，含「全部」）、状态过滤（Select，含「全部」）。
+
+列表列：
+
+| 列 | 说明 |
+| --- | --- |
+| job_id | 主键 |
+| agent_id | 目标节点 |
+| interpreter | 解释器 |
+| status | `JobStatusTag` |
+| created_at | 创建时间 |
+| started_at | 开始时间 |
+| duration | 完成时取 `finished_at - started_at` |
+| exit_code | 终态退出码 |
+
+行操作：查看（打开详情抽屉）。
+
+提交抽屉（create）：
+
+| 字段 | 控件 | 校验 |
+| --- | --- | --- |
+| agent_id | Select（在线 Agent） | 必填 |
+| interpreter | Select（bash / sh / python3） | 默认 bash |
+| script | TextArea（等宽） | 非空 |
+| args | Input（每行一项，或空格分隔） | 可选 |
+| working_dir | Input | 可选 |
+| timeout_secs | InputNumber | 默认 300，范围 1..3600 |
+
+提交中禁用提交按钮；提交成功 `Notifier.success`、关闭抽屉、刷新列表；提交失败 `Notifier.error`，保留表单内容。
+
+详情抽屉（view）Tabs：
+
+- 概览：状态、退出码或信号、`error`、解释器、agent_id、创建/开始/结束时间、超时值。
+- 标准输出：`<pre>` 等宽渲染；`stdout_truncated` 为真时顶部 `Alert` 提示已截断。
+- 标准错误：同上，依据 `stderr_truncated`。
+- 脚本：只读展示提交的脚本正文。
+
+空态与加载：Table `loading`；无数据展示空态文案。
+
+### 状态 Tag 映射
+
+| status | Tag 颜色 |
+| --- | --- |
+| `pending` | default |
+| `dispatched` | processing |
+| `running` | processing（加蓝） |
+| `succeeded` | success（绿） |
+| `failed` | error（红） |
+| `timeout` | warning（橙） |
+| `rejected` | warning（洋红） |
+| `lost` | default（灰） |
+
+### QueryStore 键
+
+| key | 数据 |
+| --- | --- |
+| `jobs.list` | Job[]（应用过滤后的最近一次结果） |
+| `jobs.one.{job_id}` | Job |
+| `agents.online` | Agent[] |
+
 ## Data Models
 
 ### jobs 表（sqlite）
@@ -284,6 +494,12 @@ CREATE INDEX IF NOT EXISTS idx_jobs_status  ON jobs(status);
 - 超时作业的子进程被终止，无遗留孤儿进程；临时脚本文件在任务结束时删除。
 - 会话离线或 Server 重启后，不存在停留在 `pending` / `dispatched` / `running` 的历史作业。
 - `job_result` 或 `job_exec` 的往返会刷新会话 `last_seen`，与心跳共同维持在线判定。
+- `@vectorman/job` 源码不出现 `fetch(`；`@vectorman/primitives` / `@vectorman/adapters` 不依赖 `antd`。
+- 作业列表在全部作业到达终态后无残留轮询定时器；组件卸载后无残留定时器。
+- 详情抽屉在作业到达终态后停止轮询。
+- 提交表单在 `agent_id` 为空、脚本为空或 `timeout_secs` 越界时不发请求。
+- 截断输出的 `JobOutput` 渲染截断提示。
+- `JobStatus` 到 Tag 颜色的映射对八种状态均有定义。
 
 ## Error Handling
 
@@ -303,6 +519,11 @@ CREATE INDEX IF NOT EXISTS idx_jobs_status  ON jobs(status);
 | Server 重启存在在途作业 | 启动时将 `pending`/`dispatched`/`running` 置 `lost` |
 | 会话运行期离线 | liveness 将该 agent 在途作业置 `lost` |
 | 台账读写失败 | HTTP 500 `query_failed`，仅记日志不影响其他作业 |
+| 前端提交时 Agent 不在线（409） | Toast warning 提示 Agent 不在线，表单保持打开与内容 |
+| 前端提交参数非法（400） | Toast error 展示后端 message，表单保持 |
+| 前端列表 / 详情请求失败 | Toast error / warning，保留上一份数据，表格空态展示 message |
+| 前端轮询失败 | Toast warning，保留上一份列表并继续轮询 |
+| 前端提交缺少必填或超时越界 | 阻止提交，Toast warning 指出字段 |
 
 ## Test Strategy
 
@@ -319,6 +540,13 @@ CREATE INDEX IF NOT EXISTS idx_jobs_status  ON jobs(status);
 - `http.rs`：提交校验（缺字段、非法解释器、超时越界、脚本超限、Agent 离线 409）、201 返回、列表过滤、单作业 404、静态托管不受影响。
 - 端到端（`crates/gse-server-core/tests/e2e.rs` 扩展）：Server + Agent 双进程，HTTP 提交 → 轮询至 `succeeded` 校验 stdout/exit_code；失败脚本 → `failed`；超时脚本 → `timeout`；杀掉 Agent 后提交或在途作业 → `lost`；并发提交第二次 → `rejected`；重启 Server 后在途作业 → `lost`。
 - 兼容性：既有 `auth` / `heartbeat` / `exec` / `ping` 用例保持通过，新增 RPC 不影响旧路径。
+- 前端（`@vectorman/job`，Vitest，不启动后端）：
+  - `GseJobAdapter` 注入假 `HttpClient`，断言 `submitJob` / `listJobs`（含查询参数）/ `getJob` 的 method、url、body。
+  - `useJobs`：加载、非终态时轮询启动、全部终态后定时器清除、卸载清除、轮询失败保留旧数据并 warning。
+  - `useJobDetail`：打开即取、非终态轮询、终态停止、关闭清除。
+  - 提交表单：必填与超时范围校验阻止请求；提交成功后刷新并关闭；409 时保留表单。
+  - `JobStatusTag`：八种状态均有稳定颜色映射。
+  - `JobOutput`：截断标记为真时渲染提示。
 
 ## References
 
@@ -330,3 +558,7 @@ CREATE INDEX IF NOT EXISTS idx_jobs_status  ON jobs(status);
 [^6]: HTTP 路由现状 - 当前工作区 `/crates/gse-server-core/src/http.rs`
 [^7]: 既有 DTO - 当前工作区 `/crates/gse-proto/src/lib.rs`
 [^8]: geminio-rs 双向 RPC（`register` / `call`） - `https://github.com/singchia/geminio-rs`
+[^9]: 节点管理前端 - 当前工作区 `/.monkeycode/specs/gse-node-app/design.md`
+[^10]: 前端分层架构 - 当前工作区 `/.monkeycode/specs/frontend-layered-architecture/design.md`
+[^11]: 既有 GSE 适配器 - 当前工作区 `/frontend/packages/adapters/src/gse/admin.ts`
+[^12]: 作业应用占位 - 当前工作区 `/frontend/apps/job/src/app/App.tsx`

@@ -2,9 +2,11 @@
 
 ## Introduction
 
-本 feature 在已有 GSE 会话通道（认证、心跳、`exec` 双向 RPC）之上，定义「Server 下发作业脚本、Agent 执行并回传结果」的协议与语义。目标交付为协议 DTO、Agent 执行器语义、Server 作业管理与 HTTP 接口的设计文档，不包含代码实现。
+本 feature 在已有 GSE 会话通道（认证、心跳、`exec` 双向 RPC）之上，定义「Server 下发作业脚本、Agent 执行并回传结果」的协议与语义，并定义配套的作业平台前端。目标交付为协议 DTO、Agent 执行器语义、Server 作业管理、HTTP 接口与前端页面的设计文档，不包含代码实现。
 
 作业采用异步模型：Server 受理提交后生成唯一 `job_id` 并落库，经会话通道将内联脚本与解释器下发至 Agent；Agent 以本机用户权限启动子进程，采集标准输出、标准错误与退出码，完成后经回传通道写回 Server；发起方通过轮询查询作业状态与结果。v1 以执行超时作为运行中作业的唯一终止手段。
+
+作业平台前端为 `@vectorman/job` 应用，遵循前端分层架构，提供作业提交、列表跟踪与结果查看。
 
 ## Glossary
 
@@ -18,6 +20,8 @@
 - **作业结果（Job Result）**：Agent 对已执行作业回传的终态载荷。
 - **台账（Ledger）**：Server 端 sqlite 持久化存储，保存主机、Agent、配置与作业记录。
 - **作业通道（Job Channel）**：承载作业下发的 geminio RPC 方法集合。
+- **作业平台（Job App）**：`@vectorman/job` 前端应用，提供作业提交、跟踪与结果查看。
+- **作业适配器（GseJobAdapter）**：`@vectorman/adapters` 中访问作业 HTTP 接口的前端适配器。
 
 ## Requirements
 
@@ -115,3 +119,20 @@
 3. THE 单个 Agent 的并发运行作业上限 SHALL 为 1。
 4. THE 标准输出与标准错误各自的大小上限 SHALL 为 1 MiB。
 5. THE 作业默认超时值 SHALL 为 300 秒，最大可配置超时值 SHALL 为 3600 秒。
+
+### Requirement 9: 作业平台前端
+
+**User Story:** AS 运维人员, I want 在作业平台上提交、跟踪并查看作业结果, so that 无需命令行即可使用远程执行能力。
+
+#### Acceptance Criteria
+
+1. THE 作业平台 SHALL 提供作业列表，展示 job_id、agent_id、解释器、状态、创建时间与退出码。
+2. WHEN 运维人员提交含 agent_id、脚本与解释器的表单，作业平台 SHALL 调用作业提交接口并在成功后刷新列表。
+3. WHILE 列表存在非终态作业，作业平台 SHALL 周期刷新列表以更新状态。
+4. WHEN 运维人员打开作业详情，作业平台 SHALL 展示状态、退出码、标准输出与标准错误。
+5. WHILE 详情作业处于非终态，作业平台 SHALL 周期刷新该作业直至终态。
+6. WHEN 标准输出或标准错误被截断，作业平台 SHALL 展示截断提示。
+7. IF 提交时目标 Agent 不在线，作业平台 SHALL 展示可读提示并保留表单内容。
+8. THE 作业平台 SHALL 按 agent-id 与状态筛选作业列表。
+9. THE 作业平台 SHALL 复用 `@vectorman/primitives` 与 `@vectorman/adapters`，且不直接调用浏览器 fetch。
+10. THE 作业平台 SHALL 通过 `/api/gse` 相对路径访问后端。
