@@ -2,6 +2,7 @@
 //! bins/gse-agent 仅作为进程入口调用本库。
 
 pub mod config;
+pub mod job;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -10,6 +11,7 @@ use geminio::{dial, Bytes, DialOptions, End};
 use gse_proto::{AuthReply, AuthRequest, Command, Heartbeat, Receipt};
 
 pub use config::{load_config, AgentConfig};
+use job::{JobConfig, JobExecutor};
 
 const BACKOFF_MAX_SECS: u64 = 60;
 
@@ -50,6 +52,22 @@ async fn connect_once(cfg: &AgentConfig) -> Result<(), AgentError> {
         .await
     {
         return Err(AgentError::ConnError(format!("register exec: {e}")));
+    }
+    let executor = JobExecutor::new(JobConfig::from_agent(cfg));
+    let jobs_end = end.clone();
+    if let Err(e) = end
+        .register("job_exec", move |req: Bytes| {
+            let executor = executor.clone();
+            let end = jobs_end.clone();
+            async move {
+                let ack = executor.handle_exec(&req, end).await;
+                let body = serde_json::to_vec(&ack).map_err(|e| Error::Remote(e.to_string()))?;
+                Ok(Bytes::from(body))
+            }
+        })
+        .await
+    {
+        return Err(AgentError::ConnError(format!("register job_exec: {e}")));
     }
     authenticate(&end, &cfg.agent_id, &cfg.token).await?;
     heartbeat_loop(&end, &cfg.agent_id, cfg.heartbeat_interval_secs).await

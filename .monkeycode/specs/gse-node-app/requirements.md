@@ -43,6 +43,8 @@
 2. WHEN 运维打开节点应用，THE 应用 SHALL 默认进入主机列表。
 3. THE 每个一级入口 SHALL 提供该资源的列表视图；登记、查看与编辑 SHALL 在列表页右侧抽屉中完成，列表保持可见。
 4. THE 前端工作区 SHALL 保留 `@vectorman/console` 与 `@vectorman/job` 应用包，并新增 `@vectorman/node`。
+
+> **架构修订（2026-09-10）**：`@vectorman/node` 现为 UI 包（导出四个页面与 Runtime Provider），由 `@vectorman/console` 组合；节点页面路由与四入口不变。
 5. THE 节点应用 SHALL 使用简体中文界面文案。
 
 ### Requirement 3: 主机 CRUD

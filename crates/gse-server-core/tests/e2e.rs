@@ -4,10 +4,12 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use geminio::Bytes;
 use gse_agent_core::{run as run_agent, AgentConfig};
+use gse_proto::JobStatus;
 use gse_server_core::{
-    http_router, AdminState, Agent, AgentConfig as LedgerAgentConfig, Server, ServerConfig,
-    SessionState,
+    http_router, AdminState, Agent, AgentConfig as LedgerAgentConfig, JobRecord, JobSubmit, Ledger,
+    NewJob, Server, ServerConfig, SessionState,
 };
+use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 fn tmp_db(name: &str) -> String {
@@ -27,6 +29,7 @@ fn server_config(db: &str, auth_enabled: bool, timeout_secs: u64) -> ServerConfi
         http_web_dir: None,
         heartbeat_interval_secs: 1,
         heartbeat_timeout_secs: timeout_secs,
+        ..Default::default()
     }
 }
 
@@ -82,6 +85,7 @@ async fn e2e_auth_heartbeat_ping_pong_update_ledger() {
         agent_id: "web-01".to_string(),
         token: "tok-1".to_string(),
         heartbeat_interval_secs: 1,
+        ..Default::default()
     };
     tokio::spawn(run_agent(cfg));
 
@@ -134,6 +138,7 @@ async fn e2e_unknown_command_rejected() {
         agent_id: "web-01".to_string(),
         token: "tok-1".to_string(),
         heartbeat_interval_secs: 1,
+        ..Default::default()
     };
     tokio::spawn(run_agent(cfg));
 
@@ -177,6 +182,7 @@ async fn e2e_auth_rejected_agent_exits() {
         agent_id: "web-01".to_string(),
         token: "wrong-token".to_string(),
         heartbeat_interval_secs: 1,
+        ..Default::default()
     };
     let task = tokio::spawn(run_agent(bad_cfg));
     let joined = tokio::time::timeout(Duration::from_secs(10), task)
@@ -208,6 +214,7 @@ async fn e2e_auth_unregistered_agent_exits() {
         agent_id: "ghost".to_string(),
         token: "any-token".to_string(),
         heartbeat_interval_secs: 1,
+        ..Default::default()
     };
     let task = tokio::spawn(run_agent(unknown_cfg));
     let joined = tokio::time::timeout(Duration::from_secs(10), task)
@@ -240,6 +247,7 @@ async fn e2e_auth_disabled_allows_unregistered_agent() {
         agent_id: "ghost".to_string(),
         token: "any".to_string(),
         heartbeat_interval_secs: 1,
+        ..Default::default()
     };
     let handle = tokio::spawn(run_agent(cfg));
 
@@ -271,6 +279,7 @@ async fn e2e_double_auth_keeps_single_session() {
         agent_id: "web-01".to_string(),
         token: "tok-1".to_string(),
         heartbeat_interval_secs: 1,
+        ..Default::default()
     };
     let h1 = tokio::spawn(run_agent(mk_cfg()));
     let h2 = tokio::spawn(run_agent(mk_cfg()));
@@ -309,6 +318,7 @@ async fn e2e_command_to_offline_session_unavailable() {
         agent_id: "web-01".to_string(),
         token: "tok-1".to_string(),
         heartbeat_interval_secs: 60,
+        ..Default::default()
     };
     let handle = tokio::spawn(run_agent(agent_cfg));
     wait_online(&server, "web-01").await;
@@ -353,6 +363,7 @@ async fn e2e_agent_reconnects_after_disconnect() {
         agent_id: "web-01".to_string(),
         token: "tok-1".to_string(),
         heartbeat_interval_secs: 1,
+        ..Default::default()
     };
     let handle = tokio::spawn(run_agent(agent_cfg));
 
@@ -416,6 +427,7 @@ async fn e2e_liveness_marks_agent_offline_in_ledger() {
         agent_id: "web-01".to_string(),
         token: "tok-1".to_string(),
         heartbeat_interval_secs: 1,
+        ..Default::default()
     };
     let handle = tokio::spawn(run_agent(agent_cfg));
 
@@ -486,6 +498,7 @@ async fn e2e_http_delete_agent_clears_ledger_and_session() {
         agent_id: "web-01".to_string(),
         token: "tok-1".to_string(),
         heartbeat_interval_secs: 1,
+        ..Default::default()
     };
     let handle = tokio::spawn(run_agent(agent_cfg));
     wait_online(&server, "web-01").await;
@@ -494,6 +507,7 @@ async fn e2e_http_delete_agent_clears_ledger_and_session() {
         AdminState {
             ledger: server.ledger.clone(),
             registry: Some(server.registry.clone()),
+            cfg: Some(server.cfg.clone()),
         },
         None,
     )
@@ -575,6 +589,7 @@ async fn malformed_connection_does_not_kill_server() {
         agent_id: "web-01".to_string(),
         token: "tok-1".to_string(),
         heartbeat_interval_secs: 1,
+        ..Default::default()
     };
     tokio::spawn(run_agent(cfg));
     wait_online(&server, "web-01").await;
@@ -596,4 +611,307 @@ async fn malformed_connection_does_not_kill_server() {
         .expect("server should survive malformed connections");
     assert!(receipt.ok, "ping should still succeed: {receipt:?}");
     assert_eq!(receipt.message.as_deref(), Some("pong"));
+}
+
+fn job_submit(agent_id: &str, interpreter: Option<&str>, script: &str, timeout_secs: Option<u64>) -> JobSubmit {
+    JobSubmit {
+        agent_id: agent_id.to_string(),
+        interpreter: interpreter.map(str::to_string),
+        script: script.to_string(),
+        args: vec![],
+        env: std::collections::BTreeMap::new(),
+        working_dir: None,
+        timeout_secs,
+    }
+}
+
+async fn wait_terminal(server: &Server, job_id: &str) -> JobRecord {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let job = server
+                .ledger
+                .get_job(job_id)
+                .await
+                .expect("get job")
+                .expect("job exists");
+            if job.status.is_terminal() {
+                return job;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("job never reached a terminal state")
+}
+
+async fn spawn_server_and_agent(db: &str, cfg: AgentConfig) -> std::sync::Arc<Server> {
+    let (server, addr) = Server::bind(server_config(db, true, 60))
+        .await
+        .expect("bind");
+    register(&server, "web-01", "tok-1").await;
+    let server_ref = server.clone();
+    tokio::spawn(async move {
+        let _ = server_ref.run().await;
+    });
+    let cfg = AgentConfig {
+        server_addr: addr.to_string(),
+        agent_id: "web-01".to_string(),
+        token: "tok-1".to_string(),
+        heartbeat_interval_secs: 1,
+        ..cfg
+    };
+    tokio::spawn(run_agent(cfg));
+    wait_online(&server, "web-01").await;
+    server
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_job_lifecycle_success_failure_timeout() {
+    let server = spawn_server_and_agent(&tmp_db("job-life"), AgentConfig::default()).await;
+
+    let ok = server
+        .submit_job(job_submit("web-01", None, "echo hello", None))
+        .await
+        .expect("submit");
+    let ok = wait_terminal(&server, &ok.job_id).await;
+    assert_eq!(ok.status, JobStatus::Succeeded, "{ok:?}");
+    assert_eq!(ok.exit_code, Some(0));
+    assert_eq!(ok.stdout.as_deref().map(str::trim), Some("hello"));
+
+    let failed = server
+        .submit_job(job_submit("web-01", None, "echo bad >&2; exit 3", None))
+        .await
+        .expect("submit");
+    let failed = wait_terminal(&server, &failed.job_id).await;
+    assert_eq!(failed.status, JobStatus::Failed, "{failed:?}");
+    assert_eq!(failed.exit_code, Some(3));
+    assert_eq!(failed.stderr.as_deref().map(str::trim), Some("bad"));
+
+    let timeout = server
+        .submit_job(job_submit("web-01", None, "sleep 30; echo done", Some(1)))
+        .await
+        .expect("submit");
+    let timeout = wait_terminal(&server, &timeout.job_id).await;
+    assert_eq!(timeout.status, JobStatus::Timeout, "{timeout:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_job_rejected_when_interpreter_not_allowed() {
+    let mut cfg = AgentConfig::default();
+    cfg.allowed_interpreters = vec!["bash".to_string()];
+    let server = spawn_server_and_agent(&tmp_db("job-reject"), cfg).await;
+
+    let job = server
+        .submit_job(job_submit("web-01", Some("python3"), "print(1)", None))
+        .await
+        .expect("submit");
+    let job = wait_terminal(&server, &job.job_id).await;
+    assert_eq!(job.status, JobStatus::Rejected, "{job:?}");
+    assert!(
+        job.error.as_deref().unwrap_or_default().contains("interpreter"),
+        "{job:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_inflight_jobs_become_lost_after_restart() {
+    let db = tmp_db("job-restart");
+    {
+        let ledger = Ledger::new(&db).expect("open ledger");
+        ledger.init().await.expect("init");
+        ledger
+            .insert_job(&NewJob {
+                job_id: "job-inflight".to_string(),
+                agent_id: "web-01".to_string(),
+                interpreter: "bash".to_string(),
+                script: "sleep 100".to_string(),
+                args: vec![],
+                env: std::collections::BTreeMap::new(),
+                working_dir: None,
+                template_id: None,
+                rerun_of: None,
+                timeout_secs: 300,
+                created_at: "1".to_string(),
+            })
+            .await
+            .expect("insert");
+    }
+
+    let (server, _addr) = Server::bind(server_config(&db, true, 5))
+        .await
+        .expect("rebind");
+    let job = server
+        .ledger
+        .get_job("job-inflight")
+        .await
+        .expect("get")
+        .expect("job");
+    assert_eq!(job.status, JobStatus::Lost, "{job:?}");
+}
+
+async fn send_json(
+    app: &mut axum::Router,
+    method: &str,
+    uri: &str,
+    body: &str,
+) -> (StatusCode, String) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("request");
+    let resp = app.clone().oneshot(request).await.expect("oneshot");
+    let status = resp.status();
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .expect("collect")
+        .to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn json_field(body: &str, key: &str) -> String {
+    let needle = format!("\"{key}\":\"");
+    body.split(&needle)
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_template_submit_and_save_as_template() {
+    let server = spawn_server_and_agent(&tmp_db("job-template"), AgentConfig::default()).await;
+    let mut app = http_router(
+        AdminState {
+            ledger: server.ledger.clone(),
+            registry: Some(server.registry.clone()),
+            cfg: Some(server.cfg.clone()),
+        },
+        None,
+    );
+
+    // 创建含 ${svc} 的模板。
+    let (status, body) = send_json(
+        &mut app,
+        "POST",
+        "/api/gse/job-templates",
+        r#"{"name":"echo-svc","script":"echo ${svc}","timeout_secs":30}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let template_id = json_field(&body, "template_id");
+    assert!(!template_id.is_empty(), "{body}");
+
+    // 用模板提交并展开变量。
+    let (status, body) = send_json(
+        &mut app,
+        "POST",
+        &format!("/api/gse/job-templates/{template_id}/submit"),
+        r#"{"agent_id":"web-01","vars":{"svc":"nginx"}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let job_id = json_field(&body, "job_id");
+    let job = wait_terminal(&server, &job_id).await;
+    assert_eq!(job.status, JobStatus::Succeeded, "{job:?}");
+    assert_eq!(job.stdout.as_deref().map(str::trim), Some("nginx"));
+    assert_eq!(job.template_id.as_deref(), Some(template_id.as_str()));
+
+    // 另存为模板后再提交。
+    let (status, body) = send_json(
+        &mut app,
+        "POST",
+        &format!("/api/gse/jobs/{job_id}/save-as-template"),
+        r#"{"name":"from-job"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let saved_id = json_field(&body, "template_id");
+    assert!(!saved_id.is_empty(), "{body}");
+
+    let (status, body) = send_json(
+        &mut app,
+        "POST",
+        &format!("/api/gse/job-templates/{saved_id}/submit"),
+        r#"{"agent_id":"web-01","vars":{}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let second_id = json_field(&body, "job_id");
+    let second = wait_terminal(&server, &second_id).await;
+    assert_eq!(second.status, JobStatus::Succeeded, "{second:?}");
+    assert_eq!(second.stdout.as_deref().map(str::trim), Some("nginx"));
+    assert_eq!(second.template_id.as_deref(), Some(saved_id.as_str()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_rerun_history_job() {
+    let server = spawn_server_and_agent(&tmp_db("job-rerun"), AgentConfig::default()).await;
+    let mut app = http_router(
+        AdminState {
+            ledger: server.ledger.clone(),
+            registry: Some(server.registry.clone()),
+            cfg: Some(server.cfg.clone()),
+        },
+        None,
+    );
+
+    // 提交来源作业并等待终态。
+    let (status, body) = send_json(
+        &mut app,
+        "POST",
+        "/api/gse/jobs",
+        r#"{"agent_id":"web-01","script":"echo src","timeout_secs":30}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let source_id = json_field(&body, "job_id");
+    let source = wait_terminal(&server, &source_id).await;
+    assert_eq!(source.status, JobStatus::Succeeded, "{source:?}");
+    assert_eq!(source.stdout.as_deref().map(str::trim), Some("src"));
+
+    // 空体重做：继承来源参数，记录来源作业且无模板来源。
+    let (status, body) = send_json(
+        &mut app,
+        "POST",
+        &format!("/api/gse/jobs/{source_id}/rerun"),
+        "{}",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let rerun_id = json_field(&body, "job_id");
+    assert_ne!(rerun_id, source_id);
+    let rerun = wait_terminal(&server, &rerun_id).await;
+    assert_eq!(rerun.status, JobStatus::Succeeded, "{rerun:?}");
+    assert_eq!(rerun.stdout.as_deref().map(str::trim), Some("src"));
+    assert_eq!(rerun.rerun_of.as_deref(), Some(source_id.as_str()));
+    assert_eq!(rerun.template_id, None);
+
+    // 编辑后重做：覆盖脚本，生成不同的 job_id。
+    let (status, body) = send_json(
+        &mut app,
+        "POST",
+        &format!("/api/gse/jobs/{source_id}/rerun"),
+        r#"{"script":"echo edited"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let edited_id = json_field(&body, "job_id");
+    assert_ne!(edited_id, rerun_id);
+    let edited = wait_terminal(&server, &edited_id).await;
+    assert_eq!(edited.status, JobStatus::Succeeded, "{edited:?}");
+    assert_eq!(edited.stdout.as_deref().map(str::trim), Some("edited"));
+    assert_eq!(edited.rerun_of.as_deref(), Some(source_id.as_str()));
+
+    // 来源作业保持不变。
+    let unchanged = server
+        .ledger
+        .get_job(&source_id)
+        .await
+        .expect("get")
+        .expect("exists");
+    assert_eq!(unchanged, source);
 }

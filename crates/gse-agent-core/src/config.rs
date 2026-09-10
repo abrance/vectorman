@@ -13,6 +13,18 @@ pub struct AgentConfig {
     /// 心跳周期（秒）。
     #[serde(default = "default_interval")]
     pub heartbeat_interval_secs: u64,
+    /// 允许执行的解释器白名单。
+    #[serde(default = "default_interpreters")]
+    pub allowed_interpreters: Vec<String>,
+    /// 未指定解释器时使用的默认解释器。
+    #[serde(default = "default_job_interpreter")]
+    pub job_default_interpreter: String,
+    /// 单个 Agent 并发运行作业上限。
+    #[serde(default = "default_max_jobs")]
+    pub max_concurrent_jobs: usize,
+    /// 作业临时脚本目录；为空时使用系统临时目录。
+    #[serde(default)]
+    pub job_work_dir: Option<String>,
 }
 
 impl Default for AgentConfig {
@@ -22,6 +34,10 @@ impl Default for AgentConfig {
             agent_id: default_agent_id(),
             token: String::new(),
             heartbeat_interval_secs: default_interval(),
+            allowed_interpreters: default_interpreters(),
+            job_default_interpreter: default_job_interpreter(),
+            max_concurrent_jobs: default_max_jobs(),
+            job_work_dir: None,
         }
     }
 }
@@ -36,6 +52,22 @@ fn default_agent_id() -> String {
 
 fn default_interval() -> u64 {
     30
+}
+
+fn default_interpreters() -> Vec<String> {
+    vec![
+        "bash".to_string(),
+        "sh".to_string(),
+        "python3".to_string(),
+    ]
+}
+
+fn default_job_interpreter() -> String {
+    "bash".to_string()
+}
+
+fn default_max_jobs() -> usize {
+    1
 }
 
 /// 从 TOML 文件加载配置并应用环境变量覆盖；失败返回含路径的错误信息。
@@ -56,6 +88,27 @@ pub fn load_config(path: &str) -> Result<AgentConfig, String> {
             cfg.heartbeat_interval_secs = secs;
         }
     }
+    if let Ok(v) = std::env::var("GSE_AGENT_INTERPRETERS") {
+        let list: Vec<String> = v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !list.is_empty() {
+            cfg.allowed_interpreters = list;
+        }
+    }
+    if let Ok(v) = std::env::var("GSE_AGENT_JOB_INTERPRETER") {
+        cfg.job_default_interpreter = v;
+    }
+    if let Ok(v) = std::env::var("GSE_AGENT_MAX_JOBS") {
+        if let Ok(n) = v.parse() {
+            cfg.max_concurrent_jobs = n;
+        }
+    }
+    if let Ok(v) = std::env::var("GSE_AGENT_JOB_WORK_DIR") {
+        cfg.job_work_dir = if v.is_empty() { None } else { Some(v) };
+    }
     Ok(cfg)
 }
 
@@ -73,6 +126,10 @@ mod tests {
             "GSE_AGENT_ID",
             "GSE_AGENT_TOKEN",
             "GSE_AGENT_HEARTBEAT",
+            "GSE_AGENT_INTERPRETERS",
+            "GSE_AGENT_JOB_INTERPRETER",
+            "GSE_AGENT_MAX_JOBS",
+            "GSE_AGENT_JOB_WORK_DIR",
         ] {
             std::env::remove_var(key);
         }
@@ -82,6 +139,10 @@ mod tests {
             "GSE_AGENT_ID",
             "GSE_AGENT_TOKEN",
             "GSE_AGENT_HEARTBEAT",
+            "GSE_AGENT_INTERPRETERS",
+            "GSE_AGENT_JOB_INTERPRETER",
+            "GSE_AGENT_MAX_JOBS",
+            "GSE_AGENT_JOB_WORK_DIR",
         ] {
             std::env::remove_var(key);
         }
@@ -128,6 +189,13 @@ heartbeat_interval_secs = 10
             assert_eq!(cfg.agent_id, "agent-1");
             assert!(cfg.token.is_empty());
             assert_eq!(cfg.heartbeat_interval_secs, 30);
+            assert_eq!(
+                cfg.allowed_interpreters,
+                vec!["bash".to_string(), "sh".to_string(), "python3".to_string()]
+            );
+            assert_eq!(cfg.job_default_interpreter, "bash");
+            assert_eq!(cfg.max_concurrent_jobs, 1);
+            assert!(cfg.job_work_dir.is_none());
         });
     }
 
@@ -141,11 +209,22 @@ heartbeat_interval_secs = 10
             std::env::set_var("GSE_AGENT_ID", "env-agent");
             std::env::set_var("GSE_AGENT_TOKEN", "env-tok");
             std::env::set_var("GSE_AGENT_HEARTBEAT", "7");
+            std::env::set_var("GSE_AGENT_INTERPRETERS", "bash, python3");
+            std::env::set_var("GSE_AGENT_JOB_INTERPRETER", "python3");
+            std::env::set_var("GSE_AGENT_MAX_JOBS", "4");
+            std::env::set_var("GSE_AGENT_JOB_WORK_DIR", "/srv/jobs");
             let cfg = load_config(&path).expect("parse");
             assert_eq!(cfg.server_addr, "10.1.0.9:7100");
             assert_eq!(cfg.agent_id, "env-agent");
             assert_eq!(cfg.token, "env-tok");
             assert_eq!(cfg.heartbeat_interval_secs, 7);
+            assert_eq!(
+                cfg.allowed_interpreters,
+                vec!["bash".to_string(), "python3".to_string()]
+            );
+            assert_eq!(cfg.job_default_interpreter, "python3");
+            assert_eq!(cfg.max_concurrent_jobs, 4);
+            assert_eq!(cfg.job_work_dir.as_deref(), Some("/srv/jobs"));
         });
     }
 

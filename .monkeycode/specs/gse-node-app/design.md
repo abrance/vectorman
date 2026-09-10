@@ -64,7 +64,9 @@ graph TD
 
 工作区应用包：`@vectorman/console`、`@vectorman/job` 保持装配入口占位；`@vectorman/node` 是本期唯一带业务页面的应用。
 
-生产托管：`node` 的 dist 构建产物放入 gse-server 的 `http_web_dir` 指定目录，同一 HTTP 端口由 `ServeDir` 托管（SPA 回退 `index.html`），页面与 `/api/gse` API 同源同端口，无需额外网关。开发态则经 Vite proxy 直通。
+> **架构修订（2026-09-10）**：前端收敛为单一产物。`@vectorman/node` 改为 UI 包（导出四个页面与 Runtime Provider），由 `@vectorman/console` 组合；生产托管改为 console dist，节点页面路由与业务代码不变。
+
+生产托管：console 的 dist 构建产物放入 gse-server 的 `http_web_dir` 指定目录，同一 HTTP 端口由 `ServeDir` 托管（SPA 回退 `index.html`），页面与 `/api/gse` API 同源同端口，无需额外网关。开发态则经 Vite proxy 直通。
 
 ## Components and Interfaces
 

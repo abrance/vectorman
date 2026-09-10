@@ -4,6 +4,8 @@
 
 vectorman 前端采用分层架构，并以 npm workspaces 拆成可独立编译的包。v1 交付：原子能力包、适配器包、控制台应用与作业应用的装配入口。本期不交付业务页面。后续 CMDB、节点、作业等页面在对应应用内增加业务模块，并复用同一套原子能力。
 
+> **架构修订（2026-09-10）**：前端收敛为单一构建产物 `@vectorman/console`；`@vectorman/node` 与 `@vectorman/job` 改为 UI 包，仅导出页面与运行时，由 console 组合。下文 Requirement 8 中三个应用各自装配/独立产物的表述为 v1 原始需求，现以实现单一入口为准。
+
 ## Glossary
 
 - **工作区（Workspace）**：根目录 `frontend/` 下的 npm workspaces，包含库包与应用包。

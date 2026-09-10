@@ -62,6 +62,8 @@ v1.1 的重点是先沉淀一批通用 crate，把「做出组件」的基础能
 
 作业编排与远程执行。建立 ssh 执行作业时使用反向隧道，基于 https://github.com/singchia/geminio-rs 实现 agent 与 server 之间的通信。
 
+> **前端实现（2026-09-10）**：前端已收敛为单一构建产物 `@vectorman/console`（`frontend/apps/console/dist`），由 gse-server `http_web_dir` 同源托管；节点管理与作业平台页面分别以 `@vectorman/node`、`@vectorman/job` UI 包被 console 组合。下方 `job-*` 组件清单为上游完整架构拆分，落地时按需实现。
+
 以下为完整技术架构的组件拆分，落地时可先实现主要组件：
 
 ```

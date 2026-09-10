@@ -951,6 +951,7 @@ version = "0.1.0"
 dependencies = [
  "geminio",
  "gse-proto",
+ "libc",
  "serde",
  "serde_json",
  "tokio",

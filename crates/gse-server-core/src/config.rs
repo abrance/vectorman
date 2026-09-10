@@ -26,6 +26,24 @@ pub struct ServerConfig {
     /// 心跳超时窗口（秒），窗口内无消息判离线。
     #[serde(default = "default_timeout")]
     pub heartbeat_timeout_secs: u64,
+    /// 是否启用作业执行（dispatch 与 HTTP /jobs）。
+    #[serde(default = "default_true")]
+    pub jobs_enabled: bool,
+    /// 作业默认执行超时（秒）。
+    #[serde(default = "default_job_timeout")]
+    pub job_default_timeout_secs: u64,
+    /// 作业允许的最大执行超时（秒）。
+    #[serde(default = "default_job_max_timeout")]
+    pub job_max_timeout_secs: u64,
+    /// 脚本最大字节数。
+    #[serde(default = "default_max_script")]
+    pub job_max_script_bytes: usize,
+    /// stdout 采集上限（字节），超出截断。
+    #[serde(default = "default_stdout_limit")]
+    pub job_stdout_limit_bytes: u64,
+    /// stderr 采集上限（字节），超出截断。
+    #[serde(default = "default_stderr_limit")]
+    pub job_stderr_limit_bytes: u64,
 }
 
 impl Default for ServerConfig {
@@ -39,6 +57,12 @@ impl Default for ServerConfig {
             http_web_dir: None,
             heartbeat_interval_secs: default_interval(),
             heartbeat_timeout_secs: default_timeout(),
+            jobs_enabled: true,
+            job_default_timeout_secs: default_job_timeout(),
+            job_max_timeout_secs: default_job_max_timeout(),
+            job_max_script_bytes: default_max_script(),
+            job_stdout_limit_bytes: default_stdout_limit(),
+            job_stderr_limit_bytes: default_stderr_limit(),
         }
     }
 }
@@ -65,6 +89,26 @@ fn default_interval() -> u64 {
 
 fn default_timeout() -> u64 {
     90
+}
+
+fn default_job_timeout() -> u64 {
+    300
+}
+
+fn default_job_max_timeout() -> u64 {
+    3600
+}
+
+fn default_max_script() -> usize {
+    262144
+}
+
+fn default_stdout_limit() -> u64 {
+    1048576
+}
+
+fn default_stderr_limit() -> u64 {
+    1048576
 }
 
 /// 从 TOML 文件加载配置并应用环境变量覆盖；失败返回含路径的错误信息。
@@ -94,6 +138,34 @@ pub fn load_config(path: &str) -> Result<ServerConfig, String> {
             cfg.heartbeat_timeout_secs = secs;
         }
     }
+    if let Ok(v) = std::env::var("GSE_SERVER_JOBS") {
+        cfg.jobs_enabled = v == "1" || v.eq_ignore_ascii_case("true");
+    }
+    if let Ok(v) = std::env::var("GSE_SERVER_JOB_DEFAULT_TIMEOUT") {
+        if let Ok(secs) = v.parse() {
+            cfg.job_default_timeout_secs = secs;
+        }
+    }
+    if let Ok(v) = std::env::var("GSE_SERVER_JOB_MAX_TIMEOUT") {
+        if let Ok(secs) = v.parse() {
+            cfg.job_max_timeout_secs = secs;
+        }
+    }
+    if let Ok(v) = std::env::var("GSE_SERVER_JOB_MAX_SCRIPT_BYTES") {
+        if let Ok(n) = v.parse() {
+            cfg.job_max_script_bytes = n;
+        }
+    }
+    if let Ok(v) = std::env::var("GSE_SERVER_JOB_STDOUT_LIMIT") {
+        if let Ok(n) = v.parse() {
+            cfg.job_stdout_limit_bytes = n;
+        }
+    }
+    if let Ok(v) = std::env::var("GSE_SERVER_JOB_STDERR_LIMIT") {
+        if let Ok(n) = v.parse() {
+            cfg.job_stderr_limit_bytes = n;
+        }
+    }
     Ok(cfg)
 }
 
@@ -113,6 +185,12 @@ mod tests {
             "GSE_SERVER_HTTP_LISTEN",
             "GSE_SERVER_HTTP_WEB_DIR",
             "GSE_SERVER_HEARTBEAT_TIMEOUT",
+            "GSE_SERVER_JOBS",
+            "GSE_SERVER_JOB_DEFAULT_TIMEOUT",
+            "GSE_SERVER_JOB_MAX_TIMEOUT",
+            "GSE_SERVER_JOB_MAX_SCRIPT_BYTES",
+            "GSE_SERVER_JOB_STDOUT_LIMIT",
+            "GSE_SERVER_JOB_STDERR_LIMIT",
         ] {
             std::env::remove_var(key);
         }
@@ -124,6 +202,12 @@ mod tests {
             "GSE_SERVER_HTTP_LISTEN",
             "GSE_SERVER_HTTP_WEB_DIR",
             "GSE_SERVER_HEARTBEAT_TIMEOUT",
+            "GSE_SERVER_JOBS",
+            "GSE_SERVER_JOB_DEFAULT_TIMEOUT",
+            "GSE_SERVER_JOB_MAX_TIMEOUT",
+            "GSE_SERVER_JOB_MAX_SCRIPT_BYTES",
+            "GSE_SERVER_JOB_STDOUT_LIMIT",
+            "GSE_SERVER_JOB_STDERR_LIMIT",
         ] {
             std::env::remove_var(key);
         }
@@ -153,6 +237,12 @@ http_listen = "127.0.0.1:9999"
 http_web_dir = "web"
 heartbeat_interval_secs = 10
 heartbeat_timeout_secs = 30
+jobs_enabled = false
+job_default_timeout_secs = 120
+job_max_timeout_secs = 600
+job_max_script_bytes = 1024
+job_stdout_limit_bytes = 2048
+job_stderr_limit_bytes = 4096
 
 [agents]
 web-01 = "tok-a"
@@ -168,6 +258,12 @@ web-02 = "tok-b"
             assert_eq!(cfg.http_web_dir.as_deref(), Some("web"));
             assert_eq!(cfg.heartbeat_interval_secs, 10);
             assert_eq!(cfg.heartbeat_timeout_secs, 30);
+            assert!(!cfg.jobs_enabled);
+            assert_eq!(cfg.job_default_timeout_secs, 120);
+            assert_eq!(cfg.job_max_timeout_secs, 600);
+            assert_eq!(cfg.job_max_script_bytes, 1024);
+            assert_eq!(cfg.job_stdout_limit_bytes, 2048);
+            assert_eq!(cfg.job_stderr_limit_bytes, 4096);
         });
     }
 
@@ -186,6 +282,12 @@ web-02 = "tok-b"
             assert!(cfg.http_web_dir.is_none());
             assert_eq!(cfg.heartbeat_interval_secs, 30);
             assert_eq!(cfg.heartbeat_timeout_secs, 90);
+            assert!(cfg.jobs_enabled);
+            assert_eq!(cfg.job_default_timeout_secs, 300);
+            assert_eq!(cfg.job_max_timeout_secs, 3600);
+            assert_eq!(cfg.job_max_script_bytes, 262144);
+            assert_eq!(cfg.job_stdout_limit_bytes, 1048576);
+            assert_eq!(cfg.job_stderr_limit_bytes, 1048576);
         });
     }
 
@@ -222,6 +324,12 @@ web-01 = "tok-a"
             std::env::set_var("GSE_SERVER_HTTP_LISTEN", "0.0.0.0:7777");
             std::env::set_var("GSE_SERVER_HTTP_WEB_DIR", "/srv/web");
             std::env::set_var("GSE_SERVER_HEARTBEAT_TIMEOUT", "45");
+            std::env::set_var("GSE_SERVER_JOBS", "false");
+            std::env::set_var("GSE_SERVER_JOB_DEFAULT_TIMEOUT", "60");
+            std::env::set_var("GSE_SERVER_JOB_MAX_TIMEOUT", "900");
+            std::env::set_var("GSE_SERVER_JOB_MAX_SCRIPT_BYTES", "2048");
+            std::env::set_var("GSE_SERVER_JOB_STDOUT_LIMIT", "4096");
+            std::env::set_var("GSE_SERVER_JOB_STDERR_LIMIT", "8192");
             let cfg = load_config(&path).expect("parse");
             assert_eq!(cfg.listen, "0.0.0.0:9999");
             assert!(!cfg.auth_enabled);
@@ -230,6 +338,12 @@ web-01 = "tok-a"
             assert_eq!(cfg.http_listen, "0.0.0.0:7777");
             assert_eq!(cfg.http_web_dir.as_deref(), Some("/srv/web"));
             assert_eq!(cfg.heartbeat_timeout_secs, 45);
+            assert!(!cfg.jobs_enabled);
+            assert_eq!(cfg.job_default_timeout_secs, 60);
+            assert_eq!(cfg.job_max_timeout_secs, 900);
+            assert_eq!(cfg.job_max_script_bytes, 2048);
+            assert_eq!(cfg.job_stdout_limit_bytes, 4096);
+            assert_eq!(cfg.job_stderr_limit_bytes, 8192);
         });
     }
 

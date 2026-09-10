@@ -1,25 +1,47 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { FetchHttpClient, GseAdminAdapter, PromQueryAdapter, SqlHttpAdapter } from "@vectorman/adapters";
-import { JsonErrorMapper, MemoryAuthSession, MemoryNotifier, MemoryQueryStore } from "@vectorman/primitives";
+import { BrowserRouter } from "react-router-dom";
+import { ConfigProvider } from "antd";
+import zhCN from "antd/locale/zh_CN";
+import {
+  FetchHttpClient,
+  GseAdminAdapter,
+  GseJobAdapter,
+  GseJobTemplateAdapter,
+} from "@vectorman/adapters";
+import {
+  JsonErrorMapper,
+  MemoryAuthSession,
+  MemoryNotifier,
+  MemoryQueryStore,
+} from "@vectorman/primitives";
+import { RuntimeProvider as NodeRuntimeProvider } from "@vectorman/node";
+import { RuntimeProvider as JobRuntimeProvider } from "@vectorman/job";
 import { App } from "./app/App";
 
 const session = new MemoryAuthSession();
 const mapper = new JsonErrorMapper();
-const queryStore = new MemoryQueryStore();
+const query = new MemoryQueryStore();
 const notifier = new MemoryNotifier();
 const http = new FetchHttpClient(session, mapper);
 const gse = new GseAdminAdapter(http);
-const sql = new SqlHttpAdapter(http);
-const prom = new PromQueryAdapter(http, mapper);
-void queryStore;
-void notifier;
-void gse;
-void sql;
-void prom;
+const jobs = new GseJobAdapter(http);
+const templates = new GseJobTemplateAdapter(http);
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <App />
+    <ConfigProvider
+      locale={zhCN}
+      theme={{ token: { motion: false } }}
+      autoInsertSpaceInButton={false}
+    >
+      <NodeRuntimeProvider value={{ gse, query, notifier }}>
+        <JobRuntimeProvider value={{ jobs, templates, gse, query, notifier }}>
+          <BrowserRouter>
+            <App />
+          </BrowserRouter>
+        </JobRuntimeProvider>
+      </NodeRuntimeProvider>
+    </ConfigProvider>
   </StrictMode>,
 );

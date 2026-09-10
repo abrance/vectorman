@@ -1,6 +1,7 @@
-import { Button, Form, Input, Modal, Space, Table, Tag } from "antd";
+import { Button, Form, Input, Modal, Space, Table, Tag, Typography } from "antd";
 import { useState } from "react";
 import type { Agent } from "@vectorman/adapters";
+import { formatTimestamp } from "@vectorman/primitives";
 import { useRuntime } from "../app/runtime";
 import { toAppError } from "../features/ledger/errors";
 import { useAgents } from "../features/ledger/use-agents";
@@ -26,11 +27,13 @@ export function AgentsPage() {
   const [submitting, setSubmitting] = useState(false);
   const [missing, setMissing] = useState<string | null>(null);
   const [originalToken, setOriginalToken] = useState("");
+  const [heartbeat, setHeartbeat] = useState("");
 
   const openCreate = () => {
     setMode("create");
     setMissing(null);
     setOriginalToken("");
+    setHeartbeat("");
     form.resetFields();
     setOpen(true);
   };
@@ -43,6 +46,7 @@ export function AgentsPage() {
     try {
       const agent = await getOne(id);
       setOriginalToken(agent.token);
+      setHeartbeat(agent.last_heartbeat_at ?? "");
       form.setFieldsValue(agent);
     } catch (e) {
       setMissing(toAppError(e).message);
@@ -92,7 +96,7 @@ export function AgentsPage() {
           { title: "agent_id", dataIndex: "agent_id" },
           { title: "host_id", dataIndex: "host_id" },
           { title: "status", dataIndex: "status", render: statusTag },
-          { title: "last_heartbeat_at", dataIndex: "last_heartbeat_at" },
+          { title: "last_heartbeat_at", dataIndex: "last_heartbeat_at", render: (v: string | null) => formatTimestamp(v) },
           { title: "version", dataIndex: "version" },
           {
             title: "操作",
@@ -161,8 +165,8 @@ export function AgentsPage() {
           <Form.Item name="status" label="status">
             <Input disabled />
           </Form.Item>
-          <Form.Item name="last_heartbeat_at" label="last_heartbeat_at">
-            <Input disabled />
+          <Form.Item label="last_heartbeat_at">
+            <Typography.Text>{formatTimestamp(heartbeat)}</Typography.Text>
           </Form.Item>
         </Form>
       </LedgerDrawer>
