@@ -91,11 +91,20 @@ impl Server {
             });
         }
         loop {
-            let (end, _drivers) = self.listener.accept().await?;
-            let registry = self.registry.clone();
-            let cfg = self.cfg.clone();
-            let ledger = self.ledger.clone();
-            tokio::spawn(handle_conn(end, registry, cfg, ledger));
+            match self.listener.accept().await {
+                Ok((end, _drivers)) => {
+                    let registry = self.registry.clone();
+                    let cfg = self.cfg.clone();
+                    let ledger = self.ledger.clone();
+                    tokio::spawn(handle_conn(end, registry, cfg, ledger));
+                }
+                Err(e) => {
+                    // 单个连接的握手/解码失败（如非法 wire-format）只影响该连接，
+                    // 不能终止整个服务；记录后短暂退避再继续 accept。
+                    eprintln!("gse-server: accept error: {e}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
         }
     }
 

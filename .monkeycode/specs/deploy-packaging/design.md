@@ -5,7 +5,7 @@ Updated: 2026-09-09
 
 ## Description
 
-把打包逻辑从 `.github/workflows/release.yml` 内联 shell 收敛为仓库内 `packaging/build-package.sh`（本地与 CI 共用唯一入口），安装包在现有四组件 `bin/ + conf/` 布局上新增 `gse-server/web/`（`@vectorman/node` 的 vite dist）与 `deploy/`（install.sh、ctl.sh、systemd unit 模板）。目标机用 `install.sh <组件|all>` 安装到默认 `/opt/vectorman`，`--with-systemd` 安装 unit；进程管理统一走 `ctl.sh <组件> <start|stop|status|restart>`（仅 systemd，无 systemd 直接报错）。dpc 为一次性 CLI，无 unit、ctl 拒绝管理。
+把打包逻辑从 `.github/workflows/release.yml` 内联 shell 收敛为仓库内 `packaging/build-package.sh`（本地与 CI 共用唯一入口），安装包在现有四组件 `bin/ + conf/` 布局上新增 `gse-server/web/`（`@vectorman/node` 的 vite dist）与 `deploy/`（install.sh、ctl.sh、systemd unit 模板）。目标机用 `install.sh <组件|all>` 安装到默认 `/opt/vectorman`，`--with-systemd` 安装 unit，`--no-systemd` 走无 systemd 的 PID 文件模式；进程管理统一走 `ctl.sh <组件> <start|stop|status|restart>`（按 `deploy/mode` 选择 systemd 或 direct 后端）。dpc 为一次性 CLI，无 unit、ctl 拒绝管理。
 
 ## Architecture
 
@@ -23,12 +23,15 @@ graph TD
     VERIFY --> TAR["tar czf 可复现参数"]
     TAR --> GH["GitHub Release 上传"]
     TAR --> LOCALPKG["本地安装包"]
-    LOCALPKG --> INST["deploy/install.sh 组件 all --dest --with-systemd"]
+    LOCALPKG --> INST["deploy/install.sh 组件 all --dest [--with-systemd|--no-systemd]"]
     INST --> ROOT["/opt/vectorman 各组件子目录"]
-    INST --> UNITD["sed 占位符 写 /etc/systemd/system"]
+    INST --> UNITD["--with-systemd: sed 占位符 写 /etc/systemd/system"]
+    INST --> MODE["--no-systemd: 写 deploy/mode=direct"]
     ROOT --> CTL["deploy/ctl.sh 组件 start|stop|status|restart"]
     UNITD --> SYSD["systemd 管理 vectorman-* service"]
+    MODE --> DIRECT["PID 文件管理 run/ logs/"]
     CTL --> SYSD
+    CTL --> DIRECT
 ```
 
 本地与 CI 走同一条 `packaging/build-package.sh` 路径，差异只在工具链安装步骤属于 workflow。打包产物即分发物，`deploy/` 随包走，目标机上脚本之间以安装根目录结构为唯一契约。
@@ -71,11 +74,12 @@ packaging/build-package.sh [--version <v>]
 ### install.sh 接口
 
 ```bash
-deploy/install.sh <apiserver|dpc|gse-server|gse-agent|all> [--dest /opt/vectorman] [--with-systemd]
+deploy/install.sh <apiserver|dpc|gse-server|gse-agent|all> [--dest /opt/vectorman] [--with-systemd|--no-systemd]
 ```
 
 - 组件来源：脚本自身位于包内 `deploy/`，按 `script_dir/../<组件>` 定位。
-- 复制 `<组件>/{bin,conf,web}` 到 `<dest>/<组件>/`；`--with-systemd` 时对守护进程将 unit 模板 `@INSTALL_ROOT@` 占位符 `sed` 替换为 `<dest>/<组件>` 后写入 `/etc/systemd/system/vectorman-<组件>.service`，执行 `systemctl daemon-reload`；dpc 传 `--with-systemd` 时打印无 unit 提示并继续。
+- 复制 `<组件>/{bin,conf,web}` 到 `<dest>/<组件>/`（包树即安装目录时跳过自复制，避免嵌套）；`--with-systemd` 时对守护进程将 unit 模板 `@INSTALL_ROOT@` 占位符 `sed` 替换为 `<dest>/<组件>` 后写入 `/etc/systemd/system/vectorman-<组件>.service`，执行 `systemctl daemon-reload`；dpc 传 `--with-systemd` 时打印无 unit 提示并继续。
+- 进程管理后端由 `--with-systemd` / `--no-systemd` 选择（两者互斥）：`--no-systemd` 写 `<dest>/deploy/mode=direct`，由 ctl.sh 用 PID 文件直接管理，不写 unit；缺省为 `systemd`。`--with-systemd` 与 `--no-systemd` 同时出现以 `conflicting flags` 非零退出。
 - 实例配置生成：`<dest>/<组件>/conf/<name>.toml` 缺失时由同名 `.example` 复制生成；已存在则保留并打印 `config kept`。
 - 需要 root（写 `/opt` 与 `/etc/systemd/system`），非 root 且涉及对应写入时以 `root required` 报错退出。
 - 完成后打印该组件 `ctl.sh` 启动与状态命令。
@@ -87,9 +91,11 @@ deploy/ctl.sh <apiserver|gse-server|gse-agent> <start|stop|status|restart>
 ```
 
 - 定位安装根：脚本复制到 `<dest>/deploy/ctl.sh`（install.sh 保留包内相对位置），按 `script_dir/..` 推导。
-- systemd 探测：`command -v systemctl` 且 `-d /run/systemd/system`，两者任一不满足即报错退出（`systemd required`，退出码非零）。
-- 操作映射为 `systemctl <动作> vectorman-<组件>.service`；dpc 一律拒绝并提示 CLI 工具。
-- unit 模板统一 `Restart=on-failure`、`RestartSec=5`、`WorkingDirectory=@INSTALL_ROOT@`（使 `config.toml`、`gse-server.db`、`web` 等相对路径全部落在组件目录内）。
+- 后端选择：读 `<dest>/deploy/mode`（缺省 `systemd`）。
+  - `systemd`：`command -v systemctl` 且 `-d /run/systemd/system`，任一不满足即报错退出（`systemd required`，退出码非零）；操作映射为 `systemctl <动作> vectorman-<组件>.service`。
+  - `direct`：不依赖 systemd，用 `<dest>/run/<组件>.pid` 记录 PID、`<dest>/logs/<组件>.log` 收集输出；`start` 以组件目录为 CWD 并注入 `GSE_SERVER_CONFIG` / `GSE_AGENT_CONFIG` 后后台启动，`stop` 先 SIGTERM 再超时 SIGKILL，`status` 按 PID 存活返回 0/3。
+- dpc 一律拒绝并提示 CLI 工具。
+- unit 模板统一 `Restart=on-failure`、`RestartSec=5`、`WorkingDirectory=@INSTALL_ROOT@`（使 `config.toml`、`gse-server.db`、`web` 等相对路径全部落在组件目录内）；direct 模式以 CWD=组件目录等价复现该相对路径语义。
 
 unit 环境注入对照：
 
@@ -167,15 +173,17 @@ vectorman-<REL>-linux-x86_64/
 | web 产物缺 index.html | `web dist invalid`，终止打包 |
 | `git describe` 失败（非 git 目录） | 报错提示必须显式传 `--version` |
 | install.sh 非 root 且目标不可写 | `root required`，非零退出 |
-| ctl.sh 无 systemd | `systemd required`，非零退出（本期决策：无回退模式） |
+| install.sh 同时传 `--with-systemd` 与 `--no-systemd` | `conflicting flags`，非零退出 |
+| ctl.sh 处于 systemd 模式但无 systemd | `systemd required`，非零退出（改用 `--no-systemd` 走 direct 模式） |
 | unit 安装后 `daemon-reload` 失败 | 报错并提示手动执行 `systemctl daemon-reload` |
 | dpc 被 ctl.sh 管理 | `dpc is a one-shot CLI tool`，非零退出 |
 
 ## Test Strategy
 
 1. **布局装配测试（本地快路径）**：`build-package.sh --version test --bin-dir target/debug --dist-dir frontend/apps/node/dist` 秒级产出包，断言目录树、index.html、可执行位、conf 示例齐全。
-2. **安装测试**：解包到临时目录，`install.sh gse-server --dest /tmp/vm-test`（无 systemd 步骤），断言实例配置生成、重复执行不覆盖、输出包含 ctl 用法。
-3. **ctl.sh 负向测试**：本沙箱无运行 systemd，`ctl.sh gse-server start` 应报 `systemd required` 非零退出；`ctl.sh dpc start` 应报 CLI 提示。
+2. **安装测试**：解包到临时目录，`install.sh gse-server --dest /tmp/vm-test`（无 systemd 步骤），断言实例配置生成、重复执行不覆盖、输出包含 ctl 用法；包树即安装目录时验证原地重装不报错、不产生嵌套目录。
+3. **ctl.sh 负向测试**：本沙箱无运行 systemd，systemd 模式 `ctl.sh gse-server start` 应报 `systemd required` 非零退出；`ctl.sh dpc start` 应报 CLI 提示。
+4. **direct 模式测试**：`install.sh gse-server --no-systemd --dest <tmp>` 后 `ctl.sh gse-server start|status|stop` 应正确管理 PID 文件与日志，`status` 停止时返回 3；`mode` 文件内容为 `direct`。
 4. **冒烟测试**：安装后 `cd /opt/vectorman/gse-server && GSE_SERVER_CONFIG=conf/gse-server.toml ./bin/gse-server`，curl `/health`、`/api/gse/agents`、`/`（200 text/html），验证 unit WorkingDirectory 语义与手工方式一致。
 5. **CI 全路径**：push 测试 tag（如 `v0.0.0-test`）观察 workflow 全绿后删除测试 release；正式验证交给下一次真实 tag。
 
