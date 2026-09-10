@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { MemoryNotifier, MemoryQueryStore } from "@vectorman/primitives";
+import { MemoryNotifier, MemoryQueryStore, type HttpClient } from "@vectorman/primitives";
 import { GseAdminAdapter } from "@vectorman/adapters";
 import { RuntimeProvider } from "../app/runtime";
 import { MaskedToken } from "./masked-token";
@@ -14,7 +14,7 @@ function wrap(ui: React.ReactElement) {
   const query = new MemoryQueryStore();
   const gse = new GseAdminAdapter({
     request: async () => ({ status: 200, body: null }),
-  });
+  } as unknown as HttpClient);
   return render(
     <RuntimeProvider value={{ gse, query, notifier }}>{ui}</RuntimeProvider>,
   );

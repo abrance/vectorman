@@ -16,3 +16,4 @@ export { JsonErrorMapper } from "./memory/mapper";
 export { MemoryAuthSession } from "./memory/session";
 export { MemoryQueryStore } from "./memory/query";
 export { MemoryNotifier } from "./memory/notifier";
+export { formatTimestamp } from "./format/time";

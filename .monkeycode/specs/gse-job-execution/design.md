@@ -364,6 +364,8 @@ type JobSubmitRequest = {
 
 gse-server 的 `http_web_dir` 一次只托管一个前端产物，`node` 与 `job` 二选一。前端产物采用独立静态服务托管，或后续合并为统一前端入口；本期按独立静态服务设计，开发态经 Vite proxy 直通。
 
+> **架构修订（2026-09-10）**：已采用统一前端入口。`@vectorman/job` 收敛为 UI 包（导出页面与 Runtime Provider），由 `@vectorman/console` 组合，唯一产物 `apps/console/dist` 交由 gse-server `http_web_dir` 托管。作业平台的路由与业务代码不变，仅导航与装配入口迁到 console。
+
 ### 路由
 
 | path | 页面 |

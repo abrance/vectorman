@@ -6,8 +6,8 @@
     "apps/*"
   ],
   "scripts": {
-    "test": "npm run test -w @vectorman/primitives && npm run test -w @vectorman/adapters && npm run test -w @vectorman/node",
-    "dev:node": "npm run dev -w @vectorman/node",
-    "build:node": "npm run build -w @vectorman/node"
+    "test": "npm run test -w @vectorman/primitives && npm run test -w @vectorman/adapters && npm run test -w @vectorman/node && npm run test -w @vectorman/job && npm run test -w @vectorman/console",
+    "dev:console": "npm run dev -w @vectorman/console",
+    "build:console": "npm run build -w @vectorman/console"
   }
 }

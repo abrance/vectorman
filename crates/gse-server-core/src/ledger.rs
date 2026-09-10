@@ -1,11 +1,13 @@
-//! 台账（Ledger）：四张 sqlite 资产的语义化封装。
+//! 台账（Ledger）：SQLite 资产的语义化封装。
 //!
-//! hosts / access_points / agents / agent_configs 均为 sqlite 持久化表，
+//! hosts / access_points / agents / agent_configs / jobs 均为 sqlite 持久化表，
 //! 以自然键为主键幂等 upsert；本模块向会话层与 HTTP 层提供统一的增删改查。
+
+use std::collections::BTreeMap;
 
 use dataplane_core::{DataplaneError, SqlValue};
 use dataplane_sql::{RelationalStore, SqliteRelationalStore};
-use gse_proto::GseError;
+use gse_proto::{GseError, JobResult, JobStatus};
 use serde::{Deserialize, Serialize};
 
 /// 主机资产。
@@ -78,6 +80,100 @@ pub struct AgentConfig {
     pub updated_at: String,
 }
 
+/// 作业持久化记录；字段与前端 `Job` 类型对齐。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobRecord {
+    pub job_id: String,
+    pub agent_id: String,
+    pub interpreter: String,
+    pub script: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    /// 由模板提交时记录的来源模板；手工提交为 None。
+    #[serde(default)]
+    pub template_id: Option<String>,
+    /// 重做时记录的来源作业 job_id；非重做作业为 None。
+    #[serde(default)]
+    pub rerun_of: Option<String>,
+    pub timeout_secs: u64,
+    pub status: JobStatus,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub signal: Option<i32>,
+    #[serde(default)]
+    pub stdout: Option<String>,
+    #[serde(default)]
+    pub stdout_truncated: bool,
+    #[serde(default)]
+    pub stderr: Option<String>,
+    #[serde(default)]
+    pub stderr_truncated: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub created_at: String,
+    #[serde(default)]
+    pub dispatched_at: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub finished_at: Option<String>,
+    pub updated_at: String,
+}
+
+/// 新作业的提交参数；由 server 层在受理时构造。
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewJob {
+    pub job_id: String,
+    pub agent_id: String,
+    pub interpreter: String,
+    pub script: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub working_dir: Option<String>,
+    pub template_id: Option<String>,
+    pub rerun_of: Option<String>,
+    pub timeout_secs: u64,
+    pub created_at: String,
+}
+
+/// 作业模板；由 server 层在受理创建时构造。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobTemplate {
+    pub template_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub interpreter: String,
+    pub script: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    pub timeout_secs: u64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// 创建/更新作业模板的输入字段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewJobTemplate {
+    pub name: String,
+    pub description: Option<String>,
+    pub interpreter: String,
+    pub script: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub working_dir: Option<String>,
+    pub timeout_secs: u64,
+}
+
 /// 台账访问入口。
 pub struct Ledger {
     store: SqliteRelationalStore,
@@ -132,10 +228,93 @@ impl Ledger {
                 log_level          TEXT NOT NULL DEFAULT 'info',
                 updated_at         TEXT NOT NULL
             )",
+            "CREATE TABLE IF NOT EXISTS jobs (
+                job_id            TEXT PRIMARY KEY,
+                agent_id          TEXT NOT NULL,
+                interpreter       TEXT NOT NULL,
+                script            TEXT NOT NULL,
+                args              TEXT NOT NULL DEFAULT '[]',
+                env               TEXT NOT NULL DEFAULT '{}',
+                working_dir       TEXT,
+                template_id       TEXT,
+                rerun_of          TEXT,
+                timeout_secs      INTEGER NOT NULL,
+                status            TEXT NOT NULL,
+                exit_code         INTEGER,
+                signal            INTEGER,
+                stdout            TEXT,
+                stdout_truncated  INTEGER NOT NULL DEFAULT 0,
+                stderr            TEXT,
+                stderr_truncated  INTEGER NOT NULL DEFAULT 0,
+                error             TEXT,
+                created_at        TEXT NOT NULL,
+                dispatched_at     TEXT,
+                started_at        TEXT,
+                finished_at       TEXT,
+                updated_at        TEXT NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_jobs_agent ON jobs(agent_id, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)",
+            "CREATE TABLE IF NOT EXISTS job_templates (
+                template_id    TEXT PRIMARY KEY,
+                name           TEXT NOT NULL UNIQUE,
+                description    TEXT,
+                interpreter    TEXT NOT NULL,
+                script         TEXT NOT NULL,
+                args           TEXT NOT NULL DEFAULT '[]',
+                env            TEXT NOT NULL DEFAULT '{}',
+                working_dir    TEXT,
+                timeout_secs   INTEGER NOT NULL,
+                created_at     TEXT NOT NULL,
+                updated_at     TEXT NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_templates_name ON job_templates(name)",
         ];
         for sql in ddl {
             self.store
                 .execute(sql, &[])
+                .await
+                .map_err(|e| format!("init ledger: {}", e.message))?;
+        }
+        self.migrate_jobs_template_id().await?;
+        self.migrate_jobs_rerun_of().await?;
+        Ok(())
+    }
+
+    /// 兼容旧库：`jobs` 表缺失 `template_id` 列时补齐，重复调用幂等。
+    async fn migrate_jobs_template_id(&self) -> Result<(), String> {
+        let info = self
+            .store
+            .execute("PRAGMA table_info(jobs)", &[])
+            .await
+            .map_err(|e| format!("init ledger: {}", e.message))?;
+        let present = info
+            .rows
+            .iter()
+            .any(|row| field_text(&info.columns, row, "name") == "template_id");
+        if !present {
+            self.store
+                .execute("ALTER TABLE jobs ADD COLUMN template_id TEXT", &[])
+                .await
+                .map_err(|e| format!("init ledger: {}", e.message))?;
+        }
+        Ok(())
+    }
+
+    /// 兼容旧库：`jobs` 表缺失 `rerun_of` 列时补齐，重复调用幂等。
+    async fn migrate_jobs_rerun_of(&self) -> Result<(), String> {
+        let info = self
+            .store
+            .execute("PRAGMA table_info(jobs)", &[])
+            .await
+            .map_err(|e| format!("init ledger: {}", e.message))?;
+        let present = info
+            .rows
+            .iter()
+            .any(|row| field_text(&info.columns, row, "name") == "rerun_of");
+        if !present {
+            self.store
+                .execute("ALTER TABLE jobs ADD COLUMN rerun_of TEXT", &[])
                 .await
                 .map_err(|e| format!("init ledger: {}", e.message))?;
         }
@@ -388,6 +567,295 @@ impl Ledger {
         .await?;
         Ok(())
     }
+
+    // ---- jobs ----
+
+    /// 插入一条 `pending` 作业。
+    pub async fn insert_job(&self, job: &NewJob) -> Result<(), GseError> {
+        let args = serde_json::to_string(&job.args)
+            .map_err(|e| GseError::new("invalid_argument", e.to_string()))?;
+        let env = serde_json::to_string(&job.env)
+            .map_err(|e| GseError::new("invalid_argument", e.to_string()))?;
+        let sql = "INSERT INTO jobs (
+                       job_id, agent_id, interpreter, script, args, env, working_dir, template_id,
+                       rerun_of,
+                       timeout_secs, status, stdout_truncated, stderr_truncated,
+                       created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?)";
+        self.execute(
+            sql,
+            &[
+                text(&job.job_id),
+                text(&job.agent_id),
+                text(&job.interpreter),
+                text(&job.script),
+                SqlValue::Text(args),
+                SqlValue::Text(env),
+                job.working_dir
+                    .as_deref()
+                    .map(text)
+                    .unwrap_or(SqlValue::Null),
+                job.template_id
+                    .as_deref()
+                    .map(text)
+                    .unwrap_or(SqlValue::Null),
+                job.rerun_of.as_deref().map(text).unwrap_or(SqlValue::Null),
+                SqlValue::Integer(job.timeout_secs as i64),
+                text(&job.created_at),
+                text(&job.created_at),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>, GseError> {
+        let res = self
+            .execute("SELECT * FROM jobs WHERE job_id = ?", &[text(job_id)])
+            .await?;
+        Ok(res.rows.first().map(|row| row_to_job(&res.columns, row)))
+    }
+
+    /// 列出作业，可按 agent_id 与状态筛选；limit 默认 200，上限 1000。
+    pub async fn list_jobs(
+        &self,
+        agent_id: Option<&str>,
+        status: Option<&str>,
+        limit: Option<i64>,
+    ) -> Result<Vec<JobRecord>, GseError> {
+        let mut sql = String::from("SELECT * FROM jobs");
+        let mut conditions: Vec<&str> = Vec::new();
+        let mut params: Vec<SqlValue> = Vec::new();
+        if let Some(a) = agent_id {
+            conditions.push("agent_id = ?");
+            params.push(text(a));
+        }
+        if let Some(s) = status {
+            conditions.push("status = ?");
+            params.push(text(s));
+        }
+        if !conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conditions.join(" AND "));
+        }
+        sql.push_str(" ORDER BY created_at DESC LIMIT ?");
+        params.push(SqlValue::Integer(limit.unwrap_or(200).clamp(1, 1000)));
+        let res = self.execute(&sql, &params).await?;
+        Ok(res
+            .rows
+            .iter()
+            .map(|row| row_to_job(&res.columns, row))
+            .collect())
+    }
+
+    /// 标记受理成功进入运行态；已终态作业不变。
+    pub async fn mark_running(&self, job_id: &str, started_at: &str) -> Result<(), GseError> {
+        let sql = "UPDATE jobs SET status = 'running', started_at = ?, updated_at = ?
+                   WHERE job_id = ? AND status NOT IN ('succeeded', 'failed', 'timeout', 'rejected', 'lost')";
+        self.execute(sql, &[text(started_at), text(started_at), text(job_id)])
+            .await?;
+        Ok(())
+    }
+
+    /// 写入作业终态；已终态作业保留首次结果。
+    pub async fn finish_job(&self, result: &JobResult, finished_at: &str) -> Result<(), GseError> {
+        let started_at = if result.started_at_micros > 0 {
+            SqlValue::Text(result.started_at_micros.to_string())
+        } else {
+            SqlValue::Null
+        };
+        let sql = "UPDATE jobs SET
+                       status = ?,
+                       exit_code = ?,
+                       signal = ?,
+                       stdout = ?,
+                       stdout_truncated = ?,
+                       stderr = ?,
+                       stderr_truncated = ?,
+                       error = ?,
+                       started_at = COALESCE(?, started_at),
+                       finished_at = ?,
+                       updated_at = ?
+                   WHERE job_id = ?
+                     AND status NOT IN ('succeeded', 'failed', 'timeout', 'rejected', 'lost')";
+        self.execute(
+            sql,
+            &[
+                text(result.status.as_str()),
+                opt_i32(result.exit_code),
+                opt_i32(result.signal),
+                SqlValue::Text(result.stdout.clone()),
+                bool_int(result.stdout_truncated),
+                SqlValue::Text(result.stderr.clone()),
+                bool_int(result.stderr_truncated),
+                result.error.as_deref().map(text).unwrap_or(SqlValue::Null),
+                started_at,
+                text(finished_at),
+                text(finished_at),
+                text(&result.job_id),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// 标记作业被 Agent 拒绝受理；已终态作业不变。
+    pub async fn mark_rejected(&self, job_id: &str, reason: &str) -> Result<(), GseError> {
+        let sql = "UPDATE jobs SET status = 'rejected', error = ?, updated_at = ?
+                   WHERE job_id = ? AND status NOT IN ('succeeded', 'failed', 'timeout', 'rejected', 'lost')";
+        self.execute(sql, &[text(reason), text(&ledger_stamp()), text(job_id)])
+            .await?;
+        Ok(())
+    }
+
+    /// 将会话离线 Agent 的在途作业标记为 lost。
+    pub async fn mark_lost_by_agent(&self, agent_id: &str) -> Result<(), GseError> {
+        let sql = "UPDATE jobs SET status = 'lost', error = COALESCE(error, 'agent offline'), updated_at = ?
+                   WHERE agent_id = ?
+                     AND status IN ('pending', 'dispatched', 'running')";
+        self.execute(sql, &[text(&ledger_stamp()), text(agent_id)])
+            .await?;
+        Ok(())
+    }
+
+    /// 服务启动时将所有在途作业标记为 lost。
+    pub async fn mark_lost_inflight_on_startup(&self) -> Result<(), GseError> {
+        let sql = "UPDATE jobs SET status = 'lost', error = COALESCE(error, 'server restarted'), updated_at = ?
+                   WHERE status IN ('pending', 'dispatched', 'running')";
+        self.execute(sql, &[text(&ledger_stamp())]).await?;
+        Ok(())
+    }
+
+    // ---- job_templates ----
+
+    /// 插入模板；名称冲突映射为 `already_exists`。
+    pub async fn insert_template(
+        &self,
+        template_id: &str,
+        t: &NewJobTemplate,
+        now: &str,
+    ) -> Result<(), GseError> {
+        let args = serde_json::to_string(&t.args)
+            .map_err(|e| GseError::new("invalid_argument", e.to_string()))?;
+        let env = serde_json::to_string(&t.env)
+            .map_err(|e| GseError::new("invalid_argument", e.to_string()))?;
+        let sql = "INSERT INTO job_templates (
+                       template_id, name, description, interpreter, script, args, env,
+                       working_dir, timeout_secs, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        let res = self
+            .execute(
+                sql,
+                &[
+                    text(template_id),
+                    text(&t.name),
+                    opt_text(t.description.as_deref()),
+                    text(&t.interpreter),
+                    text(&t.script),
+                    SqlValue::Text(args),
+                    SqlValue::Text(env),
+                    opt_text(t.working_dir.as_deref()),
+                    SqlValue::Integer(t.timeout_secs as i64),
+                    text(now),
+                    text(now),
+                ],
+            )
+            .await;
+        map_unique_conflict(res)
+    }
+
+    pub async fn get_template(&self, template_id: &str) -> Result<Option<JobTemplate>, GseError> {
+        let res = self
+            .execute(
+                "SELECT * FROM job_templates WHERE template_id = ?",
+                &[text(template_id)],
+            )
+            .await?;
+        Ok(res
+            .rows
+            .first()
+            .map(|row| row_to_template(&res.columns, row)))
+    }
+
+    pub async fn get_template_by_name(&self, name: &str) -> Result<Option<JobTemplate>, GseError> {
+        let res = self
+            .execute("SELECT * FROM job_templates WHERE name = ?", &[text(name)])
+            .await?;
+        Ok(res
+            .rows
+            .first()
+            .map(|row| row_to_template(&res.columns, row)))
+    }
+
+    /// 列出模板，可按名称模糊筛选；limit 默认 200，上限 1000。
+    pub async fn list_templates(
+        &self,
+        name: Option<&str>,
+        limit: Option<i64>,
+    ) -> Result<Vec<JobTemplate>, GseError> {
+        let mut sql = String::from("SELECT * FROM job_templates");
+        let mut params: Vec<SqlValue> = Vec::new();
+        if let Some(n) = name {
+            sql.push_str(" WHERE name LIKE ?");
+            params.push(text(&format!("%{n}%")));
+        }
+        sql.push_str(" ORDER BY updated_at DESC LIMIT ?");
+        params.push(SqlValue::Integer(limit.unwrap_or(200).clamp(1, 1000)));
+        let res = self.execute(&sql, &params).await?;
+        Ok(res
+            .rows
+            .iter()
+            .map(|row| row_to_template(&res.columns, row))
+            .collect())
+    }
+
+    /// 更新模板；名称冲突映射为 `already_exists`。
+    pub async fn update_template(
+        &self,
+        template_id: &str,
+        t: &NewJobTemplate,
+        now: &str,
+    ) -> Result<(), GseError> {
+        let args = serde_json::to_string(&t.args)
+            .map_err(|e| GseError::new("invalid_argument", e.to_string()))?;
+        let env = serde_json::to_string(&t.env)
+            .map_err(|e| GseError::new("invalid_argument", e.to_string()))?;
+        let sql = "UPDATE job_templates SET
+                       name = ?, description = ?, interpreter = ?, script = ?, args = ?, env = ?,
+                       working_dir = ?, timeout_secs = ?, updated_at = ?
+                   WHERE template_id = ?";
+        let res = self
+            .execute(
+                sql,
+                &[
+                    text(&t.name),
+                    opt_text(t.description.as_deref()),
+                    text(&t.interpreter),
+                    text(&t.script),
+                    SqlValue::Text(args),
+                    SqlValue::Text(env),
+                    opt_text(t.working_dir.as_deref()),
+                    SqlValue::Integer(t.timeout_secs as i64),
+                    text(now),
+                    text(template_id),
+                ],
+            )
+            .await;
+        map_unique_conflict(res)
+    }
+
+    /// 删除模板；返回是否存在并删除。
+    pub async fn delete_template(&self, template_id: &str) -> Result<bool, GseError> {
+        if self.get_template(template_id).await?.is_none() {
+            return Ok(false);
+        }
+        self.execute(
+            "DELETE FROM job_templates WHERE template_id = ?",
+            &[text(template_id)],
+        )
+        .await?;
+        Ok(true)
+    }
 }
 
 // ---- SqlValue 构造与行转换辅助 ----
@@ -400,9 +868,28 @@ fn opt_int(v: Option<i64>) -> SqlValue {
     v.map(SqlValue::Integer).unwrap_or(SqlValue::Null)
 }
 
+fn opt_text(v: Option<&str>) -> SqlValue {
+    v.map(text).unwrap_or(SqlValue::Null)
+}
+
+/// 将唯一约束冲突（名称重复）转换为 `already_exists`，其余错误原样返回。
+fn map_unique_conflict(res: Result<dataplane_core::SqlResult, GseError>) -> Result<(), GseError> {
+    match res {
+        Ok(_) => Ok(()),
+        Err(e) if e.message.to_ascii_uppercase().contains("UNIQUE") => {
+            Err(GseError::new("already_exists", e.message))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn opt_i32(v: Option<i32>) -> SqlValue {
     v.map(|i| SqlValue::Integer(i64::from(i)))
         .unwrap_or(SqlValue::Null)
+}
+
+fn bool_int(v: bool) -> SqlValue {
+    SqlValue::Integer(if v { 1 } else { 0 })
 }
 
 fn sql_params_host(h: &Host) -> Vec<SqlValue> {
@@ -526,6 +1013,59 @@ fn row_to_agent_config(columns: &[String], row: &[SqlValue]) -> AgentConfig {
         cpu_limit_percent: field_opt_i64(columns, row, "cpu_limit_percent"),
         mem_limit_percent: field_opt_i64(columns, row, "mem_limit_percent"),
         log_level: field_text(columns, row, "log_level"),
+        updated_at: field_text(columns, row, "updated_at"),
+    }
+}
+
+fn row_to_job(columns: &[String], row: &[SqlValue]) -> JobRecord {
+    let status = JobStatus::parse(&field_text(columns, row, "status")).unwrap_or(JobStatus::Lost);
+    let args: Vec<String> =
+        serde_json::from_str(&field_text(columns, row, "args")).unwrap_or_default();
+    let env: BTreeMap<String, String> =
+        serde_json::from_str(&field_text(columns, row, "env")).unwrap_or_default();
+    JobRecord {
+        job_id: field_text(columns, row, "job_id"),
+        agent_id: field_text(columns, row, "agent_id"),
+        interpreter: field_text(columns, row, "interpreter"),
+        script: field_text(columns, row, "script"),
+        args,
+        env,
+        working_dir: field_opt_text(columns, row, "working_dir"),
+        template_id: field_opt_text(columns, row, "template_id"),
+        rerun_of: field_opt_text(columns, row, "rerun_of"),
+        timeout_secs: field_i64(columns, row, "timeout_secs").max(0) as u64,
+        status,
+        exit_code: field_opt_i64(columns, row, "exit_code").map(|v| v as i32),
+        signal: field_opt_i64(columns, row, "signal").map(|v| v as i32),
+        stdout: field_opt_text(columns, row, "stdout"),
+        stdout_truncated: field_i64(columns, row, "stdout_truncated") != 0,
+        stderr: field_opt_text(columns, row, "stderr"),
+        stderr_truncated: field_i64(columns, row, "stderr_truncated") != 0,
+        error: field_opt_text(columns, row, "error"),
+        created_at: field_text(columns, row, "created_at"),
+        dispatched_at: field_opt_text(columns, row, "dispatched_at"),
+        started_at: field_opt_text(columns, row, "started_at"),
+        finished_at: field_opt_text(columns, row, "finished_at"),
+        updated_at: field_text(columns, row, "updated_at"),
+    }
+}
+
+fn row_to_template(columns: &[String], row: &[SqlValue]) -> JobTemplate {
+    let args: Vec<String> =
+        serde_json::from_str(&field_text(columns, row, "args")).unwrap_or_default();
+    let env: BTreeMap<String, String> =
+        serde_json::from_str(&field_text(columns, row, "env")).unwrap_or_default();
+    JobTemplate {
+        template_id: field_text(columns, row, "template_id"),
+        name: field_text(columns, row, "name"),
+        description: field_opt_text(columns, row, "description"),
+        interpreter: field_text(columns, row, "interpreter"),
+        script: field_text(columns, row, "script"),
+        args,
+        env,
+        working_dir: field_opt_text(columns, row, "working_dir"),
+        timeout_secs: field_i64(columns, row, "timeout_secs").max(0) as u64,
+        created_at: field_text(columns, row, "created_at"),
         updated_at: field_text(columns, row, "updated_at"),
     }
 }
@@ -756,5 +1296,394 @@ mod tests {
         let offline = ledger.get_agent("a-1").await.expect("get").expect("exists");
         assert_eq!(offline.status, "offline");
         assert_eq!(offline.last_heartbeat_at.as_deref(), Some("200"));
+    }
+
+    fn new_job(id: &str, agent: &str) -> NewJob {
+        NewJob {
+            job_id: id.to_string(),
+            agent_id: agent.to_string(),
+            interpreter: "bash".to_string(),
+            script: "echo hi".to_string(),
+            args: vec!["-e".to_string()],
+            env: BTreeMap::from([("LANG".to_string(), "C".to_string())]),
+            working_dir: Some("/tmp".to_string()),
+            template_id: None,
+            rerun_of: None,
+            timeout_secs: 300,
+            created_at: ledger_stamp(),
+        }
+    }
+
+    fn job_result(id: &str, status: JobStatus) -> JobResult {
+        JobResult {
+            job_id: id.to_string(),
+            status,
+            exit_code: Some(0),
+            signal: None,
+            stdout: "hi\n".to_string(),
+            stdout_truncated: false,
+            stderr: String::new(),
+            stderr_truncated: false,
+            started_at_micros: 1_000,
+            finished_at_micros: 2_000,
+            error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn jobs_crud_roundtrip_and_filters() {
+        let ledger = fresh_ledger("jobs-crud").await;
+        ledger
+            .insert_job(&new_job("j-1", "a-1"))
+            .await
+            .expect("insert 1");
+        ledger
+            .insert_job(&new_job("j-2", "a-2"))
+            .await
+            .expect("insert 2");
+
+        let got = ledger.get_job("j-1").await.expect("get").expect("exists");
+        assert_eq!(got.status, JobStatus::Pending);
+        assert_eq!(got.interpreter, "bash");
+        assert_eq!(got.args, vec!["-e".to_string()]);
+        assert_eq!(got.env.get("LANG").map(String::as_str), Some("C"));
+        assert_eq!(got.working_dir.as_deref(), Some("/tmp"));
+        assert_eq!(got.timeout_secs, 300);
+
+        assert_eq!(
+            ledger.list_jobs(None, None, None).await.expect("all").len(),
+            2
+        );
+        assert_eq!(
+            ledger
+                .list_jobs(Some("a-1"), None, None)
+                .await
+                .expect("by agent")
+                .len(),
+            1
+        );
+        assert_eq!(
+            ledger
+                .list_jobs(None, Some("pending"), None)
+                .await
+                .expect("by status")
+                .len(),
+            2
+        );
+        assert!(ledger
+            .list_jobs(None, Some("succeeded"), None)
+            .await
+            .expect("by status")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn mark_running_then_finish_persists_result() {
+        let ledger = fresh_ledger("jobs-run").await;
+        ledger
+            .insert_job(&new_job("j-1", "a-1"))
+            .await
+            .expect("insert");
+
+        ledger.mark_running("j-1", "1500").await.expect("running");
+        let running = ledger.get_job("j-1").await.expect("get").expect("exists");
+        assert_eq!(running.status, JobStatus::Running);
+        assert_eq!(running.started_at.as_deref(), Some("1500"));
+
+        ledger
+            .finish_job(&job_result("j-1", JobStatus::Succeeded), "2000")
+            .await
+            .expect("finish");
+        let done = ledger.get_job("j-1").await.expect("get").expect("exists");
+        assert_eq!(done.status, JobStatus::Succeeded);
+        assert_eq!(done.exit_code, Some(0));
+        assert_eq!(done.stdout.as_deref(), Some("hi\n"));
+        assert_eq!(done.finished_at.as_deref(), Some("2000"));
+        // Agent 微秒时间覆盖 started_at。
+        assert_eq!(done.started_at.as_deref(), Some("1000"));
+    }
+
+    #[tokio::test]
+    async fn terminal_job_is_immutable() {
+        let ledger = fresh_ledger("jobs-immutable").await;
+        ledger
+            .insert_job(&new_job("j-1", "a-1"))
+            .await
+            .expect("insert");
+        ledger
+            .finish_job(&job_result("j-1", JobStatus::Succeeded), "2000")
+            .await
+            .expect("finish");
+
+        // 后续 running / finish / rejected / lost 均不得覆盖首次终态。
+        ledger.mark_running("j-1", "3000").await.expect("running");
+        ledger
+            .finish_job(&job_result("j-1", JobStatus::Failed), "4000")
+            .await
+            .expect("finish again");
+        ledger.mark_rejected("j-1", "busy").await.expect("rejected");
+        ledger.mark_lost_by_agent("a-1").await.expect("lost");
+
+        let final_job = ledger.get_job("j-1").await.expect("get").expect("exists");
+        assert_eq!(final_job.status, JobStatus::Succeeded);
+        assert_eq!(final_job.finished_at.as_deref(), Some("2000"));
+    }
+
+    #[tokio::test]
+    async fn mark_rejected_records_reason() {
+        let ledger = fresh_ledger("jobs-reject").await;
+        ledger
+            .insert_job(&new_job("j-1", "a-1"))
+            .await
+            .expect("insert");
+        ledger.mark_rejected("j-1", "busy").await.expect("reject");
+        let rejected = ledger.get_job("j-1").await.expect("get").expect("exists");
+        assert_eq!(rejected.status, JobStatus::Rejected);
+        assert_eq!(rejected.error.as_deref(), Some("busy"));
+    }
+
+    #[tokio::test]
+    async fn mark_lost_by_agent_only_affects_that_agent() {
+        let ledger = fresh_ledger("jobs-lost-agent").await;
+        ledger
+            .insert_job(&new_job("j-1", "a-1"))
+            .await
+            .expect("insert 1");
+        ledger
+            .insert_job(&new_job("j-2", "a-2"))
+            .await
+            .expect("insert 2");
+        ledger.mark_running("j-2", "10").await.expect("running");
+
+        ledger.mark_lost_by_agent("a-1").await.expect("lost");
+        assert_eq!(
+            ledger
+                .get_job("j-1")
+                .await
+                .expect("get")
+                .expect("exists")
+                .status,
+            JobStatus::Lost
+        );
+        assert_eq!(
+            ledger
+                .get_job("j-2")
+                .await
+                .expect("get")
+                .expect("exists")
+                .status,
+            JobStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_marks_inflight_lost_only() {
+        let ledger = fresh_ledger("jobs-recovery").await;
+        ledger
+            .insert_job(&new_job("j-1", "a-1"))
+            .await
+            .expect("insert 1");
+        ledger
+            .insert_job(&new_job("j-2", "a-2"))
+            .await
+            .expect("insert 2");
+        ledger
+            .finish_job(&job_result("j-2", JobStatus::Succeeded), "5")
+            .await
+            .expect("finish");
+
+        ledger
+            .mark_lost_inflight_on_startup()
+            .await
+            .expect("recovery");
+        assert_eq!(
+            ledger
+                .get_job("j-1")
+                .await
+                .expect("get")
+                .expect("exists")
+                .status,
+            JobStatus::Lost
+        );
+        assert_eq!(
+            ledger
+                .get_job("j-2")
+                .await
+                .expect("get")
+                .expect("exists")
+                .status,
+            JobStatus::Succeeded
+        );
+    }
+
+    fn new_template(name: &str) -> NewJobTemplate {
+        NewJobTemplate {
+            name: name.to_string(),
+            description: Some("demo".to_string()),
+            interpreter: "bash".to_string(),
+            script: "echo ${WHO}".to_string(),
+            args: vec!["-x".to_string()],
+            env: BTreeMap::from([("LANG".to_string(), "C".to_string())]),
+            working_dir: Some("/tmp".to_string()),
+            timeout_secs: 60,
+        }
+    }
+
+    #[tokio::test]
+    async fn template_crud_roundtrip() {
+        let ledger = fresh_ledger("tpl-crud").await;
+        ledger
+            .insert_template("tpl-1", &new_template("greet"), "100")
+            .await
+            .expect("insert");
+        let got = ledger
+            .get_template("tpl-1")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(got.name, "greet");
+        assert_eq!(got.script, "echo ${WHO}");
+        assert_eq!(got.args, vec!["-x".to_string()]);
+        assert_eq!(got.env.get("LANG").map(String::as_str), Some("C"));
+        assert_eq!(got.timeout_secs, 60);
+        assert_eq!(got.created_at, "100");
+
+        assert_eq!(
+            ledger
+                .get_template_by_name("greet")
+                .await
+                .expect("by name")
+                .expect("exists")
+                .template_id,
+            "tpl-1"
+        );
+        assert!(ledger
+            .get_template_by_name("missing")
+            .await
+            .expect("by name")
+            .is_none());
+
+        let mut updated = new_template("greet");
+        updated.description = None;
+        updated.timeout_secs = 90;
+        ledger
+            .update_template("tpl-1", &updated, "200")
+            .await
+            .expect("update");
+        let after = ledger
+            .get_template("tpl-1")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(after.timeout_secs, 90);
+        assert_eq!(after.description, None);
+        assert_eq!(after.updated_at, "200");
+
+        assert_eq!(
+            ledger.list_templates(None, None).await.expect("list").len(),
+            1
+        );
+        assert!(ledger.delete_template("tpl-1").await.expect("delete"));
+        assert!(!ledger.delete_template("tpl-1").await.expect("re-delete"));
+        assert!(ledger.get_template("tpl-1").await.expect("get").is_none());
+    }
+
+    #[tokio::test]
+    async fn template_name_is_unique() {
+        let ledger = fresh_ledger("tpl-unique").await;
+        ledger
+            .insert_template("tpl-1", &new_template("greet"), "1")
+            .await
+            .expect("insert 1");
+        let err = ledger
+            .insert_template("tpl-2", &new_template("greet"), "1")
+            .await
+            .expect_err("duplicate name");
+        assert_eq!(err.code, "already_exists");
+
+        ledger
+            .insert_template("tpl-2", &new_template("other"), "1")
+            .await
+            .expect("insert 2");
+        let err = ledger
+            .update_template("tpl-2", &new_template("greet"), "2")
+            .await
+            .expect_err("rename to duplicate");
+        assert_eq!(err.code, "already_exists");
+    }
+
+    #[tokio::test]
+    async fn template_list_filters_by_name_and_limit() {
+        let ledger = fresh_ledger("tpl-filter").await;
+        ledger
+            .insert_template("tpl-1", &new_template("deploy-web"), "1")
+            .await
+            .expect("insert 1");
+        ledger
+            .insert_template("tpl-2", &new_template("deploy-db"), "2")
+            .await
+            .expect("insert 2");
+        ledger
+            .insert_template("tpl-3", &new_template("cleanup"), "3")
+            .await
+            .expect("insert 3");
+
+        let deploy = ledger
+            .list_templates(Some("deploy"), None)
+            .await
+            .expect("filter");
+        assert_eq!(deploy.len(), 2);
+        assert_eq!(
+            ledger
+                .list_templates(None, Some(1))
+                .await
+                .expect("limit")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn job_records_template_source() {
+        let ledger = fresh_ledger("jobs-template").await;
+        let mut job = new_job("j-1", "a-1");
+        job.template_id = Some("tpl-1".to_string());
+        ledger.insert_job(&job).await.expect("insert");
+        let got = ledger.get_job("j-1").await.expect("get").expect("exists");
+        assert_eq!(got.template_id.as_deref(), Some("tpl-1"));
+        assert_eq!(
+            ledger.get_job("j-1").await.expect("get").expect("exists"),
+            got
+        );
+    }
+
+    #[tokio::test]
+    async fn job_records_rerun_source() {
+        let ledger = fresh_ledger("jobs-rerun").await;
+        let plain = new_job("j-plain", "a-1");
+        ledger.insert_job(&plain).await.expect("insert plain");
+        assert_eq!(
+            ledger
+                .get_job("j-plain")
+                .await
+                .expect("get")
+                .expect("exists")
+                .rerun_of,
+            None
+        );
+
+        let mut rerun = new_job("j-rerun", "a-1");
+        rerun.rerun_of = Some("j-plain".to_string());
+        ledger.insert_job(&rerun).await.expect("insert rerun");
+        assert_eq!(
+            ledger
+                .get_job("j-rerun")
+                .await
+                .expect("get")
+                .expect("exists")
+                .rerun_of
+                .as_deref(),
+            Some("j-plain")
+        );
     }
 }

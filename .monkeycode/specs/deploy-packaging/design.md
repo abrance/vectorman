@@ -5,7 +5,7 @@ Updated: 2026-09-09
 
 ## Description
 
-把打包逻辑从 `.github/workflows/release.yml` 内联 shell 收敛为仓库内 `packaging/build-package.sh`（本地与 CI 共用唯一入口），安装包在现有四组件 `bin/ + conf/` 布局上新增 `gse-server/web/`（`@vectorman/node` 的 vite dist）与 `deploy/`（install.sh、ctl.sh、systemd unit 模板）。目标机用 `install.sh <组件|all>` 安装到默认 `/opt/vectorman`，`--with-systemd` 安装 unit，`--no-systemd` 走无 systemd 的 PID 文件模式；进程管理统一走 `ctl.sh <组件> <start|stop|status|restart>`（按 `deploy/mode` 选择 systemd 或 direct 后端）。dpc 为一次性 CLI，无 unit、ctl 拒绝管理。
+把打包逻辑从 `.github/workflows/release.yml` 内联 shell 收敛为仓库内 `packaging/build-package.sh`（本地与 CI 共用唯一入口），安装包在现有四组件 `bin/ + conf/` 布局上新增 `gse-server/web/`（`@vectorman/console` 的 vite dist）与 `deploy/`（install.sh、ctl.sh、systemd unit 模板）。目标机用 `install.sh <组件|all>` 安装到默认 `/opt/vectorman`，`--with-systemd` 安装 unit，`--no-systemd` 走无 systemd 的 PID 文件模式；进程管理统一走 `ctl.sh <组件> <start|stop|status|restart>`（按 `deploy/mode` 选择 systemd 或 direct 后端）。dpc 为一次性 CLI，无 unit、ctl 拒绝管理。
 
 ## Architecture
 
@@ -15,7 +15,7 @@ graph TD
     CI["release.yml tag v*"] --> NODE["setup-node 20"]
     NODE --> BP
     BP --> CARGO["cargo build --release --workspace"]
-    BP --> NPM["npm ci + npm run build:node"]
+    BP --> NPM["npm ci + npm run build:console"]
     CARGO --> TREE["装配目录树 vectorman-REL-linux-x86_64"]
     NPM --> WEBD["gse-server/web dist"]
     WEBD --> TREE
@@ -62,7 +62,7 @@ packaging/build-package.sh [--version <v>]
 执行步骤（`set -euo pipefail`，每步失败以 `step <名称> failed` 非零退出）：
 
 1. `cargo build --release --workspace`
-2. 前端构建：`cd frontend && npm ci && npm run build:node`
+2. 前端构建：`cd frontend && npm ci && npm run build:console`（统一入口 `@vectorman/console` 产出 `apps/console/dist`）
 3. 装配目录树 `vectorman-<REL>-linux-x86_64/`（布局见 Data Models）
 4. 校验 `gse-server/web/index.html` 存在，缺失则终止
 5. `strip` 各二进制（失败忽略）
@@ -180,7 +180,7 @@ vectorman-<REL>-linux-x86_64/
 
 ## Test Strategy
 
-1. **布局装配测试（本地快路径）**：`build-package.sh --version test --bin-dir target/debug --dist-dir frontend/apps/node/dist` 秒级产出包，断言目录树、index.html、可执行位、conf 示例齐全。
+1. **布局装配测试（本地快路径）**：`build-package.sh --version test --bin-dir target/debug --dist-dir frontend/apps/console/dist` 秒级产出包，断言目录树、index.html、可执行位、conf 示例齐全。
 2. **安装测试**：解包到临时目录，`install.sh gse-server --dest /tmp/vm-test`（无 systemd 步骤），断言实例配置生成、重复执行不覆盖、输出包含 ctl 用法；包树即安装目录时验证原地重装不报错、不产生嵌套目录。
 3. **ctl.sh 负向测试**：本沙箱无运行 systemd，systemd 模式 `ctl.sh gse-server start` 应报 `systemd required` 非零退出；`ctl.sh dpc start` 应报 CLI 提示。
 4. **direct 模式测试**：`install.sh gse-server --no-systemd --dest <tmp>` 后 `ctl.sh gse-server start|status|stop` 应正确管理 PID 文件与日志，`status` 停止时返回 3；`mode` 文件内容为 `direct`。

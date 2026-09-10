@@ -61,9 +61,9 @@ else
   (
     cd frontend
     npm ci --no-audit --no-fund || fail frontend-build
-    npm run build:node || fail frontend-build
+    npm run build:console || fail frontend-build
   )
-  DIST_DIR="$REPO_ROOT/frontend/apps/node/dist"
+  DIST_DIR="$REPO_ROOT/frontend/apps/console/dist"
 fi
 
 step "assemble $ROOT"

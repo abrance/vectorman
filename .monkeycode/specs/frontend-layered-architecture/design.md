@@ -11,6 +11,8 @@ vectorman 前端 v1 交付分层骨架与多包工作区：`@vectorman/primitive
 
 技术栈：React + Vite + TypeScript，npm workspaces 根目录 `frontend/`。
 
+> **架构修订（2026-09-10）**：后端保持一体（单一 `gse-server`）；前端收敛为**单一构建产物**——`@vectorman/console` 是唯一 Vite 应用，产出 `apps/console/dist`，由 gse-server `http_web_dir` 托管。`@vectorman/node` 与 `@vectorman/job` 改为 UI 包（`exports` 指向 `src/index.ts`），只对外导出页面与运行时 Provider，不再作为独立部署入口。console 在 `main.tsx` 组合两套 Runtime（节点、作业），在 `app/App.tsx` 用分区导航承载六条路由。下方分节为 v1 原始设计，保留作历史记录。
+
 ## Architecture
 
 分层自上而下：应用装配入口 -> 页面 -> 业务模块 -> 原子能力接口 -> 适配器实现 -> 开发期反代 -> 后端 HTTP。
@@ -146,12 +148,11 @@ frontend/
 | --- | --- |
 | `npm run test -w @vectorman/primitives` | 原子能力单元测试 |
 | `npm run test -w @vectorman/adapters` | 适配器单元测试 |
-| `npm run dev -w @vectorman/console` | 控制台开发服务器 |
-| `npm run build -w @vectorman/console` | 控制台独立产物 |
-| `npm run dev -w @vectorman/job` | 作业应用开发服务器 |
-| `npm run build -w @vectorman/job` | 作业应用独立产物 |
-| `npm run dev -w @vectorman/node` | 节点应用开发服务器 |
-| `npm run build -w @vectorman/node` | 节点应用独立产物 |
+| `npm run test -w @vectorman/node` | 节点 UI 包单元测试 |
+| `npm run test -w @vectorman/job` | 作业 UI 包单元测试 |
+| `npm run test -w @vectorman/console` | 统一入口装配测试 |
+| `npm run dev -w @vectorman/console` / `npm run dev:console` | 控制台开发服务器（单入口，含节点与作业） |
+| `npm run build -w @vectorman/console` / `npm run build:console` | 唯一生产产物 `apps/console/dist` |
 
 应用包通过 workspace 协议依赖库包，例如 `"@vectorman/primitives": "*"`。Vite 用 `resolve.dedupe` 保证 React 单实例。库包以 TypeScript 源码被应用直接引用（`exports` 指向 `src/index.ts`），v1 不为库包单独产出 dist。
 
@@ -331,18 +332,14 @@ DTO 与 `crates/gse-server-core/src/ledger.rs` 字段同名：`Host`、`AccessPo
 
 ### 装配入口
 
-每个应用的 `main.tsx` 各自一次性构造：
+`@vectorman/console` 是唯一 Vite 应用，`main.tsx` 一次性构造：
 
 1. `MemoryAuthSession`、`JsonErrorMapper`、`MemoryQueryStore`、`MemoryNotifier`
 2. `FetchHttpClient({ session, mapper })`
-3. 三个后端适配器
-4. 通过 React Context 把上述实例交给该应用的 `App`
+3. 三个后端适配器：`GseAdminAdapter`、`GseJobAdapter`、`GseJobTemplateAdapter`
+4. 通过 React Context 把实例交给 `App`：嵌套节点运行时 `{ gse, query, notifier }` 与作业运行时 `{ jobs, templates, gse, query, notifier }`，两者共享同一 `query` 与 `notifier`
 
-`@vectorman/console` 的 `App.tsx` 渲染 “console composition ready”。
-`@vectorman/job` 的 `App.tsx` 渲染 “job composition ready”。
-两者 v1 不调用后端。后续业务页面写入各自 `pages/` 与 `features/`。
-
-`@vectorman/node` 的页面与抽屉见 `.monkeycode/specs/gse-node-app/design.md`。
+`@vectorman/node` 与 `@vectorman/job` 是 UI 包，导出页面与各自 `RuntimeProvider`，由 console 组合，自身不再产出部署产物。节点页面与抽屉见 `.monkeycode/specs/gse-node-app/design.md`，作业页面见 `.monkeycode/specs/gse-job-execution/design.md`。
 
 ## Data Models
 
@@ -366,8 +363,9 @@ DTO 与 `crates/gse-server-core/src/ledger.rs` 字段同名：`Host`、`AccessPo
 - `QueryStore` 同一 key 的状态为 idle/loading/success/error 四者之一。
 - `Notifier` 订阅者收到的 `error` 级 `message` 等于传入 `AppError.message`。
 - 适配器测试零真实网络。
-- `npm run build -w @vectorman/job` 不读取 console 的 dist。
-- 内存实现按实例隔离，两个应用运行时不共享 Session / QueryStore / Notifier。
+- `npm run build -w @vectorman/console` 产出唯一部署产物 `apps/console/dist`。
+- `@vectorman/node` 与 `@vectorman/job` 不产出部署产物，只以 TypeScript 源码被 console 引用。
+- console 组合节点与作业运行时：两者共享同一 `QueryStore` 与 `Notifier`，会话由 console 单一持有。
 
 ## Error Handling
 
