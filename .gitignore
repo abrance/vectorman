@@ -3,3 +3,5 @@ frontend/node_modules
 frontend/**/node_modules
 frontend/**/dist
 frontend/**/.vite
+/vectorman-*-linux-x86_64
+/vectorman-*-linux-x86_64.tar.gz

@@ -1,0 +1,14 @@
+[Unit]
+Description=Vectorman Dataplane Apiserver (SQL/Prom HTTP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@INSTALL_ROOT@
+ExecStart=@INSTALL_ROOT@/bin/apiserver
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -201,7 +201,7 @@ curl -X POST http://127.0.0.1:7101/api/gse/agents \
 curl http://127.0.0.1:7101/api/gse/agents   # 查看运行状态（status / last_heartbeat_at）
 ```
 
-配置示例见 `bins/gse-server/gse-server.toml.example` 与 `bins/gse-agent/gse-agent.toml.example`。tag `v*` 触发 CI 打包发布，安装包按组件统一目录布局（每组件一个子目录，内部 `bin/` + `conf/`）分发。
+配置示例见 `bins/gse-server/gse-server.toml.example` 与 `bins/gse-agent/gse-agent.toml.example`。打包入口为 `packaging/build-package.sh`（本地与 CI 共用，方案见 `.monkeycode/specs/deploy-packaging/design.md`）：tag `v*` 触发 CI 打包发布，安装包按组件统一目录布局（每组件一个子目录，内部 `bin/` + `conf/`，gse-server 另含前端 `web/`），包内 `deploy/` 提供 install.sh / ctl.sh / systemd unit 模板；目标机 `install.sh gse-server --dest /opt/vectorman --with-systemd` 安装后经 `ctl.sh gse-server start` 启动。
 
 ## 9. 测试覆盖
 
