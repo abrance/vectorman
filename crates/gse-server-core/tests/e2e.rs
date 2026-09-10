@@ -555,3 +555,45 @@ async fn e2e_bind_registers_access_point_idempotently() {
         format!("gse-server:{}", server_config(&db, true, 5).listen)
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_connection_does_not_kill_server() {
+    use tokio::io::AsyncWriteExt;
+
+    let db = tmp_db("malformed-conn");
+    let (server, addr) = Server::bind(server_config(&db, true, 5))
+        .await
+        .expect("bind");
+    register(&server, "web-01", "tok-1").await;
+    let server_ref = server.clone();
+    tokio::spawn(async move {
+        let _ = server_ref.run().await;
+    });
+
+    let cfg = AgentConfig {
+        server_addr: addr.to_string(),
+        agent_id: "web-01".to_string(),
+        token: "tok-1".to_string(),
+        heartbeat_interval_secs: 1,
+    };
+    tokio::spawn(run_agent(cfg));
+    wait_online(&server, "web-01").await;
+
+    // 注入非法 wire-format / 半包连接：不得使服务退出。
+    for payload in [vec![0x16u8], vec![0x00, 0xff, 0xff, 0xff]] {
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to server");
+        let _ = stream.write_all(&payload).await;
+        let _ = stream.shutdown().await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 服务仍处理正常会话与指令。
+    let receipt = server
+        .send_command("web-01", "ping", Bytes::new())
+        .await
+        .expect("server should survive malformed connections");
+    assert!(receipt.ok, "ping should still succeed: {receipt:?}");
+    assert_eq!(receipt.message.as_deref(), Some("pong"));
+}
