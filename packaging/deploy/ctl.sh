@@ -7,6 +7,7 @@
 #
 # 用法：
 #   ctl.sh <apiserver|gse-server|gse-agent> <start|stop|status|restart>
+#   dpc / vmctl 为一次性 CLI，拒绝进程管理
 set -euo pipefail
 
 USAGE="usage: ctl.sh <apiserver|gse-server|gse-agent> <start|stop|status|restart>"
@@ -16,7 +17,7 @@ ACTION="${2:-}"
 
 case "$COMPONENT" in
   apiserver|gse-server|gse-agent) ;;
-  dpc) echo "dpc is a one-shot CLI tool" >&2; exit 1 ;;
+  dpc|vmctl) echo "$COMPONENT is a one-shot CLI tool" >&2; exit 1 ;;
   *) echo "$USAGE" >&2; exit 1 ;;
 esac
 

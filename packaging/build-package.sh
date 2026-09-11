@@ -36,13 +36,13 @@ TARBALL="${ROOT}.tar.gz"
 step() { echo "==> $1"; }
 fail() { echo "step $1 failed" >&2; exit 1; }
 
-COMPONENTS=(apiserver dpc gse-server gse-agent)
+COMPONENTS=(apiserver dpc gse-server gse-agent vmctl)
 BUILT_MUSL=0
 
 if [[ -n "$BIN_DIR" ]]; then
   step "cargo-build skipped (bin-dir=$BIN_DIR)"
-  if [[ ! -x "$BIN_DIR/gse-server" || ! -x "$BIN_DIR/gse-agent" || ! -x "$BIN_DIR/apiserver" || ! -x "$BIN_DIR/dpc" ]]; then
-    echo "bin-dir missing one of: apiserver dpc gse-server gse-agent" >&2
+  if [[ ! -x "$BIN_DIR/gse-server" || ! -x "$BIN_DIR/gse-agent" || ! -x "$BIN_DIR/apiserver" || ! -x "$BIN_DIR/dpc" || ! -x "$BIN_DIR/vmctl" ]]; then
+    echo "bin-dir missing one of: apiserver dpc gse-server gse-agent vmctl" >&2
     exit 1
   fi
 else

@@ -18,6 +18,7 @@ members = [
     "bins/dpc",
     "bins/gse-server",
     "bins/gse-agent",
+    "bins/vmctl",
     "crates/gse-proto",
     "crates/gse-server-core",
     "crates/gse-agent-core",
