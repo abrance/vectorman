@@ -36,12 +36,12 @@ TARBALL="${ROOT}.tar.gz"
 step() { echo "==> $1"; }
 fail() { echo "step $1 failed" >&2; exit 1; }
 
-COMPONENTS=(apiserver dpc gse-server gse-agent)
+COMPONENTS=(apiserver dpc gse-server gse-agent console)
 
 if [[ -n "$BIN_DIR" ]]; then
   step "cargo-build skipped (bin-dir=$BIN_DIR)"
-  if [[ ! -x "$BIN_DIR/gse-server" || ! -x "$BIN_DIR/gse-agent" || ! -x "$BIN_DIR/apiserver" || ! -x "$BIN_DIR/dpc" ]]; then
-    echo "bin-dir missing one of: apiserver dpc gse-server gse-agent" >&2
+  if [[ ! -x "$BIN_DIR/gse-server" || ! -x "$BIN_DIR/gse-agent" || ! -x "$BIN_DIR/apiserver" || ! -x "$BIN_DIR/dpc" || ! -x "$BIN_DIR/console" ]]; then
+    echo "bin-dir missing one of: apiserver dpc gse-server gse-agent console" >&2
     exit 1
   fi
 else
@@ -62,6 +62,7 @@ else
     cd frontend
     npm ci --no-audit --no-fund || fail frontend-build
     npm run build:console || fail frontend-build
+    npm run build:desktop || fail frontend-build
   )
   DIST_DIR="$REPO_ROOT/frontend/apps/console/dist"
 fi
@@ -75,8 +76,16 @@ done
 cp config.toml.example "$ROOT/apiserver/conf/config.toml.example"
 cp bins/gse-server/gse-server.toml.example "$ROOT/gse-server/conf/gse-server.toml.example"
 cp bins/gse-agent/gse-agent.toml.example "$ROOT/gse-agent/conf/gse-agent.toml.example"
+cp bins/console/console.toml.example "$ROOT/console/conf/console.toml.example"
 mkdir -p "$ROOT/gse-server/web"
 cp -a "$DIST_DIR/." "$ROOT/gse-server/web/"
+DESKTOP_DIST="${DESKTOP_DIST:-$REPO_ROOT/frontend/apps/desktop/dist}"
+if [[ ! -f "$DESKTOP_DIST/index.html" ]]; then
+  echo "desktop dist missing index.html: $DESKTOP_DIST" >&2
+  exit 1
+fi
+mkdir -p "$ROOT/console/web"
+cp -a "$DESKTOP_DIST/." "$ROOT/console/web/"
 mkdir -p "$ROOT/deploy"
 cp packaging/deploy/install.sh packaging/deploy/ctl.sh "$ROOT/deploy/"
 cp -a packaging/deploy/units "$ROOT/deploy/units"
@@ -84,6 +93,10 @@ cp README.md "$ROOT/README.md"
 
 if [[ ! -f "$ROOT/gse-server/web/index.html" ]]; then
   echo "web dist invalid: index.html missing" >&2
+  exit 1
+fi
+if [[ ! -f "$ROOT/console/web/index.html" ]]; then
+  echo "console web dist invalid: index.html missing" >&2
   exit 1
 fi
 

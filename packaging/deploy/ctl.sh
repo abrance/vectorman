@@ -6,16 +6,16 @@
 #   - direct ：安装时使用 --no-systemd，ctl.sh 用 PID 文件直接管理进程（无 systemd 环境）
 #
 # 用法：
-#   ctl.sh <apiserver|gse-server|gse-agent> <start|stop|status|restart>
+#   ctl.sh <apiserver|gse-server|gse-agent|console> <start|stop|status|restart>
 set -euo pipefail
 
-USAGE="usage: ctl.sh <apiserver|gse-server|gse-agent> <start|stop|status|restart>"
+USAGE="usage: ctl.sh <apiserver|gse-server|gse-agent|console> <start|stop|status|restart>"
 
 COMPONENT="${1:-}"
 ACTION="${2:-}"
 
 case "$COMPONENT" in
-  apiserver|gse-server|gse-agent) ;;
+  apiserver|gse-server|gse-agent|console) ;;
   dpc) echo "dpc is a one-shot CLI tool" >&2; exit 1 ;;
   *) echo "$USAGE" >&2; exit 1 ;;
 esac
@@ -36,6 +36,7 @@ direct_env() {
   case "$COMPONENT" in
     gse-server) echo "GSE_SERVER_CONFIG=$INSTALL_ROOT/gse-server/conf/gse-server.toml" ;;
     gse-agent)  echo "GSE_AGENT_CONFIG=$INSTALL_ROOT/gse-agent/conf/gse-agent.toml" ;;
+    console)    echo "CONSOLE_CONFIG=$INSTALL_ROOT/console/conf/console.toml" ;;
     *)          echo "" ;;
   esac
 }
