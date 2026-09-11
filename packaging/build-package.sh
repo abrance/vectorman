@@ -37,6 +37,7 @@ step() { echo "==> $1"; }
 fail() { echo "step $1 failed" >&2; exit 1; }
 
 COMPONENTS=(apiserver dpc gse-server gse-agent)
+BUILT_MUSL=0
 
 if [[ -n "$BIN_DIR" ]]; then
   step "cargo-build skipped (bin-dir=$BIN_DIR)"
@@ -46,8 +47,19 @@ if [[ -n "$BIN_DIR" ]]; then
   fi
 else
   step "cargo-build"
-  cargo build --release --workspace || fail cargo-build
-  BIN_DIR="$REPO_ROOT/target/release"
+  MUSL_TARGET="x86_64-unknown-linux-musl"
+  if ! command -v musl-gcc >/dev/null 2>&1; then
+    echo "musl-gcc not found; install musl-tools" >&2
+    fail cargo-build
+  fi
+  if command -v rustup >/dev/null 2>&1; then
+    rustup target add "$MUSL_TARGET" || fail cargo-build
+  fi
+  export CC_x86_64_unknown_linux_musl="${CC_x86_64_unknown_linux_musl:-musl-gcc}"
+  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER:-musl-gcc}"
+  cargo build --release --workspace --target "$MUSL_TARGET" || fail cargo-build
+  BIN_DIR="$REPO_ROOT/target/$MUSL_TARGET/release"
+  BUILT_MUSL=1
 fi
 
 if [[ -n "$DIST_DIR" ]]; then
@@ -89,6 +101,18 @@ fi
 
 step "strip"
 strip "$ROOT"/*/bin/* 2>/dev/null || true
+
+if [[ "$BUILT_MUSL" -eq 1 ]]; then
+  step "verify-static"
+  for c in "${COMPONENTS[@]}"; do
+    info="$(ldd "$ROOT/$c/bin/$c" 2>&1 || true)"
+    echo "$c: $info"
+    if grep -Eq 'libc\.so|ld-linux' <<<"$info"; then
+      echo "expected musl static binary without glibc: $ROOT/$c/bin/$c" >&2
+      fail verify-static
+    fi
+  done
+fi
 
 step "tar $TARBALL"
 tar --sort=name --owner=0 --group=0 --numeric-owner \
