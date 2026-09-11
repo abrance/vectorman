@@ -56,7 +56,9 @@ else
     rustup target add "$MUSL_TARGET" || fail cargo-build
   fi
   export CC_x86_64_unknown_linux_musl="${CC_x86_64_unknown_linux_musl:-musl-gcc}"
-  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER:-musl-gcc}"
+  # rustc musl target 默认用 rust-lld 做静态链接。把 LINKER 设成 musl-gcc
+  # 时，ring/ureq（vmctl、dpc）启动会 SIGSEGV。C 依赖只需 CC=musl-gcc。
+  unset CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER
   cargo build --release --workspace --target "$MUSL_TARGET" || fail cargo-build
   BIN_DIR="$REPO_ROOT/target/$MUSL_TARGET/release"
   BUILT_MUSL=1

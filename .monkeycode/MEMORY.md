@@ -32,6 +32,13 @@ Entries discovered by the Agent during task execution should follow this format:
 ## Entries
 
 [Project Knowledge Summary]
+- Date: 2026-09-11
+- Context: Discovered by Agent while diagnosing musl vmctl SIGSEGV during packaging
+- Category: Build Methods
+- Instructions:
+  - musl 静态链接时只设置 `CC_x86_64_unknown_linux_musl=musl-gcc`。不要设置 `CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc`：ring/ureq（`vmctl`、`dpc`）启动会 SIGSEGV（`--help` 即崩，exit 139）。rustc musl target 默认 rust-lld 链接的二进制 `ldd` 仍为 statically linked。
+
+[Project Knowledge Summary]
 - Date: 2026-09-06
 - Context: Discovered by Agent while running `cargo test` for the gse feature in this workspace
 - Category: Environment Configuration
