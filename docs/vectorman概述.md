@@ -26,6 +26,7 @@ v1 暂不接入 influxdb、es、redis、七牛云 s3、mysql 等成熟组件；�
 | --- | --- |
 | `bins/apiserver` | 对外提供 SQL HTTP 与 Prometheus 查询 HTTP（单进程两端口） |
 | `bins/dpc` | 运维命令行，仅通过 HTTP 访问 apiserver（health / sql / query） |
+| `bins/vmctl` | gse-server HTTP 客户端：Host/Agent 只读查询，作业提交/查询/重做 |
 | `bins/gse-server` | GSE 全局调度引擎调度端：Agent 会话管理与信令上下行通道 |
 | `bins/gse-agent` | GSE 执行端：部署在目标机器，主动外连 Server，接收指令并执行 |
 

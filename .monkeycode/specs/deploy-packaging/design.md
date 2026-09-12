@@ -14,7 +14,7 @@ graph TD
     DEV["开发者 本地执行"] --> BP["packaging/build-package.sh"]
     CI["release.yml tag v*"] --> NODE["setup-node 20"]
     NODE --> BP
-    BP --> CARGO["cargo build --release --workspace"]
+    BP --> CARGO["cargo build --release --target musl"]
     BP --> NPM["npm ci + npm run build:console"]
     CARGO --> TREE["装配目录树 vectorman-REL-linux-x86_64"]
     NPM --> WEBD["gse-server/web dist"]
@@ -61,11 +61,11 @@ packaging/build-package.sh [--version <v>]
 
 执行步骤（`set -euo pipefail`，每步失败以 `step <名称> failed` 非零退出）：
 
-1. `cargo build --release --workspace`
+1. `cargo build --release --workspace --target x86_64-unknown-linux-musl`（静态链接，不依赖目标机 glibc；需 `musl-tools` + `rustup target add`。`CC_x86_64_unknown_linux_musl=musl-gcc` 编译 C 依赖；不要把 `CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER` 设成 musl-gcc，ring/ureq 二进制会 SIGSEGV）
 2. 前端构建：`cd frontend && npm ci && npm run build:console`（统一入口 `@vectorman/console` 产出 `apps/console/dist`）
 3. 装配目录树 `vectorman-<REL>-linux-x86_64/`（布局见 Data Models）
 4. 校验 `gse-server/web/index.html` 存在，缺失则终止
-5. `strip` 各二进制（失败忽略）
+5. `strip` 各二进制（失败忽略），并用 `ldd` 校验未链接 glibc
 6. `tar -czf`（可复现参数：`--sort=name --owner=0 --group=0 --numeric-owner --mtime='UTC 1970-01-01'`）
 7. stdout 打印产物绝对路径与大小
 

@@ -2,10 +2,10 @@
 # 目标机安装脚本：随安装包 deploy/ 分发。
 #
 # 用法：
-#   install.sh <apiserver|dpc|gse-server|gse-agent|console|all> [--dest /opt/vectorman] [--with-systemd|--no-systemd]
+#   install.sh <apiserver|dpc|gse-server|gse-agent|vmctl|console|all> [--dest /opt/vectorman] [--with-systemd|--no-systemd]
 set -euo pipefail
 
-USAGE="usage: install.sh <apiserver|dpc|gse-server|gse-agent|console|all> [--dest /opt/vectorman] [--with-systemd|--no-systemd]"
+USAGE="usage: install.sh <apiserver|dpc|gse-server|gse-agent|vmctl|console|all> [--dest /opt/vectorman] [--with-systemd|--no-systemd]"
 
 COMPONENT_ARG=""
 DEST="/opt/vectorman"
@@ -33,8 +33,8 @@ else
 fi
 
 case "$COMPONENT_ARG" in
-  apiserver|dpc|gse-server|gse-agent|console) COMPONENTS=("$COMPONENT_ARG") ;;
-  all) COMPONENTS=(apiserver dpc gse-server gse-agent console) ;;
+  apiserver|dpc|gse-server|gse-agent|vmctl|console) COMPONENTS=("$COMPONENT_ARG") ;;
+  all) COMPONENTS=(apiserver dpc gse-server gse-agent vmctl console) ;;
   *) echo "$USAGE" >&2; exit 1 ;;
 esac
 
@@ -87,6 +87,7 @@ for c in "${COMPONENTS[@]}"; do
     gse-agent)    INSTANCE="$DEST_C/conf/gse-agent.toml";  EXAMPLE="$DEST_C/conf/gse-agent.toml.example" ;;
     dpc)          INSTANCE="" ;;
     console)      INSTANCE="$DEST_C/conf/console.toml";    EXAMPLE="$DEST_C/conf/console.toml.example" ;;
+    vmctl)        INSTANCE="" ;;
   esac
 
   if [[ -n "$INSTANCE" ]]; then
@@ -105,8 +106,8 @@ for c in "${COMPONENTS[@]}"; do
   fi
 
   if [[ "$WITH_SYSTEMD" -eq 1 ]]; then
-    if [[ "$c" == "dpc" ]]; then
-      echo "[dpc] one-shot CLI tool, no unit installed"
+    if [[ "$c" == "dpc" || "$c" == "vmctl" ]]; then
+      echo "[$c] one-shot CLI tool, no unit installed"
     else
       if [[ "$(id -u)" -ne 0 ]]; then
         echo "root required: --with-systemd writes /etc/systemd/system" >&2
@@ -120,7 +121,7 @@ for c in "${COMPONENTS[@]}"; do
   fi
 
   echo "[$c] installed: $DEST_C"
-  if [[ "$c" != "dpc" ]]; then
+  if [[ "$c" != "dpc" && "$c" != "vmctl" ]]; then
     echo "[$c] start:  $DEST/deploy/ctl.sh $c start"
     echo "[$c] status: $DEST/deploy/ctl.sh $c status"
   fi

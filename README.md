@@ -7,6 +7,7 @@
 ```text
 bins/apiserver   对外提供 SQL HTTP 与 Prometheus 查询 HTTP（单进程两端口）
 bins/dpc         运维命令行，仅通过 HTTP 访问 apiserver
+bins/vmctl       gse-server HTTP 客户端：节点只读查询与作业提交
 crates/dataplane-core       错误码、配置、数据路径、鉴权 trait、SQL 类型
 crates/dataplane-file       FileStore + 本地目录引擎
 crates/dataplane-kv         KvStore + redb 引擎
@@ -55,6 +56,10 @@ cargo build --workspace
 
 # Prometheus 即时查询
 ./target/debug/dpc query --expr 'cpu_usage'
+
+# gse-server 节点与作业（默认 http://127.0.0.1:7101）
+./target/debug/vmctl agents list
+./target/debug/vmctl jobs submit --agent-id agent-1 --script-file ./run.sh --wait
 ```
 
 ## 数据路径
