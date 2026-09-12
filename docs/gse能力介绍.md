@@ -12,6 +12,7 @@ v0.1 实现了最小闭环：连接建立 → 身份认证 → 心跳保活 → 
 | --- | --- | --- |
 | `gse-server` | 调度端进程入口，加载配置并启动 `Server` | `bins/gse-server` |
 | `gse-agent` | 执行端进程入口，加载配置并启动 `run` | `bins/gse-agent` |
+| `vmctl` | gse-server HTTP 客户端：节点只读与作业提交 | `bins/vmctl` |
 | `gse-server-core` | server 核心库：配置、会话注册表、认证/心跳/信令与存活检测 | `crates/gse-server-core` |
 | `gse-agent-core` | agent 核心库：外连、重连、认证、心跳、指令执行 | `crates/gse-agent-core` |
 | `gse-proto` | 两端共享 DTO 与错误码映射 | `crates/gse-proto` |
@@ -199,6 +200,13 @@ curl -X POST http://127.0.0.1:7101/api/gse/agents \
   -H 'content-type: application/json' \
   -d '{"agent_id":"web-01","host_id":"web-01","token":"<client-gen-token>","version":"0.1.0"}'
 curl http://127.0.0.1:7101/api/gse/agents   # 查看运行状态（status / last_heartbeat_at）
+```
+
+命令行等价：
+
+```bash
+./target/debug/vmctl --url http://127.0.0.1:7101 agents list
+./target/debug/vmctl jobs submit --agent-id web-01 --script-file ./run.sh --wait
 ```
 
 配置示例见 `bins/gse-server/gse-server.toml.example` 与 `bins/gse-agent/gse-agent.toml.example`。打包入口为 `packaging/build-package.sh`（本地与 CI 共用，方案见 `.monkeycode/specs/deploy-packaging/design.md`）：tag `v*` 触发 CI 打包发布，安装包按组件统一目录布局（每组件一个子目录，内部 `bin/` + `conf/`，gse-server 另含前端 `web/`），包内 `deploy/` 提供 install.sh / ctl.sh / systemd unit 模板；目标机 `install.sh gse-server --dest /opt/vectorman --with-systemd` 安装后经 `ctl.sh gse-server start` 启动。

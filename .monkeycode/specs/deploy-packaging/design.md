@@ -61,7 +61,7 @@ packaging/build-package.sh [--version <v>]
 
 执行步骤（`set -euo pipefail`，每步失败以 `step <名称> failed` 非零退出）：
 
-1. `cargo build --release --workspace --target x86_64-unknown-linux-musl`（静态链接，不依赖目标机 glibc；需 `musl-tools` + `rustup target add`）
+1. `cargo build --release --workspace --target x86_64-unknown-linux-musl`（静态链接，不依赖目标机 glibc；需 `musl-tools` + `rustup target add`。`CC_x86_64_unknown_linux_musl=musl-gcc` 编译 C 依赖；不要把 `CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER` 设成 musl-gcc，ring/ureq 二进制会 SIGSEGV）
 2. 前端构建：`cd frontend && npm ci && npm run build:console`（统一入口 `@vectorman/console` 产出 `apps/console/dist`）
 3. 装配目录树 `vectorman-<REL>-linux-x86_64/`（布局见 Data Models）
 4. 校验 `gse-server/web/index.html` 存在，缺失则终止
