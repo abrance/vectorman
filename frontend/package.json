@@ -6,8 +6,10 @@
     "apps/*"
   ],
   "scripts": {
-    "test": "npm run test -w @vectorman/primitives && npm run test -w @vectorman/adapters && npm run test -w @vectorman/node && npm run test -w @vectorman/job && npm run test -w @vectorman/console",
+    "test": "npm run test -w @vectorman/primitives && npm run test -w @vectorman/adapters && npm run test -w @vectorman/node && npm run test -w @vectorman/job && npm run test -w @vectorman/console && npm run test -w @vectorman/desktop",
     "dev:console": "npm run dev -w @vectorman/console",
-    "build:console": "npm run build -w @vectorman/console"
+    "build:console": "npm run build -w @vectorman/console",
+    "dev:desktop": "npm run dev -w @vectorman/desktop",
+    "build:desktop": "npm run build -w @vectorman/desktop"
   }
 }

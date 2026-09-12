@@ -2,10 +2,10 @@
 # 目标机安装脚本：随安装包 deploy/ 分发。
 #
 # 用法：
-#   install.sh <apiserver|dpc|gse-server|gse-agent|vmctl|all> [--dest /opt/vectorman] [--with-systemd|--no-systemd]
+#   install.sh <apiserver|dpc|gse-server|gse-agent|vmctl|console|all> [--dest /opt/vectorman] [--with-systemd|--no-systemd]
 set -euo pipefail
 
-USAGE="usage: install.sh <apiserver|dpc|gse-server|gse-agent|vmctl|all> [--dest /opt/vectorman] [--with-systemd|--no-systemd]"
+USAGE="usage: install.sh <apiserver|dpc|gse-server|gse-agent|vmctl|console|all> [--dest /opt/vectorman] [--with-systemd|--no-systemd]"
 
 COMPONENT_ARG=""
 DEST="/opt/vectorman"
@@ -33,8 +33,8 @@ else
 fi
 
 case "$COMPONENT_ARG" in
-  apiserver|dpc|gse-server|gse-agent|vmctl) COMPONENTS=("$COMPONENT_ARG") ;;
-  all) COMPONENTS=(apiserver dpc gse-server gse-agent vmctl) ;;
+  apiserver|dpc|gse-server|gse-agent|vmctl|console) COMPONENTS=("$COMPONENT_ARG") ;;
+  all) COMPONENTS=(apiserver dpc gse-server gse-agent vmctl console) ;;
   *) echo "$USAGE" >&2; exit 1 ;;
 esac
 
@@ -76,6 +76,9 @@ for c in "${COMPONENTS[@]}"; do
     if [[ "$c" == "gse-server" && -d "$SRC/web" ]]; then
       cp -a "$SRC/web" "$DEST_C/web"
     fi
+    if [[ "$c" == "console" && -d "$SRC/web" ]]; then
+      cp -a "$SRC/web" "$DEST_C/web"
+    fi
   fi
 
   case "$c" in
@@ -83,6 +86,7 @@ for c in "${COMPONENTS[@]}"; do
     gse-server)   INSTANCE="$DEST_C/conf/gse-server.toml"; EXAMPLE="$DEST_C/conf/gse-server.toml.example" ;;
     gse-agent)    INSTANCE="$DEST_C/conf/gse-agent.toml";  EXAMPLE="$DEST_C/conf/gse-agent.toml.example" ;;
     dpc)          INSTANCE="" ;;
+    console)      INSTANCE="$DEST_C/conf/console.toml";    EXAMPLE="$DEST_C/conf/console.toml.example" ;;
     vmctl)        INSTANCE="" ;;
   esac
 
@@ -93,6 +97,9 @@ for c in "${COMPONENTS[@]}"; do
       cp "$EXAMPLE" "$INSTANCE"
       if [[ "$c" == "gse-server" && -d "$DEST_C/web" ]]; then
         printf '\n# enable single-port web hosting (web/ shipped in package)\nhttp_web_dir = "web"\n' >> "$INSTANCE"
+      fi
+      if [[ "$c" == "console" && -d "$DEST_C/web" ]]; then
+        printf '\n# enable single-port web hosting (web/ shipped in package)\nweb_dir = "web"\n' >> "$INSTANCE"
       fi
       echo "[$c] config generated: $INSTANCE"
     fi

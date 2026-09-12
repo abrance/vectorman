@@ -1,0 +1,15 @@
+[Unit]
+Description=Vectorman Console desktop portal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@INSTALL_ROOT@
+Environment=CONSOLE_CONFIG=@INSTALL_ROOT@/conf/console.toml
+ExecStart=@INSTALL_ROOT@/bin/console
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
