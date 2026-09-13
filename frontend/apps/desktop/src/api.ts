@@ -2,6 +2,7 @@ export type DesktopApp = {
   app_id: string;
   name: string;
   url: string;
+  tags: string[];
   created_at: string;
   updated_at: string;
 };
@@ -21,21 +22,30 @@ export async function listApps(): Promise<DesktopApp[]> {
   return res.json();
 }
 
-export async function createApp(name: string, url: string): Promise<DesktopApp> {
+export async function createApp(
+  name: string,
+  url: string,
+  tags: string[],
+): Promise<DesktopApp> {
   const res = await fetch("/api/console/apps", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name, url }),
+    body: JSON.stringify({ name, url, tags }),
   });
   if (!res.ok) throw new Error(await readError(res));
   return res.json();
 }
 
-export async function updateApp(appId: string, name: string, url: string): Promise<DesktopApp> {
+export async function updateApp(
+  appId: string,
+  name: string,
+  url: string,
+  tags: string[],
+): Promise<DesktopApp> {
   const res = await fetch(`/api/console/apps/${encodeURIComponent(appId)}`, {
     method: "PUT",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name, url }),
+    body: JSON.stringify({ name, url, tags }),
   });
   if (!res.ok) throw new Error(await readError(res));
   return res.json();
