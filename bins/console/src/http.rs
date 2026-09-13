@@ -21,6 +21,7 @@ struct AppState {
 struct AppInput {
     name: String,
     url: String,
+    tags: Option<Vec<String>>,
 }
 
 fn err_json(status: StatusCode, e: &CatalogError) -> Response {
@@ -35,7 +36,9 @@ fn map_err(e: CatalogError) -> Response {
     let status = match e {
         CatalogError::InvalidName(_)
         | CatalogError::InvalidUrl(_)
-        | CatalogError::LimitExceeded => StatusCode::BAD_REQUEST,
+        | CatalogError::LimitExceeded
+        | CatalogError::InvalidTag(_)
+        | CatalogError::TagLimitExceeded => StatusCode::BAD_REQUEST,
         CatalogError::NameConflict => StatusCode::CONFLICT,
         CatalogError::NotFound => StatusCode::NOT_FOUND,
         CatalogError::Persist(_) | CatalogError::Corrupt(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -114,7 +117,11 @@ async fn create_app(
                 .into_response();
         }
     };
-    match state.catalog.create(input.name, input.url).await {
+    match state
+        .catalog
+        .create(input.name, input.url, input.tags.unwrap_or_default())
+        .await
+    {
         Ok(app) => (StatusCode::CREATED, Json(app)).into_response(),
         Err(e) => map_err(e),
     }
@@ -135,7 +142,16 @@ async fn update_app(
                 .into_response();
         }
     };
-    match state.catalog.update(&app_id, input.name, input.url).await {
+    match state
+        .catalog
+        .update(
+            &app_id,
+            input.name,
+            input.url,
+            input.tags.unwrap_or_default(),
+        )
+        .await
+    {
         Ok(app) => Json(app).into_response(),
         Err(e) => map_err(e),
     }
@@ -204,6 +220,7 @@ mod tests {
         assert_eq!(st, StatusCode::CREATED, "{body}");
         let created: serde_json::Value = serde_json::from_str(&body).unwrap();
         let id = created["app_id"].as_str().unwrap().to_string();
+        assert!(created["tags"].as_array().unwrap().is_empty());
 
         let (st, body) = send(&app, req("GET", "/api/console/apps", None)).await;
         assert_eq!(st, StatusCode::OK);
@@ -259,6 +276,64 @@ mod tests {
         let (st, body) = send(&app, req("DELETE", "/api/console/apps/missing", None)).await;
         assert_eq!(st, StatusCode::NOT_FOUND);
         assert!(body.contains("not_found"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn tags_create_update_and_validation() {
+        let path = tmp_file("tags");
+        let _ = std::fs::remove_file(&path);
+        let app = router(Arc::new(Catalog::open(&path).unwrap()), None);
+
+        let (st, body) = send(
+            &app,
+            req(
+                "POST",
+                "/api/console/apps",
+                Some(r#"{"name":"GSE","url":"http://127.0.0.1:7101","tags":["prod","gse"]}"#),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "{body}");
+        let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let id = created["app_id"].as_str().unwrap().to_string();
+        assert_eq!(created["tags"], serde_json::json!(["prod", "gse"]));
+
+        let (st, body) = send(
+            &app,
+            req(
+                "PUT",
+                &format!("/api/console/apps/{id}"),
+                Some(r#"{"name":"GSE","url":"http://127.0.0.1:7101","tags":[" prod ","prod"]}"#),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let updated: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(updated["tags"], serde_json::json!(["prod"]));
+
+        let (st, body) = send(
+            &app,
+            req(
+                "POST",
+                "/api/console/apps",
+                Some(r#"{"name":"B","url":"http://127.0.0.1","tags":["  "]}"#),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(body.contains("invalid_tag"), "{body}");
+
+        let too_many: Vec<String> = (0..11).map(|i| format!("t{i}")).collect();
+        let payload = serde_json::json!({
+            "name": "C",
+            "url": "http://127.0.0.1",
+            "tags": too_many
+        })
+        .to_string();
+        let (st, body) = send(&app, req("POST", "/api/console/apps", Some(&payload))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(body.contains("tag_limit_exceeded"), "{body}");
         let _ = std::fs::remove_file(&path);
     }
 }

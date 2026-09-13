@@ -8,12 +8,16 @@ use url::Url;
 pub const MAX_APPS: usize = 100;
 pub const NAME_MAX: usize = 64;
 pub const URL_MAX: usize = 2048;
+pub const TAG_MAX_LEN: usize = 32;
+pub const TAGS_PER_APP_MAX: usize = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct App {
     pub app_id: String,
     pub name: String,
     pub url: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -29,6 +33,10 @@ pub enum CatalogError {
     InvalidName(String),
     #[error("{0}")]
     InvalidUrl(String),
+    #[error("{0}")]
+    InvalidTag(String),
+    #[error("app tag limit is {TAGS_PER_APP_MAX}")]
+    TagLimitExceeded,
     #[error("app name already exists")]
     NameConflict,
     #[error("app catalog limit is {MAX_APPS}")]
@@ -46,6 +54,8 @@ impl CatalogError {
         match self {
             CatalogError::InvalidName(_) => "invalid_name",
             CatalogError::InvalidUrl(_) => "invalid_url",
+            CatalogError::InvalidTag(_) => "invalid_tag",
+            CatalogError::TagLimitExceeded => "tag_limit_exceeded",
             CatalogError::NameConflict => "name_conflict",
             CatalogError::LimitExceeded => "limit_exceeded",
             CatalogError::NotFound => "not_found",
@@ -109,9 +119,15 @@ impl Catalog {
         apps
     }
 
-    pub async fn create(&self, name: String, url: String) -> Result<App, CatalogError> {
+    pub async fn create(
+        &self,
+        name: String,
+        url: String,
+        tags: Vec<String>,
+    ) -> Result<App, CatalogError> {
         let name = validate_name(&name)?;
         validate_url(&url)?;
+        let tags = normalize_tags(tags)?;
         let mut inner = self.inner.lock().await;
         if inner.apps.len() >= MAX_APPS {
             return Err(CatalogError::LimitExceeded);
@@ -125,6 +141,7 @@ impl Catalog {
             app_id: format!("app-{ts}-{}", inner.seq),
             name,
             url,
+            tags,
             created_at: ts.clone(),
             updated_at: ts,
         };
@@ -142,9 +159,11 @@ impl Catalog {
         app_id: &str,
         name: String,
         url: String,
+        tags: Vec<String>,
     ) -> Result<App, CatalogError> {
         let name = validate_name(&name)?;
         validate_url(&url)?;
+        let tags = normalize_tags(tags)?;
         let mut inner = self.inner.lock().await;
         let idx = inner
             .apps
@@ -162,6 +181,7 @@ impl Catalog {
         let snapshot = inner.apps[idx].clone();
         inner.apps[idx].name = name;
         inner.apps[idx].url = url;
+        inner.apps[idx].tags = tags;
         inner.apps[idx].updated_at = now_micros_string();
         let updated = inner.apps[idx].clone();
         if let Err(e) = persist(&self.data_file, &inner.apps) {
@@ -238,6 +258,25 @@ fn validate_url(raw: &str) -> Result<(), CatalogError> {
     Ok(())
 }
 
+fn normalize_tags(tags: Vec<String>) -> Result<Vec<String>, CatalogError> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in tags {
+        let tag = raw.trim().to_string();
+        if tag.is_empty() || tag.chars().count() > TAG_MAX_LEN {
+            return Err(CatalogError::InvalidTag(format!(
+                "tag must be 1 to {TAG_MAX_LEN} characters"
+            )));
+        }
+        if !out.iter().any(|existing| existing == &tag) {
+            out.push(tag);
+        }
+    }
+    if out.len() > TAGS_PER_APP_MAX {
+        return Err(CatalogError::TagLimitExceeded);
+    }
+    Ok(out)
+}
+
 fn now_micros_string() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -265,7 +304,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let cat = Catalog::open(&path).unwrap();
         let created = cat
-            .create("GSE".into(), "http://127.0.0.1:7101".into())
+            .create("GSE".into(), "http://127.0.0.1:7101".into(), vec![])
             .await
             .unwrap();
         assert!(created.app_id.starts_with("app-"));
@@ -275,6 +314,7 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, "GSE");
         assert_eq!(listed[0].url, "http://127.0.0.1:7101");
+        assert!(listed[0].tags.is_empty());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -284,11 +324,14 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let cat = Catalog::open(&path).unwrap();
         let empty = cat
-            .create("  ".into(), "http://x".into())
+            .create("  ".into(), "http://x".into(), vec![])
             .await
             .unwrap_err();
         assert_eq!(empty.code(), "invalid_name");
-        let bad = cat.create("ok".into(), "ftp://x".into()).await.unwrap_err();
+        let bad = cat
+            .create("ok".into(), "ftp://x".into(), vec![])
+            .await
+            .unwrap_err();
         assert_eq!(bad.code(), "invalid_url");
         assert!(!path.exists());
     }
@@ -298,16 +341,21 @@ mod tests {
         let path = tmp_file("conflict");
         let _ = std::fs::remove_file(&path);
         let cat = Catalog::open(&path).unwrap();
-        cat.create("A".into(), "https://example.com".into())
+        cat.create("A".into(), "https://example.com".into(), vec![])
             .await
             .unwrap();
         let err = cat
-            .create("A".into(), "https://example.com/2".into())
+            .create("A".into(), "https://example.com/2".into(), vec![])
             .await
             .unwrap_err();
         assert_eq!(err.code(), "name_conflict");
         let nf = cat
-            .update("app-nope-1", "B".into(), "https://example.com".into())
+            .update(
+                "app-nope-1",
+                "B".into(),
+                "https://example.com".into(),
+                vec![],
+            )
             .await
             .unwrap_err();
         assert_eq!(nf.code(), "not_found");
@@ -326,13 +374,14 @@ mod tests {
                     app_id: format!("app-1-{i}"),
                     name: format!("n{i}"),
                     url: "http://127.0.0.1".into(),
+                    tags: vec![],
                     created_at: "1".into(),
                     updated_at: "1".into(),
                 });
             }
         }
         let err = cat
-            .create("extra".into(), "http://127.0.0.1".into())
+            .create("extra".into(), "http://127.0.0.1".into(), vec![])
             .await
             .unwrap_err();
         assert_eq!(err.code(), "limit_exceeded");
@@ -348,6 +397,74 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.code(), "corrupt");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn tags_trim_dedup_and_roundtrip() {
+        let path = tmp_file("tags-roundtrip");
+        let _ = std::fs::remove_file(&path);
+        let cat = Catalog::open(&path).unwrap();
+        let created = cat
+            .create(
+                "GSE".into(),
+                "http://127.0.0.1:7101".into(),
+                vec![" prod ".into(), "gse".into(), "prod".into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.tags, vec!["prod", "gse"]);
+        drop(cat);
+        let listed = Catalog::open(&path).unwrap().list().await;
+        assert_eq!(listed[0].tags, vec!["prod", "gse"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn rejects_blank_and_too_long_tag() {
+        let path = tmp_file("tags-invalid");
+        let _ = std::fs::remove_file(&path);
+        let cat = Catalog::open(&path).unwrap();
+        let blank = cat
+            .create("A".into(), "http://127.0.0.1".into(), vec!["  ".into()])
+            .await
+            .unwrap_err();
+        assert_eq!(blank.code(), "invalid_tag");
+        let long = "a".repeat(TAG_MAX_LEN + 1);
+        let too_long = cat
+            .create("B".into(), "http://127.0.0.1".into(), vec![long])
+            .await
+            .unwrap_err();
+        assert_eq!(too_long.code(), "invalid_tag");
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn rejects_more_than_ten_tags() {
+        let path = tmp_file("tags-limit");
+        let _ = std::fs::remove_file(&path);
+        let cat = Catalog::open(&path).unwrap();
+        let tags: Vec<String> = (0..TAGS_PER_APP_MAX + 1).map(|i| format!("t{i}")).collect();
+        let err = cat
+            .create("A".into(), "http://127.0.0.1".into(), tags)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "tag_limit_exceeded");
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn missing_tags_field_loads_as_empty() {
+        let path = tmp_file("tags-missing");
+        std::fs::write(
+            &path,
+            r#"{"apps":[{"app_id":"app-1-1","name":"GSE","url":"http://127.0.0.1:7101","created_at":"1","updated_at":"1"}]}"#,
+        )
+        .unwrap();
+        let cat = Catalog::open(&path).unwrap();
+        let listed = cat.list().await;
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].tags.is_empty());
         let _ = std::fs::remove_file(&path);
     }
 }
