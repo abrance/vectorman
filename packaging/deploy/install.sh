@@ -2,10 +2,10 @@
 # 目标机安装脚本：随安装包 deploy/ 分发。
 #
 # 用法：
-#   install.sh <apiserver|dpc|gse-server|gse-agent|vmctl|console|all> [--dest /opt/vectorman] [--with-systemd|--no-systemd]
+#   install.sh <dataserver|dpc|gse-server|gse-agent|vmctl|console|all> [--dest /opt/vectorman] [--with-systemd|--no-systemd]
 set -euo pipefail
 
-USAGE="usage: install.sh <apiserver|dpc|gse-server|gse-agent|vmctl|console|all> [--dest /opt/vectorman] [--with-systemd|--no-systemd]"
+USAGE="usage: install.sh <dataserver|dpc|gse-server|gse-agent|vmctl|console|all> [--dest /opt/vectorman] [--with-systemd|--no-systemd]"
 
 COMPONENT_ARG=""
 DEST="/opt/vectorman"
@@ -33,8 +33,8 @@ else
 fi
 
 case "$COMPONENT_ARG" in
-  apiserver|dpc|gse-server|gse-agent|vmctl|console) COMPONENTS=("$COMPONENT_ARG") ;;
-  all) COMPONENTS=(apiserver dpc gse-server gse-agent vmctl console) ;;
+  dataserver|dpc|gse-server|gse-agent|vmctl|console) COMPONENTS=("$COMPONENT_ARG") ;;
+  all) COMPONENTS=(dataserver dpc gse-server gse-agent vmctl console) ;;
   *) echo "$USAGE" >&2; exit 1 ;;
 esac
 
@@ -82,7 +82,7 @@ for c in "${COMPONENTS[@]}"; do
   fi
 
   case "$c" in
-    apiserver)    INSTANCE="$DEST_C/config.toml";       EXAMPLE="$DEST_C/conf/config.toml.example" ;;
+    dataserver)   INSTANCE="$DEST_C/config.toml";       EXAMPLE="$DEST_C/conf/config.toml.example" ;;
     gse-server)   INSTANCE="$DEST_C/conf/gse-server.toml"; EXAMPLE="$DEST_C/conf/gse-server.toml.example" ;;
     gse-agent)    INSTANCE="$DEST_C/conf/gse-agent.toml";  EXAMPLE="$DEST_C/conf/gse-agent.toml.example" ;;
     dpc)          INSTANCE="" ;;
@@ -97,9 +97,6 @@ for c in "${COMPONENTS[@]}"; do
       cp "$EXAMPLE" "$INSTANCE"
       if [[ "$c" == "gse-server" && -d "$DEST_C/web" ]]; then
         printf '\n# enable single-port web hosting (web/ shipped in package)\nhttp_web_dir = "web"\n' >> "$INSTANCE"
-      fi
-      if [[ "$c" == "console" && -d "$DEST_C/web" ]]; then
-        printf '\n# enable single-port web hosting (web/ shipped in package)\nweb_dir = "web"\n' >> "$INSTANCE"
       fi
       echo "[$c] config generated: $INSTANCE"
     fi

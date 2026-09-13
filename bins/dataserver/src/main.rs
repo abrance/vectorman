@@ -20,7 +20,7 @@ use dataplane_ts::{PromResult, PromResultType, TimeSeriesStore, TsinkTimeSeriesS
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-const ENGINE_DIR_MODE_REQUIRED: &str = "apiserver requires a directory data_path (single-file mode only supports sqlite, and this server enables all engines)";
+const ENGINE_DIR_MODE_REQUIRED: &str = "dataserver requires a directory data_path (single-file mode only supports sqlite, and this server enables all engines)";
 
 #[derive(Parser)]
 struct Args {

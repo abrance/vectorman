@@ -1,4 +1,4 @@
-# dataplane apiserver 配置示例
+# dataplane dataserver 配置示例
 #
 # 默认值：data_path="./data"，SQL HTTP 0.0.0.0:8081，Prom HTTP 0.0.0.0:9090，鉴权关闭。
 # 环境变量覆盖：DP_DATA_PATH / DP_SQL_HTTP_LISTEN / DP_PROM_HTTP_LISTEN / DP_AUTH_ENABLED

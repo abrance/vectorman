@@ -6,17 +6,17 @@
 #   - direct ：安装时使用 --no-systemd，ctl.sh 用 PID 文件直接管理进程（无 systemd 环境）
 #
 # 用法：
-#   ctl.sh <apiserver|gse-server|gse-agent|console> <start|stop|status|restart>
+#   ctl.sh <dataserver|gse-server|gse-agent|console> <start|stop|status|restart>
 #   dpc / vmctl 为一次性 CLI，拒绝进程管理
 set -euo pipefail
 
-USAGE="usage: ctl.sh <apiserver|gse-server|gse-agent|console> <start|stop|status|restart>"
+USAGE="usage: ctl.sh <dataserver|gse-server|gse-agent|console> <start|stop|status|restart>"
 
 COMPONENT="${1:-}"
 ACTION="${2:-}"
 
 case "$COMPONENT" in
-  apiserver|gse-server|gse-agent|console) ;;
+  dataserver|gse-server|gse-agent|console) ;;
   dpc|vmctl) echo "$COMPONENT is a one-shot CLI tool" >&2; exit 1 ;;
   *) echo "$USAGE" >&2; exit 1 ;;
 esac

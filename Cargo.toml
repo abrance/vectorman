@@ -14,7 +14,7 @@ members = [
     "crates/dataplane-adapter-doris",
     "crates/dataplane-adapter-influxdb",
     "crates/dataplane-adapter-victoriametrics",
-    "bins/apiserver",
+    "bins/dataserver",
     "bins/dpc",
     "bins/gse-server",
     "bins/gse-agent",

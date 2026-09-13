@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use dataplane_core::ErrorCode;
 
 #[derive(Parser)]
-#[command(name = "dpc", about = "dataplane 运维命令行：通过 HTTP 访问 apiserver")]
+#[command(name = "dpc", about = "dataplane 运维命令行：通过 HTTP 访问 dataserver")]
 struct Cli {
     /// SQL HTTP 端口基址
     #[arg(long, default_value = "http://127.0.0.1:8081")]
@@ -83,7 +83,7 @@ fn fetch_health(base: &str) -> Result<String, DpcError> {
     if status != "ok" {
         return Err(DpcError {
             url,
-            reason: format!("apiserver unhealthy: {text}"),
+            reason: format!("dataserver unhealthy: {text}"),
         });
     }
     Ok(text)

@@ -89,23 +89,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "apiserver"
-version = "0.1.0"
-dependencies = [
- "axum",
- "clap",
- "dataplane-core",
- "dataplane-file",
- "dataplane-kv",
- "dataplane-log",
- "dataplane-sql",
- "dataplane-ts",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "app"
 version = "0.1.0-dev"
 source = "git+https://github.com/singchia/geminio-rs?rev=ff4363f814398b36c6ddf37b3d9042eb0b1dd802#ff4363f814398b36c6ddf37b3d9042eb0b1dd802"
@@ -661,6 +644,23 @@ dependencies = [
  "dataplane-core",
  "tokio",
  "tsink",
+]
+
+[[package]]
+name = "dataserver"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "clap",
+ "dataplane-core",
+ "dataplane-file",
+ "dataplane-kv",
+ "dataplane-log",
+ "dataplane-sql",
+ "dataplane-ts",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

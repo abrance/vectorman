@@ -36,13 +36,13 @@ TARBALL="${ROOT}.tar.gz"
 step() { echo "==> $1"; }
 fail() { echo "step $1 failed" >&2; exit 1; }
 
-COMPONENTS=(apiserver dpc gse-server gse-agent vmctl console)
+COMPONENTS=(dataserver dpc gse-server gse-agent vmctl console)
 BUILT_MUSL=0
 
 if [[ -n "$BIN_DIR" ]]; then
   step "cargo-build skipped (bin-dir=$BIN_DIR)"
-  if [[ ! -x "$BIN_DIR/gse-server" || ! -x "$BIN_DIR/gse-agent" || ! -x "$BIN_DIR/apiserver" || ! -x "$BIN_DIR/dpc" || ! -x "$BIN_DIR/vmctl" || ! -x "$BIN_DIR/console" ]]; then
-    echo "bin-dir missing one of: apiserver dpc gse-server gse-agent vmctl console" >&2
+  if [[ ! -x "$BIN_DIR/gse-server" || ! -x "$BIN_DIR/gse-agent" || ! -x "$BIN_DIR/dataserver" || ! -x "$BIN_DIR/dpc" || ! -x "$BIN_DIR/vmctl" || ! -x "$BIN_DIR/console" ]]; then
+    echo "bin-dir missing one of: dataserver dpc gse-server gse-agent vmctl console" >&2
     exit 1
   fi
 else
@@ -87,7 +87,7 @@ for c in "${COMPONENTS[@]}"; do
   mkdir -p "$ROOT/$c/bin" "$ROOT/$c/conf"
   cp "$BIN_DIR/$c" "$ROOT/$c/bin/"
 done
-cp config.toml.example "$ROOT/apiserver/conf/config.toml.example"
+cp config.toml.example "$ROOT/dataserver/conf/config.toml.example"
 cp bins/gse-server/gse-server.toml.example "$ROOT/gse-server/conf/gse-server.toml.example"
 cp bins/gse-agent/gse-agent.toml.example "$ROOT/gse-agent/conf/gse-agent.toml.example"
 cp bins/console/console.toml.example "$ROOT/console/conf/console.toml.example"
