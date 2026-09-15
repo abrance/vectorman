@@ -674,6 +674,7 @@ dependencies = [
  "dataplane-log",
  "dataplane-sql",
  "dataplane-ts",
+ "gse-server-core",
  "http-body-util",
  "serde",
  "serde_json",
