@@ -71,16 +71,15 @@ for c in "${COMPONENTS[@]}"; do
   mkdir -p "$DEST_C"
 
   if [[ "$IN_PLACE" -eq 0 ]]; then
-    cp -a "$SRC/bin" "$DEST_C/bin"
-    cp -a "$SRC/conf" "$DEST_C/conf"
-    if [[ "$c" == "gse-server" && -d "$SRC/web" ]]; then
-      cp -a "$SRC/web" "$DEST_C/web"
-    fi
-    if [[ "$c" == "dataserver" && -d "$SRC/web" ]]; then
-      cp -a "$SRC/web" "$DEST_C/web"
-    fi
-    if [[ "$c" == "console" && -d "$SRC/web" ]]; then
-      cp -a "$SRC/web" "$DEST_C/web"
+    # 使用 "src/." 合并复制：重复安装时覆盖内容而不是嵌套出 bin/bin、web/web。
+    mkdir -p "$DEST_C/bin" "$DEST_C/conf"
+    cp -a "$SRC/bin/." "$DEST_C/bin/"
+    cp -a "$SRC/conf/." "$DEST_C/conf/"
+    if [[ "$c" == "gse-server" || "$c" == "dataserver" || "$c" == "console" ]]; then
+      if [[ -d "$SRC/web" ]]; then
+        mkdir -p "$DEST_C/web"
+        cp -a "$SRC/web/." "$DEST_C/web/"
+      fi
     fi
   fi
 
