@@ -230,7 +230,9 @@ async fn prom_query(State(state): State<AppState>, Query(params): Query<Value>) 
         Err(e) => return prom_error_response(e),
     };
     match state.ts.query_instant(&expr, eval_time).await {
-        Ok(r) => Json(json!({"status": "success", "data": prom_result_to_json(&r)})).into_response(),
+        Ok(r) => {
+            Json(json!({"status": "success", "data": prom_result_to_json(&r)})).into_response()
+        }
         Err(e) => prom_error_response(e),
     }
 }
@@ -285,7 +287,9 @@ async fn prom_query_range(State(state): State<AppState>, Query(params): Query<Va
         ));
     }
     match state.ts.query_range(&expr, start, end, step).await {
-        Ok(r) => Json(json!({"status": "success", "data": prom_result_to_json(&r)})).into_response(),
+        Ok(r) => {
+            Json(json!({"status": "success", "data": prom_result_to_json(&r)})).into_response()
+        }
         Err(e) => prom_error_response(e),
     }
 }
@@ -303,7 +307,14 @@ async fn ingest(
             );
         }
     };
-    match apply(envelope, state.ts.as_ref(), state.log.as_ref(), state.kv.as_ref()).await {
+    match apply(
+        envelope,
+        state.ts.as_ref(),
+        state.log.as_ref(),
+        state.kv.as_ref(),
+    )
+    .await
+    {
         Ok(reply) => Json(reply).into_response(),
         Err(e) => map_err(e),
     }
@@ -387,7 +398,13 @@ fn require_gse(state: &AppState) -> Result<&str, DataplaneError> {
         .ok_or_else(|| unavailable("gse_admin_url is not configured"))
 }
 
-async fn forward_gse(state: &AppState, method: &str, gse_path: &str, query: Option<&str>, body: &[u8]) -> Response {
+async fn forward_gse(
+    state: &AppState,
+    method: &str,
+    gse_path: &str,
+    query: Option<&str>,
+    body: &[u8],
+) -> Response {
     let base = match require_gse(state) {
         Ok(u) => u,
         Err(e) => return map_err(e),
@@ -396,12 +413,7 @@ async fn forward_gse(state: &AppState, method: &str, gse_path: &str, query: Opti
     match gse_call(method, &url, body).await {
         Ok((status, text)) => {
             let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-            (
-                code,
-                [("content-type", "application/json")],
-                text,
-            )
-                .into_response()
+            (code, [("content-type", "application/json")], text).into_response()
         }
         Err(e) => map_err(e),
     }
@@ -412,14 +424,7 @@ async fn collect_list(State(state): State<AppState>, uri: Uri) -> Response {
 }
 
 async fn collect_create(State(state): State<AppState>, uri: Uri, body: Bytes) -> Response {
-    forward_gse(
-        &state,
-        "POST",
-        "/api/gse/collect-items",
-        uri.query(),
-        &body,
-    )
-    .await
+    forward_gse(&state, "POST", "/api/gse/collect-items", uri.query(), &body).await
 }
 
 async fn collect_get(
@@ -461,7 +466,10 @@ async fn collect_delete(
     let payload = json!({"until_micros": until});
     if let Err(e) = state
         .kv
-        .set(retain_key(&item_id).as_bytes(), payload.to_string().as_bytes())
+        .set(
+            retain_key(&item_id).as_bytes(),
+            payload.to_string().as_bytes(),
+        )
         .await
     {
         return map_err(e);
@@ -559,8 +567,7 @@ mod tests {
         let kv: Arc<dyn KvStore> = Arc::new(RedbKvStore::new(&paths.kv).unwrap());
         let sql: Arc<dyn RelationalStore> =
             Arc::new(SqliteRelationalStore::new(&paths.sql).unwrap());
-        let ts: Arc<dyn TimeSeriesStore> =
-            Arc::new(TsinkTimeSeriesStore::new(&paths.ts).unwrap());
+        let ts: Arc<dyn TimeSeriesStore> = Arc::new(TsinkTimeSeriesStore::new(&paths.ts).unwrap());
         let log: Arc<dyn LogStore> = Arc::new(TantivyLogStore::new(&paths.logs).unwrap());
         TestEnv {
             state: AppState {
@@ -658,11 +665,18 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK, "{body}");
-        assert!(body.contains("cpu_usage") || body.contains("12.5"), "{body}");
+        assert!(
+            body.contains("cpu_usage") || body.contains("12.5"),
+            "{body}"
+        );
 
         let (st, body) = send(
             &app,
-            req("POST", "/v1/ingest", Some(&logs_envelope("l1", "item-1", "listen failed"))),
+            req(
+                "POST",
+                "/v1/ingest",
+                Some(&logs_envelope("l1", "item-1", "listen failed")),
+            ),
         )
         .await;
         assert_eq!(st, StatusCode::OK, "{body}");
@@ -681,11 +695,7 @@ mod tests {
 
         let (st, body) = send(
             &app,
-            req(
-                "POST",
-                "/v1/logs/search",
-                Some(r#"{"data_type":"apm"}"#),
-            ),
+            req("POST", "/v1/logs/search", Some(r#"{"data_type":"apm"}"#)),
         )
         .await;
         assert_eq!(st, StatusCode::OK, "{body}");
@@ -761,21 +771,13 @@ mod tests {
         let (st, body) = send(&app, req("DELETE", "/v1/collect-items/item-del", None)).await;
         assert_eq!(st, StatusCode::OK, "{body}");
 
-        let retain = env
-            .state
-            .kv
-            .get(b"retain/item-del")
-            .await
-            .unwrap();
+        let retain = env.state.kv.get(b"retain/item-del").await.unwrap();
         let meta: Value = serde_json::from_slice(&retain).unwrap();
         assert!(meta["until_micros"].as_i64().unwrap() > now_micros());
 
         env.state
             .kv
-            .set(
-                b"retain/item-del",
-                br#"{"until_micros":1}"#,
-            )
+            .set(b"retain/item-del", br#"{"until_micros":1}"#)
             .await
             .unwrap();
         apply_retention(

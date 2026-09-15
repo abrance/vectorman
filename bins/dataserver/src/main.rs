@@ -109,11 +109,7 @@ async fn main() -> ExitCode {
             )
             .await
             {
-                eprintln!(
-                    "retention cleanup: {}: {}",
-                    e.code.as_str(),
-                    e.message
-                );
+                eprintln!("retention cleanup: {}: {}", e.code.as_str(), e.message);
             }
         }
     });

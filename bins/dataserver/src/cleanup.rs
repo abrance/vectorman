@@ -63,7 +63,11 @@ pub fn join_gse_url(base: &str, path: &str, query: Option<&str>) -> String {
 }
 
 /// 同步调用 GSE HTTP；连接失败返回 `unavailable`。
-pub fn gse_http_sync(method: &str, url: &str, body: &[u8]) -> Result<(u16, String), DataplaneError> {
+pub fn gse_http_sync(
+    method: &str,
+    url: &str,
+    body: &[u8],
+) -> Result<(u16, String), DataplaneError> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(10))
         .build();
@@ -88,7 +92,11 @@ pub fn gse_http_sync(method: &str, url: &str, body: &[u8]) -> Result<(u16, Strin
 }
 
 /// 异步包装 `gse_http_sync`。
-pub async fn gse_call(method: &str, url: &str, body: &[u8]) -> Result<(u16, String), DataplaneError> {
+pub async fn gse_call(
+    method: &str,
+    url: &str,
+    body: &[u8],
+) -> Result<(u16, String), DataplaneError> {
     let method = method.to_string();
     let url = url.to_string();
     let body = body.to_vec();

@@ -36,8 +36,7 @@ impl Buffer {
     /// 入队；为容纳新批将弹出最旧批次，直到总和不超过上限。
     pub async fn push(&self, env: DataEnvelope) {
         let mut guard = self.inner.lock().await;
-        while !guard.queue.is_empty()
-            && guard.total_records + env.record_count() > self.max_records
+        while !guard.queue.is_empty() && guard.total_records + env.record_count() > self.max_records
         {
             if let Some(dropped) = guard.queue.pop_front() {
                 guard.total_records -= dropped.record_count();

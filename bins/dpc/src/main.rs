@@ -4,7 +4,10 @@ use clap::{Parser, Subcommand};
 use dataplane_core::ErrorCode;
 
 #[derive(Parser)]
-#[command(name = "dpc", about = "dataplane 运维命令行：通过 HTTP 访问 dataserver")]
+#[command(
+    name = "dpc",
+    about = "dataplane 运维命令行：通过 HTTP 访问 dataserver"
+)]
 struct Cli {
     /// SQL HTTP 端口基址
     #[arg(long, default_value = "http://127.0.0.1:8081")]
@@ -275,9 +278,21 @@ mod tests {
 
     #[test]
     fn logs_body_keeps_only_provided_filters() {
-        assert_eq!(logs_body(None, None, None, None, None, None, None, None), json!({}));
         assert_eq!(
-            logs_body(Some("logs"), Some("agent-1"), None, None, Some("error"), None, None, Some(50)),
+            logs_body(None, None, None, None, None, None, None, None),
+            json!({})
+        );
+        assert_eq!(
+            logs_body(
+                Some("logs"),
+                Some("agent-1"),
+                None,
+                None,
+                Some("error"),
+                None,
+                None,
+                Some(50)
+            ),
             json!({"data_type": "logs", "agent_id": "agent-1", "message_query": "error", "limit": 50})
         );
     }

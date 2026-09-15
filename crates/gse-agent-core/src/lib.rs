@@ -1,9 +1,9 @@
 //! gse-agent 核心库：配置、外连、认证、心跳与指令执行。
 //! bins/gse-agent 仅作为进程入口调用本库。
 
+pub mod collect;
 pub mod config;
 pub mod job;
-pub mod collect;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -85,7 +85,9 @@ async fn connect_once(cfg: &AgentConfig) -> Result<(), AgentError> {
         })
         .await
     {
-        return Err(AgentError::ConnError(format!("register collect_items: {e}")));
+        return Err(AgentError::ConnError(format!(
+            "register collect_items: {e}"
+        )));
     }
     authenticate(&end, &cfg.agent_id, &cfg.token).await?;
     pull_collect_items(&end, &collector).await;

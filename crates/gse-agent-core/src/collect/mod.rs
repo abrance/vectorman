@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, RwLock};
 use buffer::{Buffer, DEFAULT_MAX_RECORDS};
 use config::CollectorConfig;
 use envelope::{DataEnvelope, IngestReply};
-use gse_proto::{CollectItem, CollectItemsReply, DataplaneAddrRequest, DataplaneAddrReply};
+use gse_proto::{CollectItem, CollectItemsReply, DataplaneAddrReply, DataplaneAddrRequest};
 
 /// 当前时间（微秒）。
 pub fn now_micros() -> i64 {
@@ -175,11 +175,7 @@ struct Runner {
     handle: tokio::task::JoinHandle<()>,
 }
 
-async fn supervise(
-    shared: Arc<CollectShared>,
-    end: End,
-    mut rx: mpsc::UnboundedReceiver<Control>,
-) {
+async fn supervise(shared: Arc<CollectShared>, end: End, mut rx: mpsc::UnboundedReceiver<Control>) {
     tokio::spawn(report_loop(shared.clone()));
     let mut runners: HashMap<String, Runner> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_secs(5));
@@ -388,7 +384,9 @@ mod tests {
     }
 
     fn http_agent() -> ureq::Agent {
-        ureq::AgentBuilder::new().timeout(Duration::from_secs(5)).build()
+        ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(5))
+            .build()
     }
 
     #[test]

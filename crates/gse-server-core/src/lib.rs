@@ -11,12 +11,12 @@ pub mod session;
 pub mod template;
 
 pub use config::{load_config, ServerConfig};
+pub use dataplane::{probe_dataplanes, probe_once};
 pub use http::{router as http_router, AdminState};
 pub use ledger::{
-    AccessPoint, Agent, AgentConfig, DataplaneService, Host, JobRecord, JobTemplate, Ledger, NewJob,
-    NewJobTemplate,
+    AccessPoint, Agent, AgentConfig, DataplaneService, Host, JobRecord, JobTemplate, Ledger,
+    NewJob, NewJobTemplate,
 };
-pub use dataplane::{probe_dataplanes, probe_once};
 pub use rerun::{build_rerun_submit, RerunRequest};
 pub use server::{
     handle_job_result, submit_job, submit_job_with_source, submit_job_with_template, submit_rerun,

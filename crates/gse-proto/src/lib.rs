@@ -300,9 +300,7 @@ mod tests {
             storage: serde_json::json!({"retention_days": 1}),
         };
         roundtrip(&item);
-        roundtrip(&CollectItemsReply {
-            items: vec![item],
-        });
+        roundtrip(&CollectItemsReply { items: vec![item] });
         roundtrip(&CollectItemsReply::default());
     }
 

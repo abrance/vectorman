@@ -14,9 +14,10 @@ const SA_DIR: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
 /// 解析凭证：`kubeconfig` 非空则读该路径，空则先试 in-cluster 再回退默认 kubeconfig。
 pub fn resolve(kubeconfig: &str) -> Result<K8sCredential, String> {
     if !kubeconfig.is_empty() {
-        return parse_kubeconfig(&std::fs::read_to_string(kubeconfig).map_err(|e| {
-            format!("read kubeconfig {kubeconfig}: {e}")
-        })?);
+        return parse_kubeconfig(
+            &std::fs::read_to_string(kubeconfig)
+                .map_err(|e| format!("read kubeconfig {kubeconfig}: {e}"))?,
+        );
     }
     let sa_token = PathBuf::from(SA_DIR).join("token");
     if let Ok(token) = std::fs::read_to_string(&sa_token) {
@@ -30,7 +31,10 @@ pub fn resolve(kubeconfig: &str) -> Result<K8sCredential, String> {
     }
     let home = std::env::var("HOME").unwrap_or_default();
     let default = format!("{home}/.kube/config");
-    parse_kubeconfig(&std::fs::read_to_string(&default).map_err(|e| format!("read kubeconfig {default}: {e}"))?)
+    parse_kubeconfig(
+        &std::fs::read_to_string(&default)
+            .map_err(|e| format!("read kubeconfig {default}: {e}"))?,
+    )
 }
 
 /// 解析 kubeconfig 文本：取首个 `server:` 与 `token:`（常见单 context 形式）。

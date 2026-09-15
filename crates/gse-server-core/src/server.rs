@@ -520,8 +520,7 @@ async fn handle_conn(
             let authed = authed_addr.clone();
             async move {
                 let conn_agent_id = authed.lock().ok().and_then(|g| g.clone());
-                let reply =
-                    handle_dataplane_addr(&req, conn_agent_id.as_deref(), &ledger).await;
+                let reply = handle_dataplane_addr(&req, conn_agent_id.as_deref(), &ledger).await;
                 serde_json::to_vec(&reply)
                     .map(Bytes::from)
                     .map_err(|e| Error::Remote(e.to_string()))
@@ -562,7 +561,10 @@ async fn handle_collect_items(conn_agent_id: Option<&str>, ledger: &Ledger) -> C
             items: items.iter().map(|i| i.to_proto()).collect(),
         },
         Err(e) => {
-            eprintln!("gse-server: list collect_items for {agent_id} failed: {}", e.message);
+            eprintln!(
+                "gse-server: list collect_items for {agent_id} failed: {}",
+                e.message
+            );
             CollectItemsReply::default()
         }
     }
@@ -590,10 +592,14 @@ pub async fn push_collect_items(ledger: &Ledger, registry: &SessionRegistry, age
 }
 
 /// 向多个 Agent 各推一份过滤后的整表，重复目标只推一次。
-pub async fn push_collect_items_to(ledger: &Ledger, registry: &SessionRegistry, agent_ids: &[String]) {
+pub async fn push_collect_items_to(
+    ledger: &Ledger,
+    registry: &SessionRegistry,
+    agent_ids: &[String],
+) {
     let mut seen: Vec<&str> = Vec::new();
     for id in agent_ids {
-        if seen.iter().any(|s| *s == id.as_str()) {
+        if seen.contains(&id.as_str()) {
             continue;
         }
         seen.push(id.as_str());
@@ -929,7 +935,10 @@ mod tests {
 
         // 删除 i-1 后 a-1 的剩余列表为空，a-2 只剩 i-2。
         assert!(ledger.delete_collect_item("i-1").await.unwrap());
-        assert!(handle_collect_items(Some("a-1"), &ledger).await.items.is_empty());
+        assert!(handle_collect_items(Some("a-1"), &ledger)
+            .await
+            .items
+            .is_empty());
         let a2 = handle_collect_items(Some("a-2"), &ledger).await;
         assert_eq!(a2.items.len(), 1);
         assert_eq!(a2.items[0].item_id, "i-2");

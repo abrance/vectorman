@@ -607,7 +607,10 @@ impl Ledger {
             .collect())
     }
 
-    pub async fn get_dataplane(&self, service_id: &str) -> Result<Option<DataplaneService>, GseError> {
+    pub async fn get_dataplane(
+        &self,
+        service_id: &str,
+    ) -> Result<Option<DataplaneService>, GseError> {
         let res = self
             .execute(
                 "SELECT * FROM dataplane_services WHERE service_id = ?",
@@ -647,10 +650,8 @@ impl Ledger {
     /// 在 `online` 集合中按 `service_id` 字典序取模选一条 `ingest_url`。
     pub async fn pick_ingest_url(&self, agent_id: &str) -> Result<Option<String>, GseError> {
         let all = self.list_dataplanes().await?;
-        let online: Vec<DataplaneService> = all
-            .into_iter()
-            .filter(|d| d.status == "online")
-            .collect();
+        let online: Vec<DataplaneService> =
+            all.into_iter().filter(|d| d.status == "online").collect();
         if online.is_empty() {
             return Ok(None);
         }
@@ -732,8 +733,11 @@ impl Ledger {
         if self.get_collect_item(item_id).await?.is_none() {
             return Ok(false);
         }
-        self.execute("DELETE FROM collect_items WHERE item_id = ?", &[text(item_id)])
-            .await?;
+        self.execute(
+            "DELETE FROM collect_items WHERE item_id = ?",
+            &[text(item_id)],
+        )
+        .await?;
         Ok(true)
     }
 
@@ -1450,15 +1454,24 @@ mod tests {
         // 无 online 实例 -> None。
         assert!(ledger.pick_ingest_url("agent-1").await.unwrap().is_none());
 
-        ledger.set_dataplane_status("a", "online", Some("t")).await.unwrap();
-        ledger.set_dataplane_status("b", "online", Some("t")).await.unwrap();
+        ledger
+            .set_dataplane_status("a", "online", Some("t"))
+            .await
+            .unwrap();
+        ledger
+            .set_dataplane_status("b", "online", Some("t"))
+            .await
+            .unwrap();
         let first = ledger.pick_ingest_url("agent-1").await.unwrap();
         let second = ledger.pick_ingest_url("agent-1").await.unwrap();
         assert_eq!(first, second);
         assert!(first.is_some());
 
         // 只留一台时所有 agent 都落到该台。
-        ledger.set_dataplane_status("a", "offline", None).await.unwrap();
+        ledger
+            .set_dataplane_status("a", "offline", None)
+            .await
+            .unwrap();
         assert_eq!(
             ledger.pick_ingest_url("agent-1").await.unwrap().as_deref(),
             Some("http://b:8081")
@@ -1508,14 +1521,25 @@ mod tests {
             ledger.list_collect_items(Some("a-2")).await.unwrap().len(),
             2
         );
-        assert!(ledger.list_collect_items(Some("a-3")).await.unwrap().is_empty());
+        assert!(ledger
+            .list_collect_items(Some("a-3"))
+            .await
+            .unwrap()
+            .is_empty());
         assert_eq!(ledger.list_collect_items(None).await.unwrap().len(), 2);
 
         // 关闭开关后仍在列表中（前端需要显示禁用的项）。
         let mut disabled = collect_item("i-2", &["a-2"]);
         disabled.enabled = false;
         ledger.upsert_collect_item(&disabled).await.unwrap();
-        assert!(!ledger.get_collect_item("i-2").await.unwrap().unwrap().enabled);
+        assert!(
+            !ledger
+                .get_collect_item("i-2")
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
 
         assert!(ledger.delete_collect_item("i-1").await.unwrap());
         assert!(!ledger.delete_collect_item("i-1").await.unwrap());

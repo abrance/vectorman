@@ -88,15 +88,15 @@ fn ledger_routes(admin: AdminState) -> Router {
         )
         .route("/agents", get(list_agents).post(create_agent))
         .route("/agents/{agent_id}", get(get_agent).delete(delete_agent))
-        .route(
-            "/dataplanes",
-            get(list_dataplanes).post(create_dataplane),
-        )
+        .route("/dataplanes", get(list_dataplanes).post(create_dataplane))
         .route(
             "/dataplanes/{service_id}",
             get(get_dataplane).delete(delete_dataplane),
         )
-        .route("/collect-items", get(list_collect_items).post(create_collect_item))
+        .route(
+            "/collect-items",
+            get(list_collect_items).post(create_collect_item),
+        )
         .route(
             "/collect-items/{item_id}",
             get(get_collect_item)
@@ -385,7 +385,10 @@ async fn create_dataplane(
     }
 }
 
-async fn get_dataplane(State(admin): State<AdminState>, Path(service_id): Path<String>) -> Response {
+async fn get_dataplane(
+    State(admin): State<AdminState>,
+    Path(service_id): Path<String>,
+) -> Response {
     match admin.ledger.get_dataplane(&service_id).await {
         Ok(Some(d)) => ok(&d),
         Ok(None) => err_json(
@@ -471,7 +474,10 @@ fn normalize_storage(v: &serde_json::Value) -> serde_json::Value {
 /// 校验输入并构造完整采集项：类型合法、目标至少一个、日志类含匹配模式。
 fn build_collect_item(item_id: &str, input: &CollectItemInput) -> Result<CollectItem, GseError> {
     if input.name.trim().is_empty() {
-        return Err(GseError::new("invalid_argument", "missing required field: name"));
+        return Err(GseError::new(
+            "invalid_argument",
+            "missing required field: name",
+        ));
     }
     if !matches!(
         input.kind.as_str(),
@@ -548,7 +554,10 @@ async fn list_collect_items(
     }
 }
 
-async fn get_collect_item(State(admin): State<AdminState>, Path(item_id): Path<String>) -> Response {
+async fn get_collect_item(
+    State(admin): State<AdminState>,
+    Path(item_id): Path<String>,
+) -> Response {
     match admin.ledger.get_collect_item(&item_id).await {
         Ok(Some(i)) => ok(&i),
         Ok(None) => err_json(
@@ -1361,8 +1370,11 @@ mod tests {
 
         // 合法创建：目标去重去空白，storage 缺省回落 1 天。
         let create = r#"{"name":"cpu","kind":"metrics_host","agent_ids":["a-1","a-1"," a-2 ",""],"collector":{"interval_secs":15},"storage":{}}"#;
-        let (status, body) =
-            send(&mut app, req("POST", "/api/gse/collect-items", Some(create))).await;
+        let (status, body) = send(
+            &mut app,
+            req("POST", "/api/gse/collect-items", Some(create)),
+        )
+        .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         assert!(body.contains("\"retention_days\":1"), "{body}");
         assert!(body.contains("\"agent_ids\":[\"a-1\",\"a-2\"]"), "{body}");
@@ -1402,7 +1414,11 @@ mod tests {
         let update = r#"{"name":"cpu","kind":"metrics_host","enabled":false,"agent_ids":["a-1"],"collector":{"interval_secs":15},"storage":{"retention_days":2}}"#;
         let (status, body) = send(
             &mut app,
-            req("PUT", &format!("/api/gse/collect-items/{item_id}"), Some(update)),
+            req(
+                "PUT",
+                &format!("/api/gse/collect-items/{item_id}"),
+                Some(update),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");

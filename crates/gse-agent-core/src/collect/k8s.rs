@@ -121,9 +121,7 @@ impl K8sClient {
             .get(&path)
             .call()
             .map_err(|e| format!("list pods: {e}"))?;
-        let v: Value = resp
-            .into_json()
-            .map_err(|e| format!("decode pods: {e}"))?;
+        let v: Value = resp.into_json().map_err(|e| format!("decode pods: {e}"))?;
         Ok(parse_pods(&v))
     }
 

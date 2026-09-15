@@ -56,9 +56,7 @@ async fn http(method: &str, url: &str, body: Option<String>) -> (u16, String) {
         };
         match result {
             Ok(resp) => (resp.status(), resp.into_string().unwrap_or_default()),
-            Err(ureq::Error::Status(code, resp)) => {
-                (code, resp.into_string().unwrap_or_default())
-            }
+            Err(ureq::Error::Status(code, resp)) => (code, resp.into_string().unwrap_or_default()),
             Err(e) => panic!("transport error on {method} {url}: {e}"),
         }
     })
@@ -78,8 +76,7 @@ async fn register_probe_collect_ingest_and_query() {
     let kv: Arc<dyn KvStore> = Arc::new(RedbKvStore::new(&paths.kv).expect("kv"));
     let sql: Arc<dyn RelationalStore> =
         Arc::new(SqliteRelationalStore::new(&paths.sql).expect("sql"));
-    let ts: Arc<dyn TimeSeriesStore> =
-        Arc::new(TsinkTimeSeriesStore::new(&paths.ts).expect("ts"));
+    let ts: Arc<dyn TimeSeriesStore> = Arc::new(TsinkTimeSeriesStore::new(&paths.ts).expect("ts"));
     let log: Arc<dyn LogStore> = Arc::new(TantivyLogStore::new(&paths.logs).expect("log"));
 
     // 2. GSE 控制面：台账 + HTTP 管理端口。
