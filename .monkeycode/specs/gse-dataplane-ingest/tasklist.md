@@ -73,7 +73,7 @@
 - [x] 11. 检查点 - 前端测试与构建通过
   - 确保所有测试通过,如有疑问请询问用户
 
-- [ ] 12. 集成与 dpc
+- [x] 12. 集成与 dpc
   - [x] 12.1 `dpc logs` 子命令打 `POST /v1/logs/search`
     - 对应 Requirement 12
   - [x]* 12.2 e2e：登记 dataserver → 探活 online → 新建 metrics 采集项 → Agent 上报 → Prom 查到 `cpu_usage{agent_id,item_id}`
