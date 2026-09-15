@@ -76,6 +76,9 @@ for c in "${COMPONENTS[@]}"; do
     if [[ "$c" == "gse-server" && -d "$SRC/web" ]]; then
       cp -a "$SRC/web" "$DEST_C/web"
     fi
+    if [[ "$c" == "dataserver" && -d "$SRC/web" ]]; then
+      cp -a "$SRC/web" "$DEST_C/web"
+    fi
     if [[ "$c" == "console" && -d "$SRC/web" ]]; then
       cp -a "$SRC/web" "$DEST_C/web"
     fi
@@ -97,6 +100,26 @@ for c in "${COMPONENTS[@]}"; do
       cp "$EXAMPLE" "$INSTANCE"
       if [[ "$c" == "gse-server" && -d "$DEST_C/web" ]]; then
         printf '\n# enable single-port web hosting (web/ shipped in package)\nhttp_web_dir = "web"\n' >> "$INSTANCE"
+      fi
+      if [[ "$c" == "dataserver" && -d "$DEST_C/web" ]]; then
+        # dataserver 示例配置以 [auth] 段结尾，直接追加会把 http_web_dir 归入该表，
+        # 因此插到首个表头之前，保证它是顶层键。
+        awk '
+          inserted == 0 && /^\[/ {
+            print "# enable single-port web hosting (web/ shipped in package)"
+            print "http_web_dir = \"web\""
+            print ""
+            inserted = 1
+          }
+          { print }
+          END {
+            if (inserted == 0) {
+              print "# enable single-port web hosting (web/ shipped in package)"
+              print "http_web_dir = \"web\""
+            }
+          }
+        ' "$INSTANCE" > "$INSTANCE.tmp"
+        mv "$INSTANCE.tmp" "$INSTANCE"
       fi
       echo "[$c] config generated: $INSTANCE"
     fi
