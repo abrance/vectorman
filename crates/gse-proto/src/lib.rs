@@ -160,6 +160,44 @@ pub struct GseError {
     pub message: String,
 }
 
+/// Agent → Server：拉取本 Agent 应写入的数据面地址。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataplaneAddrRequest {
+    pub agent_id: String,
+}
+
+/// Server → Agent：数据面接入地址与主机归属。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataplaneAddrReply {
+    pub ok: bool,
+    #[serde(default)]
+    pub ingest_url: Option<String>,
+    #[serde(default)]
+    pub host_id: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// 单个采集项：GSE 按 `agent_ids` 过滤后下发，Agent 按 `item_id` 对齐采集器。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollectItem {
+    pub item_id: String,
+    pub agent_ids: Vec<String>,
+    pub name: String,
+    /// metrics_host | log_file | log_k8s_stdout。
+    pub kind: String,
+    pub enabled: bool,
+    pub collector: serde_json::Value,
+    pub storage: serde_json::Value,
+}
+
+/// Server → Agent / Agent 拉取：过滤后的采集项整表（可空）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CollectItemsReply {
+    #[serde(default)]
+    pub items: Vec<CollectItem>,
+}
+
 impl GseError {
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
@@ -229,6 +267,41 @@ mod tests {
             agent_id: "web-01".to_string(),
             token: "tok-1".to_string(),
         });
+    }
+
+    #[test]
+    fn dataplane_addr_roundtrip() {
+        roundtrip(&DataplaneAddrRequest {
+            agent_id: "web-01".to_string(),
+        });
+        roundtrip(&DataplaneAddrReply {
+            ok: true,
+            ingest_url: Some("http://10.0.0.5:8081".to_string()),
+            host_id: Some("h-1".to_string()),
+            reason: None,
+        });
+        roundtrip(&DataplaneAddrReply {
+            ok: false,
+            ingest_url: None,
+            host_id: None,
+            reason: Some("no online dataplane".to_string()),
+        });
+    }
+
+    #[test]
+    fn collect_items_roundtrip() {
+        let item = CollectItem {
+            item_id: "item-1".to_string(),
+            agent_ids: vec!["a-1".to_string(), "a-2".to_string()],
+            name: "cpu".to_string(),
+            kind: "metrics_host".to_string(),
+            enabled: true,
+            collector: serde_json::json!({"interval_secs": 15}),
+            storage: serde_json::json!({"retention_days": 1}),
+        };
+        roundtrip(&item);
+        roundtrip(&CollectItemsReply { items: vec![item] });
+        roundtrip(&CollectItemsReply::default());
     }
 
     #[test]

@@ -6,6 +6,7 @@
 #   packaging/build-package.sh [--version <v>]
 #     [--bin-dir <dir>]   测试钩子：跳过 cargo build，直接使用现成二进制目录
 #     [--dist-dir <dir>]  测试钩子：跳过前端构建，直接使用现成 dist 目录
+#     [--dataplane-dist-dir <dir>]  测试钩子：跳过 dataserver 前端构建，直接使用现成 dist 目录
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -14,11 +15,13 @@ cd "$REPO_ROOT"
 VERSION=""
 BIN_DIR=""
 DIST_DIR=""
+DATAPLANE_DIST_DIR=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --version) VERSION="$2"; shift 2 ;;
     --bin-dir) BIN_DIR="$2"; shift 2 ;;
     --dist-dir) DIST_DIR="$2"; shift 2 ;;
+    --dataplane-dist-dir) DATAPLANE_DIST_DIR="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
   esac
 done
@@ -36,13 +39,13 @@ TARBALL="${ROOT}.tar.gz"
 step() { echo "==> $1"; }
 fail() { echo "step $1 failed" >&2; exit 1; }
 
-COMPONENTS=(apiserver dpc gse-server gse-agent vmctl console)
+COMPONENTS=(dataserver dpc gse-server gse-agent vmctl console)
 BUILT_MUSL=0
 
 if [[ -n "$BIN_DIR" ]]; then
   step "cargo-build skipped (bin-dir=$BIN_DIR)"
-  if [[ ! -x "$BIN_DIR/gse-server" || ! -x "$BIN_DIR/gse-agent" || ! -x "$BIN_DIR/apiserver" || ! -x "$BIN_DIR/dpc" || ! -x "$BIN_DIR/vmctl" || ! -x "$BIN_DIR/console" ]]; then
-    echo "bin-dir missing one of: apiserver dpc gse-server gse-agent vmctl console" >&2
+  if [[ ! -x "$BIN_DIR/gse-server" || ! -x "$BIN_DIR/gse-agent" || ! -x "$BIN_DIR/dataserver" || ! -x "$BIN_DIR/dpc" || ! -x "$BIN_DIR/vmctl" || ! -x "$BIN_DIR/console" ]]; then
+    echo "bin-dir missing one of: dataserver dpc gse-server gse-agent vmctl console" >&2
     exit 1
   fi
 else
@@ -76,9 +79,20 @@ else
     cd frontend
     npm ci --no-audit --no-fund || fail frontend-build
     npm run build:console || fail frontend-build
+    npm run build:dataplane || fail frontend-build
     npm run build:desktop || fail frontend-build
   )
   DIST_DIR="$REPO_ROOT/frontend/apps/console/dist"
+fi
+
+if [[ -n "$DATAPLANE_DIST_DIR" ]]; then
+  step "dataplane-frontend-build skipped (dataplane-dist-dir=$DATAPLANE_DIST_DIR)"
+else
+  DATAPLANE_DIST_DIR="$REPO_ROOT/frontend/apps/dataplane/dist"
+fi
+if [[ ! -f "$DATAPLANE_DIST_DIR/index.html" ]]; then
+  echo "dataplane dist missing index.html: $DATAPLANE_DIST_DIR" >&2
+  exit 1
 fi
 
 step "assemble $ROOT"
@@ -87,12 +101,14 @@ for c in "${COMPONENTS[@]}"; do
   mkdir -p "$ROOT/$c/bin" "$ROOT/$c/conf"
   cp "$BIN_DIR/$c" "$ROOT/$c/bin/"
 done
-cp config.toml.example "$ROOT/apiserver/conf/config.toml.example"
+cp config.toml.example "$ROOT/dataserver/conf/config.toml.example"
 cp bins/gse-server/gse-server.toml.example "$ROOT/gse-server/conf/gse-server.toml.example"
 cp bins/gse-agent/gse-agent.toml.example "$ROOT/gse-agent/conf/gse-agent.toml.example"
 cp bins/console/console.toml.example "$ROOT/console/conf/console.toml.example"
 mkdir -p "$ROOT/gse-server/web"
 cp -a "$DIST_DIR/." "$ROOT/gse-server/web/"
+mkdir -p "$ROOT/dataserver/web"
+cp -a "$DATAPLANE_DIST_DIR/." "$ROOT/dataserver/web/"
 DESKTOP_DIST="${DESKTOP_DIST:-$REPO_ROOT/frontend/apps/desktop/dist}"
 if [[ ! -f "$DESKTOP_DIST/index.html" ]]; then
   echo "desktop dist missing index.html: $DESKTOP_DIST" >&2
@@ -111,6 +127,10 @@ if [[ ! -f "$ROOT/gse-server/web/index.html" ]]; then
 fi
 if [[ ! -f "$ROOT/console/web/index.html" ]]; then
   echo "console web dist invalid: index.html missing" >&2
+  exit 1
+fi
+if [[ ! -f "$ROOT/dataserver/web/index.html" ]]; then
+  echo "dataserver web dist invalid: index.html missing" >&2
   exit 1
 fi
 

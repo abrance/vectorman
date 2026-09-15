@@ -24,4 +24,8 @@ impl LogStore for ElasticsearchStore {
     async fn search(&self, _filter: LogFilter) -> Result<Vec<LogRecord>, DataplaneError> {
         Err(unimplemented_store())
     }
+
+    async fn delete_matching(&self, _filter: LogFilter) -> Result<u64, DataplaneError> {
+        Err(unimplemented_store())
+    }
 }

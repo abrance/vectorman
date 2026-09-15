@@ -5,8 +5,8 @@
 ## 组件
 
 ```text
-bins/apiserver   对外提供 SQL HTTP 与 Prometheus 查询 HTTP（单进程两端口）
-bins/dpc         运维命令行，仅通过 HTTP 访问 apiserver
+bins/dataserver  对外提供 SQL HTTP 与 Prometheus 查询 HTTP（单进程两端口）
+bins/dpc         运维命令行，仅通过 HTTP 访问 dataserver
 bins/vmctl       gse-server HTTP 客户端：节点只读查询与作业提交
 crates/dataplane-core       错误码、配置、数据路径、鉴权 trait、SQL 类型
 crates/dataplane-file       FileStore + 本地目录引擎
@@ -19,7 +19,7 @@ crates/dataplane-adapter-*  v1 占位适配器（postgres/mysql/redis/elasticsea
 
 ## v1 开放接口
 
-`apiserver` 默认监听两个端口（`config.toml` 或 `DP_*` 环境变量可改，见 `config.toml.example`）：
+`dataserver` 默认监听两个端口（`config.toml` 或 `DP_*` 环境变量可改，见 `config.toml.example`）：
 
 | 端口 | 协议 | 路由 |
 | --- | --- | --- |
@@ -45,8 +45,8 @@ KV、文件、日志检索与时序写入在 v1 通过 Rust 嵌入接口（同�
 # 构建
 cargo build --workspace
 
-# 启动 apiserver（默认 ./data 目录，勿与其它进程共用）
-./target/debug/apiserver
+# 启动 dataserver（默认 ./data 目录，勿与其它进程共用）
+./target/debug/dataserver
 
 # 健康检查
 ./target/debug/dpc health
@@ -74,7 +74,7 @@ cargo build --workspace
 | KV | `{data_path}/kv.redb` |
 | SQL | `{data_path}/sql.sqlite` |
 
-单文件数据路径仅支持 sqlite，apiserver 需要目录模式。跨进程并发写同一数据路径 v1 不做文件锁，由调用方保证。
+单文件数据路径仅支持 sqlite，dataserver 需要目录模式。跨进程并发写同一数据路径 v1 不做文件锁，由调用方保证。
 
 ## 规格与实施计划
 

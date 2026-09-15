@@ -11,6 +11,8 @@ listen = "0.0.0.0:9090"
 
 [auth]
 enabled = false
+# http_web_dir = "web"
+# gse_admin_url = "http://127.0.0.1:7101"
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +41,8 @@ pub struct Config {
     pub sql_http: HttpListenConfig,
     pub prom_http: HttpListenConfig,
     pub auth: AuthConfig,
+    pub http_web_dir: Option<String>,
+    pub gse_admin_url: Option<String>,
 }
 
 impl Default for Config {
@@ -50,6 +54,8 @@ impl Default for Config {
                 listen: "0.0.0.0:9090".to_string(),
             },
             auth: AuthConfig { enabled: false },
+            http_web_dir: None,
+            gse_admin_url: None,
         }
     }
 }
@@ -57,8 +63,9 @@ impl Default for Config {
 impl Config {
     /// 从 TOML 字符串解析配置；失败返回 `config_invalid`。
     pub fn from_toml(s: &str) -> Result<Config, crate::DataplaneError> {
-        let cfg: Config = toml::from_str(s)
+        let mut cfg: Config = toml::from_str(s)
             .map_err(|e| crate::DataplaneError::config_invalid(format!("invalid TOML: {e}")))?;
+        cfg.normalize();
         Ok(cfg)
     }
 
@@ -76,6 +83,27 @@ impl Config {
         if let Ok(v) = std::env::var("DP_AUTH_ENABLED") {
             self.auth.enabled = v.eq_ignore_ascii_case("true") || v == "1";
         }
+        if let Ok(v) = std::env::var("DATASERVER_HTTP_WEB_DIR") {
+            self.http_web_dir = nonempty_opt(v);
+        }
+        if let Ok(v) = std::env::var("DATASERVER_GSE_ADMIN_URL") {
+            self.gse_admin_url = nonempty_opt(v);
+        }
+        self.normalize();
+    }
+
+    fn normalize(&mut self) {
+        self.http_web_dir = self.http_web_dir.take().and_then(nonempty_opt);
+        self.gse_admin_url = self.gse_admin_url.take().and_then(nonempty_opt);
+    }
+}
+
+fn nonempty_opt(v: String) -> Option<String> {
+    let t = v.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
     }
 }
 
@@ -93,4 +121,36 @@ pub fn load_config(path: Option<&str>) -> Result<Config, crate::DataplaneError> 
     };
     cfg.apply_env();
     Ok(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_toml_reads_web_dir_and_gse_url() {
+        let cfg = Config::from_toml(
+            r#"
+data_path = "./data"
+http_web_dir = "web"
+gse_admin_url = "http://127.0.0.1:7101"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.http_web_dir.as_deref(), Some("web"));
+        assert_eq!(cfg.gse_admin_url.as_deref(), Some("http://127.0.0.1:7101"));
+    }
+
+    #[test]
+    fn empty_web_dir_and_gse_url_become_none() {
+        let cfg = Config::from_toml(
+            r#"
+http_web_dir = ""
+gse_admin_url = "   "
+"#,
+        )
+        .unwrap();
+        assert!(cfg.http_web_dir.is_none());
+        assert!(cfg.gse_admin_url.is_none());
+    }
 }

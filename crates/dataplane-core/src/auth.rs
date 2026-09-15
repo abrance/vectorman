@@ -11,7 +11,7 @@ pub struct RequestMeta {
     pub headers: Vec<(String, String)>,
 }
 
-/// 鉴权中间件接口。apiserver 在两个 HTTP 端口的最外层调用。
+/// 鉴权中间件接口。dataserver 在两个 HTTP 端口的最外层调用。
 #[async_trait]
 pub trait AuthN: Send + Sync {
     async fn check(&self, req: &RequestMeta) -> Result<(), DataplaneError>;

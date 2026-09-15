@@ -51,3 +51,12 @@ Entries discovered by the Agent during task execution should follow this format:
 - Instructions:
   - Deploy the frontend by building first (`cd frontend && npm run build:console`), then start/mount the backend (gse-server), then serve `frontend/apps/console/dist` via gse-server `http_web_dir`. Do not treat `vite --host` dev server as the deploy path.
   - Frontend architecture (2026-09-10): backend stays a single gse-server; frontend ships one artifact `@vectorman/console`. `@vectorman/node` and `@vectorman/job` are UI packages (barrel + `exports`) composed by console; do not build or deploy them independently. Packaging entry is `packaging/build-package.sh` -> `npm run build:console`.
+  - Dataplane frontend (2026-09-15): the ingest dataplane UI is a second artifact `@vectorman/dataplane` (`cd frontend && npm run build:dataplane`), shipped as `dataserver/web/` and hosted by dataserver via its own `http_web_dir = "web"`. `packaging/build-package.sh` assembles it and `packaging/deploy/install.sh` copies `web/` for both `gse-server` and `dataserver`.
+
+[Project Knowledge Summary]
+- Date: 2026-09-15
+- Context: Discovered by Agent while committing formatting fixes on branch 260913-feat-gse-dataplane-ingest
+- Category: Workflow & Collaboration
+- Instructions:
+  - This repo ships a local `.git/hooks/prepare-commit-msg` that auto-appends `Co-authored-by: monkeycode-ai <monkeycode-ai@chaitin.com>` from git config `coauthor.*`. Do not add the co-author trailer manually; doing so produces duplicate trailers.
+  - Rust CI (`abrance/yoc/.github/workflows/rust-ci.yml@v1.0.0`) runs, in order: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`, `cargo build --all-features`. Verify these four locally before pushing; the fmt step is a common failure.

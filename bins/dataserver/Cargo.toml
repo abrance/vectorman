@@ -1,5 +1,5 @@
 [package]
-name = "apiserver"
+name = "dataserver"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,8 +11,17 @@ dataplane-kv.workspace = true
 dataplane-sql.workspace = true
 dataplane-ts.workspace = true
 dataplane-log.workspace = true
+dataplane-ingest.workspace = true
 tokio.workspace = true
 clap = { version = "4", features = ["derive"] }
 axum = "0.8"
 serde = { workspace = true }
 serde_json = { workspace = true }
+tower-http = { version = "0.6", features = ["fs"] }
+ureq = "2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"
+gse-server-core = { path = "../../crates/gse-server-core" }

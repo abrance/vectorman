@@ -102,6 +102,22 @@ describe("desktop", () => {
     expect(open).toHaveBeenCalledWith("http://127.0.0.1:7101", "_blank", "noopener,noreferrer");
   });
 
+  it("renders records whose backend omits tags", async () => {
+    // 旧版本后端不返回 tags 字段；目录应正常渲染而不是崩溃。
+    store = [
+      {
+        app_id: "app-1",
+        name: "GSE",
+        url: "http://127.0.0.1:7101",
+        created_at: "1",
+        updated_at: "1",
+      } as unknown as FakeApp,
+    ];
+    render(<App />);
+    expect(await screen.findByText("GSE")).toBeTruthy();
+    expect(screen.queryByText("全部")).toBeTruthy();
+  });
+
   it("deletes after confirm", async () => {
     store = [
       {

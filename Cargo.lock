@@ -89,23 +89,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "apiserver"
-version = "0.1.0"
-dependencies = [
- "axum",
- "clap",
- "dataplane-core",
- "dataplane-file",
- "dataplane-kv",
- "dataplane-log",
- "dataplane-sql",
- "dataplane-ts",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "app"
 version = "0.1.0-dev"
 source = "git+https://github.com/singchia/geminio-rs?rev=ff4363f814398b36c6ddf37b3d9042eb0b1dd802#ff4363f814398b36c6ddf37b3d9042eb0b1dd802"
@@ -621,6 +604,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dataplane-ingest"
+version = "0.1.0"
+dependencies = [
+ "dataplane-core",
+ "dataplane-kv",
+ "dataplane-log",
+ "dataplane-ts",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "dataplane-kv"
 version = "0.1.0"
 dependencies = [
@@ -639,6 +636,7 @@ dependencies = [
  "serde_json",
  "tantivy",
  "tantivy-jieba",
+ "tempfile",
  "tokio",
  "uuid",
 ]
@@ -661,6 +659,30 @@ dependencies = [
  "dataplane-core",
  "tokio",
  "tsink",
+]
+
+[[package]]
+name = "dataserver"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "clap",
+ "dataplane-core",
+ "dataplane-file",
+ "dataplane-ingest",
+ "dataplane-kv",
+ "dataplane-log",
+ "dataplane-sql",
+ "dataplane-ts",
+ "gse-server-core",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tower-http",
+ "ureq",
 ]
 
 [[package]]
@@ -968,10 +990,12 @@ dependencies = [
  "geminio",
  "gse-proto",
  "libc",
+ "regex",
  "serde",
  "serde_json",
  "tokio",
  "toml",
+ "ureq",
 ]
 
 [[package]]
@@ -1009,6 +1033,7 @@ dependencies = [
  "toml",
  "tower",
  "tower-http",
+ "ureq",
 ]
 
 [[package]]
@@ -2737,6 +2762,8 @@ dependencies = [
  "once_cell",
  "rustls",
  "rustls-pki-types",
+ "serde",
+ "serde_json",
  "url",
  "webpki-roots 0.26.11",
 ]

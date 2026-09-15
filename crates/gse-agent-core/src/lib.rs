@@ -1,6 +1,7 @@
 //! gse-agent 核心库：配置、外连、认证、心跳与指令执行。
 //! bins/gse-agent 仅作为进程入口调用本库。
 
+pub mod collect;
 pub mod config;
 pub mod job;
 
@@ -8,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use geminio::app::Error;
 use geminio::{dial, Bytes, DialOptions, End};
-use gse_proto::{AuthReply, AuthRequest, Command, Heartbeat, Receipt};
+use gse_proto::{AuthReply, AuthRequest, CollectItemsReply, Command, Heartbeat, Receipt};
 
 pub use config::{load_config, AgentConfig};
 use job::{JobConfig, JobExecutor};
@@ -69,8 +70,40 @@ async fn connect_once(cfg: &AgentConfig) -> Result<(), AgentError> {
     {
         return Err(AgentError::ConnError(format!("register job_exec: {e}")));
     }
+    let collector = collect::CollectorHandle::new(cfg.agent_id.clone(), end.clone());
+    let collect_handler = collector.clone();
+    if let Err(e) = end
+        .register("collect_items", move |req: Bytes| {
+            let handler = collect_handler.clone();
+            async move {
+                match serde_json::from_slice::<CollectItemsReply>(&req) {
+                    Ok(reply) => handler.apply(reply),
+                    Err(e) => eprintln!("gse-agent: bad collect_items push: {e}"),
+                }
+                Ok(Bytes::from_static(b"{}"))
+            }
+        })
+        .await
+    {
+        return Err(AgentError::ConnError(format!(
+            "register collect_items: {e}"
+        )));
+    }
     authenticate(&end, &cfg.agent_id, &cfg.token).await?;
+    pull_collect_items(&end, &collector).await;
+    collector.pull_addr_now();
     heartbeat_loop(&end, &cfg.agent_id, cfg.heartbeat_interval_secs).await
+}
+
+/// 认证后立刻拉取本 Agent 的采集项整表。
+async fn pull_collect_items(end: &End, collector: &collect::CollectorHandle) {
+    match end.call("collect_items", Bytes::from_static(b"{}")).await {
+        Ok(resp) => match serde_json::from_slice::<CollectItemsReply>(&resp) {
+            Ok(reply) => collector.apply(reply),
+            Err(e) => eprintln!("gse-agent: bad collect_items reply: {e}"),
+        },
+        Err(e) => eprintln!("gse-agent: collect_items rpc failed: {e}"),
+    }
 }
 
 async fn authenticate(end: &End, agent_id: &str, token: &str) -> Result<(), AgentError> {

@@ -4,7 +4,10 @@ use clap::{Parser, Subcommand};
 use dataplane_core::ErrorCode;
 
 #[derive(Parser)]
-#[command(name = "dpc", about = "dataplane 运维命令行：通过 HTTP 访问 apiserver")]
+#[command(
+    name = "dpc",
+    about = "dataplane 运维命令行：通过 HTTP 访问 dataserver"
+)]
 struct Cli {
     /// SQL HTTP 端口基址
     #[arg(long, default_value = "http://127.0.0.1:8081")]
@@ -35,6 +38,33 @@ enum Command {
         #[arg(long)]
         time: Option<String>,
     },
+    /// 向 dataserver 检索日志
+    Logs {
+        /// 数据类型：logs / apm / ebpf
+        #[arg(long)]
+        data_type: Option<String>,
+        /// 按 Agent 过滤
+        #[arg(long)]
+        agent_id: Option<String>,
+        /// 按采集项（data_id）过滤
+        #[arg(long)]
+        data_id: Option<String>,
+        /// 按日志级别过滤
+        #[arg(long)]
+        level: Option<String>,
+        /// 正文关键词
+        #[arg(long)]
+        query: Option<String>,
+        /// 起始时间（Unix 微秒）
+        #[arg(long)]
+        from_ts: Option<i64>,
+        /// 结束时间（Unix 微秒）
+        #[arg(long)]
+        to_ts: Option<i64>,
+        /// 最大返回条数
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 #[derive(Debug)]
@@ -63,7 +93,86 @@ fn run(cli: &Cli) -> Result<(), DpcError> {
         Command::Health => cmd_health(cli),
         Command::Sql { stmt } => cmd_sql(&cli.sql_url, stmt),
         Command::Query { expr, time } => cmd_query(&cli.prom_url, expr, time.as_deref()),
+        Command::Logs {
+            data_type,
+            agent_id,
+            data_id,
+            level,
+            query,
+            from_ts,
+            to_ts,
+            limit,
+        } => cmd_logs(
+            &cli.sql_url,
+            logs_body(
+                data_type.as_deref(),
+                agent_id.as_deref(),
+                data_id.as_deref(),
+                level.as_deref(),
+                query.as_deref(),
+                *from_ts,
+                *to_ts,
+                *limit,
+            ),
+        ),
     }
+}
+
+/// 过滤条件拼成 `/v1/logs/search` 请求体；未提供的字段不下发。
+#[allow(clippy::too_many_arguments)]
+fn logs_body(
+    data_type: Option<&str>,
+    agent_id: Option<&str>,
+    data_id: Option<&str>,
+    level: Option<&str>,
+    query: Option<&str>,
+    from_ts: Option<i64>,
+    to_ts: Option<i64>,
+    limit: Option<usize>,
+) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    if let Some(v) = data_type {
+        body.insert("data_type".into(), v.into());
+    }
+    if let Some(v) = agent_id {
+        body.insert("agent_id".into(), v.into());
+    }
+    if let Some(v) = data_id {
+        body.insert("data_id".into(), v.into());
+    }
+    if let Some(v) = level {
+        body.insert("level".into(), v.into());
+    }
+    if let Some(v) = query {
+        body.insert("message_query".into(), v.into());
+    }
+    if let Some(v) = from_ts {
+        body.insert("from_ts".into(), v.into());
+    }
+    if let Some(v) = to_ts {
+        body.insert("to_ts".into(), v.into());
+    }
+    if let Some(v) = limit {
+        body.insert("limit".into(), v.into());
+    }
+    serde_json::Value::Object(body)
+}
+
+fn cmd_logs(base: &str, body: serde_json::Value) -> Result<(), DpcError> {
+    let url = format!("{base}/v1/logs/search");
+    let resp = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+        .map_err(|e| DpcError {
+            url: url.clone(),
+            reason: ureq_err_str(e),
+        })?;
+    let text = resp.into_string().map_err(|e| DpcError {
+        url,
+        reason: format!("read body: {e}"),
+    })?;
+    println!("{text}");
+    Ok(())
 }
 
 fn fetch_health(base: &str) -> Result<String, DpcError> {
@@ -83,7 +192,7 @@ fn fetch_health(base: &str) -> Result<String, DpcError> {
     if status != "ok" {
         return Err(DpcError {
             url,
-            reason: format!("apiserver unhealthy: {text}"),
+            reason: format!("dataserver unhealthy: {text}"),
         });
     }
     Ok(text)
@@ -159,5 +268,32 @@ fn ureq_err_str(e: ureq::Error) -> String {
             format!("http status {code}: {body}")
         }
         ureq::Error::Transport(t) => t.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::logs_body;
+    use serde_json::json;
+
+    #[test]
+    fn logs_body_keeps_only_provided_filters() {
+        assert_eq!(
+            logs_body(None, None, None, None, None, None, None, None),
+            json!({})
+        );
+        assert_eq!(
+            logs_body(
+                Some("logs"),
+                Some("agent-1"),
+                None,
+                None,
+                Some("error"),
+                None,
+                None,
+                Some(50)
+            ),
+            json!({"data_type": "logs", "agent_id": "agent-1", "message_query": "error", "limit": 50})
+        );
     }
 }

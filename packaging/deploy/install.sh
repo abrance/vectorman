@@ -2,10 +2,10 @@
 # 目标机安装脚本：随安装包 deploy/ 分发。
 #
 # 用法：
-#   install.sh <apiserver|dpc|gse-server|gse-agent|vmctl|console|all> [--dest /opt/vectorman] [--with-systemd|--no-systemd]
+#   install.sh <dataserver|dpc|gse-server|gse-agent|vmctl|console|all> [--dest /opt/vectorman] [--with-systemd|--no-systemd]
 set -euo pipefail
 
-USAGE="usage: install.sh <apiserver|dpc|gse-server|gse-agent|vmctl|console|all> [--dest /opt/vectorman] [--with-systemd|--no-systemd]"
+USAGE="usage: install.sh <dataserver|dpc|gse-server|gse-agent|vmctl|console|all> [--dest /opt/vectorman] [--with-systemd|--no-systemd]"
 
 COMPONENT_ARG=""
 DEST="/opt/vectorman"
@@ -33,8 +33,8 @@ else
 fi
 
 case "$COMPONENT_ARG" in
-  apiserver|dpc|gse-server|gse-agent|vmctl|console) COMPONENTS=("$COMPONENT_ARG") ;;
-  all) COMPONENTS=(apiserver dpc gse-server gse-agent vmctl console) ;;
+  dataserver|dpc|gse-server|gse-agent|vmctl|console) COMPONENTS=("$COMPONENT_ARG") ;;
+  all) COMPONENTS=(dataserver dpc gse-server gse-agent vmctl console) ;;
   *) echo "$USAGE" >&2; exit 1 ;;
 esac
 
@@ -71,18 +71,20 @@ for c in "${COMPONENTS[@]}"; do
   mkdir -p "$DEST_C"
 
   if [[ "$IN_PLACE" -eq 0 ]]; then
-    cp -a "$SRC/bin" "$DEST_C/bin"
-    cp -a "$SRC/conf" "$DEST_C/conf"
-    if [[ "$c" == "gse-server" && -d "$SRC/web" ]]; then
-      cp -a "$SRC/web" "$DEST_C/web"
-    fi
-    if [[ "$c" == "console" && -d "$SRC/web" ]]; then
-      cp -a "$SRC/web" "$DEST_C/web"
+    # 使用 "src/." 合并复制：重复安装时覆盖内容而不是嵌套出 bin/bin、web/web。
+    mkdir -p "$DEST_C/bin" "$DEST_C/conf"
+    cp -a "$SRC/bin/." "$DEST_C/bin/"
+    cp -a "$SRC/conf/." "$DEST_C/conf/"
+    if [[ "$c" == "gse-server" || "$c" == "dataserver" || "$c" == "console" ]]; then
+      if [[ -d "$SRC/web" ]]; then
+        mkdir -p "$DEST_C/web"
+        cp -a "$SRC/web/." "$DEST_C/web/"
+      fi
     fi
   fi
 
   case "$c" in
-    apiserver)    INSTANCE="$DEST_C/config.toml";       EXAMPLE="$DEST_C/conf/config.toml.example" ;;
+    dataserver)   INSTANCE="$DEST_C/config.toml";       EXAMPLE="$DEST_C/conf/config.toml.example" ;;
     gse-server)   INSTANCE="$DEST_C/conf/gse-server.toml"; EXAMPLE="$DEST_C/conf/gse-server.toml.example" ;;
     gse-agent)    INSTANCE="$DEST_C/conf/gse-agent.toml";  EXAMPLE="$DEST_C/conf/gse-agent.toml.example" ;;
     dpc)          INSTANCE="" ;;
@@ -98,8 +100,25 @@ for c in "${COMPONENTS[@]}"; do
       if [[ "$c" == "gse-server" && -d "$DEST_C/web" ]]; then
         printf '\n# enable single-port web hosting (web/ shipped in package)\nhttp_web_dir = "web"\n' >> "$INSTANCE"
       fi
-      if [[ "$c" == "console" && -d "$DEST_C/web" ]]; then
-        printf '\n# enable single-port web hosting (web/ shipped in package)\nweb_dir = "web"\n' >> "$INSTANCE"
+      if [[ "$c" == "dataserver" && -d "$DEST_C/web" ]]; then
+        # dataserver 示例配置以 [auth] 段结尾，直接追加会把 http_web_dir 归入该表，
+        # 因此插到首个表头之前，保证它是顶层键。
+        awk '
+          inserted == 0 && /^\[/ {
+            print "# enable single-port web hosting (web/ shipped in package)"
+            print "http_web_dir = \"web\""
+            print ""
+            inserted = 1
+          }
+          { print }
+          END {
+            if (inserted == 0) {
+              print "# enable single-port web hosting (web/ shipped in package)"
+              print "http_web_dir = \"web\""
+            }
+          }
+        ' "$INSTANCE" > "$INSTANCE.tmp"
+        mv "$INSTANCE.tmp" "$INSTANCE"
       fi
       echo "[$c] config generated: $INSTANCE"
     fi

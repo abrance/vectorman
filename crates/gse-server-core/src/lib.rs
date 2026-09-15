@@ -2,6 +2,7 @@
 //! bins/gse-server 仅作为进程入口调用本库。
 
 pub mod config;
+pub mod dataplane;
 pub mod http;
 pub mod ledger;
 pub mod rerun;
@@ -10,9 +11,11 @@ pub mod session;
 pub mod template;
 
 pub use config::{load_config, ServerConfig};
+pub use dataplane::{probe_dataplanes, probe_once};
 pub use http::{router as http_router, AdminState};
 pub use ledger::{
-    AccessPoint, Agent, AgentConfig, Host, JobRecord, JobTemplate, Ledger, NewJob, NewJobTemplate,
+    AccessPoint, Agent, AgentConfig, DataplaneService, Host, JobRecord, JobTemplate, Ledger,
+    NewJob, NewJobTemplate,
 };
 pub use rerun::{build_rerun_submit, RerunRequest};
 pub use server::{

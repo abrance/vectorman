@@ -1,0 +1,17 @@
+[package]
+name = "dataplane-ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dataplane-core.workspace = true
+dataplane-kv.workspace = true
+dataplane-log.workspace = true
+dataplane-ts.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio.workspace = true
