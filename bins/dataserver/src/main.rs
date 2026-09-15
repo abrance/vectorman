@@ -1,24 +1,16 @@
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::extract::{Query, State};
-use axum::http::{Request, StatusCode};
-use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
 use clap::Parser;
-use dataplane_core::{
-    json_params_to_sql_values, load_config, resolve_data_paths, sql_value_to_json, AuthN,
-    DataplaneError, ErrorCode, NoopAuth, RequestMeta, SqlResult,
-};
+use dataplane_core::{load_config, resolve_data_paths, DataplaneError, ErrorCode, NoopAuth};
 use dataplane_file::{DirFileStore, FileStore};
 use dataplane_kv::{KvStore, RedbKvStore};
 use dataplane_log::{LogStore, TantivyLogStore};
 use dataplane_sql::{RelationalStore, SqliteRelationalStore};
-use dataplane_ts::{PromResult, PromResultType, TimeSeriesStore, TsinkTimeSeriesStore};
-use serde::Deserialize;
-use serde_json::{json, Value};
+use dataplane_ts::{TimeSeriesStore, TsinkTimeSeriesStore};
+use dataserver::cleanup::{now_micros, run_cleanup};
+use dataserver::http::{prom_router, sql_router, AppState};
 
 const ENGINE_DIR_MODE_REQUIRED: &str = "dataserver requires a directory data_path (single-file mode only supports sqlite, and this server enables all engines)";
 
@@ -29,263 +21,9 @@ struct Args {
     config: Option<String>,
 }
 
-#[derive(Clone)]
-struct AppState {
-    #[expect(dead_code)]
-    file: Arc<dyn FileStore>,
-    #[expect(dead_code)]
-    kv: Arc<dyn KvStore>,
-    sql: Arc<dyn RelationalStore>,
-    ts: Arc<dyn TimeSeriesStore>,
-    #[expect(dead_code)]
-    log: Arc<dyn LogStore>,
-    auth: Arc<dyn AuthN>,
-}
-
 fn exit_with(prefix: &str, e: DataplaneError) -> ExitCode {
     eprintln!("{prefix}: {}: {}", e.code.as_str(), e.message);
     ExitCode::FAILURE
-}
-
-fn json_err(status: StatusCode, e: DataplaneError) -> Response {
-    (
-        status,
-        Json(json!({"error": e.message, "code": e.code.as_str()})),
-    )
-        .into_response()
-}
-
-/// 鉴权中间件：在请求链最外层调用 `AuthN`。
-async fn auth_middleware(
-    State(state): State<AppState>,
-    req: Request<axum::body::Body>,
-    next: Next,
-) -> Response {
-    let headers: Vec<(String, String)> = req
-        .headers()
-        .iter()
-        .map(|(k, v)| {
-            (
-                k.as_str().to_string(),
-                v.to_str().unwrap_or_default().to_string(),
-            )
-        })
-        .collect();
-    let meta = RequestMeta {
-        method: req.method().to_string(),
-        path: req.uri().path().to_string(),
-        headers,
-        peer_addr: None,
-    };
-    if let Err(e) = state.auth.check(&meta).await {
-        return json_err(StatusCode::UNAUTHORIZED, e);
-    }
-    next.run(req).await
-}
-
-async fn health() -> Response {
-    Json(json!({"status": "ok"})).into_response()
-}
-
-#[derive(Deserialize)]
-struct SqlRequest {
-    sql: String,
-    #[serde(default)]
-    params: Vec<Value>,
-}
-
-fn sql_rows_to_json(res: &SqlResult) -> Value {
-    let rows: Vec<Vec<Value>> = res
-        .rows
-        .iter()
-        .map(|row| row.iter().map(sql_value_to_json).collect())
-        .collect();
-    json!({"columns": res.columns, "rows": rows})
-}
-
-async fn sql_exec(
-    State(state): State<AppState>,
-    body: Result<Json<SqlRequest>, axum::extract::rejection::JsonRejection>,
-) -> Response {
-    let body = match body {
-        Ok(b) => b.0,
-        Err(_) => {
-            return json_err(
-                StatusCode::BAD_REQUEST,
-                DataplaneError::new(
-                    ErrorCode::InvalidArgument,
-                    "invalid JSON body or missing 'sql' field",
-                ),
-            );
-        }
-    };
-    let params = match json_params_to_sql_values(&body.params) {
-        Ok(p) => p,
-        Err(e) => return json_err(StatusCode::BAD_REQUEST, e),
-    };
-    match state.sql.execute(&body.sql, &params).await {
-        Ok(res) => Json(sql_rows_to_json(&res)).into_response(),
-        Err(e) => json_err(StatusCode::UNPROCESSABLE_ENTITY, e),
-    }
-}
-
-fn prom_result_to_json(r: &PromResult) -> Value {
-    let result_type = match r.result_type {
-        PromResultType::Vector => "vector",
-        PromResultType::Matrix => "matrix",
-    };
-    let result: Vec<Value> = r
-        .result
-        .iter()
-        .map(|s| {
-            let metric: Value = s
-                .metric
-                .iter()
-                .map(|(k, v)| (k.clone(), Value::String(v.clone())))
-                .collect();
-            match r.result_type {
-                PromResultType::Vector => {
-                    let (ts_us, v) = s.value.unwrap_or((0, 0.0));
-                    json!({"metric": metric, "value": [ts_us as f64 / 1_000_000.0, v]})
-                }
-                PromResultType::Matrix => {
-                    let values: Vec<Value> = s
-                        .values
-                        .clone()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|(t, v)| json!([t as f64 / 1_000_000.0, v]))
-                        .collect();
-                    json!({"metric": metric, "values": values})
-                }
-            }
-        })
-        .collect();
-    json!({"resultType": result_type, "result": result})
-}
-
-fn prom_error_response(e: DataplaneError) -> Response {
-    Json(json!({"status": "error", "errorType": e.code.as_str(), "error": e.message}))
-        .into_response()
-}
-
-fn parse_time_param(v: &str) -> Result<i64, DataplaneError> {
-    v.parse::<f64>()
-        .map(|sec| (sec * 1_000_000.0) as i64)
-        .map_err(|_| {
-            DataplaneError::new(
-                ErrorCode::InvalidArgument,
-                format!("invalid time parameter: {v}"),
-            )
-        })
-}
-
-/// 从查询参数读取必需的时间参数（秒，转微秒）。
-fn required_time_us(params: &Value, name: &str) -> Result<i64, DataplaneError> {
-    match params.get(name) {
-        Some(Value::String(s)) => parse_time_param(s),
-        Some(other) => Err(DataplaneError::new(
-            ErrorCode::InvalidArgument,
-            format!("invalid '{name}' parameter: {other}"),
-        )),
-        None => Err(DataplaneError::new(
-            ErrorCode::InvalidArgument,
-            format!("missing '{name}' parameter"),
-        )),
-    }
-}
-
-/// 从查询参数读取可选时间参数（秒，转微秒）。
-fn optional_time_us(params: &Value, name: &str) -> Result<Option<i64>, DataplaneError> {
-    match params.get(name) {
-        None => Ok(None),
-        Some(Value::String(s)) => Ok(Some(parse_time_param(s)?)),
-        Some(other) => Err(DataplaneError::new(
-            ErrorCode::InvalidArgument,
-            format!("invalid '{name}' parameter: {other}"),
-        )),
-    }
-}
-
-async fn prom_query(State(state): State<AppState>, Query(params): Query<Value>) -> Response {
-    let expr = params
-        .get("query")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    if expr.is_empty() {
-        return prom_error_response(DataplaneError::new(
-            ErrorCode::InvalidArgument,
-            "missing 'query' parameter",
-        ));
-    }
-    let eval_time = match optional_time_us(&params, "time") {
-        Ok(v) => v,
-        Err(e) => return prom_error_response(e),
-    };
-    match state.ts.query_instant(&expr, eval_time).await {
-        Ok(r) => {
-            Json(json!({"status": "success", "data": prom_result_to_json(&r)})).into_response()
-        }
-        Err(e) => prom_error_response(e),
-    }
-}
-
-async fn prom_query_range(State(state): State<AppState>, Query(params): Query<Value>) -> Response {
-    let expr = params
-        .get("query")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    if expr.is_empty() {
-        return prom_error_response(DataplaneError::new(
-            ErrorCode::InvalidArgument,
-            "missing 'query' parameter",
-        ));
-    }
-    let start = match required_time_us(&params, "start") {
-        Ok(v) => v,
-        Err(e) => return prom_error_response(e),
-    };
-    let end = match required_time_us(&params, "end") {
-        Ok(v) => v,
-        Err(e) => return prom_error_response(e),
-    };
-    let step = match params.get("step") {
-        Some(Value::String(s)) => match s.parse::<i64>() {
-            Ok(v) => v,
-            Err(_) => {
-                return prom_error_response(DataplaneError::new(
-                    ErrorCode::InvalidArgument,
-                    "invalid 'step' parameter",
-                ))
-            }
-        },
-        Some(other) => {
-            return prom_error_response(DataplaneError::new(
-                ErrorCode::InvalidArgument,
-                format!("invalid 'step' parameter: {other}"),
-            ))
-        }
-        None => {
-            return prom_error_response(DataplaneError::new(
-                ErrorCode::InvalidArgument,
-                "missing 'step' parameter",
-            ))
-        }
-    };
-    if step <= 0 {
-        return prom_error_response(DataplaneError::new(
-            ErrorCode::InvalidArgument,
-            "'step' must be positive",
-        ));
-    }
-    match state.ts.query_range(&expr, start, end, step).await {
-        Ok(r) => {
-            Json(json!({"status": "success", "data": prom_result_to_json(&r)})).into_response()
-        }
-        Err(e) => prom_error_response(e),
-    }
 }
 
 #[tokio::main]
@@ -343,26 +81,42 @@ async fn main() -> ExitCode {
         ts,
         log,
         auth: Arc::new(NoopAuth),
+        gse_admin_url: cfg.gse_admin_url.clone(),
     };
 
-    let sql_router = Router::new()
-        .route("/health", get(health))
-        .route("/v1/sql", post(sql_exec))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ))
-        .with_state(state.clone());
+    let web_dir = cfg.http_web_dir.as_deref().map(std::path::Path::new);
+    if let Some(dir) = cfg.http_web_dir.as_deref() {
+        if std::path::Path::new(dir).join("index.html").is_file() {
+            println!("dataserver: serving web dist from {dir}");
+        } else {
+            eprintln!("dataserver: http_web_dir {dir} missing index.html; static UI disabled");
+        }
+    }
 
-    let prom_router = Router::new()
-        .route("/health", get(health))
-        .route("/api/v1/query", get(prom_query))
-        .route("/api/v1/query_range", get(prom_query_range))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ))
-        .with_state(state);
+    let sql_app = sql_router(state.clone(), web_dir);
+    let prom_app = prom_router(state.clone());
+
+    let cleanup_state = state.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(3600));
+        loop {
+            ticker.tick().await;
+            if let Err(e) = run_cleanup(
+                cleanup_state.log.as_ref(),
+                cleanup_state.kv.as_ref(),
+                cleanup_state.gse_admin_url.as_deref(),
+                now_micros(),
+            )
+            .await
+            {
+                eprintln!(
+                    "retention cleanup: {}: {}",
+                    e.code.as_str(),
+                    e.message
+                );
+            }
+        }
+    });
 
     let sql_listener = match tokio::net::TcpListener::bind(&cfg.sql_http.listen).await {
         Ok(l) => l,
@@ -384,8 +138,8 @@ async fn main() -> ExitCode {
         cfg.sql_http.listen, cfg.prom_http.listen
     );
 
-    let sql_fut = axum::serve(sql_listener, sql_router);
-    let prom_fut = axum::serve(prom_listener, prom_router);
+    let sql_fut = axum::serve(sql_listener, sql_app);
+    let prom_fut = axum::serve(prom_listener, prom_app);
     let _ = tokio::try_join!(sql_fut, prom_fut);
     ExitCode::SUCCESS
 }

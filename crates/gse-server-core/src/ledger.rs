@@ -80,6 +80,51 @@ pub struct AgentConfig {
     pub updated_at: String,
 }
 
+/// 数据面服务登记（运维手工 upsert，探活维护 status）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataplaneService {
+    pub service_id: String,
+    pub ingest_url: String,
+    pub query_url: String,
+    /// unknown / online / offline。
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub last_seen_at: Option<String>,
+    #[serde(default)]
+    pub registered_at: String,
+}
+
+/// 采集项：以 `item_id` 为主键，`agent_ids` 为目标 Agent 列表。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollectItem {
+    pub item_id: String,
+    pub agent_ids: Vec<String>,
+    pub name: String,
+    /// metrics_host | log_file | log_k8s_stdout。
+    pub kind: String,
+    pub enabled: bool,
+    pub collector: serde_json::Value,
+    pub storage: serde_json::Value,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+impl CollectItem {
+    /// 转为跨 RPC 下发的 DTO（不含本地 `updated_at`）。
+    pub fn to_proto(&self) -> gse_proto::CollectItem {
+        gse_proto::CollectItem {
+            item_id: self.item_id.clone(),
+            agent_ids: self.agent_ids.clone(),
+            name: self.name.clone(),
+            kind: self.kind.clone(),
+            enabled: self.enabled,
+            collector: self.collector.clone(),
+            storage: self.storage.clone(),
+        }
+    }
+}
+
 /// 作业持久化记录；字段与前端 `Job` 类型对齐。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobRecord {
@@ -269,6 +314,24 @@ impl Ledger {
                 updated_at     TEXT NOT NULL
             )",
             "CREATE INDEX IF NOT EXISTS idx_templates_name ON job_templates(name)",
+            "CREATE TABLE IF NOT EXISTS dataplane_services (
+                service_id    TEXT PRIMARY KEY,
+                ingest_url    TEXT NOT NULL,
+                query_url     TEXT NOT NULL,
+                status        TEXT NOT NULL DEFAULT 'unknown',
+                last_seen_at  TEXT,
+                registered_at TEXT NOT NULL
+            )",
+            "CREATE TABLE IF NOT EXISTS collect_items (
+                item_id        TEXT PRIMARY KEY,
+                agent_ids      TEXT NOT NULL,
+                name           TEXT NOT NULL,
+                kind           TEXT NOT NULL,
+                enabled        INTEGER NOT NULL DEFAULT 1,
+                collector_json TEXT NOT NULL,
+                storage_json   TEXT NOT NULL,
+                updated_at     TEXT NOT NULL
+            )",
         ];
         for sql in ddl {
             self.store
@@ -508,6 +571,170 @@ impl Ledger {
         )
         .await?;
         Ok(())
+    }
+
+    // ---- dataplane_services ----
+
+    /// 以 service_id 为主键幂等登记数据面；重置为 `unknown` 等待探活。
+    pub async fn upsert_dataplane(&self, d: &DataplaneService) -> Result<(), GseError> {
+        let sql = "INSERT INTO dataplane_services (service_id, ingest_url, query_url, status, last_seen_at, registered_at)
+                   VALUES (?, ?, ?, 'unknown', ?, ?)
+                   ON CONFLICT(service_id) DO UPDATE SET
+                     ingest_url = excluded.ingest_url,
+                     query_url = excluded.query_url,
+                     status = 'unknown',
+                     last_seen_at = excluded.last_seen_at,
+                     registered_at = excluded.registered_at";
+        let params = vec![
+            text(&d.service_id),
+            text(&d.ingest_url),
+            text(&d.query_url),
+            opt_text(d.last_seen_at.as_deref()),
+            text(&d.registered_at),
+        ];
+        self.execute(sql, &params).await?;
+        Ok(())
+    }
+
+    pub async fn list_dataplanes(&self) -> Result<Vec<DataplaneService>, GseError> {
+        let res = self
+            .execute("SELECT * FROM dataplane_services ORDER BY service_id", &[])
+            .await?;
+        Ok(res
+            .rows
+            .iter()
+            .map(|row| row_to_dataplane(&res.columns, row))
+            .collect())
+    }
+
+    pub async fn get_dataplane(&self, service_id: &str) -> Result<Option<DataplaneService>, GseError> {
+        let res = self
+            .execute(
+                "SELECT * FROM dataplane_services WHERE service_id = ?",
+                &[text(service_id)],
+            )
+            .await?;
+        Ok(res
+            .rows
+            .first()
+            .map(|row| row_to_dataplane(&res.columns, row)))
+    }
+
+    pub async fn delete_dataplane(&self, service_id: &str) -> Result<(), GseError> {
+        self.execute(
+            "DELETE FROM dataplane_services WHERE service_id = ?",
+            &[text(service_id)],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// 探活回写：`online` 记录 last_seen_at，其余置 `offline`。
+    pub async fn set_dataplane_status(
+        &self,
+        service_id: &str,
+        status: &str,
+        last_seen_at: Option<&str>,
+    ) -> Result<(), GseError> {
+        self.execute(
+            "UPDATE dataplane_services SET status = ?, last_seen_at = ? WHERE service_id = ?",
+            &[text(status), opt_text(last_seen_at), text(service_id)],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// 在 `online` 集合中按 `service_id` 字典序取模选一条 `ingest_url`。
+    pub async fn pick_ingest_url(&self, agent_id: &str) -> Result<Option<String>, GseError> {
+        let all = self.list_dataplanes().await?;
+        let online: Vec<DataplaneService> = all
+            .into_iter()
+            .filter(|d| d.status == "online")
+            .collect();
+        if online.is_empty() {
+            return Ok(None);
+        }
+        let idx = (hash_agent(agent_id) as usize) % online.len();
+        Ok(Some(online[idx].ingest_url.clone()))
+    }
+
+    // ---- collect_items ----
+
+    /// 以 `item_id` 为主键幂等保存采集项。
+    pub async fn upsert_collect_item(&self, item: &CollectItem) -> Result<(), GseError> {
+        let agent_ids = serde_json::to_string(&item.agent_ids)
+            .map_err(|e| GseError::new("invalid_argument", e.to_string()))?;
+        let collector = serde_json::to_string(&item.collector)
+            .map_err(|e| GseError::new("invalid_argument", e.to_string()))?;
+        let storage = serde_json::to_string(&item.storage)
+            .map_err(|e| GseError::new("invalid_argument", e.to_string()))?;
+        let sql = "INSERT INTO collect_items (item_id, agent_ids, name, kind, enabled, collector_json, storage_json, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(item_id) DO UPDATE SET
+                     agent_ids = excluded.agent_ids,
+                     name = excluded.name,
+                     kind = excluded.kind,
+                     enabled = excluded.enabled,
+                     collector_json = excluded.collector_json,
+                     storage_json = excluded.storage_json,
+                     updated_at = excluded.updated_at";
+        self.execute(
+            sql,
+            &[
+                text(&item.item_id),
+                SqlValue::Text(agent_ids),
+                text(&item.name),
+                text(&item.kind),
+                bool_int(item.enabled),
+                SqlValue::Text(collector),
+                SqlValue::Text(storage),
+                text(&item.updated_at),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_collect_item(&self, item_id: &str) -> Result<Option<CollectItem>, GseError> {
+        let res = self
+            .execute(
+                "SELECT * FROM collect_items WHERE item_id = ?",
+                &[text(item_id)],
+            )
+            .await?;
+        Ok(res
+            .rows
+            .first()
+            .map(|row| row_to_collect_item(&res.columns, row)))
+    }
+
+    /// 列出采集项，最新更新在前；`agent_id` 存在时仅返回目标列表包含它的项。
+    pub async fn list_collect_items(
+        &self,
+        agent_id: Option<&str>,
+    ) -> Result<Vec<CollectItem>, GseError> {
+        let res = self
+            .execute("SELECT * FROM collect_items ORDER BY updated_at DESC", &[])
+            .await?;
+        Ok(res
+            .rows
+            .iter()
+            .map(|row| row_to_collect_item(&res.columns, row))
+            .filter(|item| match agent_id {
+                Some(id) => item.agent_ids.iter().any(|a| a == id),
+                None => true,
+            })
+            .collect())
+    }
+
+    /// 删除采集项；返回是否存在并删除。
+    pub async fn delete_collect_item(&self, item_id: &str) -> Result<bool, GseError> {
+        if self.get_collect_item(item_id).await?.is_none() {
+            return Ok(false);
+        }
+        self.execute("DELETE FROM collect_items WHERE item_id = ?", &[text(item_id)])
+            .await?;
+        Ok(true)
     }
 
     // ---- agent_configs ----
@@ -888,6 +1115,14 @@ fn opt_i32(v: Option<i32>) -> SqlValue {
         .unwrap_or(SqlValue::Null)
 }
 
+/// 对 `agent_id` 字节做一次 `DefaultHasher`。
+fn hash_agent(agent_id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    agent_id.as_bytes().hash(&mut hasher);
+    hasher.finish()
+}
+
 fn bool_int(v: bool) -> SqlValue {
     SqlValue::Integer(if v { 1 } else { 0 })
 }
@@ -1017,6 +1252,38 @@ fn row_to_agent_config(columns: &[String], row: &[SqlValue]) -> AgentConfig {
     }
 }
 
+fn row_to_dataplane(columns: &[String], row: &[SqlValue]) -> DataplaneService {
+    DataplaneService {
+        service_id: field_text(columns, row, "service_id"),
+        ingest_url: field_text(columns, row, "ingest_url"),
+        query_url: field_text(columns, row, "query_url"),
+        status: field_text(columns, row, "status"),
+        last_seen_at: field_opt_text(columns, row, "last_seen_at"),
+        registered_at: field_text(columns, row, "registered_at"),
+    }
+}
+
+fn row_to_collect_item(columns: &[String], row: &[SqlValue]) -> CollectItem {
+    let agent_ids: Vec<String> =
+        serde_json::from_str(&field_text(columns, row, "agent_ids")).unwrap_or_default();
+    let collector: serde_json::Value =
+        serde_json::from_str(&field_text(columns, row, "collector_json"))
+            .unwrap_or(serde_json::Value::Null);
+    let storage: serde_json::Value =
+        serde_json::from_str(&field_text(columns, row, "storage_json"))
+            .unwrap_or(serde_json::Value::Null);
+    CollectItem {
+        item_id: field_text(columns, row, "item_id"),
+        agent_ids,
+        name: field_text(columns, row, "name"),
+        kind: field_text(columns, row, "kind"),
+        enabled: field_i64(columns, row, "enabled") != 0,
+        collector,
+        storage,
+        updated_at: field_text(columns, row, "updated_at"),
+    }
+}
+
 fn row_to_job(columns: &[String], row: &[SqlValue]) -> JobRecord {
     let status = JobStatus::parse(&field_text(columns, row, "status")).unwrap_or(JobStatus::Lost);
     let args: Vec<String> =
@@ -1131,6 +1398,128 @@ mod tests {
     async fn init_is_idempotent() {
         let ledger = fresh_ledger("init-idemp").await;
         ledger.init().await.expect("second init");
+    }
+
+    fn dataplane(id: &str, ingest_url: &str, status: &str) -> DataplaneService {
+        DataplaneService {
+            service_id: id.to_string(),
+            ingest_url: ingest_url.to_string(),
+            query_url: ingest_url.to_string(),
+            status: status.to_string(),
+            last_seen_at: None,
+            registered_at: ledger_stamp(),
+        }
+    }
+
+    #[tokio::test]
+    async fn dataplane_upsert_resets_status_and_crud() {
+        let ledger = fresh_ledger("dp-crud").await;
+        ledger
+            .upsert_dataplane(&dataplane("ds-1", "http://10.0.0.5:8081", "online"))
+            .await
+            .expect("upsert");
+        let got = ledger.get_dataplane("ds-1").await.unwrap().unwrap();
+        assert_eq!(got.status, "unknown");
+        assert_eq!(got.ingest_url, "http://10.0.0.5:8081");
+        assert_eq!(ledger.list_dataplanes().await.unwrap().len(), 1);
+
+        ledger
+            .set_dataplane_status("ds-1", "online", Some("t1"))
+            .await
+            .unwrap();
+        let got = ledger.get_dataplane("ds-1").await.unwrap().unwrap();
+        assert_eq!(got.status, "online");
+        assert_eq!(got.last_seen_at.as_deref(), Some("t1"));
+
+        ledger.delete_dataplane("ds-1").await.unwrap();
+        assert!(ledger.get_dataplane("ds-1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn pick_ingest_url_uses_online_sorted_subset() {
+        let ledger = fresh_ledger("dp-pick").await;
+        ledger
+            .upsert_dataplane(&dataplane("b", "http://b:8081", "unknown"))
+            .await
+            .unwrap();
+        ledger
+            .upsert_dataplane(&dataplane("a", "http://a:8081", "unknown"))
+            .await
+            .unwrap();
+
+        // 无 online 实例 -> None。
+        assert!(ledger.pick_ingest_url("agent-1").await.unwrap().is_none());
+
+        ledger.set_dataplane_status("a", "online", Some("t")).await.unwrap();
+        ledger.set_dataplane_status("b", "online", Some("t")).await.unwrap();
+        let first = ledger.pick_ingest_url("agent-1").await.unwrap();
+        let second = ledger.pick_ingest_url("agent-1").await.unwrap();
+        assert_eq!(first, second);
+        assert!(first.is_some());
+
+        // 只留一台时所有 agent 都落到该台。
+        ledger.set_dataplane_status("a", "offline", None).await.unwrap();
+        assert_eq!(
+            ledger.pick_ingest_url("agent-1").await.unwrap().as_deref(),
+            Some("http://b:8081")
+        );
+        assert_eq!(
+            ledger.pick_ingest_url("agent-2").await.unwrap().as_deref(),
+            Some("http://b:8081")
+        );
+    }
+
+    fn collect_item(id: &str, agents: &[&str]) -> CollectItem {
+        CollectItem {
+            item_id: id.to_string(),
+            agent_ids: agents.iter().map(|a| a.to_string()).collect(),
+            name: format!("item-{id}"),
+            kind: "metrics_host".to_string(),
+            enabled: true,
+            collector: serde_json::json!({"interval_secs": 15}),
+            storage: serde_json::json!({"retention_days": 1}),
+            updated_at: ledger_stamp(),
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_item_crud_and_agent_filter() {
+        let ledger = fresh_ledger("collect-crud").await;
+        ledger
+            .upsert_collect_item(&collect_item("i-1", &["a-1", "a-2"]))
+            .await
+            .unwrap();
+        ledger
+            .upsert_collect_item(&collect_item("i-2", &["a-2"]))
+            .await
+            .unwrap();
+
+        let got = ledger.get_collect_item("i-1").await.unwrap().unwrap();
+        assert_eq!(got.agent_ids, vec!["a-1", "a-2"]);
+        assert_eq!(got.collector["interval_secs"], 15);
+        assert!(got.enabled);
+
+        // 目标过滤：a-1 只命中 i-1，a-2 命中两条，a-3 为空。
+        assert_eq!(
+            ledger.list_collect_items(Some("a-1")).await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            ledger.list_collect_items(Some("a-2")).await.unwrap().len(),
+            2
+        );
+        assert!(ledger.list_collect_items(Some("a-3")).await.unwrap().is_empty());
+        assert_eq!(ledger.list_collect_items(None).await.unwrap().len(), 2);
+
+        // 关闭开关后仍在列表中（前端需要显示禁用的项）。
+        let mut disabled = collect_item("i-2", &["a-2"]);
+        disabled.enabled = false;
+        ledger.upsert_collect_item(&disabled).await.unwrap();
+        assert!(!ledger.get_collect_item("i-2").await.unwrap().unwrap().enabled);
+
+        assert!(ledger.delete_collect_item("i-1").await.unwrap());
+        assert!(!ledger.delete_collect_item("i-1").await.unwrap());
+        assert!(ledger.get_collect_item("i-1").await.unwrap().is_none());
     }
 
     #[tokio::test]

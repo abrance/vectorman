@@ -23,3 +23,13 @@ export {
 } from "./gse/templates";
 export { SqlHttpAdapter, type SqlResult } from "./dataplane/sql";
 export { PromQueryAdapter, type PromEnvelope } from "./dataplane/prom";
+export {
+  DataplaneAdapter,
+  type CollectItem,
+  type CollectItemInput,
+  type CollectItemKind,
+  type ExtractRule,
+  type LogRecord,
+  type LogSearchRequest,
+  type StreamEntry,
+} from "./dataplane/ingest";

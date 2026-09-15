@@ -21,7 +21,10 @@ use serde_json::json;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::config::ServerConfig;
-use crate::ledger::{ledger_stamp, AccessPoint, Agent, AgentConfig, Host, JobTemplate, Ledger};
+use crate::ledger::{
+    ledger_stamp, AccessPoint, Agent, AgentConfig, CollectItem, DataplaneService, Host,
+    JobTemplate, Ledger,
+};
 use crate::rerun::RerunRequest;
 use crate::server::{submit_job, submit_job_with_template, submit_rerun, JobSubmit};
 use crate::session::SessionRegistry;
@@ -85,6 +88,21 @@ fn ledger_routes(admin: AdminState) -> Router {
         )
         .route("/agents", get(list_agents).post(create_agent))
         .route("/agents/{agent_id}", get(get_agent).delete(delete_agent))
+        .route(
+            "/dataplanes",
+            get(list_dataplanes).post(create_dataplane),
+        )
+        .route(
+            "/dataplanes/{service_id}",
+            get(get_dataplane).delete(delete_dataplane),
+        )
+        .route("/collect-items", get(list_collect_items).post(create_collect_item))
+        .route(
+            "/collect-items/{item_id}",
+            get(get_collect_item)
+                .put(update_collect_item)
+                .delete(delete_collect_item),
+        )
         .route(
             "/agent-configs",
             get(list_agent_configs).post(create_agent_config),
@@ -329,6 +347,295 @@ async fn delete_agent(State(admin): State<AdminState>, Path(id): Path<String>) -
         }
     }
     Json(json!({"deleted": id})).into_response()
+}
+
+// ---- dataplanes ----
+
+async fn list_dataplanes(State(admin): State<AdminState>) -> Response {
+    match admin.ledger.list_dataplanes().await {
+        Ok(v) => ok(&v),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+async fn create_dataplane(
+    State(admin): State<AdminState>,
+    body: Result<Json<DataplaneService>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(d) = match body {
+        Ok(b) => b,
+        Err(e) => return from_json_err(e),
+    };
+    if let Some(resp) = require(!d.service_id.trim().is_empty(), "service_id") {
+        return resp;
+    }
+    if let Some(resp) = require(!d.ingest_url.trim().is_empty(), "ingest_url") {
+        return resp;
+    }
+    if let Some(resp) = require(!d.query_url.trim().is_empty(), "query_url") {
+        return resp;
+    }
+    let mut d = d;
+    if d.registered_at.is_empty() {
+        d.registered_at = ledger_stamp();
+    }
+    match admin.ledger.upsert_dataplane(&d).await {
+        Ok(()) => created(&d),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+async fn get_dataplane(State(admin): State<AdminState>, Path(service_id): Path<String>) -> Response {
+    match admin.ledger.get_dataplane(&service_id).await {
+        Ok(Some(d)) => ok(&d),
+        Ok(None) => err_json(
+            StatusCode::NOT_FOUND,
+            GseError::new("not_found", format!("dataplane {service_id} not found")),
+        ),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+async fn delete_dataplane(
+    State(admin): State<AdminState>,
+    Path(service_id): Path<String>,
+) -> Response {
+    match admin.ledger.delete_dataplane(&service_id).await {
+        Ok(()) => Json(json!({"deleted": service_id})).into_response(),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+// ---- collect-items ----
+
+#[derive(serde::Deserialize)]
+struct CollectItemsQuery {
+    agent_id: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct CollectItemInput {
+    #[serde(default)]
+    agent_ids: Vec<String>,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    collector: serde_json::Value,
+    #[serde(default)]
+    storage: serde_json::Value,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+static ITEM_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 生成采集项 ID：`item-{unix_micros}-{seq}`。
+fn new_collect_item_id() -> String {
+    let seq = ITEM_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("item-{}-{}", crate::session::now_micros(), seq)
+}
+
+fn json_non_empty_str(v: &serde_json::Value, key: &str) -> bool {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn json_non_empty_str_array(v: &serde_json::Value, key: &str) -> bool {
+    v.get(key)
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .any(|s| s.as_str().map(|x| !x.trim().is_empty()).unwrap_or(false))
+        })
+        .unwrap_or(false)
+}
+
+/// 入库配置标准化：`retention_days` 缺省或非正数时回落到 1 天。
+fn normalize_storage(v: &serde_json::Value) -> serde_json::Value {
+    let days = v
+        .get("retention_days")
+        .and_then(|x| x.as_u64())
+        .filter(|d| *d > 0)
+        .unwrap_or(1);
+    json!({"retention_days": days})
+}
+
+/// 校验输入并构造完整采集项：类型合法、目标至少一个、日志类含匹配模式。
+fn build_collect_item(item_id: &str, input: &CollectItemInput) -> Result<CollectItem, GseError> {
+    if input.name.trim().is_empty() {
+        return Err(GseError::new("invalid_argument", "missing required field: name"));
+    }
+    if !matches!(
+        input.kind.as_str(),
+        "metrics_host" | "log_file" | "log_k8s_stdout"
+    ) {
+        return Err(GseError::new(
+            "invalid_argument",
+            format!("unsupported kind: {}", input.kind),
+        ));
+    }
+    let mut agent_ids: Vec<String> = Vec::new();
+    for a in &input.agent_ids {
+        let a = a.trim();
+        if !a.is_empty() && !agent_ids.iter().any(|x| x == a) {
+            agent_ids.push(a.to_string());
+        }
+    }
+    if agent_ids.is_empty() {
+        return Err(GseError::new(
+            "invalid_argument",
+            "missing required field: agent_ids",
+        ));
+    }
+    match input.kind.as_str() {
+        "log_file" if !json_non_empty_str_array(&input.collector, "path_patterns") => {
+            return Err(GseError::new(
+                "invalid_argument",
+                "log_file requires non-empty path_patterns",
+            ));
+        }
+        "log_k8s_stdout" => {
+            if !json_non_empty_str(&input.collector, "namespace") {
+                return Err(GseError::new(
+                    "invalid_argument",
+                    "log_k8s_stdout requires namespace",
+                ));
+            }
+            if !json_non_empty_str(&input.collector, "pod_name_pattern") {
+                return Err(GseError::new(
+                    "invalid_argument",
+                    "log_k8s_stdout requires pod_name_pattern",
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(CollectItem {
+        item_id: item_id.to_string(),
+        agent_ids,
+        name: input.name.trim().to_string(),
+        kind: input.kind.clone(),
+        enabled: input.enabled,
+        collector: input.collector.clone(),
+        storage: normalize_storage(&input.storage),
+        updated_at: ledger_stamp(),
+    })
+}
+
+/// 保存或删除后向目标在线 Agent 推送过滤整表；无 registry 或推送失败不影响写入结果。
+async fn push_collect_items_to_agents(admin: &AdminState, agent_ids: &[String]) {
+    let Some(registry) = admin.registry.as_ref() else {
+        return;
+    };
+    crate::server::push_collect_items_to(&admin.ledger, registry, agent_ids).await;
+}
+
+async fn list_collect_items(
+    State(admin): State<AdminState>,
+    Query(q): Query<CollectItemsQuery>,
+) -> Response {
+    match admin.ledger.list_collect_items(q.agent_id.as_deref()).await {
+        Ok(v) => ok(&v),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+async fn get_collect_item(State(admin): State<AdminState>, Path(item_id): Path<String>) -> Response {
+    match admin.ledger.get_collect_item(&item_id).await {
+        Ok(Some(i)) => ok(&i),
+        Ok(None) => err_json(
+            StatusCode::NOT_FOUND,
+            GseError::new("not_found", format!("collect item {item_id} not found")),
+        ),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+async fn create_collect_item(
+    State(admin): State<AdminState>,
+    body: Result<Json<CollectItemInput>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(input) = match body {
+        Ok(b) => b,
+        Err(e) => return from_json_err(e),
+    };
+    let item = match build_collect_item(&new_collect_item_id(), &input) {
+        Ok(i) => i,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+    };
+    if let Err(e) = admin.ledger.upsert_collect_item(&item).await {
+        return err_json(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+    push_collect_items_to_agents(&admin, &item.agent_ids).await;
+    created(&item)
+}
+
+async fn update_collect_item(
+    State(admin): State<AdminState>,
+    Path(item_id): Path<String>,
+    body: Result<Json<CollectItemInput>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(input) = match body {
+        Ok(b) => b,
+        Err(e) => return from_json_err(e),
+    };
+    let old = match admin.ledger.get_collect_item(&item_id).await {
+        Ok(Some(i)) => i,
+        Ok(None) => {
+            return err_json(
+                StatusCode::NOT_FOUND,
+                GseError::new("not_found", format!("collect item {item_id} not found")),
+            )
+        }
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let item = match build_collect_item(&item_id, &input) {
+        Ok(i) => i,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+    };
+    if let Err(e) = admin.ledger.upsert_collect_item(&item).await {
+        return err_json(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+    // 新旧目标合并推送：被移出列表的 Agent 也要收到更新，停止该项采集。
+    let mut targets = old.agent_ids;
+    targets.extend(item.agent_ids.iter().cloned());
+    push_collect_items_to_agents(&admin, &targets).await;
+    ok(&item)
+}
+
+async fn delete_collect_item(
+    State(admin): State<AdminState>,
+    Path(item_id): Path<String>,
+) -> Response {
+    let old = match admin.ledger.get_collect_item(&item_id).await {
+        Ok(Some(i)) => i,
+        Ok(None) => {
+            return err_json(
+                StatusCode::NOT_FOUND,
+                GseError::new("not_found", format!("collect item {item_id} not found")),
+            )
+        }
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    match admin.ledger.delete_collect_item(&item_id).await {
+        Ok(true) => {
+            push_collect_items_to_agents(&admin, &old.agent_ids).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => err_json(
+            StatusCode::NOT_FOUND,
+            GseError::new("not_found", format!("collect item {item_id} not found")),
+        ),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
 }
 
 // ---- agent_configs ----
@@ -949,6 +1256,173 @@ mod tests {
         );
         // host 不随 agent 删除而消失。
         assert!(ledger.get_host("h-1").await.expect("get").is_some());
+    }
+
+    #[tokio::test]
+    async fn dataplanes_crud_and_validation() {
+        let (mut app, ledger) = app_ledger("dataplanes").await;
+
+        // 缺 ingest_url -> 400
+        let (status, body) = send(
+            &mut app,
+            req(
+                "POST",
+                "/api/gse/dataplanes",
+                Some(r#"{"service_id":"ds-1","query_url":"http://q:9090"}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("ingest_url"), "{body}");
+
+        // 登记 -> 201，状态归为 unknown
+        let (status, body) = send(
+            &mut app,
+            req(
+                "POST",
+                "/api/gse/dataplanes",
+                Some(
+                    r#"{"service_id":"ds-1","ingest_url":"http://10.0.0.5:8081","query_url":"http://10.0.0.5:9090"}"#,
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(body.contains("ds-1"), "{body}");
+
+        // 列表与单条（落库后状态归为 unknown）
+        let (status, body) = send(&mut app, req("GET", "/api/gse/dataplanes", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("\"status\":\"unknown\""), "{body}");
+        let (status, body) = send(&mut app, req("GET", "/api/gse/dataplanes/ds-1", None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("10.0.0.5:8081"), "{body}");
+        let (status, _) = send(&mut app, req("GET", "/api/gse/dataplanes/ghost", None)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // 探活回写后 pick 能命中。
+        ledger
+            .set_dataplane_status("ds-1", "online", Some("t"))
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger.pick_ingest_url("agent-1").await.unwrap().as_deref(),
+            Some("http://10.0.0.5:8081")
+        );
+
+        // 删除
+        let (status, _) = send(&mut app, req("DELETE", "/api/gse/dataplanes/ds-1", None)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = send(&mut app, req("GET", "/api/gse/dataplanes/ds-1", None)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn collect_items_crud_and_validation() {
+        let (mut app, _ledger) = app_ledger("collect-items").await;
+
+        // 非法 kind。
+        let (status, body) = send(
+            &mut app,
+            req(
+                "POST",
+                "/api/gse/collect-items",
+                Some(r#"{"name":"x","kind":"nope","agent_ids":["a-1"],"collector":{}}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("kind"), "{body}");
+
+        // 缺目标 Agent。
+        let (status, body) = send(
+            &mut app,
+            req(
+                "POST",
+                "/api/gse/collect-items",
+                Some(r#"{"name":"x","kind":"metrics_host","agent_ids":[],"collector":{}}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        // log_file 缺 path_patterns。
+        let (status, body) = send(
+            &mut app,
+            req(
+                "POST",
+                "/api/gse/collect-items",
+                Some(r#"{"name":"x","kind":"log_file","agent_ids":["a-1"],"collector":{}}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("path_patterns"), "{body}");
+
+        // 合法创建：目标去重去空白，storage 缺省回落 1 天。
+        let create = r#"{"name":"cpu","kind":"metrics_host","agent_ids":["a-1","a-1"," a-2 ",""],"collector":{"interval_secs":15},"storage":{}}"#;
+        let (status, body) =
+            send(&mut app, req("POST", "/api/gse/collect-items", Some(create))).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(body.contains("\"retention_days\":1"), "{body}");
+        assert!(body.contains("\"agent_ids\":[\"a-1\",\"a-2\"]"), "{body}");
+        let created: serde_json::Value = serde_json::from_str(&body).expect("json");
+        let item_id = created["item_id"].as_str().expect("item_id").to_string();
+
+        // 列表：全部与按 agent 过滤。
+        let (status, body) = send(&mut app, req("GET", "/api/gse/collect-items", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains(&item_id), "{body}");
+        let (status, body) = send(
+            &mut app,
+            req("GET", "/api/gse/collect-items?agent_id=a-2", None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains(&item_id), "{body}");
+        let (status, body) = send(
+            &mut app,
+            req("GET", "/api/gse/collect-items?agent_id=a-9", None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body.trim(), "[]", "{body}");
+
+        // 单条与 404。
+        let (status, _) = send(
+            &mut app,
+            req("GET", &format!("/api/gse/collect-items/{item_id}"), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = send(&mut app, req("GET", "/api/gse/collect-items/ghost", None)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // 更新为关闭并缩减目标；保存周期改为 2 天。
+        let update = r#"{"name":"cpu","kind":"metrics_host","enabled":false,"agent_ids":["a-1"],"collector":{"interval_secs":15},"storage":{"retention_days":2}}"#;
+        let (status, body) = send(
+            &mut app,
+            req("PUT", &format!("/api/gse/collect-items/{item_id}"), Some(update)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("\"enabled\":false"), "{body}");
+        assert!(body.contains("\"retention_days\":2"), "{body}");
+        assert!(!body.contains("a-2"), "{body}");
+
+        // 删除 204，再取 404。
+        let (status, _) = send(
+            &mut app,
+            req("DELETE", &format!("/api/gse/collect-items/{item_id}"), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = send(
+            &mut app,
+            req("GET", &format!("/api/gse/collect-items/{item_id}"), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

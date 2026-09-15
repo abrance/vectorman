@@ -604,6 +604,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dataplane-ingest"
+version = "0.1.0"
+dependencies = [
+ "dataplane-core",
+ "dataplane-kv",
+ "dataplane-log",
+ "dataplane-ts",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "dataplane-kv"
 version = "0.1.0"
 dependencies = [
@@ -622,6 +636,7 @@ dependencies = [
  "serde_json",
  "tantivy",
  "tantivy-jieba",
+ "tempfile",
  "tokio",
  "uuid",
 ]
@@ -654,13 +669,19 @@ dependencies = [
  "clap",
  "dataplane-core",
  "dataplane-file",
+ "dataplane-ingest",
  "dataplane-kv",
  "dataplane-log",
  "dataplane-sql",
  "dataplane-ts",
+ "http-body-util",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tower",
+ "tower-http",
+ "ureq",
 ]
 
 [[package]]
@@ -968,10 +989,12 @@ dependencies = [
  "geminio",
  "gse-proto",
  "libc",
+ "regex",
  "serde",
  "serde_json",
  "tokio",
  "toml",
+ "ureq",
 ]
 
 [[package]]
@@ -1009,6 +1032,7 @@ dependencies = [
  "toml",
  "tower",
  "tower-http",
+ "ureq",
 ]
 
 [[package]]
@@ -2737,6 +2761,8 @@ dependencies = [
  "once_cell",
  "rustls",
  "rustls-pki-types",
+ "serde",
+ "serde_json",
  "url",
  "webpki-roots 0.26.11",
 ]

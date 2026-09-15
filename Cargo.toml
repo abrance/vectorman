@@ -7,6 +7,7 @@ members = [
     "crates/dataplane-log",
     "crates/dataplane-kv",
     "crates/dataplane-sql",
+    "crates/dataplane-ingest",
     "crates/dataplane-adapter-postgres",
     "crates/dataplane-adapter-mysql",
     "crates/dataplane-adapter-redis",
@@ -37,6 +38,7 @@ dataplane-ts = { path = "crates/dataplane-ts" }
 dataplane-log = { path = "crates/dataplane-log" }
 dataplane-kv = { path = "crates/dataplane-kv" }
 dataplane-sql = { path = "crates/dataplane-sql" }
+dataplane-ingest = { path = "crates/dataplane-ingest" }
 
 gse-proto = { path = "crates/gse-proto" }
 gse-server-core = { path = "crates/gse-server-core" }

@@ -6,6 +6,7 @@
 # 环境变量覆盖（GSE_ 前缀）：
 #   GSE_SERVER_CONFIG / GSE_SERVER_LISTEN / GSE_SERVER_AUTH / GSE_SERVER_DB
 #   GSE_SERVER_HTTP_LISTEN / GSE_SERVER_HTTP_WEB_DIR / GSE_SERVER_HEARTBEAT_TIMEOUT
+#   GSE_DATAPLANE_PROBE_INTERVAL
 
 listen = "0.0.0.0:7100"
 auth_enabled = true
@@ -25,6 +26,10 @@ http_enabled = true
 # 目录需含 index.html；未配置或不含 index.html 时仅暴露 API。
 # 相对路径相对进程工作目录；安装包布局下为组件目录（unit 已设 WorkingDirectory）。
 # http_web_dir = "web"
+
+# 数据面探活周期（秒，默认 30）。对每台登记的数据面 GET {ingest_url}/health，
+# 超时 3s；成功置 online，失败立刻 offline。
+# dataplane_probe_interval_secs = 30
 
 # Agent 认证凭据改为预登记进 agents 台账表，不再使用静态 [agents] 段。
 # 登记示例：

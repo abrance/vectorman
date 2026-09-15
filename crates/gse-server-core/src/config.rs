@@ -16,6 +16,9 @@ pub struct ServerConfig {
     /// HTTP 管理端口监听地址，默认仅回环。
     #[serde(default = "default_http_listen")]
     pub http_listen: String,
+    /// 数据面探活周期（秒）。
+    #[serde(default = "default_dataplane_probe_interval")]
+    pub dataplane_probe_interval_secs: u64,
     /// 静态前端目录；配置后同一 HTTP 管理端口同时托管该目录的 dist（SPA 回退 index.html）。
     /// 目录不存在或未配置则不托管静态页面，管理端口仅暴露 API。
     #[serde(default)]
@@ -54,6 +57,7 @@ impl Default for ServerConfig {
             db: default_db(),
             http_enabled: true,
             http_listen: default_http_listen(),
+            dataplane_probe_interval_secs: default_dataplane_probe_interval(),
             http_web_dir: None,
             heartbeat_interval_secs: default_interval(),
             heartbeat_timeout_secs: default_timeout(),
@@ -81,6 +85,10 @@ fn default_db() -> String {
 
 fn default_http_listen() -> String {
     "127.0.0.1:7101".to_string()
+}
+
+fn default_dataplane_probe_interval() -> u64 {
+    30
 }
 
 fn default_interval() -> u64 {
@@ -133,6 +141,11 @@ pub fn load_config(path: &str) -> Result<ServerConfig, String> {
         // 显式设空串可关闭静态托管。
         cfg.http_web_dir = if v.is_empty() { None } else { Some(v) };
     }
+    if let Ok(v) = std::env::var("GSE_DATAPLANE_PROBE_INTERVAL") {
+        if let Ok(secs) = v.parse() {
+            cfg.dataplane_probe_interval_secs = secs;
+        }
+    }
     if let Ok(v) = std::env::var("GSE_SERVER_HEARTBEAT_TIMEOUT") {
         if let Ok(secs) = v.parse() {
             cfg.heartbeat_timeout_secs = secs;
@@ -184,6 +197,7 @@ mod tests {
             "GSE_SERVER_DB",
             "GSE_SERVER_HTTP_LISTEN",
             "GSE_SERVER_HTTP_WEB_DIR",
+            "GSE_DATAPLANE_PROBE_INTERVAL",
             "GSE_SERVER_HEARTBEAT_TIMEOUT",
             "GSE_SERVER_JOBS",
             "GSE_SERVER_JOB_DEFAULT_TIMEOUT",
@@ -201,6 +215,7 @@ mod tests {
             "GSE_SERVER_DB",
             "GSE_SERVER_HTTP_LISTEN",
             "GSE_SERVER_HTTP_WEB_DIR",
+            "GSE_DATAPLANE_PROBE_INTERVAL",
             "GSE_SERVER_HEARTBEAT_TIMEOUT",
             "GSE_SERVER_JOBS",
             "GSE_SERVER_JOB_DEFAULT_TIMEOUT",

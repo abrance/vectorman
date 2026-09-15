@@ -12,3 +12,6 @@ serde_json = { workspace = true }
 tantivy = "0.26"
 tantivy-jieba = "0.20"
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
