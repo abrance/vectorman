@@ -6,6 +6,7 @@ use vmctl::{Client, JobRerunSpec, JobSubmitSpec, UreqTransport, WaitPolicy, DEFA
 #[derive(Parser)]
 #[command(
     name = "vmctl",
+    version = vectorman_version::VERSION,
     about = "gse-server HTTP 客户端：节点只读查询与作业提交"
 )]
 struct Cli {

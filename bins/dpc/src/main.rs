@@ -6,6 +6,7 @@ use dataplane_core::ErrorCode;
 #[derive(Parser)]
 #[command(
     name = "dpc",
+    version = vectorman_version::VERSION,
     about = "dataplane 运维命令行：通过 HTTP 访问 dataserver"
 )]
 struct Cli {

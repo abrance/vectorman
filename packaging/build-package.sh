@@ -62,6 +62,8 @@ else
   # rustc musl target 默认用 rust-lld 做静态链接。把 LINKER 设成 musl-gcc
   # 时，ring/ureq（vmctl、dpc）启动会 SIGSEGV。C 依赖只需 CC=musl-gcc。
   unset CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER
+  # 注入发布版本到 --version；本地 cargo 未设该变量时回退 git describe。
+  export VECTORMAN_VERSION="$REL"
   cargo build --release --workspace --target "$MUSL_TARGET" || fail cargo-build
   BIN_DIR="$REPO_ROOT/target/$MUSL_TARGET/release"
   BUILT_MUSL=1

@@ -30,6 +30,10 @@ v1 暂不接入 influxdb、es、redis、七牛云 s3、mysql 等成熟组件；�
 | `bins/gse-server` | GSE 全局调度引擎调度端：Agent 会话管理与信令上下行通道 |
 | `bins/gse-agent` | GSE 执行端：部署在目标机器，主动外连 Server，接收指令并执行 |
 
+全部二进制支持 `--help` / `--version`（`-h` / `-V`），且不依赖配置文件。
+
+`--version` 在编译期注入：release 打包（`packaging/build-package.sh`）写入 tag 版本；本地构建优先 `VECTORMAN_VERSION`，否则 `git describe --tags --always --dirty`。
+
 ### 2.3 演进原则
 
 数据管道 + 数据存储合并在一个组件中承载，避免二进制数量膨胀。
