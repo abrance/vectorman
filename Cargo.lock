@@ -419,6 +419,7 @@ dependencies = [
  "tower",
  "tower-http",
  "url",
+ "vectorman-version",
 ]
 
 [[package]]
@@ -683,6 +684,7 @@ dependencies = [
  "tower",
  "tower-http",
  "ureq",
+ "vectorman-version",
 ]
 
 [[package]]
@@ -726,6 +728,7 @@ dependencies = [
  "serde_json",
  "ureq",
  "urlencoding",
+ "vectorman-version",
 ]
 
 [[package]]
@@ -981,6 +984,7 @@ version = "0.1.0"
 dependencies = [
  "gse-agent-core",
  "tokio",
+ "vectorman-version",
 ]
 
 [[package]]
@@ -1014,6 +1018,7 @@ version = "0.1.0"
 dependencies = [
  "gse-server-core",
  "tokio",
+ "vectorman-version",
 ]
 
 [[package]]
@@ -2823,6 +2828,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
+name = "vectorman-version"
+version = "0.1.0"
+
+[[package]]
 name = "vmctl"
 version = "0.1.0"
 dependencies = [
@@ -2831,6 +2840,7 @@ dependencies = [
  "serde_json",
  "ureq",
  "urlencoding",
+ "vectorman-version",
 ]
 
 [[package]]

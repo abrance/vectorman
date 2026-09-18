@@ -15,6 +15,11 @@ use dataserver::http::{prom_router, sql_router, AppState};
 const ENGINE_DIR_MODE_REQUIRED: &str = "dataserver requires a directory data_path (single-file mode only supports sqlite, and this server enables all engines)";
 
 #[derive(Parser)]
+#[command(
+    name = "dataserver",
+    version = vectorman_version::VERSION,
+    about = "Vectorman Dataserver (SQL/Prom HTTP)"
+)]
 struct Args {
     /// 配置文件路径；缺省时读取 ./config.toml，若不存在则使用内置默认值。
     #[arg(long)]

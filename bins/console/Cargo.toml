@@ -13,6 +13,7 @@ toml = "0.8"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs"] }
 url = "2"
+vectorman-version.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

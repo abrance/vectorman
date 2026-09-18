@@ -19,6 +19,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tower-http = { version = "0.6", features = ["fs"] }
 ureq = "2"
+vectorman-version.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -117,6 +117,8 @@ GSE_SERVER_CONFIG=/path/gse-server.toml ./gse-server
 GSE_AGENT_CONFIG=/path/gse-agent.toml ./gse-agent
 ```
 
+- `--help` / `--version`（以及 `-h` / `-V`）在读配置之前处理，缺配置文件也退出码 0。
+- `--version` 打印编译期注入的版本（release 为 tag，本地为 `git describe`）。
 - 进程退出码：正常 0；配置缺失/TOML 非法 1（stderr 含 `config_invalid` 与路径）；bind 失败 1；Agent 认证被拒 1。
 
 ## 5. 配置项

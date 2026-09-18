@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 gse-server-core = { path = "../../crates/gse-server-core" }
 tokio.workspace = true
+vectorman-version.workspace = true
