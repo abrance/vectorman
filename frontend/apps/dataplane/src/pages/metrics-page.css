@@ -1,0 +1,154 @@
+.metrics-page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: 1180px;
+}
+
+.metrics-page__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 8px 16px;
+}
+
+.metrics-page__head h1 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+
+.metrics-page__head p {
+  margin: 4px 0 0;
+  color: #667085;
+  font-size: 13px;
+}
+
+.metrics-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 16px;
+  align-items: flex-end;
+  padding: 14px 16px;
+  background: #fff;
+  border: 1px solid #eceff3;
+  border-radius: 10px;
+}
+
+.metrics-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.metrics-field span {
+  color: #667085;
+  font-size: 12px;
+}
+
+.metrics-toolbar__actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+
+.metrics-expr {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: #5b6472;
+  background: #f4f6f8;
+  border-radius: 6px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 16px;
+}
+
+.metric-panel {
+  background: #fff;
+  border: 1px solid #eceff3;
+  border-radius: 10px;
+  padding: 16px 16px 10px;
+  min-height: 318px;
+  box-shadow: inset 3px 0 0 var(--accent, #2f6bff);
+}
+
+.metric-panel__top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.metric-panel__top h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.metric-panel__top code {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  color: #8b93a2;
+}
+
+.metric-panel__reading {
+  font-size: 36px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.04em;
+  line-height: 1;
+  color: #12151a;
+}
+
+.metric-panel__reading small {
+  margin-left: 4px;
+  font-size: 14px;
+  font-weight: 500;
+  color: #667085;
+}
+
+.metric-panel__body {
+  min-height: 240px;
+}
+
+.metric-panel__error {
+  color: #a61d24;
+  font-size: 13px;
+  padding: 24px 0;
+}
+
+.metrics-custom {
+  padding: 14px 16px 12px;
+  background: #fff;
+  border: 1px solid #eceff3;
+  border-radius: 10px;
+}
+
+.metrics-custom h2 {
+  margin: 0 0 10px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+@media (max-width: 720px) {
+  .metrics-toolbar__actions {
+    margin-left: 0;
+    width: 100%;
+  }
+
+  .metric-panel__reading {
+    font-size: 28px;
+  }
+}
