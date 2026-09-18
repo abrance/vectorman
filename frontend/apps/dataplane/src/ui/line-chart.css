@@ -1,0 +1,37 @@
+.line-chart {
+  position: relative;
+}
+
+.line-chart--empty {
+  height: 220px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #8b93a2;
+  background:
+    repeating-linear-gradient(
+      -12deg,
+      #f7f8fa,
+      #f7f8fa 8px,
+      #f3f4f6 8px,
+      #f3f4f6 16px
+    );
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.line-chart__tick {
+  fill: #8b93a2;
+  font-size: 11px;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+}
+
+.line-chart__legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  min-height: 22px;
+  margin-top: 4px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}

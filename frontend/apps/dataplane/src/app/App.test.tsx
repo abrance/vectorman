@@ -99,7 +99,8 @@ describe("dataplane shell", () => {
     collect.unmount();
 
     const metrics = renderAt("/metrics");
-    expect(await screen.findByText("cpu_usage")).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "指标检索" })).toBeTruthy();
+    expect(screen.getByText("CPU 使用率")).toBeTruthy();
     metrics.unmount();
 
     const logs = renderAt("/logs");
@@ -131,11 +132,17 @@ describe("collect page", () => {
   });
 
   it("jumps to metrics with agent_id and data_id", async () => {
-    renderAt("/");
+    const { http } = renderAt("/");
     await screen.findByRole("switch", { name: "启用 cpu" });
     fireEvent.click(screen.getByRole("button", { name: "数据检索 cpu" }));
-    expect(await screen.findByText("data_id=item-1")).toBeTruthy();
-    expect((screen.getByPlaceholderText("agent_id（可选）") as HTMLInputElement).value).toBe("a-1");
+    expect(await screen.findByRole("heading", { name: "指标检索" })).toBeTruthy();
+    await waitFor(() => {
+      const call = http.calls.find((c) => c.url.startsWith("/api/v1/query_range"));
+      expect(call).toBeTruthy();
+      const decoded = decodeURIComponent(call!.url);
+      expect(decoded).toContain('agent_id="a-1"');
+      expect(decoded).toContain('item_id="item-1"');
+    });
   });
 
   it("opens a create form with multi-select agents", async () => {
@@ -157,6 +164,20 @@ describe("logs page", () => {
     await waitFor(() => {
       const call = http.calls.find((c) => c.url === "/v1/logs/search");
       expect(call?.body).toMatchObject({ data_type: "logs", agent_id: "a-1", data_id: "item-2", limit: 100 });
+    });
+  });
+});
+
+describe("metrics page", () => {
+  it("filters query_range by agent_id and data_id from the URL", async () => {
+    const { http } = renderAt("/metrics?agent_id=a-1&data_id=item-1");
+    await screen.findByRole("heading", { name: "指标检索" });
+    await waitFor(() => {
+      const urls = http.calls
+        .filter((c) => c.url.startsWith("/api/v1/query_range"))
+        .map((c) => decodeURIComponent(c.url));
+      expect(urls.some((u) => u.includes("query=cpu_usage{agent_id=\"a-1\",item_id=\"item-1\"}"))).toBe(true);
+      expect(urls.some((u) => u.includes("query=mem_usage{agent_id=\"a-1\",item_id=\"item-1\"}"))).toBe(true);
     });
   });
 });
