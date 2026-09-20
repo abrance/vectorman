@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use dataplane_core::{DataplaneError, SqlValue};
 use dataplane_sql::{RelationalStore, SqliteRelationalStore};
-use gse_proto::{GseError, JobResult, JobStatus};
+use gse_proto::{FileEndpoint, GseError, JobResult, JobStatus};
 use serde::{Deserialize, Serialize};
 
 /// 主机资产。
@@ -168,10 +168,29 @@ pub struct JobRecord {
     #[serde(default)]
     pub finished_at: Option<String>,
     pub updated_at: String,
+    /// script（缺省）或 file_transfer。
+    #[serde(default = "default_job_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub source: Option<FileEndpoint>,
+    #[serde(default)]
+    pub destination: Option<FileEndpoint>,
+    #[serde(default)]
+    pub source_agent_id: Option<String>,
+    #[serde(default)]
+    pub dest_agent_id: Option<String>,
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub file_bytes: Option<i64>,
+    #[serde(default)]
+    pub file_sha256: Option<String>,
+    #[serde(default)]
+    pub file_id: Option<String>,
 }
 
 /// 新作业的提交参数；由 server 层在受理时构造。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct NewJob {
     pub job_id: String,
     pub agent_id: String,
@@ -184,6 +203,19 @@ pub struct NewJob {
     pub rerun_of: Option<String>,
     pub timeout_secs: u64,
     pub created_at: String,
+    pub kind: String,
+    pub source: Option<FileEndpoint>,
+    pub destination: Option<FileEndpoint>,
+    pub source_agent_id: Option<String>,
+    pub dest_agent_id: Option<String>,
+    pub file_name: Option<String>,
+    pub file_bytes: Option<i64>,
+    pub file_sha256: Option<String>,
+    pub file_id: Option<String>,
+}
+
+fn default_job_kind() -> String {
+    "script".to_string()
 }
 
 /// 作业模板；由 server 层在受理创建时构造。
@@ -296,7 +328,16 @@ impl Ledger {
                 dispatched_at     TEXT,
                 started_at        TEXT,
                 finished_at       TEXT,
-                updated_at        TEXT NOT NULL
+                updated_at        TEXT NOT NULL,
+                kind              TEXT NOT NULL DEFAULT 'script',
+                source_json       TEXT,
+                dest_json         TEXT,
+                file_name         TEXT,
+                file_bytes        INTEGER,
+                file_sha256       TEXT,
+                file_id           TEXT,
+                source_agent_id   TEXT,
+                dest_agent_id     TEXT
             )",
             "CREATE INDEX IF NOT EXISTS idx_jobs_agent ON jobs(agent_id, created_at)",
             "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)",
@@ -341,6 +382,7 @@ impl Ledger {
         }
         self.migrate_jobs_template_id().await?;
         self.migrate_jobs_rerun_of().await?;
+        self.migrate_jobs_file_transfer().await?;
         Ok(())
     }
 
@@ -378,6 +420,41 @@ impl Ledger {
         if !present {
             self.store
                 .execute("ALTER TABLE jobs ADD COLUMN rerun_of TEXT", &[])
+                .await
+                .map_err(|e| format!("init ledger: {}", e.message))?;
+        }
+        Ok(())
+    }
+
+    /// 兼容旧库：补齐文件传输列，重复调用幂等。
+    async fn migrate_jobs_file_transfer(&self) -> Result<(), String> {
+        let info = self
+            .store
+            .execute("PRAGMA table_info(jobs)", &[])
+            .await
+            .map_err(|e| format!("init ledger: {}", e.message))?;
+        let present: std::collections::HashSet<String> = info
+            .rows
+            .iter()
+            .map(|row| field_text(&info.columns, row, "name"))
+            .collect();
+        let wanted = [
+            ("kind", "TEXT NOT NULL DEFAULT 'script'"),
+            ("source_json", "TEXT"),
+            ("dest_json", "TEXT"),
+            ("file_name", "TEXT"),
+            ("file_bytes", "INTEGER"),
+            ("file_sha256", "TEXT"),
+            ("file_id", "TEXT"),
+            ("source_agent_id", "TEXT"),
+            ("dest_agent_id", "TEXT"),
+        ];
+        for (name, decl) in wanted {
+            if present.contains(name) {
+                continue;
+            }
+            self.store
+                .execute(&format!("ALTER TABLE jobs ADD COLUMN {name} {decl}"), &[])
                 .await
                 .map_err(|e| format!("init ledger: {}", e.message))?;
         }
@@ -807,12 +884,21 @@ impl Ledger {
             .map_err(|e| GseError::new("invalid_argument", e.to_string()))?;
         let env = serde_json::to_string(&job.env)
             .map_err(|e| GseError::new("invalid_argument", e.to_string()))?;
+        let kind = if job.kind.trim().is_empty() {
+            "script"
+        } else {
+            job.kind.as_str()
+        };
+        let source_json = opt_json(&job.source)?;
+        let dest_json = opt_json(&job.destination)?;
         let sql = "INSERT INTO jobs (
                        job_id, agent_id, interpreter, script, args, env, working_dir, template_id,
                        rerun_of,
                        timeout_secs, status, stdout_truncated, stderr_truncated,
-                       created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?)";
+                       created_at, updated_at,
+                       kind, source_json, dest_json, file_name, file_bytes, file_sha256, file_id,
+                       source_agent_id, dest_agent_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         self.execute(
             sql,
             &[
@@ -834,6 +920,26 @@ impl Ledger {
                 SqlValue::Integer(job.timeout_secs as i64),
                 text(&job.created_at),
                 text(&job.created_at),
+                text(kind),
+                source_json,
+                dest_json,
+                job.file_name.as_deref().map(text).unwrap_or(SqlValue::Null),
+                job.file_bytes
+                    .map(SqlValue::Integer)
+                    .unwrap_or(SqlValue::Null),
+                job.file_sha256
+                    .as_deref()
+                    .map(text)
+                    .unwrap_or(SqlValue::Null),
+                job.file_id.as_deref().map(text).unwrap_or(SqlValue::Null),
+                job.source_agent_id
+                    .as_deref()
+                    .map(text)
+                    .unwrap_or(SqlValue::Null),
+                job.dest_agent_id
+                    .as_deref()
+                    .map(text)
+                    .unwrap_or(SqlValue::Null),
             ],
         )
         .await?;
@@ -858,7 +964,9 @@ impl Ledger {
         let mut conditions: Vec<&str> = Vec::new();
         let mut params: Vec<SqlValue> = Vec::new();
         if let Some(a) = agent_id {
-            conditions.push("agent_id = ?");
+            conditions.push("(agent_id = ? OR source_agent_id = ? OR dest_agent_id = ?)");
+            params.push(text(a));
+            params.push(text(a));
             params.push(text(a));
         }
         if let Some(s) = status {
@@ -885,6 +993,18 @@ impl Ledger {
                    WHERE job_id = ? AND status NOT IN ('succeeded', 'failed', 'timeout', 'rejected', 'lost')";
         self.execute(sql, &[text(started_at), text(started_at), text(job_id)])
             .await?;
+        Ok(())
+    }
+
+    /// 标记文件作业已进入后台编排；已终态作业不变。
+    pub async fn mark_dispatched(&self, job_id: &str, dispatched_at: &str) -> Result<(), GseError> {
+        let sql = "UPDATE jobs SET status = 'dispatched', dispatched_at = COALESCE(dispatched_at, ?), updated_at = ?
+                   WHERE job_id = ? AND status NOT IN ('succeeded', 'failed', 'timeout', 'rejected', 'lost')";
+        self.execute(
+            sql,
+            &[text(dispatched_at), text(dispatched_at), text(job_id)],
+        )
+        .await?;
         Ok(())
     }
 
@@ -930,6 +1050,32 @@ impl Ledger {
         Ok(())
     }
 
+    /// 回写文件作业结果字段；可在终态前后调用。
+    pub async fn set_job_file_meta(
+        &self,
+        job_id: &str,
+        file_name: Option<&str>,
+        file_bytes: Option<i64>,
+        file_sha256: Option<&str>,
+        file_id: Option<&str>,
+    ) -> Result<(), GseError> {
+        let sql = "UPDATE jobs SET file_name = ?, file_bytes = ?, file_sha256 = ?, file_id = ?, updated_at = ?
+                   WHERE job_id = ?";
+        self.execute(
+            sql,
+            &[
+                file_name.map(text).unwrap_or(SqlValue::Null),
+                file_bytes.map(SqlValue::Integer).unwrap_or(SqlValue::Null),
+                file_sha256.map(text).unwrap_or(SqlValue::Null),
+                file_id.map(text).unwrap_or(SqlValue::Null),
+                text(&ledger_stamp()),
+                text(job_id),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// 标记作业被 Agent 拒绝受理；已终态作业不变。
     pub async fn mark_rejected(&self, job_id: &str, reason: &str) -> Result<(), GseError> {
         let sql = "UPDATE jobs SET status = 'rejected', error = ?, updated_at = ?
@@ -942,10 +1088,14 @@ impl Ledger {
     /// 将会话离线 Agent 的在途作业标记为 lost。
     pub async fn mark_lost_by_agent(&self, agent_id: &str) -> Result<(), GseError> {
         let sql = "UPDATE jobs SET status = 'lost', error = COALESCE(error, 'agent offline'), updated_at = ?
-                   WHERE agent_id = ?
+                   WHERE (agent_id = ? OR source_agent_id = ? OR dest_agent_id = ?)
                      AND status IN ('pending', 'dispatched', 'running')";
-        self.execute(sql, &[text(&ledger_stamp()), text(agent_id)])
-            .await?;
+        let stamp = text(&ledger_stamp());
+        self.execute(
+            sql,
+            &[stamp, text(agent_id), text(agent_id), text(agent_id)],
+        )
+        .await?;
         Ok(())
     }
 
@@ -1206,6 +1356,20 @@ fn field_opt_i64(columns: &[String], row: &[SqlValue], name: &str) -> Option<i64
     }
 }
 
+fn opt_json<T: serde::Serialize>(v: &Option<T>) -> Result<SqlValue, GseError> {
+    match v {
+        None => Ok(SqlValue::Null),
+        Some(val) => serde_json::to_string(val)
+            .map(SqlValue::Text)
+            .map_err(|e| GseError::new("invalid_argument", e.to_string())),
+    }
+}
+
+fn parse_endpoint(raw: Option<String>) -> Option<FileEndpoint> {
+    let s = raw.filter(|v| !v.is_empty())?;
+    serde_json::from_str(&s).ok()
+}
+
 fn row_to_host(columns: &[String], row: &[SqlValue]) -> Host {
     Host {
         host_id: field_text(columns, row, "host_id"),
@@ -1318,6 +1482,22 @@ fn row_to_job(columns: &[String], row: &[SqlValue]) -> JobRecord {
         started_at: field_opt_text(columns, row, "started_at"),
         finished_at: field_opt_text(columns, row, "finished_at"),
         updated_at: field_text(columns, row, "updated_at"),
+        kind: {
+            let k = field_text(columns, row, "kind");
+            if k.is_empty() {
+                default_job_kind()
+            } else {
+                k
+            }
+        },
+        source: parse_endpoint(field_opt_text(columns, row, "source_json")),
+        destination: parse_endpoint(field_opt_text(columns, row, "dest_json")),
+        source_agent_id: field_opt_text(columns, row, "source_agent_id"),
+        dest_agent_id: field_opt_text(columns, row, "dest_agent_id"),
+        file_name: field_opt_text(columns, row, "file_name"),
+        file_bytes: field_opt_i64(columns, row, "file_bytes"),
+        file_sha256: field_opt_text(columns, row, "file_sha256"),
+        file_id: field_opt_text(columns, row, "file_id"),
     }
 }
 
@@ -1724,6 +1904,7 @@ mod tests {
             rerun_of: None,
             timeout_secs: 300,
             created_at: ledger_stamp(),
+            ..Default::default()
         }
     }
 
@@ -2098,5 +2279,54 @@ mod tests {
                 .as_deref(),
             Some("j-plain")
         );
+    }
+
+    #[tokio::test]
+    async fn file_job_filters_and_lost_by_source_or_dest() {
+        let ledger = fresh_ledger("jobs-file").await;
+        let mut job = new_job("j-ft", "dst-1");
+        job.kind = "file_transfer".to_string();
+        job.source = Some(FileEndpoint::Agent {
+            agent_id: "src-1".to_string(),
+            path: "/tmp/a".to_string(),
+        });
+        job.destination = Some(FileEndpoint::Agent {
+            agent_id: "dst-1".to_string(),
+            path: "/tmp/b".to_string(),
+        });
+        job.source_agent_id = Some("src-1".to_string());
+        job.dest_agent_id = Some("dst-1".to_string());
+        ledger.insert_job(&job).await.expect("insert");
+
+        let got = ledger.get_job("j-ft").await.expect("get").expect("exists");
+        assert_eq!(got.kind, "file_transfer");
+        assert_eq!(got.source_agent_id.as_deref(), Some("src-1"));
+        assert_eq!(got.dest_agent_id.as_deref(), Some("dst-1"));
+
+        assert_eq!(
+            ledger
+                .list_jobs(Some("src-1"), None, None)
+                .await
+                .expect("src")
+                .len(),
+            1
+        );
+        assert_eq!(
+            ledger
+                .list_jobs(Some("dst-1"), None, None)
+                .await
+                .expect("dst")
+                .len(),
+            1
+        );
+        assert!(ledger
+            .list_jobs(Some("other"), None, None)
+            .await
+            .expect("other")
+            .is_empty());
+
+        ledger.mark_lost_by_agent("src-1").await.expect("lost");
+        let lost = ledger.get_job("j-ft").await.expect("get").expect("exists");
+        assert_eq!(lost.status, JobStatus::Lost);
     }
 }

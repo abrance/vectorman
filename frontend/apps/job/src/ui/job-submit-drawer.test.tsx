@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { JobTemplate } from "@vectorman/adapters";
-import { buildJobSubmit, JobSubmitDrawer, parseArgs } from "./job-submit-drawer";
+import { buildFileJobSubmit, buildJobSubmit, JobSubmitDrawer, parseArgs } from "./job-submit-drawer";
 
 afterEach(cleanup);
 
@@ -37,6 +37,44 @@ describe("buildJobSubmit", () => {
     const req = buildJobSubmit({ agent_id: "a1", interpreter: "bash", script: "echo" });
     expect(req.working_dir).toBeUndefined();
     expect(req.args).toEqual([]);
+  });
+});
+
+describe("buildFileJobSubmit", () => {
+  it("builds agent to agent endpoints", () => {
+    expect(
+      buildFileJobSubmit({
+        kind: "file_transfer",
+        sourceType: "agent",
+        source_agent_id: "a1",
+        source_path: "/tmp/a",
+        destType: "agent",
+        dest_agent_id: "a2",
+        dest_path: "/tmp/b",
+        timeout_secs: 60,
+      }),
+    ).toEqual({
+      kind: "file_transfer",
+      source: { type: "agent", agent_id: "a1", path: "/tmp/a" },
+      destination: { type: "agent", agent_id: "a2", path: "/tmp/b" },
+      timeout_secs: 60,
+    });
+  });
+
+  it("builds uploaded file to server temp", () => {
+    expect(
+      buildFileJobSubmit({
+        kind: "file_transfer",
+        sourceType: "uploaded",
+        source_file_id: "file-1",
+        destType: "server_temp",
+      }),
+    ).toEqual({
+      kind: "file_transfer",
+      source: { type: "server_temp", file_id: "file-1" },
+      destination: { type: "server_temp" },
+      timeout_secs: undefined,
+    });
   });
 });
 

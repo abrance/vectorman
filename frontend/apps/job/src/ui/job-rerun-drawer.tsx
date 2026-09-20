@@ -39,7 +39,14 @@ export function parseEnv(text?: string): Record<string, string> {
   return out;
 }
 
-export function buildRerunRequest(v: JobRerunFormValues): JobRerunRequest {
+export function buildRerunRequest(v: JobRerunFormValues, kind?: string): JobRerunRequest {
+  if (kind === "file_transfer") {
+    return {
+      agent_id: v.agent_id,
+      dest_path: v.dest_path,
+      timeout_secs: v.timeout_secs,
+    };
+  }
   return {
     agent_id: v.agent_id,
     interpreter: v.interpreter,
@@ -69,13 +76,15 @@ export function JobRerunDrawer({
       return;
     }
     form.setFieldsValue({
-      agent_id: job.agent_id,
+      agent_id:
+        job.destination?.type === "agent" ? job.destination.agent_id : job.agent_id,
       interpreter: job.interpreter,
       script: job.script,
       argsText: (job.args ?? []).join(" "),
       envText: formatEnv(job.env),
       timeout_secs: job.timeout_secs,
       working_dir: job.working_dir ?? undefined,
+      dest_path: job.destination?.type === "agent" ? job.destination.path : undefined,
     });
   }, [job, form]);
 
@@ -98,10 +107,14 @@ export function JobRerunDrawer({
       <Typography.Paragraph type="secondary">
         表单已按来源作业预填，可修改后重做。
       </Typography.Paragraph>
-      <Form form={form} layout="vertical" onFinish={(v) => onConfirm(buildRerunRequest(v))}>
+      <Form
+        form={form}
+        layout="vertical"
+        onFinish={(v) => onConfirm(buildRerunRequest(v, job?.kind))}
+      >
         <Form.Item
           name="agent_id"
-          label="agent_id"
+          label={job?.kind === "file_transfer" ? "目标 Agent" : "agent_id"}
           rules={[{ required: true, message: "请选择 Agent" }]}
         >
           <Select
@@ -109,24 +122,37 @@ export function JobRerunDrawer({
             options={agents.map((a) => ({ value: a, label: a }))}
           />
         </Form.Item>
-        <Form.Item name="interpreter" label="interpreter" rules={[{ required: true }]}>
-          <Select options={JOB_INTERPRETERS.map((i) => ({ value: i, label: i }))} />
-        </Form.Item>
-        <Form.Item name="script" label="script" rules={[{ required: true, message: "请输入脚本" }]}>
-          <Input.TextArea rows={6} />
-        </Form.Item>
-        <Form.Item name="argsText" label="args" tooltip="以空格分隔">
-          <Input placeholder="arg1 arg2" />
-        </Form.Item>
-        <Form.Item name="envText" label="env" tooltip="每行 KEY=VALUE">
-          <Input.TextArea rows={3} placeholder="KEY=VALUE" />
-        </Form.Item>
-        <Form.Item name="timeout_secs" label="timeout_secs">
-          <InputNumber min={1} style={{ width: "100%" }} placeholder="默认 300" />
-        </Form.Item>
-        <Form.Item name="working_dir" label="working_dir">
-          <Input placeholder="可选" />
-        </Form.Item>
+        {job?.kind === "file_transfer" ? (
+          <>
+            <Form.Item name="dest_path" label="目标路径">
+              <Input placeholder="覆盖目标路径，可选" />
+            </Form.Item>
+            <Form.Item name="timeout_secs" label="timeout_secs">
+              <InputNumber min={1} style={{ width: "100%" }} placeholder="默认 300" />
+            </Form.Item>
+          </>
+        ) : (
+          <>
+            <Form.Item name="interpreter" label="interpreter" rules={[{ required: true }]}>
+              <Select options={JOB_INTERPRETERS.map((i) => ({ value: i, label: i }))} />
+            </Form.Item>
+            <Form.Item name="script" label="script" rules={[{ required: true, message: "请输入脚本" }]}>
+              <Input.TextArea rows={6} />
+            </Form.Item>
+            <Form.Item name="argsText" label="args" tooltip="以空格分隔">
+              <Input placeholder="arg1 arg2" />
+            </Form.Item>
+            <Form.Item name="envText" label="env" tooltip="每行 KEY=VALUE">
+              <Input.TextArea rows={3} placeholder="KEY=VALUE" />
+            </Form.Item>
+            <Form.Item name="timeout_secs" label="timeout_secs">
+              <InputNumber min={1} style={{ width: "100%" }} placeholder="默认 300" />
+            </Form.Item>
+            <Form.Item name="working_dir" label="working_dir">
+              <Input placeholder="可选" />
+            </Form.Item>
+          </>
+        )}
       </Form>
     </Drawer>
   );

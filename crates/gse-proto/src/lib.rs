@@ -153,6 +153,98 @@ pub struct JobResult {
     pub error: Option<String>,
 }
 
+/// 文件传输端点：Agent 本机路径或 Server 临时文件。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FileEndpoint {
+    Agent {
+        agent_id: String,
+        path: String,
+    },
+    ServerTemp {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_id: Option<String>,
+    },
+}
+
+impl FileEndpoint {
+    pub fn agent_id(&self) -> Option<&str> {
+        match self {
+            Self::Agent { agent_id, .. } => Some(agent_id.as_str()),
+            Self::ServerTemp { .. } => None,
+        }
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Self::Agent { path, .. } => Some(path.as_str()),
+            Self::ServerTemp { .. } => None,
+        }
+    }
+
+    pub fn file_id(&self) -> Option<&str> {
+        match self {
+            Self::ServerTemp { file_id } => file_id.as_deref().filter(|s| !s.is_empty()),
+            Self::Agent { .. } => None,
+        }
+    }
+}
+
+/// Server → Agent：按偏移读取普通文件一块。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileReadReq {
+    pub job_id: String,
+    pub path: String,
+    pub offset: u64,
+    pub length: u64,
+    #[serde(default)]
+    pub max_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileReadReply {
+    pub job_id: String,
+    pub size: u64,
+    pub offset: u64,
+    pub eof: bool,
+    #[serde(default)]
+    pub data_b64: String,
+    #[serde(default)]
+    pub chunk_sha256: String,
+    /// 仅 eof=true 时填写整文件 SHA-256。
+    #[serde(default)]
+    pub file_sha256: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Server → Agent：按偏移写入；eof=true 且最终路径不存在时 rename 就位。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileWriteReq {
+    pub job_id: String,
+    pub path: String,
+    pub offset: u64,
+    pub eof: bool,
+    #[serde(default)]
+    pub data_b64: String,
+    #[serde(default)]
+    pub chunk_sha256: String,
+    /// eof=true 时由 Server 带上源文件 SHA-256，Agent 比对。
+    #[serde(default)]
+    pub file_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileWriteReply {
+    pub job_id: String,
+    pub written: u64,
+    pub eof: bool,
+    #[serde(default)]
+    pub file_sha256: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 /// 跨 RPC 传输的错误载荷，code 为稳定字符串。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GseError {
@@ -473,5 +565,54 @@ mod tests {
         let unknown = GseError::new("nonsense_code", "z");
         let dp_unknown: DataplaneError = unknown.into();
         assert_eq!(dp_unknown.code, ErrorCode::Unavailable);
+    }
+
+    #[test]
+    fn file_endpoint_roundtrip() {
+        roundtrip(&FileEndpoint::Agent {
+            agent_id: "web-01".to_string(),
+            path: "/var/log/app.log".to_string(),
+        });
+        roundtrip(&FileEndpoint::ServerTemp {
+            file_id: Some("file-1".to_string()),
+        });
+        roundtrip(&FileEndpoint::ServerTemp { file_id: None });
+    }
+
+    #[test]
+    fn file_read_write_roundtrip() {
+        roundtrip(&FileReadReq {
+            job_id: "job-1".to_string(),
+            path: "/tmp/a".to_string(),
+            offset: 0,
+            length: 1024,
+            max_bytes: 64,
+        });
+        roundtrip(&FileReadReply {
+            job_id: "job-1".to_string(),
+            size: 4,
+            offset: 0,
+            eof: true,
+            data_b64: "YWJjZA==".to_string(),
+            chunk_sha256: "ab".to_string(),
+            file_sha256: Some("cd".to_string()),
+            error: None,
+        });
+        roundtrip(&FileWriteReq {
+            job_id: "job-1".to_string(),
+            path: "/tmp/b".to_string(),
+            offset: 0,
+            eof: true,
+            data_b64: "YWJjZA==".to_string(),
+            chunk_sha256: "ab".to_string(),
+            file_sha256: Some("cd".to_string()),
+        });
+        roundtrip(&FileWriteReply {
+            job_id: "job-1".to_string(),
+            written: 4,
+            eof: true,
+            file_sha256: Some("cd".to_string()),
+            error: None,
+        });
     }
 }

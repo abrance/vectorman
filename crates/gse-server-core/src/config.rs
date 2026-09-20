@@ -47,6 +47,21 @@ pub struct ServerConfig {
     /// stderr 采集上限（字节），超出截断。
     #[serde(default = "default_stderr_limit")]
     pub job_stderr_limit_bytes: u64,
+    /// 单文件大小上限（字节），缺省 64 MiB。
+    #[serde(default = "default_max_file")]
+    pub job_max_file_bytes: u64,
+    /// 临时文件目录；空则使用 `{db}.job-files`。
+    #[serde(default)]
+    pub job_file_dir: String,
+    /// 临时文件保留秒数，缺省 24h。
+    #[serde(default = "default_file_retain")]
+    pub job_file_retain_secs: u64,
+    /// 分块大小（字节），缺省 1 MiB。
+    #[serde(default = "default_file_chunk")]
+    pub job_file_chunk_bytes: u64,
+    /// 过期清理扫描间隔（秒）。
+    #[serde(default = "default_file_cleanup")]
+    pub job_file_cleanup_interval_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -67,7 +82,22 @@ impl Default for ServerConfig {
             job_max_script_bytes: default_max_script(),
             job_stdout_limit_bytes: default_stdout_limit(),
             job_stderr_limit_bytes: default_stderr_limit(),
+            job_max_file_bytes: default_max_file(),
+            job_file_dir: String::new(),
+            job_file_retain_secs: default_file_retain(),
+            job_file_chunk_bytes: default_file_chunk(),
+            job_file_cleanup_interval_secs: default_file_cleanup(),
         }
+    }
+}
+
+impl ServerConfig {
+    /// 临时文件目录：显式配置优先，否则 `{db}.job-files`。
+    pub fn resolved_job_file_dir(&self) -> std::path::PathBuf {
+        if !self.job_file_dir.trim().is_empty() {
+            return std::path::PathBuf::from(&self.job_file_dir);
+        }
+        std::path::PathBuf::from(format!("{}.job-files", self.db))
     }
 }
 
@@ -117,6 +147,22 @@ fn default_stdout_limit() -> u64 {
 
 fn default_stderr_limit() -> u64 {
     1048576
+}
+
+fn default_max_file() -> u64 {
+    67108864
+}
+
+fn default_file_retain() -> u64 {
+    86400
+}
+
+fn default_file_chunk() -> u64 {
+    1048576
+}
+
+fn default_file_cleanup() -> u64 {
+    600
 }
 
 /// 从 TOML 文件加载配置并应用环境变量覆盖；失败返回含路径的错误信息。
@@ -179,6 +225,29 @@ pub fn load_config(path: &str) -> Result<ServerConfig, String> {
             cfg.job_stderr_limit_bytes = n;
         }
     }
+    if let Ok(v) = std::env::var("GSE_SERVER_JOB_MAX_FILE") {
+        if let Ok(n) = v.parse() {
+            cfg.job_max_file_bytes = n;
+        }
+    }
+    if let Ok(v) = std::env::var("GSE_SERVER_JOB_FILE_DIR") {
+        cfg.job_file_dir = v;
+    }
+    if let Ok(v) = std::env::var("GSE_SERVER_JOB_FILE_RETAIN") {
+        if let Ok(n) = v.parse() {
+            cfg.job_file_retain_secs = n;
+        }
+    }
+    if let Ok(v) = std::env::var("GSE_SERVER_JOB_FILE_CHUNK") {
+        if let Ok(n) = v.parse() {
+            cfg.job_file_chunk_bytes = n;
+        }
+    }
+    if let Ok(v) = std::env::var("GSE_SERVER_JOB_FILE_CLEANUP") {
+        if let Ok(n) = v.parse() {
+            cfg.job_file_cleanup_interval_secs = n;
+        }
+    }
     Ok(cfg)
 }
 
@@ -205,6 +274,11 @@ mod tests {
             "GSE_SERVER_JOB_MAX_SCRIPT_BYTES",
             "GSE_SERVER_JOB_STDOUT_LIMIT",
             "GSE_SERVER_JOB_STDERR_LIMIT",
+            "GSE_SERVER_JOB_MAX_FILE",
+            "GSE_SERVER_JOB_FILE_DIR",
+            "GSE_SERVER_JOB_FILE_RETAIN",
+            "GSE_SERVER_JOB_FILE_CHUNK",
+            "GSE_SERVER_JOB_FILE_CLEANUP",
         ] {
             std::env::remove_var(key);
         }
@@ -223,6 +297,11 @@ mod tests {
             "GSE_SERVER_JOB_MAX_SCRIPT_BYTES",
             "GSE_SERVER_JOB_STDOUT_LIMIT",
             "GSE_SERVER_JOB_STDERR_LIMIT",
+            "GSE_SERVER_JOB_MAX_FILE",
+            "GSE_SERVER_JOB_FILE_DIR",
+            "GSE_SERVER_JOB_FILE_RETAIN",
+            "GSE_SERVER_JOB_FILE_CHUNK",
+            "GSE_SERVER_JOB_FILE_CLEANUP",
         ] {
             std::env::remove_var(key);
         }
@@ -303,6 +382,11 @@ web-02 = "tok-b"
             assert_eq!(cfg.job_max_script_bytes, 262144);
             assert_eq!(cfg.job_stdout_limit_bytes, 1048576);
             assert_eq!(cfg.job_stderr_limit_bytes, 1048576);
+            assert_eq!(cfg.job_max_file_bytes, 67108864);
+            assert!(cfg.job_file_dir.is_empty());
+            assert_eq!(cfg.job_file_retain_secs, 86400);
+            assert_eq!(cfg.job_file_chunk_bytes, 1048576);
+            assert_eq!(cfg.job_file_cleanup_interval_secs, 600);
         });
     }
 

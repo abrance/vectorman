@@ -10,6 +10,20 @@ export type JobStatus =
   | "rejected"
   | "lost";
 
+export type JobKind = "script" | "file_transfer";
+
+export type FileEndpoint =
+  | { type: "agent"; agent_id: string; path: string }
+  | { type: "server_temp"; file_id?: string };
+
+export type JobFileMeta = {
+  file_id: string;
+  file_name: string;
+  size_bytes: number;
+  sha256: string;
+  created_at: string;
+};
+
 export type Job = {
   job_id: string;
   agent_id: string;
@@ -34,16 +48,26 @@ export type Job = {
   started_at?: string | null;
   finished_at?: string | null;
   updated_at: string;
+  kind?: JobKind;
+  source?: FileEndpoint | null;
+  destination?: FileEndpoint | null;
+  file_name?: string | null;
+  file_bytes?: number | null;
+  file_sha256?: string | null;
+  file_id?: string | null;
 };
 
 export type JobSubmit = {
-  agent_id: string;
+  kind?: JobKind;
+  agent_id?: string;
   interpreter?: string;
-  script: string;
+  script?: string;
   args?: string[];
   env?: Record<string, string>;
   working_dir?: string;
   timeout_secs?: number;
+  source?: FileEndpoint;
+  destination?: FileEndpoint;
 };
 
 export type JobRerunRequest = {
@@ -54,6 +78,7 @@ export type JobRerunRequest = {
   env?: Record<string, string>;
   working_dir?: string;
   timeout_secs?: number;
+  dest_path?: string;
 };
 
 export type JobListQuery = {
@@ -104,5 +129,23 @@ export class GseJobAdapter {
     return this.http
       .request<Job>({ method: "POST", url: `${PREFIX}/jobs/${enc(jobId)}/rerun`, body: req })
       .then((r) => r.body);
+  }
+
+  uploadJobFile(file: File): Promise<JobFileMeta> {
+    const body = new FormData();
+    body.append("file", file);
+    return this.http.request<JobFileMeta>({ method: "POST", url: `${PREFIX}/job-files`, body }).then((r) => r.body);
+  }
+
+  listJobFiles(): Promise<JobFileMeta[]> {
+    return this.http.request<JobFileMeta[]>({ method: "GET", url: `${PREFIX}/job-files` }).then((r) => r.body);
+  }
+
+  deleteJobFile(fileId: string): Promise<void> {
+    return this.http.request<void>({ method: "DELETE", url: `${PREFIX}/job-files/${enc(fileId)}` }).then(() => undefined);
+  }
+
+  downloadJobFileUrl(fileId: string): string {
+    return `${PREFIX}/job-files/${enc(fileId)}`;
   }
 }
