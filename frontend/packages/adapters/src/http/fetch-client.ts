@@ -55,15 +55,19 @@ export class FetchHttpClient implements HttpClient {
       headers.Authorization = `Bearer ${token}`;
     }
 
-    let body: string | undefined;
+    let body: BodyInit | undefined;
     if (req.body !== undefined) {
-      try {
-        body = JSON.stringify(req.body);
-        if (!headers["Content-Type"]) {
-          headers["Content-Type"] = "application/json";
+      if (typeof FormData !== "undefined" && req.body instanceof FormData) {
+        body = req.body;
+      } else {
+        try {
+          body = JSON.stringify(req.body);
+          if (!headers["Content-Type"]) {
+            headers["Content-Type"] = "application/json";
+          }
+        } catch (error) {
+          throw this.mapper.map({ error });
         }
-      } catch (error) {
-        throw this.mapper.map({ error });
       }
     }
 

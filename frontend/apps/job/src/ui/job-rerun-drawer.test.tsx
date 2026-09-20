@@ -62,6 +62,19 @@ describe("buildRerunRequest", () => {
     expect(req.args).toEqual([]);
     expect(req.env).toEqual({});
   });
+
+  it("maps file transfer overrides", () => {
+    expect(
+      buildRerunRequest(
+        { agent_id: "a2", interpreter: "bash", script: "", dest_path: "/tmp/out", timeout_secs: 10 },
+        "file_transfer",
+      ),
+    ).toEqual({
+      agent_id: "a2",
+      dest_path: "/tmp/out",
+      timeout_secs: 10,
+    });
+  });
 });
 
 describe("JobRerunDrawer", () => {

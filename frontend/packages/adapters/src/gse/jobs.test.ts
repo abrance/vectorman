@@ -64,4 +64,36 @@ describe("GseJobAdapter", () => {
       body: {},
     });
   });
+
+  it("submits a file transfer job", async () => {
+    const http = new FakeHttp({ job_id: "job-ft" });
+    const a = new GseJobAdapter(http);
+    const body = {
+      kind: "file_transfer" as const,
+      source: { type: "agent" as const, agent_id: "a1", path: "/tmp/a" },
+      destination: { type: "server_temp" as const },
+    };
+    await a.submitJob(body);
+    expect(http.last).toMatchObject({ method: "POST", url: "/api/gse/jobs", body });
+  });
+
+  it("uploads a job file as FormData", async () => {
+    const http = new FakeHttp({ file_id: "file-1" });
+    const a = new GseJobAdapter(http);
+    const file = new File(["hello"], "a.txt");
+    await a.uploadJobFile(file);
+    expect(http.last?.method).toBe("POST");
+    expect(http.last?.url).toBe("/api/gse/job-files");
+    expect(http.last?.body).toBeInstanceOf(FormData);
+  });
+
+  it("lists and deletes job files and builds download urls", async () => {
+    const http = new FakeHttp([]);
+    const a = new GseJobAdapter(http);
+    await a.listJobFiles();
+    expect(http.last).toMatchObject({ method: "GET", url: "/api/gse/job-files" });
+    await a.deleteJobFile("file/1");
+    expect(http.last).toMatchObject({ method: "DELETE", url: "/api/gse/job-files/file%2F1" });
+    expect(a.downloadJobFileUrl("file/1")).toBe("/api/gse/job-files/file%2F1");
+  });
 });

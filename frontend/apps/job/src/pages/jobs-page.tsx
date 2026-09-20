@@ -21,7 +21,7 @@ import { JobSubmitDrawer } from "../ui/job-submit-drawer";
 import { JOB_STATUSES } from "../features/jobs/status";
 
 export function JobsPage() {
-  const { notifier, templates } = useRuntime();
+  const { notifier, templates, jobs } = useRuntime();
   const [agentFilter, setAgentFilter] = useState<string | undefined>();
   const [statusFilter, setStatusFilter] = useState<JobStatus | undefined>();
   const [detailId, setDetailId] = useState<string | null>(null);
@@ -102,6 +102,11 @@ export function JobsPage() {
         locale={{ emptyText: list.error?.message ?? "暂无作业" }}
         columns={[
           { title: "job_id", dataIndex: "job_id" },
+          {
+            title: "种类",
+            dataIndex: "kind",
+            render: (k?: string) => (k === "file_transfer" ? "文件传输" : "脚本"),
+          },
           { title: "agent_id", dataIndex: "agent_id" },
           { title: "interpreter", dataIndex: "interpreter" },
           { title: "status", dataIndex: "status", render: (s: JobStatus) => <JobStatusTag status={s} /> },
@@ -125,6 +130,8 @@ export function JobsPage() {
         onClose={() => setSubmitOpen(false)}
         onSubmit={(values) => void doSubmit(values)}
         onSubmitTemplate={(id, req) => void doSubmitTemplate(id, req)}
+        onUploadFile={(file) => jobs.uploadJobFile(file)}
+        listJobFiles={() => jobs.listJobFiles()}
       />
 
       <JobDetailDrawer

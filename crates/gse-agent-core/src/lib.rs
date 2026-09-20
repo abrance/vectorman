@@ -3,6 +3,7 @@
 
 pub mod collect;
 pub mod config;
+pub mod file_io;
 pub mod job;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -69,6 +70,27 @@ async fn connect_once(cfg: &AgentConfig) -> Result<(), AgentError> {
         .await
     {
         return Err(AgentError::ConnError(format!("register job_exec: {e}")));
+    }
+    let file_io = file_io::FileIo::new();
+    let file_read = file_io.clone();
+    if let Err(e) = end
+        .register("file_read", move |req: Bytes| {
+            let file_io = file_read.clone();
+            async move { file_io.handle_read(&req).await }
+        })
+        .await
+    {
+        return Err(AgentError::ConnError(format!("register file_read: {e}")));
+    }
+    let file_write = file_io.clone();
+    if let Err(e) = end
+        .register("file_write", move |req: Bytes| {
+            let file_io = file_write.clone();
+            async move { file_io.handle_write(&req).await }
+        })
+        .await
+    {
+        return Err(AgentError::ConnError(format!("register file_write: {e}")));
     }
     let collector = collect::CollectorHandle::new(cfg.agent_id.clone(), end.clone());
     let collect_handler = collector.clone();

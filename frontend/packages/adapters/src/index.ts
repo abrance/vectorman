@@ -13,6 +13,9 @@ export {
   type JobRerunRequest,
   type JobStatus,
   type JobSubmit,
+  type JobKind,
+  type FileEndpoint,
+  type JobFileMeta,
 } from "./gse/jobs";
 export {
   GseJobTemplateAdapter,

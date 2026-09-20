@@ -14,6 +14,7 @@ use gse_proto::{
 use crate::config::ServerConfig;
 use crate::dataplane::probe_dataplanes;
 use crate::http;
+use crate::job_file_store::JobFileStore;
 use crate::ledger::{ledger_stamp, AccessPoint, JobRecord, Ledger, NewJob};
 use crate::rerun::{build_rerun_submit, RerunRequest};
 use crate::session::{now_micros, Session, SessionRegistry, SessionState};
@@ -41,7 +42,7 @@ pub struct JobSubmit {
     pub timeout_secs: Option<u64>,
 }
 
-fn new_job_id() -> String {
+pub(crate) fn new_job_id() -> String {
     let seq = JOB_SEQ.fetch_add(1, Ordering::Relaxed);
     format!("job-{}-{}", now_micros(), seq)
 }
@@ -51,6 +52,7 @@ pub struct Server {
     pub registry: Arc<SessionRegistry>,
     pub ledger: Arc<Ledger>,
     pub cfg: Arc<ServerConfig>,
+    pub file_store: Arc<JobFileStore>,
     listener: EndListener,
 }
 
@@ -94,10 +96,15 @@ impl Server {
             .await
             .map_err(|e| Error::Remote(format!("register access point: {}", e.message)))?;
 
+        let file_store = Arc::new(
+            JobFileStore::open(cfg.resolved_job_file_dir())
+                .map_err(|e| Error::Remote(format!("open job file store: {}", e.message)))?,
+        );
         let server = Arc::new(Server {
             registry: Arc::new(SessionRegistry::new()),
             ledger,
             cfg: Arc::new(cfg),
+            file_store,
             listener,
         });
         Ok((server, addr))
@@ -115,11 +122,17 @@ impl Server {
             self.ledger.clone(),
             Duration::from_secs(self.cfg.dataplane_probe_interval_secs),
         ));
+        tokio::spawn(crate::file_transfer::run_job_file_cleanup(
+            self.file_store.clone(),
+            Duration::from_secs(self.cfg.job_file_cleanup_interval_secs.max(1)),
+            self.cfg.job_file_retain_secs,
+        ));
         if self.cfg.http_enabled {
             let admin = http::AdminState {
                 ledger: self.ledger.clone(),
                 registry: Some(self.registry.clone()),
                 cfg: Some(self.cfg.clone()),
+                file_store: Some(self.file_store.clone()),
             };
             let listen = self.cfg.http_listen.clone();
             let web_dir = self.cfg.http_web_dir.clone();
@@ -285,6 +298,7 @@ pub async fn submit_job_with_source(
             rerun_of,
             timeout_secs: timeout,
             created_at,
+            ..Default::default()
         })
         .await?;
 
@@ -766,6 +780,7 @@ mod tests {
                 rerun_of: None,
                 timeout_secs: 30,
                 created_at: ledger_stamp(),
+                ..Default::default()
             })
             .await
             .expect("insert job");

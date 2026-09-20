@@ -1,12 +1,22 @@
 import { Button, Descriptions, Drawer, Input, Modal, Space, Spin, Typography } from "antd";
 import { useState } from "react";
-import type { Job } from "@vectorman/adapters";
+import type { FileEndpoint, Job } from "@vectorman/adapters";
 import { formatTimestamp } from "@vectorman/primitives";
 import { useRuntime } from "../app/runtime";
 import { toAppError } from "../features/jobs/errors";
 import { useJobDetail } from "../features/jobs/use-job-detail";
 import { JobOutput } from "./job-output";
 import { JobStatusTag } from "./job-status-tag";
+
+export function formatFileEndpoint(ep?: FileEndpoint | null): string {
+  if (!ep) {
+    return "-";
+  }
+  if (ep.type === "agent") {
+    return `${ep.agent_id}:${ep.path}`;
+  }
+  return ep.file_id ? `临时文件 ${ep.file_id}` : "Server 临时目录";
+}
 
 export function JobDetailDrawer({
   jobId,
@@ -17,7 +27,7 @@ export function JobDetailDrawer({
   onClose: () => void;
   onRerun?: (job: Job) => void;
 }) {
-  const { templates, notifier } = useRuntime();
+  const { templates, notifier, jobs } = useRuntime();
   const detail = useJobDetail(jobId);
   const [saveOpen, setSaveOpen] = useState(false);
   const [name, setName] = useState("");
@@ -49,7 +59,9 @@ export function JobDetailDrawer({
         job ? (
           <Space>
             {onRerun ? <Button onClick={() => onRerun(job)}>重做</Button> : null}
-            <Button onClick={() => setSaveOpen(true)}>另存为模板</Button>
+            {job.kind === "file_transfer" ? null : (
+              <Button onClick={() => setSaveOpen(true)}>另存为模板</Button>
+            )}
           </Space>
         ) : null
       }
@@ -62,34 +74,58 @@ export function JobDetailDrawer({
               <JobStatusTag status={job.status} />
             </Descriptions.Item>
             <Descriptions.Item label="Agent">{job.agent_id}</Descriptions.Item>
-            <Descriptions.Item label="解释器">{job.interpreter}</Descriptions.Item>
-            <Descriptions.Item label="退出码">{job.exit_code ?? "-"}</Descriptions.Item>
-            <Descriptions.Item label="信号">{job.signal ?? "-"}</Descriptions.Item>
+            <Descriptions.Item label="种类">{job.kind === "file_transfer" ? "文件传输" : "脚本"}</Descriptions.Item>
+            {job.kind === "file_transfer" ? (
+              <>
+                <Descriptions.Item label="源端">{formatFileEndpoint(job.source)}</Descriptions.Item>
+                <Descriptions.Item label="目标端">{formatFileEndpoint(job.destination)}</Descriptions.Item>
+                <Descriptions.Item label="文件名">{job.file_name ?? "-"}</Descriptions.Item>
+                <Descriptions.Item label="字节">{job.file_bytes ?? "-"}</Descriptions.Item>
+                <Descriptions.Item label="SHA-256">{job.file_sha256 ?? "-"}</Descriptions.Item>
+                <Descriptions.Item label="file_id">{job.file_id ?? "-"}</Descriptions.Item>
+              </>
+            ) : (
+              <>
+                <Descriptions.Item label="解释器">{job.interpreter}</Descriptions.Item>
+                <Descriptions.Item label="退出码">{job.exit_code ?? "-"}</Descriptions.Item>
+                <Descriptions.Item label="信号">{job.signal ?? "-"}</Descriptions.Item>
+              </>
+            )}
             <Descriptions.Item label="超时(秒)">{job.timeout_secs}</Descriptions.Item>
-            <Descriptions.Item label="来源模板">{job.template_id ?? "-"}</Descriptions.Item>
+            {job.kind === "file_transfer" ? null : (
+              <Descriptions.Item label="来源模板">{job.template_id ?? "-"}</Descriptions.Item>
+            )}
             <Descriptions.Item label="来源作业">{job.rerun_of ?? "-"}</Descriptions.Item>
             <Descriptions.Item label="开始时间">{formatTimestamp(job.started_at)}</Descriptions.Item>
             <Descriptions.Item label="结束时间">{formatTimestamp(job.finished_at)}</Descriptions.Item>
             {job.error ? <Descriptions.Item label="错误">{job.error}</Descriptions.Item> : null}
           </Descriptions>
-          <JobOutput title="stdout" text={job.stdout} truncated={job.stdout_truncated} />
-          <JobOutput title="stderr" text={job.stderr} truncated={job.stderr_truncated} />
-          <div>
-            <Typography.Text strong>脚本</Typography.Text>
-            <pre
-              style={{
-                background: "#fafafa",
-                border: "1px solid #f0f0f0",
-                borderRadius: 4,
-                padding: 8,
-                margin: "4px 0 0",
-                whiteSpace: "pre-wrap",
-                wordBreak: "break-all",
-              }}
-            >
-              {job.script}
-            </pre>
-          </div>
+          {job.kind === "file_transfer" ? (
+            job.file_id ? (
+              <Button href={jobs.downloadJobFileUrl(job.file_id)}>下载文件</Button>
+            ) : null
+          ) : (
+            <>
+              <JobOutput title="stdout" text={job.stdout} truncated={job.stdout_truncated} />
+              <JobOutput title="stderr" text={job.stderr} truncated={job.stderr_truncated} />
+              <div>
+                <Typography.Text strong>脚本</Typography.Text>
+                <pre
+                  style={{
+                    background: "#fafafa",
+                    border: "1px solid #f0f0f0",
+                    borderRadius: 4,
+                    padding: 8,
+                    margin: "4px 0 0",
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-all",
+                  }}
+                >
+                  {job.script}
+                </pre>
+              </div>
+            </>
+          )}
         </Space>
       ) : null}
 
