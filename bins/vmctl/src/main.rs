@@ -35,7 +35,7 @@ enum Command {
     /// 作业提交、查询与重做
     Jobs {
         #[command(subcommand)]
-        cmd: JobsCmd,
+        cmd: Box<JobsCmd>,
     },
 }
 
@@ -66,9 +66,11 @@ enum JobsCmd {
     },
     Submit {
         #[arg(long)]
-        agent_id: String,
+        kind: Option<String>,
         #[arg(long)]
-        script_file: String,
+        agent_id: Option<String>,
+        #[arg(long)]
+        script_file: Option<String>,
         #[arg(long)]
         interpreter: Option<String>,
         #[arg(long = "arg")]
@@ -81,6 +83,16 @@ enum JobsCmd {
         timeout_secs: Option<u64>,
         #[arg(long)]
         wait: bool,
+        #[arg(long)]
+        from_agent: Option<String>,
+        #[arg(long)]
+        from_path: Option<String>,
+        #[arg(long)]
+        to_agent: Option<String>,
+        #[arg(long)]
+        to_path: Option<String>,
+        #[arg(long)]
+        upload: Option<String>,
     },
     Rerun {
         job_id: String,
@@ -100,6 +112,30 @@ enum JobsCmd {
         timeout_secs: Option<u64>,
         #[arg(long)]
         wait: bool,
+        #[arg(long)]
+        dest_path: Option<String>,
+    },
+    /// Server 临时文件
+    Files {
+        #[command(subcommand)]
+        cmd: JobFilesCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum JobFilesCmd {
+    List,
+    Upload {
+        #[arg(long)]
+        file: String,
+    },
+    Download {
+        file_id: String,
+        #[arg(long)]
+        output: String,
+    },
+    Delete {
+        file_id: String,
     },
 }
 
@@ -121,7 +157,7 @@ fn main() -> ExitCode {
             AgentsCmd::List => client.agents_list(),
             AgentsCmd::Get { agent_id } => client.agents_get(&agent_id),
         },
-        Command::Jobs { cmd } => match cmd {
+        Command::Jobs { cmd } => match *cmd {
             JobsCmd::List {
                 agent_id,
                 status,
@@ -129,6 +165,7 @@ fn main() -> ExitCode {
             } => client.jobs_list(agent_id.as_deref(), status.as_deref(), limit),
             JobsCmd::Get { job_id } => client.jobs_get(&job_id),
             JobsCmd::Submit {
+                kind,
                 agent_id,
                 script_file,
                 interpreter,
@@ -137,15 +174,26 @@ fn main() -> ExitCode {
                 working_dir,
                 timeout_secs,
                 wait,
+                from_agent,
+                from_path,
+                to_agent,
+                to_path,
+                upload,
             } => client.jobs_submit(&JobSubmitSpec {
-                agent_id,
-                script_file,
+                kind: kind.unwrap_or_default(),
+                agent_id: agent_id.unwrap_or_default(),
+                script_file: script_file.unwrap_or_default(),
                 interpreter,
                 args,
                 env,
                 working_dir,
                 timeout_secs,
                 wait,
+                from_agent,
+                from_path,
+                to_agent,
+                to_path,
+                upload,
             }),
             JobsCmd::Rerun {
                 job_id,
@@ -157,6 +205,7 @@ fn main() -> ExitCode {
                 working_dir,
                 timeout_secs,
                 wait,
+                dest_path,
             } => client.jobs_rerun(&JobRerunSpec {
                 job_id,
                 agent_id,
@@ -167,7 +216,16 @@ fn main() -> ExitCode {
                 working_dir,
                 timeout_secs,
                 wait,
+                dest_path,
             }),
+            JobsCmd::Files { cmd } => match cmd {
+                JobFilesCmd::List => client.jobs_files_list(),
+                JobFilesCmd::Upload { file } => client.jobs_files_upload(&file),
+                JobFilesCmd::Download { file_id, output } => {
+                    client.jobs_files_download(&file_id, &output)
+                }
+                JobFilesCmd::Delete { file_id } => client.jobs_files_delete(&file_id),
+            },
         },
     };
     if !out.stdout.is_empty() {
