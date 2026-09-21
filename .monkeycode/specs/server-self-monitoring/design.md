@@ -144,10 +144,10 @@ HTTP 中间件：
 `config.toml.example`：
 
 ```toml
+self_metrics_interval_secs = 60
+
 [metrics_http]
 listen = "127.0.0.1:9091"
-
-self_metrics_interval_secs = 60
 ```
 
 `gse-server.toml.example`：

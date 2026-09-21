@@ -1,9 +1,11 @@
 # console 桌面门户配置示例
 #
 # 默认值：listen="0.0.0.0:7200"，web_dir="web"，data_file="apps.json"
+# metrics_listen="127.0.0.1:7201"
 # 配置文件非法时进程退出码 1，stderr 含 config_invalid 与路径。
 # 环境变量覆盖（CONSOLE_ 前缀）：
 #   CONSOLE_CONFIG / CONSOLE_LISTEN / CONSOLE_WEB_DIR / CONSOLE_DATA_FILE
+#   CONSOLE_METRICS_LISTEN
 #
 # App 目录初始为空。可在桌面新增，例如：
 #   name = "GSE"
@@ -12,3 +14,4 @@
 listen = "0.0.0.0:7200"
 web_dir = "web"
 data_file = "apps.json"
+# metrics_listen = "127.0.0.1:7201"

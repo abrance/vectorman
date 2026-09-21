@@ -11,6 +11,7 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use crate::catalog::{Catalog, CatalogError};
 use crate::config::ConsoleConfig;
+use vectorman_metrics::SelfMetrics;
 
 #[derive(Clone)]
 struct AppState {
@@ -46,7 +47,27 @@ fn map_err(e: CatalogError) -> Response {
     err_json(status, &e)
 }
 
+struct ConsoleScrapeHook {
+    catalog: Arc<Catalog>,
+}
+
+#[async_trait::async_trait]
+impl vectorman_metrics::ScrapeHook for ConsoleScrapeHook {
+    async fn on_scrape(&self, metrics: &SelfMetrics) {
+        let n = self.catalog.list().await.len();
+        metrics.set_gauge("vectorman_console_apps", n as f64);
+    }
+}
+
 pub fn router(catalog: Arc<Catalog>, web_dir: Option<&std::path::Path>) -> Router {
+    build_router(catalog, web_dir, None)
+}
+
+fn build_router(
+    catalog: Arc<Catalog>,
+    web_dir: Option<&std::path::Path>,
+    metrics: Option<Arc<SelfMetrics>>,
+) -> Router {
     let api = Router::new()
         .route("/health", get(health))
         .route("/api/console/apps", get(list_apps).post(create_app))
@@ -55,13 +76,14 @@ pub fn router(catalog: Arc<Catalog>, web_dir: Option<&std::path::Path>) -> Route
             axum::routing::put(update_app).delete(delete_app),
         )
         .with_state(AppState { catalog });
-    match web_dir {
+    let app = match web_dir {
         Some(dir) => {
             let index = dir.join("index.html");
             api.fallback_service(ServeDir::new(dir).fallback(ServeFile::new(index)))
         }
         None => api,
-    }
+    };
+    vectorman_metrics::apply_http_metrics(app, metrics)
 }
 
 pub async fn serve(cfg: ConsoleConfig, catalog: Catalog) -> Result<(), String> {
@@ -79,17 +101,33 @@ pub async fn serve(cfg: ConsoleConfig, catalog: Catalog) -> Result<(), String> {
         );
         None
     };
-    let app = router(
-        Arc::new(catalog),
+    let catalog = Arc::new(catalog);
+    let metrics = SelfMetrics::new("console", &cfg.listen)?;
+    metrics.set_hook(Arc::new(ConsoleScrapeHook {
+        catalog: catalog.clone(),
+    }));
+    let app = build_router(
+        catalog,
         web_dir.as_deref().map(std::path::Path::new),
+        Some(metrics.clone()),
     );
     let listener = tokio::net::TcpListener::bind(&cfg.listen)
         .await
         .map_err(|e| format!("bind {}: {e}", cfg.listen))?;
+    let metrics_listener = tokio::net::TcpListener::bind(&cfg.metrics_listen)
+        .await
+        .map_err(|e| format!("bind {}: {e}", cfg.metrics_listen))?;
     let addr = listener
         .local_addr()
         .map_err(|e| format!("local_addr: {e}"))?;
     println!("console: listening on {addr}");
+    println!("console: metrics listening on {}", cfg.metrics_listen);
+    let metrics_app = metrics.metrics_router();
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(metrics_listener, metrics_app).await {
+            eprintln!("console: metrics serve failed: {e}");
+        }
+    });
     axum::serve(listener, app)
         .await
         .map_err(|e| format!("serve: {e}"))
@@ -334,6 +372,23 @@ mod tests {
         let (st, body) = send(&app, req("POST", "/api/console/apps", Some(&payload))).await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
         assert!(body.contains("tag_limit_exceeded"), "{body}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn metrics_exposes_apps_and_component() {
+        let path = tmp_file("metrics");
+        let _ = std::fs::remove_file(&path);
+        let catalog = Arc::new(Catalog::open(&path).unwrap());
+        let metrics = SelfMetrics::new("console", "0.0.0.0:7200").unwrap();
+        metrics.set_hook(Arc::new(ConsoleScrapeHook {
+            catalog: catalog.clone(),
+        }));
+        let app = metrics.metrics_router();
+        let (st, body) = send(&app, req("GET", "/metrics", None)).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert!(body.contains("vectorman_console_apps"), "{body}");
+        assert!(body.contains("component=\"console\""), "{body}");
         let _ = std::fs::remove_file(&path);
     }
 }

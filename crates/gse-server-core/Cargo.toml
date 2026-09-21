@@ -16,6 +16,8 @@ dataplane-sql.workspace = true
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs"] }
 ureq = "2"
+vectorman-metrics.workspace = true
+async-trait.workspace = true
 
 [dev-dependencies]
 gse-agent-core = { path = "../gse-agent-core" }

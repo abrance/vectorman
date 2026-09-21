@@ -2,15 +2,20 @@
 #
 # 默认值：data_path="./data"，SQL HTTP 0.0.0.0:8081，Prom HTTP 0.0.0.0:9090，鉴权关闭。
 # 环境变量覆盖：DP_DATA_PATH / DP_SQL_HTTP_LISTEN / DP_PROM_HTTP_LISTEN / DP_AUTH_ENABLED
+# DP_METRICS_HTTP_LISTEN / DP_SELF_METRICS_INTERVAL
 # DATASERVER_HTTP_WEB_DIR / DATASERVER_GSE_ADMIN_URL
 
 data_path = "./data"
+self_metrics_interval_secs = 60
 
 [sql_http]
 listen = "0.0.0.0:8081"
 
 [prom_http]
 listen = "0.0.0.0:9090"
+
+[metrics_http]
+listen = "127.0.0.1:9091"
 
 [auth]
 enabled = false

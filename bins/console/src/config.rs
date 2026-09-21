@@ -9,6 +9,8 @@ pub struct ConsoleConfig {
     pub web_dir: String,
     #[serde(default = "default_data_file")]
     pub data_file: String,
+    #[serde(default = "default_metrics_listen")]
+    pub metrics_listen: String,
 }
 
 impl Default for ConsoleConfig {
@@ -17,6 +19,7 @@ impl Default for ConsoleConfig {
             listen: default_listen(),
             web_dir: default_web_dir(),
             data_file: default_data_file(),
+            metrics_listen: default_metrics_listen(),
         }
     }
 }
@@ -31,6 +34,10 @@ fn default_web_dir() -> String {
 
 fn default_data_file() -> String {
     "apps.json".to_string()
+}
+
+fn default_metrics_listen() -> String {
+    "127.0.0.1:7201".to_string()
 }
 
 /// 文件存在则解析；缺失则用默认值。解析失败返回说明。
@@ -50,6 +57,9 @@ pub fn load_config(path: &str) -> Result<ConsoleConfig, String> {
     if let Ok(v) = std::env::var("CONSOLE_DATA_FILE") {
         cfg.data_file = v;
     }
+    if let Ok(v) = std::env::var("CONSOLE_METRICS_LISTEN") {
+        cfg.metrics_listen = v;
+    }
     Ok(cfg)
 }
 
@@ -62,10 +72,12 @@ mod tests {
         std::env::remove_var("CONSOLE_LISTEN");
         std::env::remove_var("CONSOLE_WEB_DIR");
         std::env::remove_var("CONSOLE_DATA_FILE");
+        std::env::remove_var("CONSOLE_METRICS_LISTEN");
         let cfg = load_config("/tmp/console-missing-config-does-not-exist.toml").expect("load");
         assert_eq!(cfg.listen, "0.0.0.0:7200");
         assert_eq!(cfg.web_dir, "web");
         assert_eq!(cfg.data_file, "apps.json");
+        assert_eq!(cfg.metrics_listen, "127.0.0.1:7201");
     }
 
     #[test]

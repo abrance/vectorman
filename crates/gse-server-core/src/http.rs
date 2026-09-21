@@ -19,6 +19,7 @@ use axum::{Json, Router};
 use gse_proto::GseError;
 use serde_json::json;
 use tower_http::services::{ServeDir, ServeFile};
+use vectorman_metrics::SelfMetrics;
 
 use crate::config::ServerConfig;
 use crate::ledger::{
@@ -38,6 +39,26 @@ pub struct AdminState {
     pub registry: Option<Arc<SessionRegistry>>,
     /// 作业提交校验所需的 server 配置；独立部署管理端口时为 None，作业接口不可用。
     pub cfg: Option<Arc<ServerConfig>>,
+}
+
+pub(crate) struct GseScrapeHook {
+    pub ledger: Arc<Ledger>,
+    pub registry: Option<Arc<SessionRegistry>>,
+}
+
+#[async_trait::async_trait]
+impl vectorman_metrics::ScrapeHook for GseScrapeHook {
+    async fn on_scrape(&self, metrics: &SelfMetrics) {
+        if let Ok(agents) = self.ledger.list_agents().await {
+            let n = agents.iter().filter(|a| a.status == "online").count();
+            metrics.set_gauge("vectorman_gse_agents_online", n as f64);
+        }
+        let n = match &self.registry {
+            Some(r) => r.list().await.len(),
+            None => 0,
+        };
+        metrics.set_gauge("vectorman_gse_sessions", n as f64);
+    }
 }
 
 fn err_json(status: StatusCode, e: GseError) -> Response {
@@ -136,16 +157,25 @@ fn ledger_routes(admin: AdminState) -> Router {
 /// 提供 `web_dir` 时同一端口托管该目录下的前端 dist，未命中的路径回退
 /// `index.html`（SPA 客户端路由），已存在的静态资源（JS/CSS/字体）正常返回。
 pub fn router(admin: AdminState, web_dir: Option<&std::path::Path>) -> Router {
+    build_router(admin, web_dir, None)
+}
+
+fn build_router(
+    admin: AdminState,
+    web_dir: Option<&std::path::Path>,
+    metrics: Option<Arc<SelfMetrics>>,
+) -> Router {
     let api = Router::new()
         .route("/health", get(health))
         .nest("/api/gse", ledger_routes(admin));
-    match web_dir {
+    let app = match web_dir {
         Some(dir) => {
             let index = dir.join("index.html");
             api.fallback_service(ServeDir::new(dir).fallback(ServeFile::new(index)))
         }
         None => api,
-    }
+    };
+    vectorman_metrics::apply_http_metrics(app, metrics)
 }
 
 /// 绑定并托管 HTTP 管理端口；成功后持续运行直至底层错误。
@@ -153,8 +183,9 @@ pub async fn serve(
     admin: AdminState,
     listen: &str,
     web_dir: Option<String>,
+    metrics: Option<Arc<SelfMetrics>>,
 ) -> Result<(), GseError> {
-    let app = router(admin, web_dir.as_deref().map(std::path::Path::new));
+    let app = build_router(admin, web_dir.as_deref().map(std::path::Path::new), metrics);
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .map_err(|e| GseError::new("query_failed", format!("bind http {listen}: {e}")))?;
@@ -1921,5 +1952,22 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn metrics_exposes_sessions_and_component() {
+        let metrics = SelfMetrics::new("gse-server", "127.0.0.1:7101").unwrap();
+        let db = test_db("metrics");
+        let ledger = Arc::new(Ledger::new(&db).expect("open"));
+        ledger.init().await.expect("init");
+        metrics.set_hook(Arc::new(GseScrapeHook {
+            ledger,
+            registry: Some(Arc::new(SessionRegistry::new())),
+        }));
+        let app = metrics.metrics_router();
+        let (status, body) = send(&mut app.clone(), req("GET", "/metrics", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("vectorman_gse_sessions"), "{body}");
+        assert!(body.contains("component=\"gse-server\""), "{body}");
     }
 }

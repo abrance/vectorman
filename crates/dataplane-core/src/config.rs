@@ -2,12 +2,16 @@ use serde::{Deserialize, Serialize};
 
 /// 默认配置文件内容，供 `config.toml.example` 使用。
 pub const DEFAULT_CONFIG_TOML: &str = r#"data_path = "./data"
+self_metrics_interval_secs = 60
 
 [sql_http]
 listen = "0.0.0.0:8081"
 
 [prom_http]
 listen = "0.0.0.0:9090"
+
+[metrics_http]
+listen = "127.0.0.1:9091"
 
 [auth]
 enabled = false
@@ -43,6 +47,10 @@ pub struct Config {
     pub auth: AuthConfig,
     pub http_web_dir: Option<String>,
     pub gse_admin_url: Option<String>,
+    #[serde(default = "default_metrics_http")]
+    pub metrics_http: HttpListenConfig,
+    #[serde(default = "default_self_metrics_interval")]
+    pub self_metrics_interval_secs: u64,
 }
 
 impl Default for Config {
@@ -56,6 +64,8 @@ impl Default for Config {
             auth: AuthConfig { enabled: false },
             http_web_dir: None,
             gse_admin_url: None,
+            metrics_http: default_metrics_http(),
+            self_metrics_interval_secs: default_self_metrics_interval(),
         }
     }
 }
@@ -89,6 +99,14 @@ impl Config {
         if let Ok(v) = std::env::var("DATASERVER_GSE_ADMIN_URL") {
             self.gse_admin_url = nonempty_opt(v);
         }
+        if let Ok(v) = std::env::var("DP_METRICS_HTTP_LISTEN") {
+            self.metrics_http.listen = v;
+        }
+        if let Ok(v) = std::env::var("DP_SELF_METRICS_INTERVAL") {
+            if let Ok(n) = v.parse() {
+                self.self_metrics_interval_secs = n;
+            }
+        }
         self.normalize();
     }
 
@@ -96,6 +114,16 @@ impl Config {
         self.http_web_dir = self.http_web_dir.take().and_then(nonempty_opt);
         self.gse_admin_url = self.gse_admin_url.take().and_then(nonempty_opt);
     }
+}
+
+fn default_metrics_http() -> HttpListenConfig {
+    HttpListenConfig {
+        listen: "127.0.0.1:9091".to_string(),
+    }
+}
+
+fn default_self_metrics_interval() -> u64 {
+    60
 }
 
 fn nonempty_opt(v: String) -> Option<String> {
@@ -152,5 +180,22 @@ gse_admin_url = "   "
         .unwrap();
         assert!(cfg.http_web_dir.is_none());
         assert!(cfg.gse_admin_url.is_none());
+    }
+
+    #[test]
+    fn default_metrics_listen_and_interval() {
+        let cfg = Config::default();
+        assert_eq!(cfg.metrics_http.listen, "127.0.0.1:9091");
+        assert_eq!(cfg.self_metrics_interval_secs, 60);
+    }
+
+    #[test]
+    fn from_toml_reads_metrics_http() {
+        let cfg = Config::from_toml(
+            "self_metrics_interval_secs = 15\n[metrics_http]\nlisten = \"127.0.0.1:9199\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.metrics_http.listen, "127.0.0.1:9199");
+        assert_eq!(cfg.self_metrics_interval_secs, 15);
     }
 }

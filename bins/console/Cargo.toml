@@ -14,6 +14,8 @@ axum = "0.8"
 tower-http = { version = "0.6", features = ["fs"] }
 url = "2"
 vectorman-version.workspace = true
+vectorman-metrics.workspace = true
+async-trait.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
