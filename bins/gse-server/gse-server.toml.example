@@ -6,7 +6,7 @@
 # 环境变量覆盖（GSE_ 前缀）：
 #   GSE_SERVER_CONFIG / GSE_SERVER_LISTEN / GSE_SERVER_AUTH / GSE_SERVER_DB
 #   GSE_SERVER_HTTP_LISTEN / GSE_SERVER_HTTP_WEB_DIR / GSE_SERVER_HEARTBEAT_TIMEOUT
-#   GSE_DATAPLANE_PROBE_INTERVAL
+#   GSE_SERVER_METRICS_LISTEN / GSE_DATAPLANE_PROBE_INTERVAL
 
 listen = "0.0.0.0:7100"
 auth_enabled = true
@@ -20,6 +20,9 @@ heartbeat_timeout_secs = 90
 # 台账 API 统一挂在 /api/gse 前缀下；根路径仅保留 /health。
 http_enabled = true
 # http_listen = "127.0.0.1:7101"
+
+# 独立 Prometheus 口（默认 127.0.0.1:7102），仅 GET /metrics。
+# metrics_listen = "127.0.0.1:7102"
 
 # 静态前端目录：配置后同一 HTTP 端口同时托管该目录下的前端 dist，
 # SPA 客户端路由回退到 index.html（页面与 API 同源同端口）。

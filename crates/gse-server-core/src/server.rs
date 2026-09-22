@@ -122,6 +122,25 @@ impl Server {
             self.ledger.clone(),
             Duration::from_secs(self.cfg.dataplane_probe_interval_secs),
         ));
+        let metrics = vectorman_metrics::SelfMetrics::new("gse-server", &self.cfg.http_listen)
+            .map_err(|e| Error::Remote(format!("metrics init: {e}")))?;
+        metrics.set_hook(Arc::new(http::GseScrapeHook {
+            ledger: self.ledger.clone(),
+            registry: Some(self.registry.clone()),
+        }));
+        let metrics_listener = tokio::net::TcpListener::bind(&self.cfg.metrics_listen)
+            .await
+            .map_err(|e| Error::Remote(format!("bind metrics {}: {e}", self.cfg.metrics_listen)))?;
+        println!(
+            "gse-server: metrics listening on {}",
+            self.cfg.metrics_listen
+        );
+        let metrics_app = metrics.clone().metrics_router();
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(metrics_listener, metrics_app).await {
+                eprintln!("gse-server: metrics serve failed: {e}");
+            }
+        });
         tokio::spawn(crate::file_transfer::run_job_file_cleanup(
             self.file_store.clone(),
             Duration::from_secs(self.cfg.job_file_cleanup_interval_secs.max(1)),
@@ -137,7 +156,7 @@ impl Server {
             let listen = self.cfg.http_listen.clone();
             let web_dir = self.cfg.http_web_dir.clone();
             tokio::spawn(async move {
-                if let Err(e) = http::serve(admin, &listen, web_dir).await {
+                if let Err(e) = http::serve(admin, &listen, web_dir, Some(metrics)).await {
                     eprintln!("gse-server: http management failed: {:?}", e);
                 }
             });

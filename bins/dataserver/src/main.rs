@@ -10,7 +10,8 @@ use dataplane_log::{LogStore, TantivyLogStore};
 use dataplane_sql::{RelationalStore, SqliteRelationalStore};
 use dataplane_ts::{TimeSeriesStore, TsinkTimeSeriesStore};
 use dataserver::cleanup::{now_micros, run_cleanup};
-use dataserver::http::{prom_router, sql_router, AppState};
+use dataserver::http::{prom_router, sql_router, AppState, LocalTsSink};
+use vectorman_metrics::SelfMetrics;
 
 const ENGINE_DIR_MODE_REQUIRED: &str = "dataserver requires a directory data_path (single-file mode only supports sqlite, and this server enables all engines)";
 
@@ -79,6 +80,14 @@ async fn main() -> ExitCode {
         Err(e) => return exit_with("engine log init failed", e),
     };
 
+    let metrics = match SelfMetrics::new("dataserver", &cfg.sql_http.listen) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("metrics init failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let state = AppState {
         file,
         kv,
@@ -87,6 +96,7 @@ async fn main() -> ExitCode {
         log,
         auth: Arc::new(NoopAuth),
         gse_admin_url: cfg.gse_admin_url.clone(),
+        metrics: Some(metrics.clone()),
     };
 
     let web_dir = cfg.http_web_dir.as_deref().map(std::path::Path::new);
@@ -100,6 +110,7 @@ async fn main() -> ExitCode {
 
     let sql_app = sql_router(state.clone(), web_dir);
     let prom_app = prom_router(state.clone());
+    let metrics_app = metrics.clone().metrics_router();
 
     let cleanup_state = state.clone();
     tokio::spawn(async move {
@@ -119,6 +130,17 @@ async fn main() -> ExitCode {
         }
     });
 
+    if cfg.self_metrics_interval_secs > 0 {
+        let sink: Arc<dyn vectorman_metrics::MetricsSink> = Arc::new(LocalTsSink {
+            ts: state.ts.clone(),
+        });
+        let flush_metrics = metrics.clone();
+        let interval = Duration::from_secs(cfg.self_metrics_interval_secs);
+        tokio::spawn(async move {
+            vectorman_metrics::flush_loop(flush_metrics, sink, interval).await;
+        });
+    }
+
     let sql_listener = match tokio::net::TcpListener::bind(&cfg.sql_http.listen).await {
         Ok(l) => l,
         Err(e) => {
@@ -133,14 +155,22 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let metrics_listener = match tokio::net::TcpListener::bind(&cfg.metrics_http.listen).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("bind metrics_http {} failed: {e}", cfg.metrics_http.listen);
+            return ExitCode::FAILURE;
+        }
+    };
 
     println!(
-        "sql_http={} prom_http={}",
-        cfg.sql_http.listen, cfg.prom_http.listen
+        "sql_http={} prom_http={} metrics_http={}",
+        cfg.sql_http.listen, cfg.prom_http.listen, cfg.metrics_http.listen
     );
 
     let sql_fut = axum::serve(sql_listener, sql_app);
     let prom_fut = axum::serve(prom_listener, prom_app);
-    let _ = tokio::try_join!(sql_fut, prom_fut);
+    let metrics_fut = axum::serve(metrics_listener, metrics_app);
+    let _ = tokio::try_join!(sql_fut, prom_fut, metrics_fut);
     ExitCode::SUCCESS
 }

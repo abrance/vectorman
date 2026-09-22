@@ -25,6 +25,7 @@ members = [
     "crates/gse-server-core",
     "crates/gse-agent-core",
     "crates/vectorman-version",
+    "crates/vectorman-metrics",
 ]
 
 [workspace.package]
@@ -45,6 +46,7 @@ gse-proto = { path = "crates/gse-proto" }
 gse-server-core = { path = "crates/gse-server-core" }
 gse-agent-core = { path = "crates/gse-agent-core" }
 vectorman-version = { path = "crates/vectorman-version" }
+vectorman-metrics = { path = "crates/vectorman-metrics" }
 
 geminio = { git = "https://github.com/singchia/geminio-rs", rev = "ff4363f814398b36c6ddf37b3d9042eb0b1dd802" }
 

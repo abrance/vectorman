@@ -102,6 +102,7 @@ async fn register_probe_collect_ingest_and_query() {
         log,
         auth: Arc::new(NoopAuth),
         gse_admin_url: Some(gse_url.clone()),
+        metrics: None,
     };
     let ds_url = spawn(sql_router(state.clone(), None)).await;
     let prom_url = spawn(prom_router(state)).await;

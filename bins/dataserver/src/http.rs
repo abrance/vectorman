@@ -17,7 +17,7 @@ use dataplane_ingest::{apply, search, DataEnvelope, LogSearchQuery, StreamIndex}
 use dataplane_kv::KvStore;
 use dataplane_log::LogStore;
 use dataplane_sql::RelationalStore;
-use dataplane_ts::{PromResult, PromResultType, TimeSeriesStore};
+use dataplane_ts::{PromResult, PromResultType, TimeSeriesStore, TsPoint};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tower_http::services::{ServeDir, ServeFile};
@@ -37,6 +37,7 @@ pub struct AppState {
     pub log: Arc<dyn LogStore>,
     pub auth: Arc<dyn AuthN>,
     pub gse_admin_url: Option<String>,
+    pub metrics: Option<Arc<vectorman_metrics::SelfMetrics>>,
 }
 
 fn json_err(status: StatusCode, e: DataplaneError) -> Response {
@@ -315,7 +316,19 @@ async fn ingest(
     )
     .await
     {
-        Ok(reply) => Json(reply).into_response(),
+        Ok(reply) => {
+            if let Some(m) = &state.metrics {
+                m.inc_counter(
+                    "vectorman_ingest_records_accepted_total",
+                    f64::from(reply.accepted),
+                );
+                m.inc_counter(
+                    "vectorman_ingest_records_failed_total",
+                    reply.failures.len() as f64,
+                );
+            }
+            Json(reply).into_response()
+        }
         Err(e) => map_err(e),
     }
 }
@@ -512,19 +525,22 @@ fn api_routes(state: AppState) -> Router {
 
 /// SQL 口路由：接入、查询、流、采集项反代、可选 SPA。
 pub fn sql_router(state: AppState, web_dir: Option<&Path>) -> Router {
+    let metrics = state.metrics.clone();
     let api = api_routes(state);
-    match web_dir {
+    let app = match web_dir {
         Some(dir) => {
             let index = dir.join("index.html");
             api.fallback_service(ServeDir::new(dir).fallback(ServeFile::new(index)))
         }
         None => api,
-    }
+    };
+    vectorman_metrics::apply_http_metrics(app, metrics)
 }
 
 /// Prom 口路由，处理器与 SQL 口 `/api/v1/query*` 相同。
 pub fn prom_router(state: AppState) -> Router {
-    Router::new()
+    let metrics = state.metrics.clone();
+    let app = Router::new()
         .route("/health", get(health))
         .route("/api/v1/query", get(prom_query))
         .route("/api/v1/query_range", get(prom_query_range))
@@ -532,7 +548,36 @@ pub fn prom_router(state: AppState) -> Router {
             state.clone(),
             auth_middleware,
         ))
-        .with_state(state)
+        .with_state(state);
+    vectorman_metrics::apply_http_metrics(app, metrics)
+}
+
+/// Write Prometheus samples into the local time series store.
+pub struct LocalTsSink {
+    pub ts: Arc<dyn TimeSeriesStore>,
+}
+
+#[async_trait::async_trait]
+impl vectorman_metrics::MetricsSink for LocalTsSink {
+    async fn write(
+        &self,
+        samples: &[vectorman_metrics::MetricSample],
+        timestamp_micros: i64,
+    ) -> Result<(), String> {
+        for s in samples {
+            self.ts
+                .write(TsPoint {
+                    measurement: s.name.clone(),
+                    tags: s.tags.clone(),
+                    field_name: "value".to_string(),
+                    field_value: s.value,
+                    timestamp: timestamp_micros,
+                })
+                .await
+                .map_err(|e| e.message)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -551,6 +596,7 @@ mod tests {
 
     use super::*;
     use crate::cleanup::{apply_retention, LiveItem};
+    use vectorman_metrics::MetricsSink;
 
     struct TestEnv {
         state: AppState,
@@ -578,6 +624,7 @@ mod tests {
                 log,
                 auth: Arc::new(NoopAuth),
                 gse_admin_url,
+                metrics: None,
             },
             _dir: dir,
         }
@@ -897,5 +944,40 @@ mod tests {
             "storage": {"retention_days": 2}
         }))
         .into_response()
+    }
+
+    #[tokio::test]
+    async fn metrics_router_exposes_process_uptime() {
+        let metrics = vectorman_metrics::SelfMetrics::new("dataserver", "0.0.0.0:8081").unwrap();
+        let app = metrics.metrics_router();
+        let (st, body) = send(&app, req("GET", "/metrics", None)).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert!(body.contains("vectorman_process_uptime_seconds"), "{body}");
+        assert!(body.contains("component=\"dataserver\""), "{body}");
+    }
+
+    #[tokio::test]
+    async fn flush_writes_self_metrics_queryable() {
+        let env = test_env(None);
+        let metrics = vectorman_metrics::SelfMetrics::new("dataserver", "0.0.0.0:8081").unwrap();
+        let sink = LocalTsSink {
+            ts: env.state.ts.clone(),
+        };
+        let samples = metrics.snapshot().await.unwrap();
+        sink.write(&samples, now_micros()).await.unwrap();
+
+        let result = env
+            .state
+            .ts
+            .query_instant("vectorman_process_uptime_seconds", None)
+            .await
+            .unwrap();
+        assert!(
+            result.result.iter().any(|s| {
+                s.metric.get("component").map(String::as_str) == Some("dataserver")
+                    && s.metric.get("data_id").map(String::as_str) == Some("self")
+            }),
+            "{result:?}"
+        );
     }
 }

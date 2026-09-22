@@ -47,6 +47,9 @@ pub struct ServerConfig {
     /// stderr 采集上限（字节），超出截断。
     #[serde(default = "default_stderr_limit")]
     pub job_stderr_limit_bytes: u64,
+    /// 独立 Prometheus 口，默认仅回环。
+    #[serde(default = "default_metrics_listen")]
+    pub metrics_listen: String,
     /// 单文件大小上限（字节），缺省 64 MiB。
     #[serde(default = "default_max_file")]
     pub job_max_file_bytes: u64,
@@ -82,6 +85,7 @@ impl Default for ServerConfig {
             job_max_script_bytes: default_max_script(),
             job_stdout_limit_bytes: default_stdout_limit(),
             job_stderr_limit_bytes: default_stderr_limit(),
+            metrics_listen: default_metrics_listen(),
             job_max_file_bytes: default_max_file(),
             job_file_dir: String::new(),
             job_file_retain_secs: default_file_retain(),
@@ -147,6 +151,10 @@ fn default_stdout_limit() -> u64 {
 
 fn default_stderr_limit() -> u64 {
     1048576
+}
+
+fn default_metrics_listen() -> String {
+    "127.0.0.1:7102".to_string()
 }
 
 fn default_max_file() -> u64 {
@@ -225,6 +233,9 @@ pub fn load_config(path: &str) -> Result<ServerConfig, String> {
             cfg.job_stderr_limit_bytes = n;
         }
     }
+    if let Ok(v) = std::env::var("GSE_SERVER_METRICS_LISTEN") {
+        cfg.metrics_listen = v;
+    }
     if let Ok(v) = std::env::var("GSE_SERVER_JOB_MAX_FILE") {
         if let Ok(n) = v.parse() {
             cfg.job_max_file_bytes = n;
@@ -274,6 +285,7 @@ mod tests {
             "GSE_SERVER_JOB_MAX_SCRIPT_BYTES",
             "GSE_SERVER_JOB_STDOUT_LIMIT",
             "GSE_SERVER_JOB_STDERR_LIMIT",
+            "GSE_SERVER_METRICS_LISTEN",
             "GSE_SERVER_JOB_MAX_FILE",
             "GSE_SERVER_JOB_FILE_DIR",
             "GSE_SERVER_JOB_FILE_RETAIN",
@@ -297,6 +309,7 @@ mod tests {
             "GSE_SERVER_JOB_MAX_SCRIPT_BYTES",
             "GSE_SERVER_JOB_STDOUT_LIMIT",
             "GSE_SERVER_JOB_STDERR_LIMIT",
+            "GSE_SERVER_METRICS_LISTEN",
             "GSE_SERVER_JOB_MAX_FILE",
             "GSE_SERVER_JOB_FILE_DIR",
             "GSE_SERVER_JOB_FILE_RETAIN",
@@ -358,6 +371,7 @@ web-02 = "tok-b"
             assert_eq!(cfg.job_max_script_bytes, 1024);
             assert_eq!(cfg.job_stdout_limit_bytes, 2048);
             assert_eq!(cfg.job_stderr_limit_bytes, 4096);
+            assert_eq!(cfg.metrics_listen, "127.0.0.1:7102");
         });
     }
 
@@ -382,6 +396,7 @@ web-02 = "tok-b"
             assert_eq!(cfg.job_max_script_bytes, 262144);
             assert_eq!(cfg.job_stdout_limit_bytes, 1048576);
             assert_eq!(cfg.job_stderr_limit_bytes, 1048576);
+            assert_eq!(cfg.metrics_listen, "127.0.0.1:7102");
             assert_eq!(cfg.job_max_file_bytes, 67108864);
             assert!(cfg.job_file_dir.is_empty());
             assert_eq!(cfg.job_file_retain_secs, 86400);
@@ -429,6 +444,7 @@ web-01 = "tok-a"
             std::env::set_var("GSE_SERVER_JOB_MAX_SCRIPT_BYTES", "2048");
             std::env::set_var("GSE_SERVER_JOB_STDOUT_LIMIT", "4096");
             std::env::set_var("GSE_SERVER_JOB_STDERR_LIMIT", "8192");
+            std::env::set_var("GSE_SERVER_METRICS_LISTEN", "127.0.0.1:7109");
             let cfg = load_config(&path).expect("parse");
             assert_eq!(cfg.listen, "0.0.0.0:9999");
             assert!(!cfg.auth_enabled);
@@ -443,6 +459,7 @@ web-01 = "tok-a"
             assert_eq!(cfg.job_max_script_bytes, 2048);
             assert_eq!(cfg.job_stdout_limit_bytes, 4096);
             assert_eq!(cfg.job_stderr_limit_bytes, 8192);
+            assert_eq!(cfg.metrics_listen, "127.0.0.1:7109");
         });
     }
 

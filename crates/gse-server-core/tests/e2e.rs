@@ -30,6 +30,7 @@ fn server_config(db: &str, auth_enabled: bool, timeout_secs: u64) -> ServerConfi
         http_web_dir: None,
         heartbeat_interval_secs: 1,
         heartbeat_timeout_secs: timeout_secs,
+        metrics_listen: "127.0.0.1:0".to_string(),
         ..Default::default()
     }
 }
