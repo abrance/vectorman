@@ -87,6 +87,7 @@ async fn register_probe_collect_ingest_and_query() {
             ledger: ledger.clone(),
             registry: None,
             cfg: None,
+            file_store: None,
         },
         None,
     ))

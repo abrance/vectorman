@@ -55,4 +55,17 @@ describe("FetchHttpClient", () => {
       message: "gone",
     });
   });
+
+  it("sends FormData without JSON content-type", async () => {
+    const session = new MemoryAuthSession();
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ file_id: "f1" }), { status: 201 }));
+    const client = new FetchHttpClient(session, new JsonErrorMapper(), fetchImpl as unknown as typeof fetch);
+    const form = new FormData();
+    form.append("file", new File(["hi"], "a.txt"));
+    await client.request({ method: "POST", url: "/api/gse/job-files", body: form });
+    const init = fetchImpl.mock.calls[0][1] as RequestInit;
+    const headers = init.headers as Record<string, string>;
+    expect(init.body).toBe(form);
+    expect(headers["Content-Type"]).toBeUndefined();
+  });
 });

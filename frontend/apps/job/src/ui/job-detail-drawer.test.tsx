@@ -20,6 +20,7 @@ vi.mock("../app/runtime", () => ({
   useRuntime: () => ({
     templates: { saveJobAsTemplate: vi.fn() },
     notifier: { success: vi.fn(), error: vi.fn() },
+    jobs: { downloadJobFileUrl: (id: string) => `/api/gse/job-files/${id}` },
   }),
 }));
 
@@ -27,7 +28,7 @@ vi.mock("../features/jobs/use-job-detail", () => ({
   useJobDetail: () => ({ data: mocks.job, status: "success" }),
 }));
 
-import { JobDetailDrawer } from "./job-detail-drawer";
+import { formatFileEndpoint, JobDetailDrawer } from "./job-detail-drawer";
 
 afterEach(cleanup);
 
@@ -39,5 +40,11 @@ describe("JobDetailDrawer", () => {
     expect(screen.getByText("job-src")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: /重\s*做/ }));
     expect(onRerun).toHaveBeenCalledWith(mocks.job);
+  });
+
+  it("formats file endpoints", () => {
+    expect(formatFileEndpoint({ type: "agent", agent_id: "a1", path: "/tmp/a" })).toBe("a1:/tmp/a");
+    expect(formatFileEndpoint({ type: "server_temp", file_id: "file-1" })).toBe("临时文件 file-1");
+    expect(formatFileEndpoint({ type: "server_temp" })).toBe("Server 临时目录");
   });
 });

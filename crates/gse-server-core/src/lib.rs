@@ -3,7 +3,10 @@
 
 pub mod config;
 pub mod dataplane;
+pub mod file_transfer;
+pub mod hashutil;
 pub mod http;
+pub mod job_file_store;
 pub mod ledger;
 pub mod rerun;
 pub mod server;

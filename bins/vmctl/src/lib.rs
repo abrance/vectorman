@@ -1,6 +1,7 @@
 //! vmctl：通过 HTTP 访问 gse-server 的节点只读接口与作业接口。
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -11,7 +12,7 @@ pub const WAIT_INTERVAL: Duration = Duration::from_secs(1);
 pub const WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const READ_TIMEOUT: Duration = Duration::from_secs(30);
+const READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// CLI 输出：2xx 正文进 stdout，错误进 stderr。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +65,41 @@ impl Default for WaitPolicy {
 }
 
 pub trait Transport {
-    fn send(&self, method: &str, url: &str, body: Option<&str>) -> Result<(u16, String), String>;
+    fn exchange(
+        &self,
+        method: &str,
+        url: &str,
+        body: RequestBody<'_>,
+    ) -> Result<HttpResponse, String>;
+
+    fn send(&self, method: &str, url: &str, body: Option<&str>) -> Result<(u16, String), String> {
+        let req = match body {
+            Some(payload) => RequestBody::Json(payload),
+            None => RequestBody::Empty,
+        };
+        let resp = self.exchange(method, url, req)?;
+        Ok((
+            resp.status,
+            String::from_utf8_lossy(&resp.body).into_owned(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestBody<'a> {
+    Empty,
+    Json(&'a str),
+    MultipartFile {
+        field: &'a str,
+        filename: &'a str,
+        data: &'a [u8],
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
 }
 
 pub struct UreqTransport {
@@ -89,28 +124,30 @@ impl Default for UreqTransport {
 }
 
 impl Transport for UreqTransport {
-    fn send(&self, method: &str, url: &str, body: Option<&str>) -> Result<(u16, String), String> {
-        let req = match method {
-            "GET" => self.agent.get(url),
-            "POST" => self.agent.post(url),
-            other => return Err(format!("unsupported method: {other}")),
-        };
+    fn exchange(
+        &self,
+        method: &str,
+        url: &str,
+        body: RequestBody<'_>,
+    ) -> Result<HttpResponse, String> {
+        let req = self.agent.request(method, url);
         let result = match body {
-            Some(payload) => req
+            RequestBody::Empty => req.call(),
+            RequestBody::Json(payload) => req
                 .set("Content-Type", "application/json")
                 .send_string(payload),
-            None => req.call(),
+            RequestBody::MultipartFile {
+                field,
+                filename,
+                data,
+            } => {
+                let (content_type, bytes) = encode_multipart(field, filename, data);
+                req.set("Content-Type", &content_type).send_bytes(&bytes)
+            }
         };
         match result {
-            Ok(resp) => {
-                let status = resp.status();
-                let text = resp.into_string().unwrap_or_default();
-                Ok((status, text))
-            }
-            Err(ureq::Error::Status(code, resp)) => {
-                let text = resp.into_string().unwrap_or_default();
-                Ok((code, text))
-            }
+            Ok(resp) => read_ureq_response(resp.status(), resp),
+            Err(ureq::Error::Status(code, resp)) => read_ureq_response(code, resp),
             Err(e) => Err(e.to_string()),
         }
     }
@@ -124,6 +161,7 @@ pub struct Client<'a, T: Transport> {
 
 #[derive(Debug, Clone, Default)]
 pub struct JobSubmitSpec {
+    pub kind: String,
     pub agent_id: String,
     pub script_file: String,
     pub interpreter: Option<String>,
@@ -132,6 +170,11 @@ pub struct JobSubmitSpec {
     pub working_dir: Option<String>,
     pub timeout_secs: Option<u64>,
     pub wait: bool,
+    pub from_agent: Option<String>,
+    pub from_path: Option<String>,
+    pub to_agent: Option<String>,
+    pub to_path: Option<String>,
+    pub upload: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -145,6 +188,7 @@ pub struct JobRerunSpec {
     pub working_dir: Option<String>,
     pub timeout_secs: Option<u64>,
     pub wait: bool,
+    pub dest_path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -159,6 +203,15 @@ struct JobSubmitBody {
     env: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     working_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct FileJobBody {
+    kind: &'static str,
+    source: serde_json::Value,
+    destination: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     timeout_secs: Option<u64>,
 }
@@ -190,6 +243,85 @@ pub fn parse_env(pairs: &[String]) -> Result<BTreeMap<String, String>, String> {
         }
     }
     Ok(env)
+}
+
+fn filled(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn nonempty(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
+fn opt_filled(value: &Option<String>) -> Option<&str> {
+    filled(value.as_deref())
+}
+
+fn normalize_kind(kind: &str) -> String {
+    let trimmed = kind.trim();
+    if trimmed.is_empty() {
+        "script".to_string()
+    } else {
+        trimmed.to_ascii_lowercase()
+    }
+}
+
+fn basename_or_upload(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "upload.bin".to_string())
+}
+
+fn encode_multipart(field: &str, filename: &str, data: &[u8]) -> (String, Vec<u8>) {
+    let safe_name = filename.replace(['\r', '\n', '"'], "_");
+    let boundary = format!(
+        "----VmctlFormBoundary{:x}{:x}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let header = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{safe_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+    );
+    let footer = format!("\r\n--{boundary}--\r\n");
+    let mut body = Vec::with_capacity(header.len() + data.len() + footer.len());
+    body.extend_from_slice(header.as_bytes());
+    body.extend_from_slice(data);
+    body.extend_from_slice(footer.as_bytes());
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
+fn read_ureq_response(status: u16, resp: ureq::Response) -> Result<HttpResponse, String> {
+    let mut body = Vec::new();
+    resp.into_reader()
+        .read_to_end(&mut body)
+        .map_err(|e| e.to_string())?;
+    Ok(HttpResponse { status, body })
+}
+
+fn file_id_of(body: &str) -> Result<String, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("parse upload json: {e}"))?;
+    value
+        .get("file_id")
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| "missing file_id in response".to_string())
+}
+
+fn http_bytes_to_output(result: Result<HttpResponse, String>) -> Output {
+    match result {
+        Ok(resp) if (200..300).contains(&resp.status) => {
+            Output::ok(String::from_utf8_lossy(&resp.body).into_owned())
+        }
+        Ok(resp) => Output::err(1, String::from_utf8_lossy(&resp.body).into_owned()),
+        Err(e) => Output::err(1, e),
+    }
 }
 
 fn enc(segment: &str) -> String {
@@ -282,6 +414,34 @@ impl<'a, T: Transport> Client<'a, T> {
     }
 
     pub fn jobs_submit(&self, spec: &JobSubmitSpec) -> Output {
+        match normalize_kind(&spec.kind).as_str() {
+            "script" => self.jobs_submit_script(spec),
+            "file_transfer" => self.jobs_submit_file(spec),
+            other => Output::err(
+                1,
+                format!("unsupported --kind {other}, want script or file_transfer"),
+            ),
+        }
+    }
+
+    fn jobs_submit_script(&self, spec: &JobSubmitSpec) -> Output {
+        if opt_filled(&spec.from_agent).is_some()
+            || opt_filled(&spec.from_path).is_some()
+            || opt_filled(&spec.to_agent).is_some()
+            || opt_filled(&spec.to_path).is_some()
+            || opt_filled(&spec.upload).is_some()
+        {
+            return Output::err(
+                1,
+                "file transfer flags cannot be used with script jobs".to_string(),
+            );
+        }
+        if !nonempty(&spec.agent_id) || !nonempty(&spec.script_file) {
+            return Output::err(
+                1,
+                "script job requires --agent-id and --script-file".to_string(),
+            );
+        }
         let script = match read_script_file(Path::new(&spec.script_file)) {
             Ok(s) => s,
             Err(e) => return Output::err(1, e),
@@ -309,6 +469,119 @@ impl<'a, T: Transport> Client<'a, T> {
             Some(&payload),
         ));
         self.after_job_write(created, spec.wait)
+    }
+
+    fn jobs_submit_file(&self, spec: &JobSubmitSpec) -> Output {
+        if nonempty(&spec.script_file) {
+            return Output::err(
+                1,
+                "--kind file_transfer cannot be used with --script-file".to_string(),
+            );
+        }
+        let upload = opt_filled(&spec.upload);
+        let from_agent = opt_filled(&spec.from_agent);
+        let from_path = opt_filled(&spec.from_path);
+        let to_agent = opt_filled(&spec.to_agent);
+        let to_path = opt_filled(&spec.to_path);
+        if upload.is_some() && (from_agent.is_some() || from_path.is_some()) {
+            return Output::err(1, "--upload cannot be used with --from-agent".to_string());
+        }
+        let (Some(to_agent), Some(to_path)) = (to_agent, to_path) else {
+            return Output::err(
+                1,
+                "file transfer requires --to-agent and --to-path".to_string(),
+            );
+        };
+        let source = if let Some(local) = upload {
+            match self.upload_local_file(local) {
+                Ok(file_id) => serde_json::json!({"type": "server_temp", "file_id": file_id}),
+                Err(out) => return out,
+            }
+        } else if let (Some(agent_id), Some(path)) = (from_agent, from_path) {
+            serde_json::json!({"type": "agent", "agent_id": agent_id, "path": path})
+        } else {
+            return Output::err(
+                1,
+                "file transfer requires --from-agent --from-path --to-agent --to-path, or --upload --to-agent --to-path".to_string(),
+            );
+        };
+        let body = FileJobBody {
+            kind: "file_transfer",
+            source,
+            destination: serde_json::json!({
+                "type": "agent",
+                "agent_id": to_agent,
+                "path": to_path
+            }),
+            timeout_secs: spec.timeout_secs,
+        };
+        let payload = match serde_json::to_string(&body) {
+            Ok(s) => s,
+            Err(e) => return Output::err(1, format!("encode submit body: {e}")),
+        };
+        let created = http_to_output(self.transport.send(
+            "POST",
+            &join_url(&self.base_url, "/api/gse/jobs"),
+            Some(&payload),
+        ));
+        self.after_job_write(created, spec.wait)
+    }
+
+    fn upload_local_file(&self, path: &str) -> Result<String, Output> {
+        let out = self.jobs_files_upload(path);
+        if out.code != 0 {
+            return Err(out);
+        }
+        file_id_of(&out.stdout).map_err(|e| Output::err(1, e))
+    }
+
+    pub fn jobs_files_list(&self) -> Output {
+        self.get("/api/gse/job-files")
+    }
+
+    pub fn jobs_files_upload(&self, path: &str) -> Output {
+        let data = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) => return Output::err(1, format!("read {path}: {e}")),
+        };
+        let filename = basename_or_upload(path);
+        http_bytes_to_output(self.transport.exchange(
+            "POST",
+            &join_url(&self.base_url, "/api/gse/job-files"),
+            RequestBody::MultipartFile {
+                field: "file",
+                filename: &filename,
+                data: &data,
+            },
+        ))
+    }
+
+    pub fn jobs_files_download(&self, file_id: &str, output: &str) -> Output {
+        let url = join_url(
+            &self.base_url,
+            &format!("/api/gse/job-files/{}", enc(file_id)),
+        );
+        match self.transport.exchange("GET", &url, RequestBody::Empty) {
+            Ok(resp) if (200..300).contains(&resp.status) => {
+                match std::fs::write(output, &resp.body) {
+                    Ok(()) => Output::ok(String::new()),
+                    Err(e) => Output::err(1, format!("write {output}: {e}")),
+                }
+            }
+            Ok(resp) => Output::err(1, String::from_utf8_lossy(&resp.body).into_owned()),
+            Err(e) => Output::err(1, e),
+        }
+    }
+
+    pub fn jobs_files_delete(&self, file_id: &str) -> Output {
+        http_to_output(self.transport.send(
+            "DELETE",
+            &join_url(
+                &self.base_url,
+                &format!("/api/gse/job-files/{}", enc(file_id)),
+            ),
+            None,
+        ))
     }
 
     pub fn jobs_rerun(&self, spec: &JobRerunSpec) -> Output {
@@ -347,6 +620,12 @@ impl<'a, T: Transport> Client<'a, T> {
         }
         if let Some(secs) = spec.timeout_secs {
             obj.insert("timeout_secs".into(), serde_json::json!(secs));
+        }
+        if let Some(path) = opt_filled(&spec.dest_path) {
+            obj.insert(
+                "dest_path".into(),
+                serde_json::Value::String(path.to_string()),
+            );
         }
         let url = join_url(
             &self.base_url,
@@ -434,22 +713,36 @@ mod tests {
     }
 
     impl Transport for Mock {
-        fn send(
+        fn exchange(
             &self,
             method: &str,
             url: &str,
-            body: Option<&str>,
-        ) -> Result<(u16, String), String> {
+            body: RequestBody<'_>,
+        ) -> Result<HttpResponse, String> {
+            let body = match body {
+                RequestBody::Empty => None,
+                RequestBody::Json(payload) => Some(payload.to_string()),
+                RequestBody::MultipartFile {
+                    field,
+                    filename,
+                    data,
+                } => Some(format!("multipart:{field}:{filename}:{} bytes", data.len())),
+            };
             let mut inner = self.inner.lock().expect("lock");
-            inner.calls.push((
-                method.to_string(),
-                url.to_string(),
-                body.map(ToOwned::to_owned),
-            ));
             inner
+                .calls
+                .push((method.to_string(), url.to_string(), body));
+            match inner
                 .next
                 .pop_front()
                 .unwrap_or_else(|| Err("no more mock responses".into()))
+            {
+                Ok((status, body)) => Ok(HttpResponse {
+                    status,
+                    body: body.into_bytes(),
+                }),
+                Err(e) => Err(e),
+            }
         }
     }
 
@@ -560,6 +853,41 @@ mod tests {
     }
 
     #[test]
+    fn submit_upload_missing_file_id_skips_job() {
+        let dir = tmp_dir("upload-noid");
+        let path = dir.join("pkg.tar");
+        std::fs::write(&path, b"x").expect("write");
+        let mock = Mock::new(vec![Ok((201, "{\"file_name\":\"pkg.tar\"}".into()))]);
+        let c = client(&mock, WaitPolicy::default());
+        let out = c.jobs_submit(&JobSubmitSpec {
+            kind: "file_transfer".into(),
+            upload: Some(path.to_string_lossy().into_owned()),
+            to_agent: Some("web-02".into()),
+            to_path: Some("/opt/pkg.tar".into()),
+            ..JobSubmitSpec::default()
+        });
+        assert_eq!(out.code, 1);
+        assert!(out.stderr.contains("missing file_id"));
+        assert_eq!(mock.calls().len(), 1);
+    }
+
+    #[test]
+    fn submit_upload_unreadable_local_file() {
+        let mock = Mock::new(vec![]);
+        let c = client(&mock, WaitPolicy::default());
+        let out = c.jobs_submit(&JobSubmitSpec {
+            kind: "file_transfer".into(),
+            upload: Some("/no/such/vmctl-upload.bin".into()),
+            to_agent: Some("web-02".into()),
+            to_path: Some("/opt/pkg.tar".into()),
+            ..JobSubmitSpec::default()
+        });
+        assert_eq!(out.code, 1);
+        assert!(out.stderr.contains("read /no/such/vmctl-upload.bin"));
+        assert!(mock.calls().is_empty());
+    }
+
+    #[test]
     fn submit_missing_script_file_exits_1() {
         let mock = Mock::new(vec![]);
         let c = client(&mock, WaitPolicy::default());
@@ -664,5 +992,234 @@ mod tests {
         assert_eq!(call.0, "POST");
         assert_eq!(call.1, "http://127.0.0.1:7101/api/gse/jobs/j-1/rerun");
         assert_eq!(call.2, None);
+    }
+
+    fn tmp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "vmctl-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    #[test]
+    fn submit_script_json_omits_kind() {
+        let dir = tmp_dir("script-kind");
+        let path = dir.join("job.sh");
+        std::fs::write(&path, "echo hi").expect("write");
+        let mock = Mock::new(vec![Ok((201, "{\"job_id\":\"j-1\"}".into()))]);
+        let c = client(&mock, WaitPolicy::default());
+        let out = c.jobs_submit(&JobSubmitSpec {
+            kind: "script".into(),
+            agent_id: "agent-1".into(),
+            script_file: path.to_string_lossy().into_owned(),
+            ..JobSubmitSpec::default()
+        });
+        assert_eq!(out.code, 0);
+        let body = mock.calls()[0].2.clone().expect("body");
+        assert!(!body.contains("\"kind\""));
+        assert!(body.contains("\"agent_id\":\"agent-1\""));
+    }
+
+    #[test]
+    fn submit_file_transfer_agent_to_agent() {
+        let mock = Mock::new(vec![Ok((201, "{\"job_id\":\"j-ft\"}".into()))]);
+        let c = client(&mock, WaitPolicy::default());
+        let out = c.jobs_submit(&JobSubmitSpec {
+            kind: "file_transfer".into(),
+            from_agent: Some("web-01".into()),
+            from_path: Some("/var/log/app.log".into()),
+            to_agent: Some("web-02".into()),
+            to_path: Some("/tmp/app.log".into()),
+            timeout_secs: Some(300),
+            ..JobSubmitSpec::default()
+        });
+        assert_eq!(out.code, 0);
+        let body: serde_json::Value =
+            serde_json::from_str(mock.calls()[0].2.as_deref().expect("body")).expect("json");
+        assert_eq!(body["kind"], "file_transfer");
+        assert_eq!(body["source"]["type"], "agent");
+        assert_eq!(body["source"]["agent_id"], "web-01");
+        assert_eq!(body["source"]["path"], "/var/log/app.log");
+        assert_eq!(body["destination"]["type"], "agent");
+        assert_eq!(body["destination"]["agent_id"], "web-02");
+        assert_eq!(body["destination"]["path"], "/tmp/app.log");
+        assert_eq!(body["timeout_secs"], 300);
+        assert!(body.get("script").is_none());
+    }
+
+    #[test]
+    fn submit_file_transfer_upload_then_push() {
+        let dir = tmp_dir("upload");
+        let path = dir.join("pkg.tar");
+        std::fs::write(&path, b"tar-bytes").expect("write");
+        let mock = Mock::new(vec![
+            Ok((201, "{\"file_id\":\"file-1\"}".into())),
+            Ok((201, "{\"job_id\":\"j-up\"}".into())),
+        ]);
+        let c = client(&mock, WaitPolicy::default());
+        let out = c.jobs_submit(&JobSubmitSpec {
+            kind: "file_transfer".into(),
+            upload: Some(path.to_string_lossy().into_owned()),
+            to_agent: Some("web-02".into()),
+            to_path: Some("/opt/pkg.tar".into()),
+            ..JobSubmitSpec::default()
+        });
+        assert_eq!(out.code, 0);
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "POST");
+        assert_eq!(calls[0].1, "http://127.0.0.1:7101/api/gse/job-files");
+        assert!(calls[0]
+            .2
+            .as_deref()
+            .expect("multipart")
+            .starts_with("multipart:file:pkg.tar:"));
+        let body: serde_json::Value =
+            serde_json::from_str(calls[1].2.as_deref().expect("job body")).expect("json");
+        assert_eq!(body["source"]["type"], "server_temp");
+        assert_eq!(body["source"]["file_id"], "file-1");
+        assert_eq!(body["destination"]["agent_id"], "web-02");
+        assert_eq!(body["destination"]["path"], "/opt/pkg.tar");
+    }
+
+    #[test]
+    fn submit_upload_failure_skips_job() {
+        let dir = tmp_dir("upload-fail");
+        let path = dir.join("pkg.tar");
+        std::fs::write(&path, b"x").expect("write");
+        let mock = Mock::new(vec![Ok((400, "{\"error\":\"too big\"}".into()))]);
+        let c = client(&mock, WaitPolicy::default());
+        let out = c.jobs_submit(&JobSubmitSpec {
+            kind: "file_transfer".into(),
+            upload: Some(path.to_string_lossy().into_owned()),
+            to_agent: Some("web-02".into()),
+            to_path: Some("/opt/pkg.tar".into()),
+            ..JobSubmitSpec::default()
+        });
+        assert_eq!(out.code, 1);
+        assert_eq!(out.stderr, "{\"error\":\"too big\"}");
+        assert_eq!(mock.calls().len(), 1);
+    }
+
+    #[test]
+    fn submit_rejects_kind_and_flag_conflicts() {
+        let mock = Mock::new(vec![]);
+        let c = client(&mock, WaitPolicy::default());
+        let unknown = c.jobs_submit(&JobSubmitSpec {
+            kind: "copy".into(),
+            ..JobSubmitSpec::default()
+        });
+        assert_eq!(unknown.code, 1);
+        assert!(unknown.stderr.contains("unsupported --kind"));
+
+        let mixed = c.jobs_submit(&JobSubmitSpec {
+            kind: "file_transfer".into(),
+            script_file: "run.sh".into(),
+            from_agent: Some("a".into()),
+            from_path: Some("/tmp/a".into()),
+            to_agent: Some("b".into()),
+            to_path: Some("/tmp/b".into()),
+            ..JobSubmitSpec::default()
+        });
+        assert_eq!(mixed.code, 1);
+        assert!(mixed.stderr.contains("--script-file"));
+
+        let both_src = c.jobs_submit(&JobSubmitSpec {
+            kind: "file_transfer".into(),
+            from_agent: Some("a".into()),
+            upload: Some("./pkg.tar".into()),
+            to_agent: Some("b".into()),
+            to_path: Some("/tmp/b".into()),
+            ..JobSubmitSpec::default()
+        });
+        assert_eq!(both_src.code, 1);
+        assert!(both_src.stderr.contains("--upload"));
+        assert!(mock.calls().is_empty());
+    }
+
+    #[test]
+    fn wait_file_job_maps_terminal_status() {
+        let mock = Mock::new(vec![
+            Ok((201, "{\"job_id\":\"j-ft\"}".into())),
+            Ok((200, "{\"job_id\":\"j-ft\",\"status\":\"succeeded\"}".into())),
+        ]);
+        let c = client(&mock, instant_wait());
+        let out = c.jobs_submit(&JobSubmitSpec {
+            kind: "file_transfer".into(),
+            from_agent: Some("a".into()),
+            from_path: Some("/tmp/a".into()),
+            to_agent: Some("b".into()),
+            to_path: Some("/tmp/b".into()),
+            wait: true,
+            ..JobSubmitSpec::default()
+        });
+        assert_eq!(out.code, 0);
+        assert!(out.stdout.contains("succeeded"));
+    }
+
+    #[test]
+    fn rerun_includes_dest_path() {
+        let mock = Mock::new(vec![Ok((201, "{\"job_id\":\"j-3\"}".into()))]);
+        let c = client(&mock, WaitPolicy::default());
+        let out = c.jobs_rerun(&JobRerunSpec {
+            job_id: "j-1".into(),
+            dest_path: Some("/tmp/app.log".into()),
+            agent_id: Some("web-03".into()),
+            ..JobRerunSpec::default()
+        });
+        assert_eq!(out.code, 0);
+        let body: serde_json::Value =
+            serde_json::from_str(mock.calls()[0].2.as_deref().expect("body")).expect("json");
+        assert_eq!(body["dest_path"], "/tmp/app.log");
+        assert_eq!(body["agent_id"], "web-03");
+    }
+
+    #[test]
+    fn jobs_files_crud() {
+        let dir = tmp_dir("files");
+        let src = dir.join("pkg.bin");
+        let dst = dir.join("out.bin");
+        std::fs::write(&src, b"\0abc").expect("write");
+
+        let mock = Mock::new(vec![
+            Ok((200, "[{\"file_id\":\"file-1\"}]".into())),
+            Ok((201, "{\"file_id\":\"file-1\"}".into())),
+            Ok((200, String::from_utf8(b"\0abc".to_vec()).expect("latin1"))),
+            Ok((204, String::new())),
+        ]);
+        let c = client(&mock, WaitPolicy::default());
+
+        let list = c.jobs_files_list();
+        assert_eq!(list.code, 0);
+        assert_eq!(mock.calls()[0].0, "GET");
+        assert_eq!(mock.calls()[0].1, "http://127.0.0.1:7101/api/gse/job-files");
+
+        let upload = c.jobs_files_upload(&src.to_string_lossy());
+        assert_eq!(upload.code, 0);
+        assert!(mock.calls()[1]
+            .2
+            .as_deref()
+            .expect("multipart")
+            .contains("multipart:file:pkg.bin:"));
+
+        let download = c.jobs_files_download("file-1", &dst.to_string_lossy());
+        assert_eq!(download.code, 0);
+        assert!(download.stdout.is_empty());
+        assert_eq!(std::fs::read(&dst).expect("read"), b"\0abc");
+
+        let delete = c.jobs_files_delete("file-1");
+        assert_eq!(delete.code, 0);
+        assert!(delete.stdout.is_empty());
+        assert_eq!(mock.calls()[3].0, "DELETE");
+        assert_eq!(
+            mock.calls()[3].1,
+            "http://127.0.0.1:7101/api/gse/job-files/file-1"
+        );
     }
 }

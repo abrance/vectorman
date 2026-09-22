@@ -14,3 +14,5 @@ toml = "0.8"
 libc = "0.2"
 ureq = { version = "2", features = ["json"] }
 regex = "1"
+sha2 = "0.10"
+base64 = "0.22"

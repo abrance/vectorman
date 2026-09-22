@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use axum::extract::Multipart;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -22,6 +23,8 @@ use tower_http::services::{ServeDir, ServeFile};
 use vectorman_metrics::SelfMetrics;
 
 use crate::config::ServerConfig;
+use crate::file_transfer::{submit_file_job, submit_file_rerun, FileJobSubmit};
+use crate::job_file_store::JobFileStore;
 use crate::ledger::{
     ledger_stamp, AccessPoint, Agent, AgentConfig, CollectItem, DataplaneService, Host,
     JobTemplate, Ledger,
@@ -39,6 +42,8 @@ pub struct AdminState {
     pub registry: Option<Arc<SessionRegistry>>,
     /// 作业提交校验所需的 server 配置；独立部署管理端口时为 None，作业接口不可用。
     pub cfg: Option<Arc<ServerConfig>>,
+    /// 作业临时文件；独立部署管理端口时为 None，文件接口不可用。
+    pub file_store: Option<Arc<JobFileStore>>,
 }
 
 pub(crate) struct GseScrapeHook {
@@ -149,6 +154,11 @@ fn ledger_routes(admin: AdminState) -> Router {
         .route(
             "/job-templates/{template_id}/submit",
             post(submit_job_template),
+        )
+        .route("/job-files", get(list_job_files).post(upload_job_file))
+        .route(
+            "/job-files/{file_id}",
+            get(download_job_file).delete(delete_job_file),
         )
         .with_state(admin)
 }
@@ -758,7 +768,7 @@ async fn list_jobs(State(admin): State<AdminState>, Query(q): Query<JobListQuery
 
 async fn create_job(
     State(admin): State<AdminState>,
-    body: Result<Json<JobSubmit>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Json(req) = match body {
         Ok(b) => b,
@@ -770,9 +780,50 @@ async fn create_job(
             GseError::new("unavailable", "job dispatch requires the in-process server"),
         );
     };
-    match submit_job(&admin.ledger, registry, cfg, req).await {
-        Ok(record) => created(&record),
-        Err(e) => err_json(job_status(&e.code), e),
+    let kind = req.get("kind").and_then(|v| v.as_str()).unwrap_or("script");
+    if kind == "file_transfer" {
+        let Some(store) = admin.file_store.as_ref() else {
+            return err_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                GseError::new("unavailable", "job file store unavailable"),
+            );
+        };
+        let parsed: FileJobSubmit = match serde_json::from_value(req) {
+            Ok(v) => v,
+            Err(e) => {
+                return err_json(
+                    StatusCode::BAD_REQUEST,
+                    GseError::new("invalid_argument", e.to_string()),
+                )
+            }
+        };
+        match submit_file_job(
+            admin.ledger.clone(),
+            registry.clone(),
+            cfg.clone(),
+            store.clone(),
+            parsed,
+            None,
+        )
+        .await
+        {
+            Ok(record) => created(&record),
+            Err(e) => err_json(job_status(&e.code), e),
+        }
+    } else {
+        let parsed: JobSubmit = match serde_json::from_value(req) {
+            Ok(v) => v,
+            Err(e) => {
+                return err_json(
+                    StatusCode::BAD_REQUEST,
+                    GseError::new("invalid_argument", e.to_string()),
+                )
+            }
+        };
+        match submit_job(&admin.ledger, registry, cfg, parsed).await {
+            Ok(record) => created(&record),
+            Err(e) => err_json(job_status(&e.code), e),
+        }
     }
 }
 
@@ -823,9 +874,33 @@ async fn rerun_job(
             GseError::new("unavailable", "job dispatch requires the in-process server"),
         );
     };
-    match submit_rerun(&admin.ledger, registry, cfg, &source, req).await {
-        Ok(record) => created(&record),
-        Err(e) => err_json(job_status(&e.code), e),
+    if source.kind == "file_transfer" {
+        let Some(store) = admin.file_store.as_ref() else {
+            return err_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                GseError::new("unavailable", "job file store unavailable"),
+            );
+        };
+        match submit_file_rerun(
+            admin.ledger.clone(),
+            registry.clone(),
+            cfg.clone(),
+            store.clone(),
+            &source,
+            req.timeout_secs,
+            req.agent_id,
+            req.dest_path,
+        )
+        .await
+        {
+            Ok(record) => created(&record),
+            Err(e) => err_json(job_status(&e.code), e),
+        }
+    } else {
+        match submit_rerun(&admin.ledger, registry, cfg, &source, req).await {
+            Ok(record) => created(&record),
+            Err(e) => err_json(job_status(&e.code), e),
+        }
     }
 }
 
@@ -1038,6 +1113,15 @@ async fn save_job_as_template(
         }
         Err(e) => return err_json(job_status(&e.code), e),
     };
+    if job.kind == "file_transfer" {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            GseError::new(
+                "invalid_argument",
+                "file transfer jobs cannot be saved as templates",
+            ),
+        );
+    }
     let input = TemplateInput {
         name: req.name,
         description: None,
@@ -1051,6 +1135,151 @@ async fn save_job_as_template(
     let cfg = template_cfg(&admin);
     match write_template(&admin, &input, &cfg).await {
         Ok(t) => created(&t),
+        Err(e) => err_json(job_status(&e.code), e),
+    }
+}
+
+fn require_file_store(admin: &AdminState) -> Option<(&Arc<JobFileStore>, &ServerConfig)> {
+    Some((admin.file_store.as_ref()?, admin.cfg.as_ref()?))
+}
+
+fn file_store_unavailable() -> Response {
+    err_json(
+        StatusCode::SERVICE_UNAVAILABLE,
+        GseError::new("unavailable", "job file store unavailable"),
+    )
+}
+
+async fn list_job_files(State(admin): State<AdminState>) -> Response {
+    let Some((store, cfg)) = require_file_store(&admin) else {
+        return file_store_unavailable();
+    };
+    match store.list_unexpired(crate::session::now_micros(), cfg.job_file_retain_secs) {
+        Ok(v) => ok(&v),
+        Err(e) => err_json(job_status(&e.code), e),
+    }
+}
+
+async fn upload_job_file(
+    State(admin): State<AdminState>,
+    headers: axum::http::HeaderMap,
+    mut multipart: Multipart,
+) -> Response {
+    let Some((store, cfg)) = require_file_store(&admin) else {
+        return file_store_unavailable();
+    };
+    let max = cfg.job_max_file_bytes;
+    if let Some(len) = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        if len > max.saturating_add(4096) {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                GseError::new("invalid_argument", format!("upload exceeds {max} bytes")),
+            );
+        }
+    }
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => {
+                return err_json(
+                    StatusCode::BAD_REQUEST,
+                    GseError::new("invalid_argument", e.to_string()),
+                )
+            }
+        };
+        if field.name() != Some("file") {
+            continue;
+        }
+        let file_name = field
+            .file_name()
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "upload.bin".to_string());
+        let file_id = JobFileStore::new_file_id();
+        let mut writer = match store.begin_write(&file_id, &file_name) {
+            Ok(w) => w,
+            Err(e) => return err_json(job_status(&e.code), e),
+        };
+        let mut size = 0u64;
+        let mut field = field;
+        loop {
+            match field.chunk().await {
+                Ok(Some(chunk)) => {
+                    size += chunk.len() as u64;
+                    if size > max {
+                        writer.abort();
+                        return err_json(
+                            StatusCode::BAD_REQUEST,
+                            GseError::new(
+                                "invalid_argument",
+                                format!("upload exceeds {max} bytes"),
+                            ),
+                        );
+                    }
+                    if let Err(e) = writer.write_all(&chunk) {
+                        writer.abort();
+                        return err_json(job_status(&e.code), e);
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    writer.abort();
+                    return err_json(
+                        StatusCode::BAD_REQUEST,
+                        GseError::new("invalid_argument", e.to_string()),
+                    );
+                }
+            }
+        }
+        match writer.finish() {
+            Ok(meta) => return created(&meta),
+            Err(e) => return err_json(job_status(&e.code), e),
+        }
+    }
+    err_json(
+        StatusCode::BAD_REQUEST,
+        GseError::new("invalid_argument", "missing required field: file"),
+    )
+}
+
+async fn download_job_file(
+    State(admin): State<AdminState>,
+    Path(file_id): Path<String>,
+) -> Response {
+    let Some((store, _)) = require_file_store(&admin) else {
+        return file_store_unavailable();
+    };
+    match store.get(&file_id) {
+        Ok((meta, data)) => {
+            let disp = format!(
+                "attachment; filename=\"{}\"",
+                meta.file_name.replace(['\\', '"'], "_")
+            );
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/octet-stream"),
+            );
+            if let Ok(v) = axum::http::HeaderValue::from_str(&disp) {
+                headers.insert(axum::http::header::CONTENT_DISPOSITION, v);
+            }
+            (StatusCode::OK, headers, data).into_response()
+        }
+        Err(e) => err_json(job_status(&e.code), e),
+    }
+}
+
+async fn delete_job_file(State(admin): State<AdminState>, Path(file_id): Path<String>) -> Response {
+    let Some((store, _)) = require_file_store(&admin) else {
+        return file_store_unavailable();
+    };
+    match store.delete(&file_id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => err_json(job_status(&e.code), e),
     }
 }
@@ -1080,6 +1309,7 @@ mod tests {
                 ledger: ledger.clone(),
                 registry: None,
                 cfg: None,
+                file_store: None,
             },
             None,
         );
@@ -1487,6 +1717,7 @@ mod tests {
                 ledger: ledger.clone(),
                 registry: None,
                 cfg: None,
+                file_store: None,
             },
             Some(&dir),
         );
@@ -1513,11 +1744,14 @@ mod tests {
         let db = test_db(name);
         let ledger = Arc::new(Ledger::new(&db).expect("open"));
         ledger.init().await.expect("init");
+        let store =
+            Arc::new(JobFileStore::open(format!("{db}.job-files")).expect("job file store"));
         let app = router(
             AdminState {
                 ledger: ledger.clone(),
                 registry: Some(Arc::new(SessionRegistry::new())),
                 cfg: Some(Arc::new(ServerConfig::default())),
+                file_store: Some(store),
             },
             None,
         );
@@ -1644,6 +1878,7 @@ mod tests {
                 rerun_of: None,
                 timeout_secs: 30,
                 created_at: ledger_stamp(),
+                ..Default::default()
             })
             .await
             .expect("insert");
@@ -1677,6 +1912,7 @@ mod tests {
                 rerun_of: None,
                 timeout_secs: 30,
                 created_at: ledger_stamp(),
+                ..Default::default()
             })
             .await
             .expect("insert job");
@@ -1969,5 +2205,185 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body.contains("vectorman_gse_sessions"), "{body}");
         assert!(body.contains("component=\"gse-server\""), "{body}");
+    }
+
+    #[tokio::test]
+    async fn file_job_submit_validation() {
+        let (mut app, _ledger) = app_with_jobs("file-val").await;
+
+        let (status, body) = send(
+            &mut app,
+            req(
+                "POST",
+                "/api/gse/jobs",
+                Some(r#"{"kind":"file_transfer","destination":{"type":"server_temp"}}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("source"), "{body}");
+
+        let (status, body) = send(
+            &mut app,
+            req(
+                "POST",
+                "/api/gse/jobs",
+                Some(
+                    r#"{"kind":"file_transfer","source":{"type":"server_temp","file_id":"a"},"destination":{"type":"server_temp"}}"#,
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        let (status, body) = send(
+            &mut app,
+            req(
+                "POST",
+                "/api/gse/jobs",
+                Some(
+                    r#"{"kind":"file_transfer","source":{"type":"agent","agent_id":"a","path":"/tmp/x"},"destination":{"type":"agent","agent_id":"a","path":"/tmp/x"}}"#,
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        let (status, body) = send(
+            &mut app,
+            req(
+                "POST",
+                "/api/gse/jobs",
+                Some(
+                    r#"{"kind":"file_transfer","source":{"type":"agent","agent_id":"a1","path":"/tmp/x"},"destination":{"type":"agent","agent_id":"a2","path":"/tmp/y"}}"#,
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("unavailable"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn job_files_upload_list_download_delete() {
+        let (mut app, _ledger) = app_with_jobs("job-files").await;
+        let boundary = "----gseboundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\nContent-Type: application/octet-stream\r\n\r\nhello\r\n--{boundary}--\r\n"
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/gse/job-files")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .expect("multipart");
+        let (status, body) = send(&mut app, request).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(body.contains("a.txt"), "{body}");
+        let file_id = body
+            .split("\"file_id\":\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("file_id")
+            .to_string();
+
+        let (status, body) = send(&mut app, req("GET", "/api/gse/job-files", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains(&file_id), "{body}");
+
+        let (status, body) = send(
+            &mut app,
+            req("GET", &format!("/api/gse/job-files/{file_id}"), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, "hello");
+
+        let (status, _) = send(
+            &mut app,
+            req("DELETE", &format!("/api/gse/job-files/{file_id}"), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, _) = send(
+            &mut app,
+            req("GET", &format!("/api/gse/job-files/{file_id}"), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = send(&mut app, req("DELETE", "/api/gse/job-files/nope", None)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn file_job_cannot_save_as_template() {
+        let (mut app, ledger) = app_with_jobs("file-tpl").await;
+        let mut job = crate::ledger::NewJob {
+            job_id: "job-ft".to_string(),
+            agent_id: "a-1".to_string(),
+            timeout_secs: 30,
+            created_at: ledger_stamp(),
+            kind: "file_transfer".to_string(),
+            ..Default::default()
+        };
+        job.source = Some(gse_proto::FileEndpoint::Agent {
+            agent_id: "a-1".to_string(),
+            path: "/tmp/a".to_string(),
+        });
+        job.destination = Some(gse_proto::FileEndpoint::ServerTemp { file_id: None });
+        ledger.insert_job(&job).await.expect("insert");
+
+        let (status, body) = send(
+            &mut app,
+            req(
+                "POST",
+                "/api/gse/jobs/job-ft/save-as-template",
+                Some(r#"{"name":"nope"}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test]
+    async fn job_files_upload_rejects_oversize() {
+        let db = test_db("job-files-big");
+        let ledger = Arc::new(Ledger::new(&db).expect("open"));
+        ledger.init().await.expect("init");
+        let store = Arc::new(JobFileStore::open(format!("{db}.job-files")).expect("store"));
+        let cfg = ServerConfig {
+            job_max_file_bytes: 4,
+            ..ServerConfig::default()
+        };
+        let mut app = router(
+            AdminState {
+                ledger,
+                registry: Some(Arc::new(SessionRegistry::new())),
+                cfg: Some(Arc::new(cfg)),
+                file_store: Some(store),
+            },
+            None,
+        );
+        let boundary = "----gseboundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"big.bin\"\r\nContent-Type: application/octet-stream\r\n\r\nhello world\r\n--{boundary}--\r\n"
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/gse/job-files")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .expect("multipart");
+        let (status, body) = send(&mut app, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("exceeds"), "{body}");
     }
 }

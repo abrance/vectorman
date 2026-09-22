@@ -4,7 +4,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use geminio::Bytes;
 use gse_agent_core::{run as run_agent, AgentConfig};
-use gse_proto::JobStatus;
+use gse_proto::{FileEndpoint, JobStatus};
+use gse_server_core::file_transfer::{submit_file_job, FileJobSubmit};
 use gse_server_core::{
     http_router, AdminState, Agent, AgentConfig as LedgerAgentConfig, JobRecord, JobSubmit, Ledger,
     NewJob, Server, ServerConfig, SessionState,
@@ -509,6 +510,7 @@ async fn e2e_http_delete_agent_clears_ledger_and_session() {
             ledger: server.ledger.clone(),
             registry: Some(server.registry.clone()),
             cfg: Some(server.cfg.clone()),
+            file_store: Some(server.file_store.clone()),
         },
         None,
     )
@@ -651,9 +653,14 @@ async fn wait_terminal(server: &Server, job_id: &str) -> JobRecord {
 }
 
 async fn spawn_server_and_agent(db: &str, cfg: AgentConfig) -> std::sync::Arc<Server> {
-    let (server, addr) = Server::bind(server_config(db, true, 60))
-        .await
-        .expect("bind");
+    spawn_server_and_agent_with(server_config(db, true, 60), cfg).await
+}
+
+async fn spawn_server_and_agent_with(
+    scfg: ServerConfig,
+    cfg: AgentConfig,
+) -> std::sync::Arc<Server> {
+    let (server, addr) = Server::bind(scfg).await.expect("bind");
     register(&server, "web-01", "tok-1").await;
     let server_ref = server.clone();
     tokio::spawn(async move {
@@ -743,6 +750,7 @@ async fn e2e_inflight_jobs_become_lost_after_restart() {
                 rerun_of: None,
                 timeout_secs: 300,
                 created_at: "1".to_string(),
+                ..Default::default()
             })
             .await
             .expect("insert");
@@ -800,6 +808,7 @@ async fn e2e_template_submit_and_save_as_template() {
             ledger: server.ledger.clone(),
             registry: Some(server.registry.clone()),
             cfg: Some(server.cfg.clone()),
+            file_store: Some(server.file_store.clone()),
         },
         None,
     );
@@ -866,6 +875,7 @@ async fn e2e_rerun_history_job() {
             ledger: server.ledger.clone(),
             registry: Some(server.registry.clone()),
             cfg: Some(server.cfg.clone()),
+            file_store: Some(server.file_store.clone()),
         },
         None,
     );
@@ -925,4 +935,180 @@ async fn e2e_rerun_history_job() {
         .expect("get")
         .expect("exists");
     assert_eq!(unchanged, source);
+}
+
+fn abs_tmp(name: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("gse-e2e-ft-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(name).to_string_lossy().into_owned()
+}
+
+fn file_job(source: FileEndpoint, destination: FileEndpoint) -> FileJobSubmit {
+    FileJobSubmit {
+        kind: "file_transfer".to_string(),
+        source: Some(source),
+        destination: Some(destination),
+        timeout_secs: Some(30),
+    }
+}
+
+async fn submit_file(server: &Server, req: FileJobSubmit) -> JobRecord {
+    submit_file_job(
+        server.ledger.clone(),
+        server.registry.clone(),
+        server.cfg.clone(),
+        server.file_store.clone(),
+        req,
+        None,
+    )
+    .await
+    .expect("submit file job")
+}
+
+fn agent_path(path: &str) -> FileEndpoint {
+    FileEndpoint::Agent {
+        agent_id: "web-01".to_string(),
+        path: path.to_string(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_file_agent_to_agent() {
+    let server = spawn_server_and_agent(&tmp_db("ft-aa"), AgentConfig::default()).await;
+    let src = abs_tmp("src.bin");
+    let dst = abs_tmp("dst.bin");
+    std::fs::write(&src, b"payload-aa").expect("write src");
+    let _ = std::fs::remove_file(&dst);
+    let job = submit_file(&server, file_job(agent_path(&src), agent_path(&dst))).await;
+    let job = wait_terminal(&server, &job.job_id).await;
+    assert_eq!(job.status, JobStatus::Succeeded, "{job:?}");
+    assert_eq!(std::fs::read(&dst).expect("read dst"), b"payload-aa");
+    assert_eq!(job.file_name.as_deref(), Some("src.bin"));
+    assert_eq!(job.file_bytes, Some(10));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_file_agent_to_temp() {
+    let server = spawn_server_and_agent(&tmp_db("ft-at"), AgentConfig::default()).await;
+    let src = abs_tmp("pull.bin");
+    std::fs::write(&src, b"from-agent").expect("write src");
+    let job = submit_file(
+        &server,
+        file_job(agent_path(&src), FileEndpoint::ServerTemp { file_id: None }),
+    )
+    .await;
+    let job = wait_terminal(&server, &job.job_id).await;
+    assert_eq!(job.status, JobStatus::Succeeded, "{job:?}");
+    let file_id = job.file_id.clone().expect("file_id");
+    let (meta, data) = server.file_store.get(&file_id).expect("get temp");
+    assert_eq!(data, b"from-agent");
+    assert_eq!(meta.file_name, "pull.bin");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_file_temp_to_agent() {
+    let server = spawn_server_and_agent(&tmp_db("ft-ta"), AgentConfig::default()).await;
+    let meta = server.file_store.put("up.bin", b"uploaded").expect("put");
+    let dst = abs_tmp("out.bin");
+    let _ = std::fs::remove_file(&dst);
+    let job = submit_file(
+        &server,
+        file_job(
+            FileEndpoint::ServerTemp {
+                file_id: Some(meta.file_id.clone()),
+            },
+            agent_path(&dst),
+        ),
+    )
+    .await;
+    let job = wait_terminal(&server, &job.job_id).await;
+    assert_eq!(job.status, JobStatus::Succeeded, "{job:?}");
+    assert_eq!(std::fs::read(&dst).expect("read dst"), b"uploaded");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_file_source_missing() {
+    let server = spawn_server_and_agent(&tmp_db("ft-miss"), AgentConfig::default()).await;
+    let src = abs_tmp("no-such.bin");
+    let _ = std::fs::remove_file(&src);
+    let dst = abs_tmp("miss-dst.bin");
+    let _ = std::fs::remove_file(&dst);
+    let job = submit_file(&server, file_job(agent_path(&src), agent_path(&dst))).await;
+    let job = wait_terminal(&server, &job.job_id).await;
+    assert_eq!(job.status, JobStatus::Failed, "{job:?}");
+    assert!(
+        job.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not_found"),
+        "{job:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_file_too_large() {
+    let mut scfg = server_config(&tmp_db("ft-big"), true, 60);
+    scfg.job_max_file_bytes = 4;
+    scfg.job_file_chunk_bytes = 4;
+    let server = spawn_server_and_agent_with(scfg, AgentConfig::default()).await;
+    let src = abs_tmp("big.bin");
+    std::fs::write(&src, b"too-big").expect("write src");
+    let dst = abs_tmp("big-dst.bin");
+    let _ = std::fs::remove_file(&dst);
+    let job = submit_file(&server, file_job(agent_path(&src), agent_path(&dst))).await;
+    let job = wait_terminal(&server, &job.job_id).await;
+    assert_eq!(job.status, JobStatus::Failed, "{job:?}");
+    assert!(
+        job.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("file_too_large")
+            || job.error.as_deref().unwrap_or_default().contains("exceeds"),
+        "{job:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_file_dest_already_exists() {
+    let server = spawn_server_and_agent(&tmp_db("ft-exists"), AgentConfig::default()).await;
+    let src = abs_tmp("exists-src.bin");
+    let dst = abs_tmp("exists-dst.bin");
+    std::fs::write(&src, b"src").expect("write src");
+    std::fs::write(&dst, b"keep").expect("write dst");
+    let job = submit_file(&server, file_job(agent_path(&src), agent_path(&dst))).await;
+    let job = wait_terminal(&server, &job.job_id).await;
+    assert_eq!(job.status, JobStatus::Failed, "{job:?}");
+    assert!(
+        job.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("already_exists"),
+        "{job:?}"
+    );
+    assert_eq!(std::fs::read(&dst).expect("read dst"), b"keep");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_file_missing_file_id_is_404() {
+    let server = spawn_server_and_agent(&tmp_db("ft-404"), AgentConfig::default()).await;
+    let mut app = http_router(
+        AdminState {
+            ledger: server.ledger.clone(),
+            registry: Some(server.registry.clone()),
+            cfg: Some(server.cfg.clone()),
+            file_store: Some(server.file_store.clone()),
+        },
+        None,
+    );
+    let dst = abs_tmp("404-dst.bin");
+    let (status, body) = send_json(
+        &mut app,
+        "POST",
+        "/api/gse/jobs",
+        &format!(
+            r#"{{"kind":"file_transfer","source":{{"type":"server_temp","file_id":"file-nope"}},"destination":{{"type":"agent","agent_id":"web-01","path":"{dst}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }

@@ -29,6 +29,9 @@ pub struct RerunRequest {
     pub working_dir: Option<String>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// 文件作业重做时可覆盖目标路径。
+    #[serde(default)]
+    pub dest_path: Option<String>,
 }
 
 /// 以来源作业为默认值合并重做覆盖，产出下游提交请求。
@@ -91,6 +94,15 @@ mod tests {
             started_at: None,
             finished_at: None,
             updated_at: "1".to_string(),
+            kind: "script".to_string(),
+            source: None,
+            destination: None,
+            source_agent_id: None,
+            dest_agent_id: None,
+            file_name: None,
+            file_bytes: None,
+            file_sha256: None,
+            file_id: None,
         }
     }
 
@@ -116,6 +128,7 @@ mod tests {
             env: Some(BTreeMap::from([("MODE".to_string(), "prod".to_string())])),
             working_dir: Some("/srv".to_string()),
             timeout_secs: Some(60),
+            dest_path: None,
         };
         let submit = build_rerun_submit(&source(), req);
         assert_eq!(submit.agent_id, "agent-b");
