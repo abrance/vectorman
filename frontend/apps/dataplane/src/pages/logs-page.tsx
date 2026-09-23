@@ -2,7 +2,7 @@ import { Button, Card, DatePicker, Form, Input, InputNumber, Select, Space, Tabl
 import type { Dayjs } from "dayjs";
 import dayjs from "dayjs";
 import { useCallback, useEffect } from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import type { LogSearchRequest } from "@vectorman/adapters";
 import { formatTimestamp } from "@vectorman/primitives";
 import { useLogs } from "../features/use-logs";
@@ -11,6 +11,8 @@ type LogFormValues = {
   data_type: string;
   agent_id?: string;
   data_id?: string;
+  service?: string;
+  trace_id?: string;
   level?: string;
   keyword?: string;
   range?: [Dayjs, Dayjs];
@@ -30,6 +32,9 @@ export function LogsPage() {
       data_id: values.data_id?.trim() || undefined,
       level: values.level?.trim() || undefined,
       message_query: values.keyword?.trim() || undefined,
+      // trace_id 走独立过滤字段，service 走 labels（对齐 `/v1/logs/search` 的契约）。
+      trace_id: values.trace_id?.trim() || undefined,
+      labels: values.service?.trim() ? { service: values.service.trim() } : undefined,
       limit: values.limit,
     };
     if (values.range?.[0] && values.range[1]) {
@@ -40,11 +45,16 @@ export function LogsPage() {
   }, [form, run]);
 
   useEffect(() => {
+    const from = params.get("from_ts");
+    const to = params.get("to_ts");
     form.setFieldsValue({
       data_type: params.get("data_type") ?? "logs",
       agent_id: params.get("agent_id") ?? "",
       data_id: params.get("data_id") ?? "",
+      service: params.get("service") ?? "",
+      trace_id: params.get("trace_id") ?? "",
       limit: 100,
+      range: from && to ? [dayjs(Number(from) / 1000), dayjs(Number(to) / 1000)] : undefined,
     });
     void search();
   }, [form, params, search]);
@@ -68,6 +78,12 @@ export function LogsPage() {
           </Form.Item>
           <Form.Item name="data_id" label="data_id">
             <Input allowClear style={{ width: 180 }} />
+          </Form.Item>
+          <Form.Item name="service" label="服务">
+            <Input allowClear style={{ width: 140 }} placeholder="labels.service" />
+          </Form.Item>
+          <Form.Item name="trace_id" label="trace_id">
+            <Input allowClear style={{ width: 200 }} />
           </Form.Item>
           <Form.Item name="level" label="level">
             <Input allowClear style={{ width: 110 }} />
@@ -113,6 +129,17 @@ export function LogsPage() {
               Object.entries(value ?? {})
                 .map(([k, v]) => `${k}=${v}`)
                 .join(", "),
+          },
+          {
+            title: "trace",
+            dataIndex: "labels",
+            width: 110,
+            render: (value: Record<string, string>) =>
+              value?.trace_id ? (
+                <Link to={`/traces/${value.trace_id}`} style={{ fontFamily: "monospace" }}>
+                  查看链路
+                </Link>
+              ) : null,
           },
         ]}
       />

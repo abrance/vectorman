@@ -380,6 +380,8 @@ dpc edges --src gateway --dst order-api --source otlp
 - 页面通过 `Runtime` 注入的 `ApmAdapter`（`@vectorman/adapters`）访问接口；时间戳一律用 `formatTimestamp(String(micros))`，耗时用 `formatDuration(micros)`。
 - 拓扑页的边来源是 `/v1/edges/search`（sqlite 边摘要，含 agent 与分钟桶），而不是 PromQL 的 `apm_edge_*`：同一份数据少一层聚合、还能显示 agent 与桶数；`features/apm/aggregate.ts` 负责把分钟桶合并成逻辑边（调用量/错误率/平均与最大耗时），并在前端算错误率（服务端 PromQL 子集不做除法）。
 - 注意指标曲线必须用 `promSeries(record.data?.data)`（envelope 内层），传外层会得到空序列、表现为「图表没数据」而非报错。
+- 设置页两个页签：**存储与运行状态**（`/v1/ts/stats` + 自监控 instant 读数：数据目录占用、保留任务轮数、已删明细/摘要/边、限流批次、已配对边、待配对 span —— 让容量上限与淘汰结果可见）与**服务名映射**（CRUD + 批量导入 + 拓扑未识别节点一键预填）。
+- 日志与 trace 互跳：日志页按 `labels.service` 与 `trace_id` 过滤、命中 `trace_id` 时提供「查看链路」；详情页「查看该服务日志」带根服务与 trace 时间窗。
 - 查询通过既有 `@vectorman/adapters` HttpClient，接口封装进 `src/features/apm/`，页面只做渲染与参数拼装。
 - 刷新由按钮显式触发（与既有指标页/日志页一致，无定时器）。
 - 空态与 `partial` 提示按 Requirement 13 第 11、13 条实现。
