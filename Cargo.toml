@@ -25,6 +25,7 @@ members = [
     "crates/gse-proto",
     "crates/gse-server-core",
     "crates/gse-agent-core",
+    "crates/gse-agent-ebpf",
     "crates/vectorman-version",
     "crates/vectorman-metrics",
 ]
@@ -47,6 +48,7 @@ dataplane-apm = { path = "crates/dataplane-apm" }
 gse-proto = { path = "crates/gse-proto" }
 gse-server-core = { path = "crates/gse-server-core" }
 gse-agent-core = { path = "crates/gse-agent-core" }
+gse-agent-ebpf = { path = "crates/gse-agent-ebpf" }
 vectorman-version = { path = "crates/vectorman-version" }
 vectorman-metrics = { path = "crates/vectorman-metrics" }
 

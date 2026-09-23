@@ -7,12 +7,15 @@
 - [ ] 1. P1 前置：eBPF 构建链与前置校验
   - [ ] 1.1 新增 `crates/gse-ebpf-programs`（`#![no_std]`，aya-bpf 风格），产出 `*.o`；CI 单独一步用 `bpfel-unknown-none` 构建，产物入库 `packaging/ebpf/`
     - 对应需求 17.6 与设计 Pitfalls 第一条
-  - [ ] 1.2 新增 `crates/gse-agent-ebpf`：preflight（内核 ≥5.8、`/sys/kernel/btf/vmlinux`、`CapEff` bit 39/38 或 euid 0）
+  - [x] 1.2 新增 `crates/gse-agent-ebpf`：preflight（内核 ≥5.8、`/sys/kernel/btf/vmlinux`、`CapEff` bit 39/38 或 euid 0）
     - 对应需求 1.1-1.3、1.4；失败只降级该项能力并在 Agent 日志输出 warn（含建议动作），不阻止 Agent 启动
-  - [ ] 1.3 校验结果上报：`agent_ebpf_capability` 指标点，链路页可读
+    - 状态：已实现（PR #46）：新 crate `crates/gse-agent-ebpf` 的 `preflight`（内核 ≥5.8、`/sys/kernel/btf/vmlinux`、root 或 `CAP_BPF`+`CAP_PERFMON`/`CAP_SYS_ADMIN`），读取路径可注入
+  - [x] 1.3 校验结果上报：`agent_ebpf_capability` 指标点，链路页可读
     - 对应需求 1.5
-  - [ ] 1.4 单测：注入式 `uname` / `/proc/self/status` 夹具，断言各检查项判定与错误文本
+    - 状态：部分实现（PR #46）：`agent_ebpf_capability` 指标点（含 kernel/btf/capability 与 reason 标签）已就绪，Agent 侧接线随 aya loader 一起做（PR-B）
+  - [x] 1.4 单测：注入式 `uname` / `/proc/self/status` 夹具，断言各检查项判定与错误文本
 - [ ] 2. P1 内核态程序（网络、TCP、进程）
+    - 状态：已实现（PR #46）：内核版本解析（5.4/4.19 拒绝、5.8/6.1 通过、乱码拒绝）、`CapEff` 解析与权限规则、失败原因+建议动作、全通过场景
   - [ ] 2.1 `network.bpf.c`/`.rs`：`inet_sock_set_state`、`kretprobe/tcp_connect`、`kretprobe/inet_csk_accept`、`kretprobe/tcp_sendmsg`/`tcp_recvmsg`、`kprobe/tcp_close`
     - 对应需求 3.1-3.8 与设计挂载点表
   - [ ] 2.2 `CONN_AGG` per-CPU map（`ConnKey`/`ConnAgg`）与 log2 直方图槽、`OVERFLOW_SLOT` 累加
@@ -25,7 +28,17 @@
     - 对应需求 9.5-9.7
   - [ ] 2.6 `max_cpu_percent` 内核态令牌桶限流
     - 对应需求 9.5、12.1-12.2
-- [ ] 3. P1 用户态加载、差分与聚合
+- [ ] 3. P1 用户态加载、差分与聚合（差分/聚合/过滤逻辑已完成，见 PR #46；aya 加载与挂载管理待做）
+  - [x] 3.3 差分线程：遍历全部 CPU 副本求和、与上周期相减、写零值复位、清理零增量键
+    - 状态：已实现（PR #46）：`sum_per_cpu` / `diff`（首次出现按绝对值、快照回退饱和不为负、最大值单调）与 `run_loop` 中的快照清理；「写零复位」由 aya `MapSource` 实现负责（PR-B）
+  - [x] 3.4 过滤：`cgroup`/`process`/`port` include-exclude、`include_loopback`
+    - 状态：已实现（PR #46）：`config::keep` + 组合矩阵单测（回环、include/exclude 优先级、前缀匹配、进程名未知时不误杀）
+  - [x] 3.5 `EbpfEdge` 组装与 10 秒桶对齐；跨桶时只输出整桶
+    - 状态：已实现（PR #46）：`edge_record`（空增量不产生记录、record_id 规则、失败原因枚举）与 `bucket_start` 对齐
+  - [x] 3.6 1 分钟指标汇总：保留最近 6 个 10 秒桶，输出 `ebpf_*` 与 `apm_edge_*`（`source=ebpf`）
+    - 状态：部分实现（PR #46）：`MinuteAccumulator` 按分钟汇总 10 秒桶并只输出已关闭桶，产出 `ebpf_edge_connections_total`/`ebpf_edge_bytes_total{direction}`/`ebpf_edge_duration_micros{avg,max}`/`ebpf_tcp_retrans_total`/`ebpf_tcp_failures_total`；**`apm_edge_*{source=ebpf}` 改由服务端在服务名反查后产生**（Agent 不知道全局服务表），已同步到设计文档
+  - [x] 3.8 单测：假 map 快照驱动差分、过滤矩阵、桶对齐与 P95 近似、`record_id` 规则、退避序列、上限汇总
+    - 状态：部分实现（PR #46）：假快照驱动差分、过滤矩阵、桶对齐与分钟汇总、`record_id`、能力降级路径；退避序列与资源上限汇总随 aya loader（PR-B）
   - [ ] 3.1 aya 加载与挂载管理：幂等启停、detach→drop links→删 map、启动时清理遗留
     - 对应需求 1.6-1.8、16.2
   - [ ] 3.2 加载失败退避重试（30 秒起、×2、上限 10 分钟，成功清零）

@@ -315,6 +315,11 @@ Agent 侧产出（每 60 秒一批），严格按 `observability-data-model` 命
 | `ebpf_dns_duration_micros` | `DNS_PENDING` 匹配结果 | `avg` `p95` | P2 |
 | `ebpf_cpu_profile_samples_total` | `STACKS` 计数 | `value` | P3 |
 
+**口径修正（实现期）**：`apm_edge_*{source="ebpf"}` 改由 **dataserver** 在服务名反查后产生——Agent
+不知道全局服务表，只有 IP/端口/Pod/进程；Agent 侧只产 `ebpf_*` 指标（`ebpf_edge_connections_total`、
+`ebpf_edge_bytes_total{direction}`、`ebpf_edge_duration_micros{avg,max}`、`ebpf_tcp_retrans_total`、
+`ebpf_tcp_failures_total`）与 `ebpf_edges` 边记录（服务名留空）。
+
 `apm_edge_duration_micros` 的 `p95` 在 eBPF 侧用直方图槽上界近似（不是精确分位数），与 OTLP 侧的 nearest-rank 精确 P95 存在口径差异：读取该指标时需注意 `source` label；文档与前端 tooltip 明确标注 `source=ebpf` 为近似值。
 
 ### 保留期
