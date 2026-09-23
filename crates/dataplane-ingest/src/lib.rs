@@ -1,4 +1,8 @@
 //! 采集信封 DTO、接入落盘、日志检索映射与 record_id 去重。
+//!
+//! 新增 `data_type=traces`（OTel 语义 span，见 [`trace`]）：明细写 `LogStore`，
+//! 派生数据（trace 摘要、服务端点半）通过 [`trace::TraceSink`] 外置钩子交给
+//! `dataplane-apm`，本 crate 不依赖具体存储实现。
 
 use std::collections::BTreeMap;
 
@@ -9,6 +13,10 @@ use dataplane_ts::{TimeSeriesStore, TsPoint};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod trace;
+
+pub use trace::{SpanEvent, SpanLink, TraceSink, TraceSpan};
+
 /// 采集类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -17,6 +25,7 @@ pub enum DataType {
     Logs,
     Apm,
     Ebpf,
+    Traces,
 }
 
 impl DataType {
@@ -26,6 +35,7 @@ impl DataType {
             Self::Logs => "logs",
             Self::Apm => "apm",
             Self::Ebpf => "ebpf",
+            Self::Traces => "traces",
         }
     }
 }
@@ -145,12 +155,26 @@ pub fn stream_key(agent_id: &str, data_type: DataType, data_id: &str) -> String 
     format!("stream/{}/{}/{}", agent_id, data_type.as_str(), data_id)
 }
 
-/// 将一批信封写入时序/日志存储，并用 KvStore 去重。
+/// 将一批信封写入时序/日志存储，并用 KvStore 去重。（无派生数据钩子）
 pub async fn apply(
     envelope: DataEnvelope,
     ts: &dyn TimeSeriesStore,
     log: &dyn LogStore,
     kv: &dyn KvStore,
+) -> Result<IngestReply, DataplaneError> {
+    apply_with_trace_sink(envelope, ts, log, kv, None).await
+}
+
+/// 接入一批记录，并把 `traces` 的派生数据交给 `trace_sink`。
+///
+/// `trace_sink` 的失败**不影响**接入应答：明细已落库，重试整批只会造成明细重复，
+/// 因此只记录到标准错误并由自监控计数（见 `apm-tracing` 设计「错误处理」）。
+pub async fn apply_with_trace_sink(
+    envelope: DataEnvelope,
+    ts: &dyn TimeSeriesStore,
+    log: &dyn LogStore,
+    kv: &dyn KvStore,
+    trace_sink: Option<&dyn TraceSink>,
 ) -> Result<IngestReply, DataplaneError> {
     if envelope.agent_id.trim().is_empty() {
         return Err(DataplaneError::invalid_argument("agent_id is required"));
@@ -165,7 +189,7 @@ pub async fn apply(
     let mut failures = Vec::new();
 
     for raw in &envelope.records {
-        match apply_one(&envelope, raw, ts, log, kv).await {
+        match apply_one(&envelope, raw, ts, log, kv, trace_sink).await {
             Ok(()) => accepted += 1,
             Err(ApplyRecordError::Invalid(failure)) => failures.push(failure),
             Err(ApplyRecordError::Engine(e)) => return Err(e),
@@ -196,6 +220,7 @@ async fn apply_one(
     ts: &dyn TimeSeriesStore,
     log: &dyn LogStore,
     kv: &dyn KvStore,
+    trace_sink: Option<&dyn TraceSink>,
 ) -> Result<(), ApplyRecordError> {
     match envelope.data_type {
         DataType::Metrics => {
@@ -294,6 +319,50 @@ async fn apply_one(
             .map_err(ApplyRecordError::Engine)?;
             mark_ingested(kv, &rec.record_id).await
         }
+        DataType::Traces => {
+            if trace::exceeds_size_limit(raw) {
+                return Err(ApplyRecordError::Invalid(RecordFailure {
+                    record_id: raw
+                        .get("record_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    code: "invalid_argument".into(),
+                    message: format!(
+                        "span exceeds {} bytes (256 KiB); reduce attributes/events or drop them at the collector",
+                        trace::MAX_TRACE_SPAN_BYTES
+                    ),
+                }));
+            }
+            let span: TraceSpan = parse_record(raw)?;
+            require_record_id(&span.record_id, raw)?;
+            let span = trace::normalize(span);
+            if let Err(reason) = trace::validate(&span) {
+                return Err(ApplyRecordError::Invalid(RecordFailure {
+                    record_id: span.record_id.clone(),
+                    code: "invalid_argument".into(),
+                    message: reason,
+                }));
+            }
+            if already_accepted(kv, &span.record_id).await? {
+                return Ok(());
+            }
+            // 明细是权威数据，先落库；派生数据失败不回退整批（重试会造成明细重复）。
+            log.append(trace::to_log_record(&span, envelope))
+                .await
+                .map_err(ApplyRecordError::Engine)?;
+            if let Some(sink) = trace_sink {
+                if let Err(e) = sink.observe_span(&span, envelope).await {
+                    eprintln!(
+                        "apm: observe_span failed for {}: {}: {}",
+                        span.record_id,
+                        e.code.as_str(),
+                        e.message
+                    );
+                }
+            }
+            mark_ingested(kv, &span.record_id).await
+        }
     }
 }
 
@@ -347,7 +416,7 @@ fn merge_envelope_tags(tags: &mut BTreeMap<String, String>, envelope: &DataEnvel
     }
 }
 
-fn merge_common_labels(labels: &mut BTreeMap<String, String>, envelope: &DataEnvelope) {
+pub(crate) fn merge_common_labels(labels: &mut BTreeMap<String, String>, envelope: &DataEnvelope) {
     labels.insert("data_type".into(), envelope.data_type.as_str().to_string());
     labels.insert("agent_id".into(), envelope.agent_id.clone());
     labels.insert("data_id".into(), envelope.data_id.clone());
@@ -717,5 +786,176 @@ mod tests {
         let env = envelope("logs", vec![]);
         let err = apply(env, &e.ts, &e.log, &e.kv).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    /// 记录型 sink：断言派生数据钩子被调用与入参。
+    #[derive(Default)]
+    struct RecordingSink {
+        spans: std::sync::Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl TraceSink for RecordingSink {
+        async fn observe_span(
+            &self,
+            span: &TraceSpan,
+            envelope: &DataEnvelope,
+        ) -> Result<(), DataplaneError> {
+            self.spans
+                .lock()
+                .unwrap()
+                .push(format!("{}@{}", span.record_id, envelope.data_id));
+            if self.fail {
+                return Err(DataplaneError::new(ErrorCode::QueryFailed, "sink boom"));
+            }
+            Ok(())
+        }
+    }
+
+    fn trace_span_json(trace_id: &str, span_id: &str, parent: &str) -> Value {
+        json!({
+            "record_id": format!("{trace_id}:{span_id}"),
+            "timestamp": 1_710_000_000_000_000i64,
+            "trace_id": trace_id,
+            "span_id": span_id,
+            "parent_span_id": parent,
+            "name": "GET /orders/{id}",
+            "kind": "server",
+            "start_unix_nano": 1_710_000_000_000_000_000i64,
+            "end_unix_nano": 1_710_000_000_012_000_000i64,
+            "status_code": "ok",
+            "service": "order-api",
+            "collector": "otlp",
+            "labels": {}
+        })
+    }
+
+    #[tokio::test]
+    async fn traces_roundtrip_writes_detail_and_calls_sink() {
+        let e = engines();
+        let sink = RecordingSink::default();
+        let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let span_id = "00f067aa0ba902b7";
+        let env = envelope("traces", vec![trace_span_json(trace_id, span_id, "")]);
+        let reply = apply_with_trace_sink(env, &e.ts, &e.log, &e.kv, Some(&sink as &dyn TraceSink))
+            .await
+            .unwrap();
+        assert_eq!(reply.status, "ok");
+        assert_eq!(reply.accepted, 1);
+        assert!(reply.failures.is_empty());
+
+        let hits = search(
+            &e.log,
+            LogSearchQuery {
+                data_type: Some("traces".into()),
+                trace_id: Some(trace_id.into()),
+                ..LogSearchQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].message, "order-api GET /orders/{id} 12000us");
+        assert_eq!(hits[0].level, "info");
+        assert_eq!(hits[0].labels.get("service").unwrap(), "order-api");
+        assert_eq!(hits[0].labels.get("data_type").unwrap(), "traces");
+        assert_eq!(
+            sink.spans.lock().unwrap().as_slice(),
+            [format!("{trace_id}:{span_id}@item-1")]
+        );
+
+        // 幂等：重放不新增明细，也不再回调 sink。
+        let env = envelope("traces", vec![trace_span_json(trace_id, span_id, "")]);
+        let reply = apply_with_trace_sink(env, &e.ts, &e.log, &e.kv, Some(&sink as &dyn TraceSink))
+            .await
+            .unwrap();
+        assert_eq!(reply.accepted, 1, "重复记录仍计入 accepted");
+        let hits = search(
+            &e.log,
+            LogSearchQuery {
+                data_type: Some("traces".into()),
+                trace_id: Some(trace_id.into()),
+                ..LogSearchQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(hits.len(), 1, "重复 record_id 不应新增明细");
+        assert_eq!(sink.spans.lock().unwrap().len(), 1, "重复记录不再回调 sink");
+    }
+
+    #[tokio::test]
+    async fn traces_normalizes_ids_and_derives_timestamp() {
+        let e = engines();
+        let mut raw = trace_span_json("4BF92F3577B34DA6A3CE929D0E0E4736", "00F067AA0BA902B7", "");
+        raw["record_id"] = json!("4BF92F3577B34DA6A3CE929D0E0E4736:00F067AA0BA902B7");
+        raw["timestamp"] = json!(0);
+        let env = envelope("traces", vec![raw]);
+        let reply = apply(env, &e.ts, &e.log, &e.kv).await.unwrap();
+        assert_eq!(reply.status, "ok", "{reply:?}");
+
+        let hits = search(
+            &e.log,
+            LogSearchQuery {
+                data_type: Some("traces".into()),
+                trace_id: Some("4bf92f3577b34da6a3ce929d0e0e4736".into()),
+                ..LogSearchQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].timestamp, 1_710_000_000_000_000);
+        assert_eq!(hits[0].labels.get("service").unwrap(), "order-api");
+    }
+
+    #[tokio::test]
+    async fn traces_invalid_records_become_partial_failures() {
+        let e = engines();
+        let good = trace_span_json("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7", "");
+        let mut bad_trace =
+            trace_span_json("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7", "");
+        bad_trace["trace_id"] = json!("short");
+        let mut bad_span =
+            trace_span_json("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7", "");
+        bad_span["span_id"] = json!("zzz");
+        let mut oversized =
+            trace_span_json("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7", "");
+        oversized["attributes"] = json!({"big": "x".repeat(256 * 1024)});
+        let env = envelope("traces", vec![good, bad_trace, bad_span, oversized]);
+
+        let reply = apply(env, &e.ts, &e.log, &e.kv).await.unwrap();
+        assert_eq!(reply.status, "partial");
+        assert_eq!(reply.accepted, 1);
+        assert_eq!(reply.failures.len(), 3);
+        assert!(reply.failures.iter().all(|f| f.code == "invalid_argument"));
+        assert!(
+            reply.failures.iter().any(|f| f.message.contains("256 KiB")),
+            "超限原因应说明上限: {:?}",
+            reply.failures
+        );
+    }
+
+    #[tokio::test]
+    async fn traces_sink_failure_does_not_fail_the_batch() {
+        let e = engines();
+        let sink = RecordingSink {
+            fail: true,
+            ..RecordingSink::default()
+        };
+        let env = envelope(
+            "traces",
+            vec![trace_span_json(
+                "4bf92f3577b34da6a3ce929d0e0e4736",
+                "00f067aa0ba902b7",
+                "",
+            )],
+        );
+        let reply = apply_with_trace_sink(env, &e.ts, &e.log, &e.kv, Some(&sink as &dyn TraceSink))
+            .await
+            .unwrap();
+        assert_eq!(reply.status, "ok", "派生数据失败不影响接入应答");
+        assert_eq!(sink.spans.lock().unwrap().len(), 1);
     }
 }
