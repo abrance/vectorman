@@ -1,0 +1,52 @@
+import { useCallback } from "react";
+import type { TraceDetail, TraceSearchPage, TraceSearchRequest } from "@vectorman/adapters";
+import { useRuntime } from "../../app/runtime";
+import { toAppError } from "../errors";
+import { useQueryRecord } from "../use-query";
+
+const TRACE_LIST = "apm.traces";
+const TRACE_DETAIL = "apm.trace";
+
+/// trace 列表：手动触发 `POST /v1/traces/search`。
+export function useTraces() {
+  const { apm, query, notifier } = useRuntime();
+  const result = useQueryRecord<TraceSearchPage>(query, TRACE_LIST);
+
+  const run = useCallback(
+    async (req: TraceSearchRequest) => {
+      query.setLoading(TRACE_LIST);
+      try {
+        query.setSuccess(TRACE_LIST, await apm.searchTraces(req));
+      } catch (e) {
+        const err = toAppError(e);
+        query.setError(TRACE_LIST, err);
+        notifier.error(err);
+      }
+    },
+    [apm, query, notifier],
+  );
+
+  return { result, run };
+}
+
+/// 单个 trace 的摘要与 span：`GET /v1/traces/{trace_id}`。
+export function useTraceDetail() {
+  const { apm, query, notifier } = useRuntime();
+  const result = useQueryRecord<TraceDetail>(query, TRACE_DETAIL);
+
+  const run = useCallback(
+    async (traceId: string) => {
+      query.setLoading(TRACE_DETAIL);
+      try {
+        query.setSuccess(TRACE_DETAIL, await apm.getTrace(traceId));
+      } catch (e) {
+        const err = toAppError(e);
+        query.setError(TRACE_DETAIL, err);
+        notifier.error(err);
+      }
+    },
+    [apm, query, notifier],
+  );
+
+  return { result, run };
+}

@@ -25,6 +25,24 @@ export {
   type TemplateSubmitRequest,
 } from "./gse/templates";
 export { SqlHttpAdapter, type SqlResult } from "./dataplane/sql";
+export {
+  ApmAdapter,
+  type AliasInput,
+  type AliasRecord,
+  type EdgeRow,
+  type EdgeSearchPage,
+  type EdgeSearchRequest,
+  type ServiceInstance,
+  type ServiceRow,
+  type SpanDetail,
+  type SpanEvent,
+  type SpanLink,
+  type TraceDetail,
+  type TraceSearchPage,
+  type TraceSearchRequest,
+  type TraceSummary,
+  type TsStorageStats,
+} from "./dataplane/apm";
 export { PromQueryAdapter, type PromEnvelope } from "./dataplane/prom";
 export {
   DataplaneAdapter,

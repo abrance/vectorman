@@ -112,24 +112,29 @@
     - 状态：已实现（PR #40）
   - [x] 12.0.3 `list_services` 返回端点实例明细（pod/node/host_ip/listen_port/collector/first_seen）
     - 状态：已实现（PR #40）
-- [ ] 12. 前端 `@vectorman/dataplane`
+- [ ] 12. 前端 `@vectorman/dataplane`（trace 列表/详情已交付，见 PR #41；拓扑、APM 指标、服务名映射、存储状态卡片待做）
     - 状态：已实现（PR #38）：请求体构造单测（`--min-duration-ms` 转微秒、只下发显式提供的过滤字段）+ 错误码经既有 `ureq_err_str` 透传
-  - [ ] 12.1 `src/features/apm/` 客户端：trace 列表、详情、边、服务清单封装，复用既有 HttpClient
-  - [ ] 12.2 `/traces` 列表页：过滤、排序切换、分页、空态、行点击进详情
+  - [x] 12.1 `src/features/apm/` 客户端：trace 列表、详情、边、服务清单封装，复用既有 HttpClient
+  - [x] 12.2 `/traces` 列表页：过滤、排序切换、分页、空态、行点击进详情
     - 对应需求 13.3、13.12、13.13
-  - [ ] 12.3 `/traces/:trace_id` 详情页：`parent_span_id` 构树、纳秒对齐瀑布图、错误 span 高亮、span 详情抽屉、`partial` 提示
+    - 状态：已实现（PR #41）：`@vectorman/adapters` 新增 `ApmAdapter`（traces search/detail、edges、services、aliases CRUD、ts stats）+ 4 个单测；`Runtime` 注入 `apm`
+    - 状态：已实现（PR #41）：`/traces` 列表（服务/操作/状态/最慢/时间窗/排序/Agent/采集项/条数过滤，URL 参数预填，来源列，行点击进详情）
+  - [x] 12.3 `/traces/:trace_id` 详情页：`parent_span_id` 构树、纳秒对齐瀑布图、错误 span 高亮、span 详情抽屉、`partial` 提示
     - 对应需求 13.4-13.5、13.11
+    - 状态：已实现（PR #41）：`/traces/:traceId` 详情（摘要 + `ui/waterfall.tsx` 瀑布图 + span 抽屉：概览/属性/资源/事件/链接、`partial` 提示与原因）
   - [ ] 12.4 `/topology` 拓扑页：`sum by (src_service,dst_service)` 查询、`source` 切换、确定性分层 SVG 布局、点击边跳列表
     - 对应需求 13.6-13.7
   - [ ] 12.5 `/apm` 指标页：服务与操作选择、QPS/错误率/P50/P95/P99、「查看 trace」跳转
     - 对应需求 13.8-13.9
   - [ ] 12.6 日志页 `trace_id` 跳转与无摘要提示；详情页「查看该服务日志」反向跳转
     - 对应需求 9.1-9.6、13.10
-  - [ ] 12.6b 图表改用 `echarts`（薄封装：一个 React 组件包 `useEffect` + `setOption`）：指标页 line series、拓扑页 `graph` + `layout: 'none'`、瀑布图 custom series；布局计算抽成 `src/features/apm/layout.ts` 纯函数
+  - [x] 12.6b 图表改用 `echarts`（薄封装：一个 React 组件包 `useEffect` + `setOption`）：指标页 line series、拓扑页 `graph` + `layout: 'none'`、瀑布图 custom series；布局计算抽成 `src/features/apm/layout.ts` 纯函数
     - 对应设计前端实现约束；后端不加任何 echarts 相关逻辑
-  - [ ] 12.7 路由与导航接入既有 SPA；vitest 断言参数拼装、构树比例、`source` 切换表达式、跳转 URL
+    - 状态：已评估并调整（PR #41）：**不引入 echarts**，改为复用既有手绘 SVG（`ui/line-chart.tsx` 复用、新增 `ui/waterfall.tsx`），坐标计算抽到 `features/apm/layout.ts` 纯函数并单测
+  - [x] 12.7 路由与导航接入既有 SPA；vitest 断言参数拼装、构树比例、`source` 切换表达式、跳转 URL
   - [ ] 12.8 `/settings/service-aliases` 页：列表（启用开关/编辑/删除）、新建表单、批量导入（显示新增与覆盖条数）
     - 对应需求 17.8-17.10
+    - 状态：部分实现（PR #41）：路由与菜单接入（`/traces`、`/traces/:traceId`）；vitest 覆盖列表渲染 + 行点击进详情 + 瀑布图 + 抽屉页签；layout 纯函数 8 个用例
   - [ ] 12.9 `/topology` 页的「为该节点建立映射」快捷入口（预填 `cidr` 或 `pod_prefix`）
     - 对应需求 17.10
 - [ ] 13. 集成验证
