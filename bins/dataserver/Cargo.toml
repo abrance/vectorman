@@ -12,6 +12,7 @@ dataplane-sql.workspace = true
 dataplane-ts.workspace = true
 dataplane-log.workspace = true
 dataplane-ingest.workspace = true
+dataplane-apm.workspace = true
 tokio.workspace = true
 clap = { version = "4", features = ["derive"] }
 axum = "0.8"

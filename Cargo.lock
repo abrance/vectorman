@@ -618,6 +618,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dataplane-apm"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "dataplane-core",
+ "dataplane-sql",
+ "dataplane-ts",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "dataplane-core"
 version = "0.1.0"
 dependencies = [
@@ -708,6 +720,7 @@ dependencies = [
  "async-trait",
  "axum",
  "clap",
+ "dataplane-apm",
  "dataplane-core",
  "dataplane-file",
  "dataplane-ingest",
