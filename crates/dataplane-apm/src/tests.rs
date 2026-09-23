@@ -6,6 +6,7 @@ use std::sync::Arc;
 use dataplane_core::{DataplaneError, SqlValue};
 use dataplane_ingest::trace::TraceSpan;
 use dataplane_ingest::{DataEnvelope, DataType};
+use dataplane_log::LogStore;
 use dataplane_sql::{RelationalStore, SqliteRelationalStore};
 
 use crate::accumulator::TraceSummaryAccumulator;
@@ -1008,4 +1009,216 @@ fn query_limit_and_window_helpers() {
     let (from, to) = resolve_window(Some(1), None, NOW).unwrap();
     assert_eq!((from, to), (1, NOW));
     assert!(resolve_window(Some(10), Some(1), NOW).is_err());
+}
+
+fn apm_retention_config(max_bytes: u64) -> crate::retention::ApmRetentionConfig {
+    crate::retention::ApmRetentionConfig {
+        default_retention_days: 3,
+        endpoint_retention_days: 30,
+        max_bytes,
+        evict_step_secs: 3_600,
+        max_rounds: 24,
+    }
+}
+
+async fn seed_trace_row(sql: &dyn RelationalStore, trace_id: &str, start_ts: i64) {
+    sql.execute(
+        "INSERT OR REPLACE INTO apm_trace_summary (trace_id, start_ts, max_end_ts, duration_micros,
+            root_service, root_operation, root_start_ts, span_count, error_count, status,
+            services_json, collector, agent_id, host_id, data_id, updated_ts)
+         VALUES (?1,?2,?2,1,'svc','op',?2,1,0,'ok','[\"svc\"]','otlp','agent-1','','item-1',?2)",
+        &[
+            SqlValue::Text(trace_id.to_string()),
+            SqlValue::Integer(start_ts),
+        ],
+    )
+    .await
+    .unwrap();
+}
+
+async fn seed_edge_row(sql: &dyn RelationalStore, bucket: i64) {
+    sql.execute(
+        "INSERT OR REPLACE INTO apm_edge_summary (bucket_start, src_service, dst_service, span_kind,
+            calls, errors, duration_sum, duration_max, agent_id, data_id)
+         VALUES (?1,'gw','svc','server',1,0,10,10,'agent-1','item-1')",
+        &[SqlValue::Integer(bucket)],
+    )
+    .await
+    .unwrap();
+}
+
+async fn seed_trace_detail(log: &dyn LogStore, id: &str, ts: i64) {
+    let mut labels = std::collections::BTreeMap::new();
+    labels.insert("data_type".to_string(), "traces".to_string());
+    labels.insert("trace_id".to_string(), "a".repeat(32));
+    labels.insert("data_id".to_string(), "item-1".to_string());
+    log.append(dataplane_log::LogRecord {
+        id: id.to_string(),
+        timestamp: ts,
+        level: "info".into(),
+        message: "span".into(),
+        labels,
+    })
+    .await
+    .unwrap();
+}
+
+async fn seed_log_line(log: &dyn LogStore, id: &str, ts: i64) {
+    let mut labels = std::collections::BTreeMap::new();
+    labels.insert("data_type".to_string(), "logs".to_string());
+    labels.insert("data_id".to_string(), "log-1".to_string());
+    log.append(dataplane_log::LogRecord {
+        id: id.to_string(),
+        timestamp: ts,
+        level: "info".into(),
+        message: "line".into(),
+        labels,
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn retention_expires_old_apm_data_and_keeps_other_types() {
+    use crate::retention::ApmRetention;
+    use dataplane_log::TantivyLogStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sql = store(dir.path());
+    bootstrap(sql.as_ref()).await.unwrap();
+    let ts = ts_store(dir.path());
+    let log = TantivyLogStore::new(dir.path().join("logs")).unwrap();
+
+    let old = NOW - 10 * 86_400 * 1_000_000;
+    let fresh = NOW - 60_000_000;
+    seed_trace_row(sql.as_ref(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", old).await;
+    seed_trace_row(sql.as_ref(), "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", fresh).await;
+    seed_edge_row(sql.as_ref(), old).await;
+    seed_edge_row(sql.as_ref(), fresh).await;
+    seed_trace_detail(&log, "d-old", old).await;
+    seed_trace_detail(&log, "d-fresh", fresh).await;
+    seed_log_line(&log, "l-old", old).await;
+    sql.execute(
+        "INSERT INTO apm_service_endpoint (service, instance_id, pod_name, node_name, host_ip,
+            listen_port, collector, first_seen_ts, last_seen_ts)
+         VALUES ('stale','stale-1','','','',0,'otlp',?1,?1)",
+        &[SqlValue::Integer(NOW - 40 * 86_400 * 1_000_000)],
+    )
+    .await
+    .unwrap();
+
+    let retention = ApmRetention::new(apm_retention_config(0));
+    let report = retention
+        .run(sql.as_ref(), &log, ts.as_ref(), dir.path(), NOW)
+        .await
+        .unwrap();
+
+    assert_eq!(report.summaries_deleted, 1, "只删过期的摘要");
+    assert_eq!(report.edges_deleted, 1);
+    assert_eq!(report.details_deleted, 1, "只删过期的 traces 明细");
+    assert_eq!(report.endpoints_deleted, 1, "40 天前的端点超过 30 天");
+    assert_eq!(report.stopped_reason, None);
+
+    // 新数据保留；logs 类型的旧数据不动。
+    let traces = sql
+        .execute("SELECT trace_id FROM apm_trace_summary", &[])
+        .await
+        .unwrap();
+    assert_eq!(traces.rows.len(), 1);
+    assert_eq!(
+        traces.rows[0][0],
+        SqlValue::Text("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into())
+    );
+    let remaining: Vec<String> = log
+        .search(dataplane_log::LogFilter::default())
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.id.clone())
+        .collect();
+    assert!(remaining.contains(&"d-fresh".to_string()));
+    assert!(
+        remaining.contains(&"l-old".to_string()),
+        "logs 不受 APM 保留策略影响"
+    );
+    assert!(!remaining.contains(&"d-old".to_string()));
+}
+
+#[tokio::test]
+async fn retention_evicts_oldest_when_over_size_budget() {
+    use crate::retention::ApmRetention;
+    use dataplane_log::TantivyLogStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sql = store(dir.path());
+    bootstrap(sql.as_ref()).await.unwrap();
+    let ts = ts_store(dir.path());
+    let log = TantivyLogStore::new(dir.path().join("logs")).unwrap();
+
+    // 3 小时粒度递增的旧数据（都在默认保留期内，只有 size 上限才会删它们）。
+    let base = NOW - 6 * 3_600 * 1_000_000;
+    for i in 0..6 {
+        let ts_i = base + i * 3_600 * 1_000_000;
+        seed_trace_row(sql.as_ref(), &format!("{:0>32}", i), ts_i).await;
+        seed_edge_row(sql.as_ref(), ts_i).await;
+        seed_trace_detail(&log, &format!("d-{i}"), ts_i).await;
+    }
+
+    // 预算设为 1 字节：必然超限，只能一路淘汰到没有 APM 数据可删。
+    let retention = ApmRetention::new(apm_retention_config(1));
+    let report = retention
+        .run(sql.as_ref(), &log, ts.as_ref(), dir.path(), NOW)
+        .await
+        .unwrap();
+
+    assert!(report.evict_rounds >= 1, "应有淘汰轮次: {report:?}");
+    assert_eq!(
+        report.stopped_reason.as_deref(),
+        Some("no_apm_data_left"),
+        "APM 数据删完后应停止而不是继续越权删除: {report:?}"
+    );
+    assert!(report.bytes_after <= report.bytes_before, "{report:?}");
+
+    // 最久远的先被删掉；因为一直删到没数据，最后一条也留不下。
+    let left = sql
+        .execute("SELECT COUNT(*) FROM apm_trace_summary", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        left.rows[0][0],
+        SqlValue::Integer(0),
+        "超限会一路淘汰最久远的"
+    );
+    let logs_left = log
+        .search(dataplane_log::LogFilter::default())
+        .await
+        .unwrap();
+    assert!(logs_left.is_empty(), "只删 traces 明细");
+}
+
+#[tokio::test]
+async fn retention_without_budget_leaves_fresh_data_alone() {
+    use crate::retention::ApmRetention;
+    use dataplane_log::TantivyLogStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sql = store(dir.path());
+    bootstrap(sql.as_ref()).await.unwrap();
+    let ts = ts_store(dir.path());
+    let log = TantivyLogStore::new(dir.path().join("logs")).unwrap();
+    seed_trace_row(sql.as_ref(), &"c".repeat(32), NOW - 60_000_000).await;
+
+    let retention = ApmRetention::new(apm_retention_config(0));
+    let report = retention
+        .run(sql.as_ref(), &log, ts.as_ref(), dir.path(), NOW)
+        .await
+        .unwrap();
+    assert_eq!(report.evict_rounds, 0, "未配置上限就不做容量淘汰");
+    assert!(report.stopped_reason.is_none());
+    let left = sql
+        .execute("SELECT COUNT(*) FROM apm_trace_summary", &[])
+        .await
+        .unwrap();
+    assert_eq!(left.rows[0][0], SqlValue::Integer(1), "保留期内不删");
+    assert!(crate::retention::dir_size(dir.path()) > 0, "目录计量可用");
 }

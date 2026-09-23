@@ -26,7 +26,10 @@ const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 const DELETE_SCAN_LIMIT: usize = 100_000;
 /// 索引 schema 版本，写入 `<index_dir>/schema_version`。
-const SCHEMA_VERSION: u32 = 2;
+///
+/// v2 → v3：新增索引字段 `data_type`（按类型清理必需——没有它就只能靠 post-filter
+/// 扫全量，受 `DELETE_SCAN_LIMIT` 上限约束）。
+const SCHEMA_VERSION: u32 = 3;
 const SCHEMA_VERSION_FILE: &str = "schema_version";
 /// `search_indexed` 的默认与上限，trace 详情需要一次拉全一个 trace 的 span。
 const INDEXED_DEFAULT_LIMIT: usize = 100;
@@ -40,6 +43,7 @@ const FIELD_MESSAGE: &str = "message";
 const FIELD_LABELS_JSON: &str = "labels_json";
 const FIELD_ID: &str = "id";
 const FIELD_TRACE_ID: &str = "trace_id";
+const FIELD_DATA_TYPE: &str = "data_type";
 const FIELD_SERVICE: &str = "service";
 const FIELD_DATA_ID: &str = "data_id";
 
@@ -114,6 +118,8 @@ pub struct IndexedLogFilter {
     pub trace_id: Option<String>,
     /// `service` 索引字段精确匹配。
     pub service: Option<String>,
+    /// `data_type` 索引字段精确匹配（`logs` / `traces` / `ebpf` ...）。
+    pub data_type: Option<String>,
     /// `data_id` 索引字段精确匹配（采集项 `item_id`）。
     pub data_id: Option<String>,
     /// `level` 精确匹配。
@@ -132,6 +138,7 @@ impl Default for IndexedLogFilter {
             from_ts: None,
             to_ts: None,
             trace_id: None,
+            data_type: None,
             service: None,
             data_id: None,
             level: None,
@@ -197,6 +204,13 @@ pub trait LogStore: Send + Sync {
 
     /// 按时间上界与 labels 删除匹配记录，返回删除条数。
     async fn delete_matching(&self, filter: LogFilter) -> Result<u64, DataplaneError>;
+
+    /// 删除后回收磁盘（合并/清理不再被引用的段文件），返回删除的文件数。
+    ///
+    /// 默认实现不做任何事：只有真正能在删除后压缩空间的引擎才需要覆盖。
+    async fn reclaim_space(&self) -> Result<u64, DataplaneError> {
+        Ok(0)
+    }
 }
 
 async fn blocking<F, R>(f: F) -> Result<R, DataplaneError>
@@ -229,15 +243,16 @@ struct LogFields {
     labels_json: Field,
     id: Field,
     trace_id: Field,
+    data_type: Field,
     service: Field,
     data_id: Field,
 }
 
 /// 解析实际使用的索引目录，处理 schema 版本切换。
 ///
-/// 版本文件缺失且目录内已有索引（即 v1 索引）时，改用相邻的 `<name>-v2`
-/// 目录重建，旧目录原样保留供人工恢复。返回第二个值为需要输出到 stderr 的
-/// 提示行（仅版本切换时非空）。
+/// 版本文件缺失或低于当前版本时，改用相邻的 `<name>-v<版本>` 目录重建，
+/// 旧目录原样保留供人工恢复。返回第二个值为需要输出到 stderr 的提示行
+/// （仅版本切换时非空）。
 fn resolve_index_dir(requested: &Path) -> Result<(PathBuf, Option<String>), DataplaneError> {
     let current: Option<u32> = std::fs::read_to_string(requested.join(SCHEMA_VERSION_FILE))
         .ok()
@@ -258,7 +273,7 @@ fn resolve_index_dir(requested: &Path) -> Result<(PathBuf, Option<String>), Data
                 format!("log index path has no file name: {}", requested.display()),
             )
         })?;
-    let upgraded = requested.with_file_name(format!("{name}-v2"));
+    let upgraded = requested.with_file_name(format!("{name}-v{SCHEMA_VERSION}"));
     let warn = format!(
         "log index schema upgraded: rebuilding into {}, old index kept at {}",
         upgraded.display(),
@@ -281,6 +296,7 @@ fn build_schema() -> tantivy::schema::Schema {
     // v2：从 labels 提升的三个索引字段（tantivy 的文本字段默认即建倒排，
     // `INDEXED` 标志不能与 `STRING` 叠加）。
     b.add_text_field(FIELD_TRACE_ID, STRING | STORED);
+    b.add_text_field(FIELD_DATA_TYPE, STRING | STORED);
     b.add_text_field(FIELD_SERVICE, STRING | STORED);
     b.add_text_field(FIELD_DATA_ID, STRING | STORED);
     b.build()
@@ -335,6 +351,7 @@ impl TantivyLogStore {
                 .map_err(dp_err)?,
             id: index.schema().get_field(FIELD_ID).map_err(dp_err)?,
             trace_id: index.schema().get_field(FIELD_TRACE_ID).map_err(dp_err)?,
+            data_type: index.schema().get_field(FIELD_DATA_TYPE).map_err(dp_err)?,
             service: index.schema().get_field(FIELD_SERVICE).map_err(dp_err)?,
             data_id: index.schema().get_field(FIELD_DATA_ID).map_err(dp_err)?,
         };
@@ -388,6 +405,7 @@ impl LogStore for TantivyLogStore {
             doc.add_text(fields.id, &id);
             // v2：把 labels 中的三个键提升为索引字段（对既有调用方零改动）。
             doc.add_text(fields.trace_id, promoted(&record.labels, "trace_id"));
+            doc.add_text(fields.data_type, promoted(&record.labels, "data_type"));
             doc.add_text(fields.service, promoted(&record.labels, "service"));
             doc.add_text(fields.data_id, promoted(&record.labels, "data_id"));
             guard.add_document(doc).map_err(dp_err)?;
@@ -425,6 +443,19 @@ impl LogStore for TantivyLogStore {
                 out.push(doc_to_record(&searcher, &fields, doc_addr)?);
             }
             Ok(out)
+        })
+        .await
+    }
+
+    async fn reclaim_space(&self) -> Result<u64, DataplaneError> {
+        let writer = self.writer.clone();
+        blocking(move || {
+            let guard = writer.lock().map_err(|_| {
+                DataplaneError::new(ErrorCode::QueryFailed, "log writer lock poisoned")
+            })?;
+            // `garbage_collect_files` 删除不再被 meta 引用的文件（删除与合并后的旧段）。
+            let result = guard.garbage_collect_files().wait().map_err(dp_err)?;
+            Ok(result.deleted_files.len() as u64)
         })
         .await
     }
@@ -521,8 +552,9 @@ fn indexed_top_docs(
             std::ops::Bound::Included(upper),
         )),
     ));
-    let exact: [(&Field, &Option<String>); 4] = [
+    let exact: [(&Field, &Option<String>); 5] = [
         (&fields.trace_id, &filter.trace_id),
+        (&fields.data_type, &filter.data_type),
         (&fields.service, &filter.service),
         (&fields.data_id, &filter.data_id),
         (&fields.level, &filter.level),
@@ -613,6 +645,7 @@ fn to_indexed_filter(filter: &LogFilter) -> Option<IndexedLogFilter> {
     for (key, value) in &filter.labels {
         match key.as_str() {
             "trace_id" => out.trace_id = Some(value.clone()),
+            "data_type" => out.data_type = Some(value.clone()),
             "service" => out.service = Some(value.clone()),
             "data_id" => out.data_id = Some(value.clone()),
             _ => return None,
@@ -885,7 +918,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_v1_index_switches_to_v2_sibling() {
+    async fn older_index_switches_to_versioned_sibling() {
         let root = tempfile::tempdir().unwrap();
         let v1_dir = root.path().join("logs");
         std::fs::create_dir_all(&v1_dir).unwrap();
@@ -898,8 +931,11 @@ mod tests {
             .append(rec("v2", 1, "after upgrade", "item"))
             .await
             .unwrap();
-        let v2_dir = root.path().join("logs-v2");
-        assert!(v2_dir.join("meta.json").exists(), "应切换到 -v2 目录");
+        let v2_dir = root.path().join(format!("logs-v{SCHEMA_VERSION}"));
+        assert!(
+            v2_dir.join("meta.json").exists(),
+            "应切换到 -v{SCHEMA_VERSION} 目录"
+        );
         assert_eq!(
             std::fs::read_to_string(v2_dir.join(SCHEMA_VERSION_FILE)).unwrap(),
             SCHEMA_VERSION.to_string()
@@ -915,6 +951,55 @@ mod tests {
         let hits = reopened.search(LogFilter::default()).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "v2");
+    }
+
+    #[tokio::test]
+    async fn indexed_filter_by_data_type_and_reclaim() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TantivyLogStore::new(dir.path()).unwrap();
+        let mut traces = rec("t1", 10, "span", "apm-1");
+        traces.labels.insert("data_type".into(), "traces".into());
+        let mut logs = rec("l1", 20, "line", "log-1");
+        logs.labels.insert("data_type".into(), "logs".into());
+        store.append(traces).await.unwrap();
+        store.append(logs).await.unwrap();
+
+        let hits = store
+            .search_indexed(IndexedLogFilter {
+                data_type: Some("traces".into()),
+                ..IndexedLogFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "t1");
+
+        // 按类型 + 时间界删除（`data_type` 建了索引，不走 post-filter）。
+        let deleted = store
+            .delete_matching(LogFilter {
+                to_ts: Some(15),
+                labels: [("data_type".to_string(), "traces".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..LogFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1, "只删该类型且时间界内的记录");
+        assert_eq!(
+            store
+                .search(LogFilter::default())
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["l1"],
+            "logs 类型不受影响"
+        );
+
+        // `reclaim_space` 可调用且不报错（默认实现返回 0，tantivy 回收段文件）。
+        store.reclaim_space().await.unwrap();
     }
 
     #[tokio::test]

@@ -128,7 +128,7 @@ async fn main() -> ExitCode {
         kv,
         sql: Arc::clone(&sql),
         ts: Arc::clone(&ts),
-        log,
+        log: Arc::clone(&log),
         auth: Arc::new(NoopAuth),
         gse_admin_url: cfg.gse_admin_url.clone(),
         metrics: Some(metrics.clone()),
@@ -191,6 +191,77 @@ async fn main() -> ExitCode {
             }
         }
     });
+
+    if cfg.apm_enabled && cfg.apm_clean_interval_secs > 0 {
+        let retention = dataplane_apm::ApmRetention::new(dataplane_apm::ApmRetentionConfig {
+            default_retention_days: cfg.apm_retention_days_default,
+            endpoint_retention_days: cfg.apm_endpoint_retention_days,
+            max_bytes: cfg.apm_max_bytes,
+            ..dataplane_apm::ApmRetentionConfig::default()
+        });
+        let retention_path = paths.root.clone();
+        let retention_sql = Arc::clone(&sql);
+        let retention_log = Arc::clone(&log);
+        let retention_ts = Arc::clone(&ts);
+        let retention_metrics = metrics.clone();
+        let interval = Duration::from_secs(cfg.apm_clean_interval_secs.max(60));
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                match retention
+                    .run(
+                        retention_sql.as_ref(),
+                        retention_log.as_ref(),
+                        retention_ts.as_ref(),
+                        &retention_path,
+                        now_micros(),
+                    )
+                    .await
+                {
+                    Ok(report) => {
+                        retention_metrics.inc_counter("dataserver_apm_retention_runs_total", 1.0);
+                        retention_metrics.inc_counter(
+                            "dataserver_apm_details_deleted_total",
+                            report.details_deleted as f64,
+                        );
+                        retention_metrics.inc_counter(
+                            "dataserver_apm_summaries_deleted_total",
+                            report.summaries_deleted as f64,
+                        );
+                        retention_metrics.inc_counter(
+                            "dataserver_apm_edges_deleted_total",
+                            report.edges_deleted as f64,
+                        );
+                        retention_metrics
+                            .set_gauge("dataserver_apm_data_bytes", report.bytes_after as f64);
+                        println!(
+                            "apm retention: details={} summaries={} edges={} endpoints={} ts_tombstones={} bytes {} -> {} evict_rounds={} stopped={:?}",
+                            report.details_deleted,
+                            report.summaries_deleted,
+                            report.edges_deleted,
+                            report.endpoints_deleted,
+                            report.ts_tombstoned,
+                            report.bytes_before,
+                            report.bytes_after,
+                            report.evict_rounds,
+                            report.stopped_reason
+                        );
+                        if let Some(reason) = &report.stopped_reason {
+                            eprintln!(
+                                "apm retention: over apm_max_bytes but stopped early ({reason}); \
+                                 raise apm_max_bytes or shrink the data set"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        retention_metrics.inc_counter("dataserver_apm_retention_errors_total", 1.0);
+                        eprintln!("apm retention failed: {}: {}", e.code.as_str(), e.message);
+                    }
+                }
+            }
+        });
+    }
 
     if cfg.apm_enabled && cfg.apm_agg_interval_secs > 0 {
         let aggregator = dataplane_apm::ApmAggregator::new(
