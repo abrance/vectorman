@@ -1145,6 +1145,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gse-agent-ebpf"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "gse-proto"
 version = "0.1.0"
 dependencies = [
