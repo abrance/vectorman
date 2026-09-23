@@ -99,11 +99,13 @@
 - [x] 10. 检查点 - 确保所有测试通过
     - 状态：部分实现：列表分页排序、详情 400/404/partial、边与服务清单、限流 429、apm 关闭 503 已覆盖（PR #35/#37）；清理三类数据的 httptest 由 dataplane-apm 的保留策略测试覆盖（PR #36）
   - 确保所有测试通过,如有疑问请询问用户
-- [ ] 11. dpc 子命令
-  - [ ] 11.1 `traces`、`trace <trace_id>`、`edges` 三个只读子命令，stdout 打印 JSON
+- [x] 11. dpc 子命令
+  - [x] 11.1 `traces`、`trace <trace_id>`、`edges` 三个只读子命令，stdout 打印 JSON
     - 对应需求 12.7
-  - [ ] 11.2 CLI 参数解析与错误码透传单测
+    - 状态：已实现（PR #38）：`dpc traces`（service/operation/status/min-duration-ms/agent_id/data_id/sort/order/时间窗/limit）、`dpc trace <trace_id>`、`dpc edges`（src/dst/source/min-requests），stdout 打印 JSON；复用 `--sql-url`
+  - [x] 11.2 CLI 参数解析与错误码透传单测
 - [ ] 12. 前端 `@vectorman/dataplane`
+    - 状态：已实现（PR #38）：请求体构造单测（`--min-duration-ms` 转微秒、只下发显式提供的过滤字段）+ 错误码经既有 `ureq_err_str` 透传
   - [ ] 12.1 `src/features/apm/` 客户端：trace 列表、详情、边、服务清单封装，复用既有 HttpClient
   - [ ] 12.2 `/traces` 列表页：过滤、排序切换、分页、空态、行点击进详情
     - 对应需求 13.3、13.12、13.13
