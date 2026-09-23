@@ -6,7 +6,7 @@ use axum::extract::{Path as PathParam, Query, State};
 use axum::http::{Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use dataplane_apm::ApmSink;
 use dataplane_core::{
@@ -623,6 +623,100 @@ async fn edges_search(
     }
 }
 
+async fn aliases_list(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if let Some(resp) = apm_unavailable(&state) {
+        return resp;
+    }
+    let sink = state.apm.as_ref().expect("checked above");
+    let match_kind = params.get("match_kind").cloned();
+    let enabled = params
+        .get("enabled")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1");
+    match sink.list_aliases(match_kind.as_deref(), enabled).await {
+        Ok(aliases) => Json(json!({ "aliases": aliases })).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+async fn alias_create(
+    State(state): State<AppState>,
+    body: Result<Json<dataplane_apm::AliasUpsert>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Some(resp) = apm_unavailable(&state) {
+        return resp;
+    }
+    let sink = state.apm.as_ref().expect("checked above");
+    let upsert = match body {
+        Ok(b) => b.0,
+        Err(_) => {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                DataplaneError::invalid_argument("invalid JSON body"),
+            )
+        }
+    };
+    match sink.upsert_alias(&upsert, now_micros()).await {
+        Ok(record) => (StatusCode::CREATED, Json(record)).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+async fn alias_update(
+    State(state): State<AppState>,
+    PathParam(alias_id): PathParam<String>,
+    body: Result<Json<dataplane_apm::AliasUpsert>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Some(resp) = apm_unavailable(&state) {
+        return resp;
+    }
+    let sink = state.apm.as_ref().expect("checked above");
+    let upsert = match body {
+        Ok(b) => b.0,
+        Err(_) => {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                DataplaneError::invalid_argument("invalid JSON body"),
+            )
+        }
+    };
+    // PUT 只允许改开关/备注：匹配条件与派生主键不可变，避免同一行换键造成困惑。
+    let Ok((kind, match_value, _)) = upsert.validate() else {
+        return map_err(upsert.validate().expect_err("validate already failed"));
+    };
+    if dataplane_apm::alias::alias_id(kind, match_value) != alias_id {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            DataplaneError::invalid_argument(
+                "PUT cannot change match_kind/match_value; delete and recreate instead",
+            ),
+        );
+    }
+    match sink.upsert_alias(&upsert, now_micros()).await {
+        Ok(record) => Json(record).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+async fn alias_delete(
+    State(state): State<AppState>,
+    PathParam(alias_id): PathParam<String>,
+) -> Response {
+    if let Some(resp) = apm_unavailable(&state) {
+        return resp;
+    }
+    let sink = state.apm.as_ref().expect("checked above");
+    match sink.delete_alias(&alias_id).await {
+        Ok(true) => Json(json!({ "deleted": true, "alias_id": alias_id })).into_response(),
+        Ok(false) => map_err(DataplaneError::not_found(format!(
+            "alias not found: {alias_id}"
+        ))),
+        Err(e) => map_err(e),
+    }
+}
+
 async fn apm_services(State(state): State<AppState>) -> Response {
     if let Some(resp) = apm_unavailable(&state) {
         return resp;
@@ -674,6 +768,14 @@ fn api_routes(state: AppState) -> Router {
         .route("/v1/traces/{trace_id}", get(trace_detail))
         .route("/v1/edges/search", post(edges_search))
         .route("/v1/apm/services", get(apm_services))
+        .route(
+            "/v1/apm/service-aliases",
+            get(aliases_list).post(alias_create),
+        )
+        .route(
+            "/v1/apm/service-aliases/{alias_id}",
+            put(alias_update).delete(alias_delete),
+        )
         .route("/v1/ts/delete", post(ts_delete))
         .route("/v1/ts/stats", get(ts_stats))
         .route("/api/v1/query", get(prom_query))
@@ -1653,5 +1755,113 @@ mod tests {
         assert_eq!(detail["spans"].as_array().unwrap().len(), 0);
         assert_eq!(detail["partial"], true);
         assert_eq!(detail["reason"], "detail_filtered");
+    }
+
+    #[tokio::test]
+    async fn service_alias_crud_and_validation() {
+        let env = test_env(None).await;
+        let app = sql_router(env.state.clone(), None);
+
+        // 列表初始为空。
+        let (st, body) = send(&app, req("GET", "/v1/apm/service-aliases", None)).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert!(body.contains("\"aliases\":[]"), "{body}");
+
+        // 新建（201）。
+        let (st, body) = send(
+            &app,
+            req(
+                "POST",
+                "/v1/apm/service-aliases",
+                Some(r#"{"match_kind":"pod_prefix","match_value":"order-api","service":"order-api"}"#),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "{body}");
+        assert!(body.contains("pod_prefix:order-api"), "{body}");
+
+        // 非法输入：cidr 不合法、match_kind 未知、service 为空。
+        for payload in [
+            r#"{"match_kind":"cidr","match_value":"10.0.0.0","service":"svc"}"#,
+            r#"{"match_kind":"nope","match_value":"x","service":"svc"}"#,
+            r#"{"match_kind":"process_name","match_value":"java","service":"  "}"#,
+        ] {
+            let (st, body) =
+                send(&app, req("POST", "/v1/apm/service-aliases", Some(payload))).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("invalid_argument"), "{body}");
+        }
+
+        // 列表带过滤；GET ?match_kind=cidr 为空。
+        let (st, body) = send(
+            &app,
+            req("GET", "/v1/apm/service-aliases?match_kind=pod_prefix", None),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert!(body.contains("order-api"), "{body}");
+        let (st, body) = send(
+            &app,
+            req("GET", "/v1/apm/service-aliases?match_kind=cidr", None),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert!(body.contains("\"aliases\":[]"), "{body}");
+
+        // PUT 只能改开关：换匹配条件 → 400；同条件停用 → 200。
+        let id = "pod_prefix:order-api";
+        let (st, body) = send(
+            &app,
+            req(
+                "PUT",
+                &format!("/v1/apm/service-aliases/{id}"),
+                Some(r#"{"match_kind":"process_name","match_value":"java","service":"x"}"#),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("cannot change"), "{body}");
+
+        let (st, body) = send(
+            &app,
+            req(
+                "PUT",
+                &format!("/v1/apm/service-aliases/{id}"),
+                Some(r#"{"match_kind":"pod_prefix","match_value":"order-api","service":"order-api","enabled":false}"#),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert!(body.contains("\"enabled\":false"), "{body}");
+
+        let (st, body) = send(
+            &app,
+            req("GET", "/v1/apm/service-aliases?enabled=false", None),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert!(body.contains("order-api"), "{body}");
+
+        // 删除：首次 200，再删 404。
+        let (st, body) = send(
+            &app,
+            req("DELETE", &format!("/v1/apm/service-aliases/{id}"), None),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let (st, body) = send(
+            &app,
+            req("DELETE", &format!("/v1/apm/service-aliases/{id}"), None),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains("not_found"), "{body}");
+
+        // apm 关闭时返回 unavailable。
+        let mut state = env.state.clone();
+        state.apm = None;
+        let app = sql_router(state, None);
+        let (st, body) = send(&app, req("GET", "/v1/apm/service-aliases", None)).await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     }
 }
