@@ -63,16 +63,20 @@
     - 状态：已实现（PR #32 + PR #33）：乱序极值合并、根取最小、跨 flush 替换根、error 单调、幂等 flush、容量淘汰、冷启动回载、端点反查与清理、v1→v2 迁移；配对三场景（client 先到 / server 先到 / 未配对兜底）、一 client 多 server 只计一次、重放去重
   - [ ] 7.6 静态服务名映射：`apm_service_alias` CRUD API（`/v1/apm/service-aliases`）、校验、缓存失效版本号、反查优先级（alias → endpoint → `unknown-<ip>`）
     - 对应需求 17.1-17.7、17.11 与共享模型「服务名映射（alias）」
-- [ ] 8. dataserver 聚合任务
+- [x] 8. dataserver 聚合任务
     - 状态：部分实现（PR #32）：乱序摘要、根取 start 最小、跨 flush 替换根、error 单调、幂等 flush、容量淘汰、回载、端点反查；配对三场景随 7.4 待做
-  - [ ] 8.1 `ApmAggregator`：60 秒周期、桶对齐、服务维度与 span 维度、nearest-rank 分位数、空桶不写零值
+  - [x] 8.1 `ApmAggregator`：60 秒周期、桶对齐、服务维度与 span 维度、nearest-rank 分位数、空桶不写零值
     - 对应需求 7.1-7.9
-  - [ ] 8.2 边指标聚合：`apm_edge_requests_total`/`errors`/`duration_micros`，label 与 `source=otlp`
+    - 状态：已实现（PR #34）：已关闭桶结算、服务计数按 status 拆分、耗时按 (service,operation,kind) 合并、nearest-rank 分位数、空桶不写零值
+  - [x] 8.2 边指标聚合：`apm_edge_requests_total`/`errors`/`duration_micros`，label 与 `source=otlp`
     - 对应需求 8.3-8.4 与共享模型命名表
-  - [ ] 8.3 失败处理与自监控计数：单轮失败 stderr 一行、不回填、计数 +1
+    - 状态：已实现（PR #34）：边计数/耗时和取 apm_edge_summary，p95 取内存边样本，label 与 source=otlp
+  - [x] 8.3 失败处理与自监控计数：单轮失败 stderr 一行、不回填、计数 +1
     - 对应需求 7.8 与 16.2
-  - [ ] 8.4 单测：5 个 `field_name` 点、label 集合、单位量级、同桶重跑结果一致
+    - 状态：已实现（PR #34）：单轮失败 stderr + 计数，不回填；样本取出后不重复结算
+  - [x] 8.4 单测：5 个 `field_name` 点、label 集合、单位量级、同桶重跑结果一致
 - [ ] 9. dataserver 查询接口与清理
+    - 状态：已实现（PR #34）：dataplane-apm 23 个单测（含聚合端到端与空桶）
   - [ ] 9.1 `POST /v1/traces/search`：过滤、`sort`/`order`、`limit`/`offset`、`total`、默认 1 小时、`from_ts > to_ts` → 400
     - 对应需求 5.1-5.8
   - [ ] 9.2 `GET /v1/traces/{trace_id}`：`summary` + `spans`、升序、`partial` 与 `reason`

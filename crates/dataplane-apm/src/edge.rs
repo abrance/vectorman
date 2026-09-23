@@ -16,7 +16,7 @@
 //! 淘汰后重建，只要每次都读回就不会重复计数。
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use dataplane_core::{DataplaneError, ErrorCode, SqlValue};
@@ -24,6 +24,7 @@ use dataplane_ingest::trace::TraceSpan;
 use dataplane_ingest::DataEnvelope;
 use dataplane_sql::RelationalStore;
 
+use crate::red::RedSamples;
 use crate::tables;
 
 /// 边桶宽（秒）：与 RED 指标的 1 分钟聚合对齐。
@@ -142,6 +143,8 @@ struct Inner {
 pub struct EdgeAccumulator {
     /// 待配对 span 的内存上限（超过时按时间淘汰最旧）。
     pending_capacity: usize,
+    /// 边延迟样本（供聚合任务算 p95）；桶关闭后由聚合任务取走。
+    samples: Arc<RedSamples>,
     inner: Mutex<Inner>,
     dropped_pending: Mutex<u64>,
     paired_edges: Mutex<u64>,
@@ -149,9 +152,10 @@ pub struct EdgeAccumulator {
 
 impl EdgeAccumulator {
     #[must_use]
-    pub fn new(pending_capacity: usize) -> Self {
+    pub fn new(pending_capacity: usize, samples: Arc<RedSamples>) -> Self {
         Self {
             pending_capacity: pending_capacity.max(1),
+            samples,
             inner: Mutex::new(Inner::default()),
             dropped_pending: Mutex::new(0),
             paired_edges: Mutex::new(0),
@@ -215,9 +219,7 @@ impl EdgeAccumulator {
             None => (client.fallback_dst.clone(), String::new()),
         };
         // 桶由发起端（client）时间戳决定：一条调用归属它发起的那个分钟。
-        let bucket_start = client.timestamp.div_euclid(EDGE_BUCKET_SECS * 1_000_000)
-            * EDGE_BUCKET_SECS
-            * 1_000_000;
+        let bucket_start = bucket_of(client.timestamp);
         let key = EdgeKey {
             bucket_start,
             src_service: client.service.clone(),
@@ -225,6 +227,7 @@ impl EdgeAccumulator {
             span_kind: "server".to_string(),
             agent_id: envelope.agent_id.clone(),
         };
+        let dst_for_samples = key.dst_service.clone();
         let entry = inner.edges.entry(key).or_insert_with(|| EdgeDelta {
             data_id: envelope.data_id.clone(),
             peer_host: client.peer_host.clone(),
@@ -246,6 +249,14 @@ impl EdgeAccumulator {
         if entry.peer_pod.is_empty() {
             entry.peer_pod = peer_pod;
         }
+        self.samples.observe_edge(
+            bucket_start,
+            &client.service,
+            &dst_for_samples,
+            "server",
+            &client.status_code,
+            client.duration_micros,
+        );
         if let Ok(mut count) = self.paired_edges.lock() {
             *count += 1;
         }
@@ -349,6 +360,14 @@ impl EdgeAccumulator {
                     continue;
                 }
                 inner.recorded.insert(key.clone(), span.timestamp);
+                self.samples.observe_edge(
+                    bucket_of(span.timestamp),
+                    &span.service,
+                    &span.fallback_dst,
+                    "server",
+                    &span.status_code,
+                    span.duration_micros,
+                );
                 batch.push((fallback_edge_key(&span), fallback_edge_delta(&span)));
             }
             // 2) 已配对的边。
@@ -392,12 +411,21 @@ impl EdgeAccumulator {
     }
 }
 
+/// 把时间戳对齐到分钟桶起点（供 sink 记录 span 样本复用）。
+#[must_use]
+pub fn bucket_of_public(timestamp: i64) -> i64 {
+    bucket_of(timestamp)
+}
+
+/// 把时间戳对齐到分钟桶起点。
+fn bucket_of(timestamp: i64) -> i64 {
+    timestamp.div_euclid(EDGE_BUCKET_SECS * 1_000_000) * EDGE_BUCKET_SECS * 1_000_000
+}
+
 /// 兜底边的键：`dst_service` 用 client 的 `unknown*` 目标。
 fn fallback_edge_key(client: &PendingSpan) -> EdgeKey {
     EdgeKey {
-        bucket_start: client.timestamp.div_euclid(EDGE_BUCKET_SECS * 1_000_000)
-            * EDGE_BUCKET_SECS
-            * 1_000_000,
+        bucket_start: bucket_of(client.timestamp),
         src_service: client.service.clone(),
         dst_service: client.fallback_dst.clone(),
         span_kind: "server".to_string(),

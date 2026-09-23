@@ -14,6 +14,7 @@ ts_cardinality_limit = 2000000
 ts_clean_interval_secs = 3600
 apm_enabled = true
 apm_endpoint_retention_days = 30
+apm_agg_interval_secs = 60
 
 [sql_http]
 listen = "0.0.0.0:8081"
@@ -86,6 +87,9 @@ pub struct Config {
     /// 服务端点半保留期（天）。
     #[serde(default = "default_apm_endpoint_retention_days")]
     pub apm_endpoint_retention_days: u32,
+    /// RED 与边指标的聚合周期（秒）。
+    #[serde(default = "default_apm_agg_interval")]
+    pub apm_agg_interval_secs: u64,
 }
 
 impl Default for Config {
@@ -109,6 +113,7 @@ impl Default for Config {
             ts_clean_interval_secs: default_ts_clean_interval(),
             apm_enabled: true,
             apm_endpoint_retention_days: default_apm_endpoint_retention_days(),
+            apm_agg_interval_secs: default_apm_agg_interval(),
         }
     }
 }
@@ -176,6 +181,11 @@ impl Config {
         if let Ok(v) = std::env::var("DATASERVER_APM_ENABLED") {
             self.apm_enabled = v.eq_ignore_ascii_case("true") || v == "1";
         }
+        if let Ok(v) = std::env::var("DATASERVER_APM_AGG_INTERVAL") {
+            if let Ok(n) = v.parse() {
+                self.apm_agg_interval_secs = n;
+            }
+        }
         if let Ok(v) = std::env::var("DATASERVER_APM_ENDPOINT_RETENTION_DAYS") {
             if let Ok(n) = v.parse() {
                 self.apm_endpoint_retention_days = n;
@@ -223,6 +233,10 @@ fn default_true() -> bool {
 
 fn default_apm_endpoint_retention_days() -> u32 {
     30
+}
+
+fn default_apm_agg_interval() -> u64 {
+    60
 }
 
 fn nonempty_opt(v: String) -> Option<String> {

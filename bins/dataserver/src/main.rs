@@ -93,13 +93,17 @@ async fn main() -> ExitCode {
 
     // APM 派生数据：摘要累加器 + 服务端点半。`apm_enabled=false` 时不创建，
     // 接入路径退回无钩子的 `apply`（既有行为）。
+    let red_samples = Arc::new(dataplane_apm::RedSamples::new(
+        dataplane_apm::red::DEFAULT_GROUP_SAMPLE_CAP,
+    ));
     let apm = if cfg.apm_enabled {
         let sink = Arc::new(dataplane_apm::ApmSink::new(
-            sql.clone(),
+            Arc::clone(&sql),
             dataplane_apm::ApmSinkConfig {
                 endpoint_retention_days: cfg.apm_endpoint_retention_days,
                 ..dataplane_apm::ApmSinkConfig::default()
             },
+            Arc::clone(&red_samples),
         ));
         match sink.reload(now_micros()).await {
             Ok(n) if n > 0 => println!("apm: reloaded {n} live traces"),
@@ -122,8 +126,8 @@ async fn main() -> ExitCode {
     let state = AppState {
         file,
         kv,
-        sql,
-        ts,
+        sql: Arc::clone(&sql),
+        ts: Arc::clone(&ts),
         log,
         auth: Arc::new(NoopAuth),
         gse_admin_url: cfg.gse_admin_url.clone(),
@@ -187,6 +191,43 @@ async fn main() -> ExitCode {
             }
         }
     });
+
+    if cfg.apm_enabled && cfg.apm_agg_interval_secs > 0 {
+        let aggregator = dataplane_apm::ApmAggregator::new(
+            Arc::clone(&sql),
+            Arc::clone(&ts),
+            Arc::clone(&red_samples),
+        );
+        let agg_metrics = metrics.clone();
+        let interval = Duration::from_secs(cfg.apm_agg_interval_secs.max(1));
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                match aggregator.run_once(now_micros()).await {
+                    Ok(report) => {
+                        agg_metrics.inc_counter("dataserver_apm_agg_runs_total", 1.0);
+                        agg_metrics.inc_counter(
+                            "dataserver_apm_agg_points_total",
+                            (report.service_points + report.edge_points) as f64,
+                        );
+                        if let Some(bucket) = report.buckets.first() {
+                            agg_metrics.set_gauge("dataserver_apm_last_agg_bucket", *bucket as f64);
+                        }
+                    }
+                    Err(e) => {
+                        agg_metrics.inc_counter("dataserver_apm_agg_errors_total", 1.0);
+                        eprintln!("apm: aggregate failed: {}: {}", e.code.as_str(), e.message);
+                    }
+                }
+                agg_metrics.set_gauge("dataserver_apm_open_groups", red_samples.groups() as f64);
+                agg_metrics.set_gauge(
+                    "dataserver_apm_dropped_samples",
+                    red_samples.dropped_samples() as f64,
+                );
+            }
+        });
+    }
 
     if let Some(sink) = apm.clone() {
         let flush_metrics = metrics.clone();

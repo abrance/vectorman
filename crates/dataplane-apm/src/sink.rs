@@ -15,6 +15,7 @@ use dataplane_sql::RelationalStore;
 use crate::accumulator::{ApmSinkConfig, TraceSummaryAccumulator};
 use crate::edge::{EdgeAccumulator, ServiceResolver};
 use crate::endpoint::EndpointRegistry;
+use crate::red::RedSamples;
 
 pub use crate::accumulator::ApmSinkConfig as Config;
 
@@ -33,6 +34,7 @@ pub struct ApmSink {
     accumulator: TraceSummaryAccumulator,
     endpoints: EndpointRegistry,
     edges: EdgeAccumulator,
+    samples: Arc<RedSamples>,
 }
 
 /// 把端点表适配成边目标归一用的解析器（需要同时拿到 sql 与 registry）。
@@ -62,18 +64,23 @@ impl ServiceResolver for EndpointResolver<'_> {
 
 impl ApmSink {
     #[must_use]
-    pub fn new(sql: Arc<dyn RelationalStore>, config: ApmSinkConfig) -> Self {
+    pub fn new(
+        sql: Arc<dyn RelationalStore>,
+        config: ApmSinkConfig,
+        samples: Arc<RedSamples>,
+    ) -> Self {
         let endpoints = EndpointRegistry::new(
             config.endpoint_retention_days,
             config.endpoint_cache_ttl_secs,
         );
-        let edges = EdgeAccumulator::new(config.edge_pending_capacity);
+        let edges = EdgeAccumulator::new(config.edge_pending_capacity, samples.clone());
         Self {
             sql,
             accumulator: TraceSummaryAccumulator::new(config.clone()),
             config,
             endpoints,
             edges,
+            samples,
         }
     }
 
@@ -178,6 +185,11 @@ impl ApmSink {
     }
 
     #[must_use]
+    pub fn samples(&self) -> &Arc<RedSamples> {
+        &self.samples
+    }
+
+    #[must_use]
     pub fn edges(&self) -> &EdgeAccumulator {
         &self.edges
     }
@@ -209,6 +221,17 @@ impl TraceSink for ApmSink {
         self.accumulator.observe(span, envelope);
         self.endpoints.observe(span, now_ts);
         self.edges.observe(span, envelope);
+        // 服务 RED 只用 OTLP 来源（eBPF 推导的 span 不计入 apm_service_*）。
+        if span.collector == "otlp" {
+            self.samples.observe_span(
+                crate::edge::bucket_of_public(span.timestamp),
+                &span.service,
+                &span.name,
+                &span.kind,
+                &span.status_code,
+                span.duration_micros(),
+            );
+        }
         Ok(())
     }
 }

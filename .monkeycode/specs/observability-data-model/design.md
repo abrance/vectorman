@@ -218,11 +218,13 @@ CREATE INDEX IF NOT EXISTS apm_service_alias_match ON apm_service_alias(match_ki
 
 Prom 查询侧通过 `TimeSeriesStore` 暴露。约束来自现有引擎：一个 point 只有一个数值 field（`TsPoint.field_value: f64`），没有 histogram 类型，因此所有指标都是 1 分钟粒度的标量点，分位数由 dataserver 聚合时算好，用 `field_name` 区分。
 
-| measurement | field_name | 维度 labels | 来源 | feature |
+多值指标（同一 measurement 下要暴露多个数值）用 **label `field`** 区分，`TsPoint.field_name` 固定为 `value`。原因见下方 Pitfalls：tsink 里 field 不是序列身份，同 measurement+labels 的不同 `field_name` 会互相覆盖（实测一次 instant 查询只剩最后写入的那一个）。
+
+| measurement | `field` label | 维度 labels | 来源 | feature |
 | --- | --- | --- | --- | --- |
 | `apm_service_requests_total` | `value` | `service` `operation` `span_kind` `status` `source` | spans | apm-tracing |
 | `apm_service_errors_total` | `value` | `service` `operation` `span_kind` `source` | spans | apm-tracing |
-| `apm_service_duration_micros` | `avg` `p50` `p95` `p99` `max` | `service` `operation` `span_kind` `source` | spans | apm-tracing |
+| `apm_service_duration_micros` | `avg` `p50` `p95` `p99` `max` | `service` `operation` `span_kind` `source` | spans | apm-tracing（耗时按状态合并：labels 无 `status`） |
 | `apm_edge_requests_total` | `value` | `src_service` `dst_service` `span_kind` `status` `source` | spans + ebpf | 共享 |
 | `apm_edge_errors_total` | `value` | `src_service` `dst_service` `span_kind` `source` | spans + ebpf | 共享 |
 | `apm_edge_duration_micros` | `avg` `p95` | `src_service` `dst_service` `span_kind` `source` | spans | 共享 |
