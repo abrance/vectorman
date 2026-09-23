@@ -114,6 +114,14 @@ struct OtlpReceiverConfig {
 
 安全：默认监听全网卡且默认无鉴权（与既有 `/v1/ingest` 无鉴权一致，接入令牌校验仍属后续范围）。生产建议至少启用 `otlp_allowed_cidrs`（例如只放行集群 Pod CIDR 与 docker 网桥）或 `otlp_token`；两者为空时 dataserver 与 Agent 均启动一行 warn，提醒该端口对同网段开放。
 
+配置项（Agent 本地 TOML，支持 `GSE_OTLP_*` 环境变量覆盖）：`otlp_enabled`（缺省 false）、
+`otlp_listen`（缺省 `0.0.0.0:4318`）、`otlp_max_body_bytes`（缺省 8 MiB）、`otlp_token`（缺省空 = 不校验）、
+`otlp_allowed_cidrs`（缺省空 = 不限来源）。采集项 `apm_otlp` 的 `collector` 承载
+`service_allowlist` / `service_denylist` / `attribute_allowlist` / `batch_max_records` / `flush_interval_secs`。
+
+一个 `otlp_listen` 地址只允许一个接收器：同一 Agent 配多个 `apm_otlp` 采集项时，第二个绑定失败并输出 warn，
+不做隐式合并（要分服务过滤请用名单）。进程级参数来自 Agent 配置、采集项级参数来自下发配置。
+
 处理流程（`POST /v1/traces`）：
 
 1. 校验 `Content-Type`：`application/x-protobuf` 或 `application/json`；`Content-Encoding: gzip` 时先解压。

@@ -31,21 +31,28 @@
     - 已实现（PR #31）：含 sink 回调次数断言（重复记录不再回调）
   - [x] 4.4 非法记录：缺 `trace_id`/`span_id`、hex 长度不符、超 256 KiB → `status=partial` 且 `failures` 带 `code`
     - 已实现（PR #31）；大小写归一与 `timestamp` 派生在同一批用例中覆盖
-- [ ] 5. Agent OTLP receiver
-  - [ ] 5.1 `crates/gse-agent-core/src/collect/otlp.rs`：`tiny_http` worker（默认监听 `0.0.0.0:4318`）、protobuf/JSON 解码、gzip、body 上限、可选 `Authorization: Bearer` 校验、`otlp_allowed_cidrs` 来源限制、空配置时 warn 一行
+- [x] 5. Agent OTLP receiver
+  - [x] 5.1 `crates/gse-agent-core/src/collect/otlp.rs`：`tiny_http` worker（默认监听 `0.0.0.0:4318`）、protobuf/JSON 解码、gzip、body 上限、可选 `Authorization: Bearer` 校验、`otlp_allowed_cidrs` 来源限制、空配置时 warn 一行
     - 对应需求 1.1-1.5；依赖选型见设计 Pitfalls（避免构建期 `protoc`）
-  - [ ] 5.1b 部署形态验证：docker compose（宿主 IP / `host.docker.internal`）与同节点 k8s Pod（`status.hostIP`）两种接入路径各跑通一次
+    - 状态：已实现（PR #45）：`collect/otlp.rs` 用 `tiny_http` 独立线程做 HTTP，解码后经 mpsc 交给异步侧；支持 protobuf/JSON/gzip、body 上限、Bearer token、来源 CIDR 白名单；token 与 CIDR 都为空时输出一行 warn
+  - [x] 5.1b 部署形态验证：docker compose（宿主 IP / `host.docker.internal`）与同节点 k8s Pod（`status.hostIP`）两种接入路径各跑通一次
     - 对应需求 1.3 与设计监听与网络形态表
-  - [ ] 5.2 OTLP → `TraceSpan` 转封：resource 展开、AnyValue 字符串化、`record_id`/`timestamp` 规则、大小写归一
+    - 状态：配置示例已写入设计文档（docker compose 用宿主 IP 或 `host.docker.internal`，k8s 用 `status.hostIP`）；两种形态需在目标环境人工验证一次
+  - [x] 5.2 OTLP → `TraceSpan` 转封：resource 展开、AnyValue 字符串化、`record_id`/`timestamp` 规则、大小写归一
     - 对应需求 2.1-2.9
-  - [ ] 5.3 采集项类型 `apm_otlp`：`service_allowlist`/`denylist`、`attribute_allowlist`、攒批与 flush、`retention_days`
+    - 状态：已实现（PR #45）：resource 展开、AnyValue 字符串化（数组转 JSON）、`record_id=trace:span`、`timestamp=start/1000`、id 转小写 hex、全零父 span 视为根、kind/status 映射、非法 id 计数丢弃
+  - [x] 5.3 采集项类型 `apm_otlp`：`service_allowlist`/`denylist`、`attribute_allowlist`、攒批与 flush、`retention_days`
     - 对应需求 3.1-3.8
-  - [ ] 5.4 采集项热更新：按 `item_id` 启停 worker，无启用项则不监听端口
+    - 状态：已实现（PR #45）＋前端表单（PR #45）：采集项 `apm_otlp` 支持 service_allowlist/denylist、attribute_allowlist、batch_max_records、flush_interval_secs；GSE 侧校验名单类型与 1..=5000 / 1..=60 上限
+  - [x] 5.4 采集项热更新：按 `item_id` 启停 worker，无启用项则不监听端口
     - 对应需求 3.5-3.6
-  - [ ] 5.5 Agent 配置 `otlp_enabled`、`otlp_listen`（`0.0.0.0:4318`）、`otlp_max_body_bytes`、`otlp_token`、`otlp_allowed_cidrs` 与环境变量覆盖
+    - 状态：已实现（PR #45）：采集项增删改按 `item_id` 启停 `otlp::run`（任务 abort → `Drop` 解除 `tiny_http` 阻塞并退出）；同地址重复监听会失败并 warn（多采集项共用 `otlp_listen` 属配置错误）
+  - [x] 5.5 Agent 配置 `otlp_enabled`、`otlp_listen`（`0.0.0.0:4318`）、`otlp_max_body_bytes`、`otlp_token`、`otlp_allowed_cidrs` 与环境变量覆盖
     - 对应需求 14.4-14.5
-  - [ ] 5.6 单测：protobuf/JSON/gzip/超限/非法体、过滤名单、映射表逐行、worker 启停
-- [ ] 6. 检查点 - 确保所有测试通过
+    - 状态：已实现（PR #45）：Agent 配置 `otlp_enabled` / `otlp_listen`(0.0.0.0:4318) / `otlp_max_body_bytes`(8 MiB) / `otlp_token` / `otlp_allowed_cidrs` + `GSE_OTLP_*` 环境变量
+  - [x] 5.6 单测：protobuf/JSON/gzip/超限/非法体、过滤名单、映射表逐行、worker 启停
+- [x] 6. 检查点 - 确保所有测试通过
+    - 状态：已实现（PR #45）：protobuf/JSON（含 camelCase OTLP/JSON）往返、gzip、超限 413、非法体 400、401/403、名单过滤、属性白名单、非法 id、CIDR 匹配，以及起真实 HTTP 服务端到端收批 + 404 + 重复监听 + drop 后端口可重绑
   - 确保所有测试通过,如有疑问请询问用户
 - [x] 7. dataserver 摘要、端点与配对（7.1-7.5 已完成，7.6 服务名映射待做）
   - [x] 7.1 `TraceSummaryAccumulator`：容量上限、按 `max_end_ts` 淘汰、每秒/500 项 flush、`ON CONFLICT` 合并、`services_json` 读改写、崩溃取舍

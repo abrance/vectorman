@@ -25,6 +25,21 @@ pub struct AgentConfig {
     /// 作业临时脚本目录；为空时使用系统临时目录。
     #[serde(default)]
     pub job_work_dir: Option<String>,
+    /// 是否启用 OTLP trace 接收器（`apm_otlp` 采集项的前置开关）。
+    #[serde(default)]
+    pub otlp_enabled: bool,
+    /// OTLP 监听地址；缺省 `0.0.0.0:4318`（应用与 Agent 通常不同 netns）。
+    #[serde(default = "default_otlp_listen")]
+    pub otlp_listen: String,
+    /// OTLP 请求体上限（字节）。
+    #[serde(default = "default_otlp_max_body")]
+    pub otlp_max_body_bytes: usize,
+    /// 可选 Bearer token；为空不校验。
+    #[serde(default)]
+    pub otlp_token: String,
+    /// 可选来源网段白名单（CIDR）；为空不限来源。
+    #[serde(default)]
+    pub otlp_allowed_cidrs: Vec<String>,
 }
 
 impl Default for AgentConfig {
@@ -38,6 +53,11 @@ impl Default for AgentConfig {
             job_default_interpreter: default_job_interpreter(),
             max_concurrent_jobs: default_max_jobs(),
             job_work_dir: None,
+            otlp_enabled: false,
+            otlp_listen: default_otlp_listen(),
+            otlp_max_body_bytes: default_otlp_max_body(),
+            otlp_token: String::new(),
+            otlp_allowed_cidrs: Vec::new(),
         }
     }
 }
@@ -64,6 +84,14 @@ fn default_job_interpreter() -> String {
 
 fn default_max_jobs() -> usize {
     1
+}
+
+fn default_otlp_listen() -> String {
+    "0.0.0.0:4318".to_string()
+}
+
+fn default_otlp_max_body() -> usize {
+    8 * 1024 * 1024
 }
 
 /// 从 TOML 文件加载配置并应用环境变量覆盖；失败返回含路径的错误信息。
@@ -104,6 +132,29 @@ pub fn load_config(path: &str) -> Result<AgentConfig, String> {
     }
     if let Ok(v) = std::env::var("GSE_AGENT_JOB_WORK_DIR") {
         cfg.job_work_dir = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Ok(v) = std::env::var("GSE_OTLP_ENABLED") {
+        cfg.otlp_enabled = v.eq_ignore_ascii_case("true") || v == "1";
+    }
+    if let Ok(v) = std::env::var("GSE_OTLP_LISTEN") {
+        if !v.trim().is_empty() {
+            cfg.otlp_listen = v;
+        }
+    }
+    if let Ok(v) = std::env::var("GSE_OTLP_MAX_BODY_BYTES") {
+        if let Ok(n) = v.parse() {
+            cfg.otlp_max_body_bytes = n;
+        }
+    }
+    if let Ok(v) = std::env::var("GSE_OTLP_TOKEN") {
+        cfg.otlp_token = v;
+    }
+    if let Ok(v) = std::env::var("GSE_OTLP_ALLOWED_CIDRS") {
+        cfg.otlp_allowed_cidrs = v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
     }
     Ok(cfg)
 }

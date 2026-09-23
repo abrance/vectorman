@@ -92,7 +92,17 @@ async fn connect_once(cfg: &AgentConfig) -> Result<(), AgentError> {
     {
         return Err(AgentError::ConnError(format!("register file_write: {e}")));
     }
-    let collector = collect::CollectorHandle::new(cfg.agent_id.clone(), end.clone());
+    let collector = collect::CollectorHandle::new_with_otlp(
+        cfg.agent_id.clone(),
+        end.clone(),
+        collect::OtlpOptions {
+            enabled: cfg.otlp_enabled,
+            listen: cfg.otlp_listen.clone(),
+            max_body_bytes: cfg.otlp_max_body_bytes,
+            token: cfg.otlp_token.clone(),
+            allowed_cidrs: cfg.otlp_allowed_cidrs.clone(),
+        },
+    );
     let collect_handler = collector.clone();
     if let Err(e) = end
         .register("collect_items", move |req: Bytes| {
