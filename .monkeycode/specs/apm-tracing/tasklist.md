@@ -61,8 +61,9 @@
     - 状态：已实现（PR #33）：双向等待索引 + 桶关闭时产生兜底边 + 一次调用只计一次 + 端点解析器归一 + TTL/容量淘汰
   - [x] 7.5 单测：乱序 12 条 span 的摘要断言、根 span 取 `start_ts` 最小者、error 单调、配对三场景
     - 状态：已实现（PR #32 + PR #33）：乱序极值合并、根取最小、跨 flush 替换根、error 单调、幂等 flush、容量淘汰、冷启动回载、端点反查与清理、v1→v2 迁移；配对三场景（client 先到 / server 先到 / 未配对兜底）、一 client 多 server 只计一次、重放去重
-  - [ ] 7.6 静态服务名映射：`apm_service_alias` CRUD API（`/v1/apm/service-aliases`）、校验、缓存失效版本号、反查优先级（alias → endpoint → `unknown-<ip>`）
+  - [x] 7.6 静态服务名映射：`apm_service_alias` CRUD API（`/v1/apm/service-aliases`）、校验、缓存失效版本号、反查优先级（alias → endpoint → `unknown-<ip>`）
     - 对应需求 17.1-17.7、17.11 与共享模型「服务名映射（alias）」
+    - 状态：已实现（PR #39）：CRUD + 校验（cidr/空值/未知 kind）、`alias_id` 派生去重、`AliasCache` 版本失效、优先级 process_name → process_prefix → pod_prefix → cidr（同类取最新）、resolver 顺序 alias → endpoint → 原值；前端页（17.8-17.10）随阶段 12
 - [x] 8. dataserver 聚合任务
     - 状态：部分实现（PR #32）：乱序摘要、根取 start 最小、跨 flush 替换根、error 单调、幂等 flush、容量淘汰、回载、端点反查；配对三场景随 7.4 待做
   - [x] 8.1 `ApmAggregator`：60 秒周期、桶对齐、服务维度与 span 维度、nearest-rank 分位数、空桶不写零值

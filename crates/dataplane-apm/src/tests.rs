@@ -1222,3 +1222,195 @@ async fn retention_without_budget_leaves_fresh_data_alone() {
     assert_eq!(left.rows[0][0], SqlValue::Integer(1), "保留期内不删");
     assert!(crate::retention::dir_size(dir.path()) > 0, "目录计量可用");
 }
+
+#[tokio::test]
+async fn alias_cache_matches_by_priority_and_invalidates() {
+    use crate::alias::{
+        alias_id, set_alias_enabled, upsert_alias, AliasCache, AliasMatchKind, AliasUpsert,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let sql = store(dir.path());
+    bootstrap(sql.as_ref()).await.unwrap();
+    let cache = AliasCache::new(60);
+    let host = "10.0.0.9";
+    let pod = "order-api-7c9f";
+    let process = "java";
+
+    assert_eq!(
+        cache
+            .resolve(sql.as_ref(), host, pod, process)
+            .await
+            .unwrap(),
+        None,
+        "空表未命中"
+    );
+
+    // cidr 先建立。
+    upsert_alias(
+        sql.as_ref(),
+        &AliasUpsert {
+            match_kind: "cidr".into(),
+            match_value: "10.0.0.0/8".into(),
+            service: "legacy".into(),
+            ..AliasUpsert::default()
+        },
+        NOW,
+    )
+    .await
+    .unwrap();
+    cache.invalidate();
+    assert_eq!(
+        cache
+            .resolve(sql.as_ref(), host, pod, process)
+            .await
+            .unwrap(),
+        Some("legacy".into())
+    );
+
+    // pod_prefix 优先于 cidr。
+    upsert_alias(
+        sql.as_ref(),
+        &AliasUpsert {
+            match_kind: "pod_prefix".into(),
+            match_value: "order-api".into(),
+            service: "order-api".into(),
+            ..AliasUpsert::default()
+        },
+        NOW + 1,
+    )
+    .await
+    .unwrap();
+    cache.invalidate();
+    assert_eq!(
+        cache
+            .resolve(sql.as_ref(), host, pod, process)
+            .await
+            .unwrap(),
+        Some("order-api".into())
+    );
+
+    // process_name 优先于 pod_prefix。
+    upsert_alias(
+        sql.as_ref(),
+        &AliasUpsert {
+            match_kind: "process_name".into(),
+            match_value: "java".into(),
+            service: "java-svc".into(),
+            ..AliasUpsert::default()
+        },
+        NOW + 2,
+    )
+    .await
+    .unwrap();
+    cache.invalidate();
+    assert_eq!(
+        cache
+            .resolve(sql.as_ref(), host, pod, process)
+            .await
+            .unwrap(),
+        Some("java-svc".into())
+    );
+
+    // 停用后回落到 pod_prefix。
+    let id = alias_id(AliasMatchKind::ProcessName, "java");
+    assert!(set_alias_enabled(sql.as_ref(), &id, false, NOW + 3)
+        .await
+        .unwrap());
+    cache.invalidate();
+    assert_eq!(
+        cache
+            .resolve(sql.as_ref(), host, pod, process)
+            .await
+            .unwrap(),
+        Some("order-api".into())
+    );
+
+    // 进程名不匹配时不会命中 process_name。
+    assert_eq!(
+        cache
+            .resolve(sql.as_ref(), "192.168.1.1", "", "python")
+            .await
+            .unwrap(),
+        None,
+        "cidr 不匹配且无其它规则"
+    );
+}
+
+#[tokio::test]
+async fn edge_target_normalization_prefers_alias_over_endpoint() {
+    use crate::alias::AliasUpsert;
+    use dataplane_ingest::trace::TraceSink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sql = store(dir.path());
+    bootstrap(sql.as_ref()).await.unwrap();
+    let sink = ApmSink::new(
+        sql.clone(),
+        ApmSinkConfig {
+            endpoint_cache_ttl_secs: 0,
+            ..ApmSinkConfig::default()
+        },
+        Arc::new(RedSamples::new(1_000)),
+    );
+
+    // 端点表登记的 10.0.0.9:8080 = endpoint-svc。
+    let mut registered = span(
+        "cccc0000000000000000000000000001",
+        "0000000000000001",
+        "",
+        "endpoint-svc",
+        "GET /orders",
+        NOW,
+        10,
+        "ok",
+    );
+    registered
+        .resource
+        .insert("host.ip".into(), "10.0.0.9".into());
+    registered
+        .attributes
+        .insert("server.port".into(), "8080".into());
+    sink.observe_span(&registered, &envelope()).await.unwrap();
+    sink.flush_now(NOW).await.unwrap();
+    assert_eq!(
+        sink.lookup_service("10.0.0.9", 8080, "").await.unwrap(),
+        Some("endpoint-svc".into())
+    );
+
+    // 静态映射把同一网段归一为 alias-svc。
+    sink.upsert_alias(
+        &AliasUpsert {
+            match_kind: "cidr".into(),
+            match_value: "10.0.0.0/8".into(),
+            service: "alias-svc".into(),
+            ..AliasUpsert::default()
+        },
+        NOW,
+    )
+    .await
+    .unwrap();
+
+    // 一条配不上对的 client span（dst 兜底为 unknown:10.0.0.9）flush 后应归一为 alias-svc。
+    let unpaired = edge_span(
+        "cccc0000000000000000000000000002",
+        "0000000000000002",
+        "0000000000000000",
+        "client",
+        "gateway",
+        NOW,
+        500,
+        "ok",
+        &[("server.address", "10.0.0.9"), ("server.port", "8080")],
+    );
+    sink.observe_span(&unpaired, &envelope()).await.unwrap();
+    // 兜底边要等桶关闭才产生。
+    sink.flush_now(NOW + 61_000_000).await.unwrap();
+
+    let rows = edge_rows(sql.as_ref()).await;
+    let dsts: Vec<String> = rows.iter().map(|r| as_text(&r[2])).collect();
+    assert!(
+        dsts.contains(&"alias-svc".to_string()),
+        "静态映射优先于端点表: {dsts:?}"
+    );
+}

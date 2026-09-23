@@ -18,6 +18,7 @@ use dataplane_sql::RelationalStore;
 
 pub mod accumulator;
 pub mod aggregator;
+pub mod alias;
 pub mod edge;
 pub mod query;
 pub mod red;
@@ -30,6 +31,7 @@ mod tests;
 
 pub use accumulator::{ApmSinkConfig, TraceSummaryAccumulator};
 pub use aggregator::{AggReport, ApmAggregator};
+pub use alias::{AliasCache, AliasMatchKind, AliasRecord, AliasUpsert};
 pub use edge::{EdgeAccumulator, ServiceResolver};
 pub use endpoint::{Endpoint, EndpointRegistry};
 pub use query::{

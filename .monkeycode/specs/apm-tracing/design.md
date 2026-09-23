@@ -238,6 +238,15 @@ ON CONFLICT(trace_id) DO UPDATE SET
 - 静态映射只影响 eBPF 边与 `unknown-*` 归一，不覆盖 OTLP span 自带的 `service`。
 - 保留期：`apm_endpoint_retention_days`（默认 30），每小时清理 `last_seen_ts < now - retention` 的行。
 
+### dataserver：静态服务名映射
+
+`apm_service_alias` 的 CRUD 在 dataserver 的 `/v1/apm/service-aliases`；`alias_id` 由
+`match_kind:match_value` 派生（同一匹配条件天然去重，upsert 幂等）。`AliasCache` 缓存
+启用中的映射，写入/删除时通过版本号自增失效；反查优先级固定为
+`process_name → process_prefix → pod_prefix → cidr`（同类取 `updated_ts` 最新），
+命中即返回，否则落到端点表，最后才是 `unknown-<ip>`。`PUT` 不允许改
+`match_kind`/`match_value`（否则等于换主键），需要改就删掉重建。
+
 ### dataserver：接入保护
 
 - **限流**：`BatchLimiter`（固定秒窗计数）只作用于 `data_type=traces` 批次；超限回 HTTP 429 + `code=unavailable`，Agent 按既有退避重试（不丢批）；计数进 `dataserver_apm_ingest_throttled_batches_total` / `_throttled_records_total`。`apm_ingest_max_batches_per_sec=0` 表示不限。锁中毒时保守放行（宁可写入也不静默丢观测数据）。
@@ -500,6 +509,7 @@ struct ApmRetentionConfig {
 - `LogStore` 索引字段提升必须在 `append` 内部实现（对既有调用方零改动），否则同一份日志写入路径会出现两套行为。
 - `apm_service_*` 的 `operation` 用根 span 的 `name`，而 `span_kind` 固定 `server`；若后续要按内部 span 统计，需要新增 measurement，不要改写既有语义。
 - 边 P95 依赖聚合任务与 accumulator 同进程的内存直方图；不要把样本写进 sqlite 再算，规模会失控。
+- 兜底边由「待配对 span」在桶关闭时产生，因此**触发时机不能只看「已配对边是否脏」**：`flush` 的提前返回条件必须同时考虑待配对队列，否则没有配对成功的调用永远不会落库（这类 bug 只在端到端断言里才暴露）。
 - 兜底边不要试图在 `observe` 阶段就产生：此时无法区分「对端还没到」与「对端不存在」，会把每一条正常调用的边都写成 `unknown*`。
 - `TsPoint.field_name` **不是序列身份**：同 measurement + labels 的两条点即使 `field_name` 不同也会互相覆盖（实测 instant 查询只剩最后写入的值）。多值指标必须把区分维度放在 label（本设计用 `field`），或拆成不同 measurement。
 - 写同一 measurement 的多组点时，先确认 label 集能区分它们：`apm_service_duration_micros` 的 labels 里没有 `status`，所以按 `status` 分组写入就会互相覆盖——这类冲突不会报错，只表现为「值不对/随机」。

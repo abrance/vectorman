@@ -13,6 +13,7 @@ use dataplane_ingest::DataEnvelope;
 use dataplane_sql::RelationalStore;
 
 use crate::accumulator::{ApmSinkConfig, TraceSummaryAccumulator};
+use crate::alias::{AliasCache, AliasRecord, AliasUpsert};
 use crate::edge::{EdgeAccumulator, ServiceResolver};
 use crate::endpoint::EndpointRegistry;
 use crate::red::RedSamples;
@@ -35,22 +36,33 @@ pub struct ApmSink {
     endpoints: EndpointRegistry,
     edges: EdgeAccumulator,
     samples: Arc<RedSamples>,
+    aliases: AliasCache,
 }
 
-/// 把端点表适配成边目标归一用的解析器（需要同时拿到 sql 与 registry）。
-struct EndpointResolver<'a> {
+/// 把静态映射与端点表适配成边目标归一用的解析器。
+///
+/// 优先级固定为：静态映射（`apm_service_alias`）> 端点表 > `unknown-<ip>`（调用方保持原值）。
+struct ServiceNameResolver<'a> {
     sql: &'a dyn RelationalStore,
     registry: &'a EndpointRegistry,
+    aliases: &'a AliasCache,
 }
 
 #[async_trait]
-impl ServiceResolver for EndpointResolver<'_> {
+impl ServiceResolver for ServiceNameResolver<'_> {
     async fn resolve(
         &self,
         host_ip: &str,
         port: i64,
         pod_name: &str,
     ) -> Result<Option<String>, DataplaneError> {
+        if let Some(service) = self
+            .aliases
+            .resolve(self.sql, host_ip, pod_name, "")
+            .await?
+        {
+            return Ok(Some(service));
+        }
         if let Some(service) = self
             .registry
             .lookup_by_ip_port(self.sql, host_ip, port)
@@ -69,10 +81,8 @@ impl ApmSink {
         config: ApmSinkConfig,
         samples: Arc<RedSamples>,
     ) -> Self {
-        let endpoints = EndpointRegistry::new(
-            config.endpoint_retention_days,
-            config.endpoint_cache_ttl_secs,
-        );
+        let cache_ttl_secs = config.endpoint_cache_ttl_secs;
+        let endpoints = EndpointRegistry::new(config.endpoint_retention_days, cache_ttl_secs);
         let edges = EdgeAccumulator::new(config.edge_pending_capacity, samples.clone());
         Self {
             sql,
@@ -81,6 +91,7 @@ impl ApmSink {
             endpoints,
             edges,
             samples,
+            aliases: AliasCache::new(cache_ttl_secs),
         }
     }
 
@@ -121,12 +132,15 @@ impl ApmSink {
     }
 
     async fn flush_edges(&self, now_ts: i64) -> Result<usize, DataplaneError> {
-        if self.edges.dirty_len() == 0 {
+        // 注意：不能只看「已配对的边是否脏」——兜底边是在桶关闭时由**待配对 span** 产生的，
+        // 若此处按 `dirty_len() == 0` 提前返回，没有配对成功的调用就永远不会落库。
+        if self.edges.dirty_len() == 0 && self.edges.pending_len() == 0 {
             return Ok(0);
         }
-        let resolver = EndpointResolver {
+        let resolver = ServiceNameResolver {
             sql: self.sql.as_ref(),
             registry: &self.endpoints,
+            aliases: &self.aliases,
         };
         self.edges
             .flush(self.sql.as_ref(), now_ts, Some(&resolver))
@@ -138,6 +152,55 @@ impl ApmSink {
         self.endpoints
             .purge_expired(self.sql.as_ref(), now_ts)
             .await
+    }
+
+    /// 列出静态服务名映射。
+    pub async fn list_aliases(
+        &self,
+        match_kind: Option<&str>,
+        enabled: Option<bool>,
+    ) -> Result<Vec<AliasRecord>, DataplaneError> {
+        crate::alias::list_aliases(self.sql.as_ref(), match_kind, enabled).await
+    }
+
+    /// 新建/覆盖静态映射，并立即使反查缓存失效。
+    pub async fn upsert_alias(
+        &self,
+        upsert: &AliasUpsert,
+        now_ts: i64,
+    ) -> Result<AliasRecord, DataplaneError> {
+        let record = crate::alias::upsert_alias(self.sql.as_ref(), upsert, now_ts).await?;
+        self.aliases.invalidate();
+        Ok(record)
+    }
+
+    /// 开关静态映射，并立即使反查缓存失效。
+    pub async fn set_alias_enabled(
+        &self,
+        alias_id: &str,
+        enabled: bool,
+        now_ts: i64,
+    ) -> Result<bool, DataplaneError> {
+        let hit =
+            crate::alias::set_alias_enabled(self.sql.as_ref(), alias_id, enabled, now_ts).await?;
+        if hit {
+            self.aliases.invalidate();
+        }
+        Ok(hit)
+    }
+
+    /// 删除静态映射，并立即使反查缓存失效。
+    pub async fn delete_alias(&self, alias_id: &str) -> Result<bool, DataplaneError> {
+        let hit = crate::alias::delete_alias(self.sql.as_ref(), alias_id).await?;
+        if hit {
+            self.aliases.invalidate();
+        }
+        Ok(hit)
+    }
+
+    #[must_use]
+    pub fn aliases(&self) -> &AliasCache {
+        &self.aliases
     }
 
     /// 端点反查：优先 `(host_ip, listen_port)`，其次 Pod 名。
