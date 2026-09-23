@@ -1,0 +1,15 @@
+[package]
+name = "dataplane-apm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dataplane-core.workspace = true
+dataplane-sql.workspace = true
+dataplane-ts.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tempfile = "3"

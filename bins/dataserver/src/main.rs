@@ -71,6 +71,10 @@ async fn main() -> ExitCode {
         Ok(s) => Arc::new(s),
         Err(e) => return exit_with("engine sql init failed", e),
     };
+    if let Err(e) = dataplane_apm::bootstrap(sql.as_ref()).await {
+        return exit_with("apm schema init failed", e);
+    }
+
     let ts_retention = TsRetentionConfig {
         retention_days: cfg.ts_retention_days,
         enforced: cfg.ts_retention_enforced,
