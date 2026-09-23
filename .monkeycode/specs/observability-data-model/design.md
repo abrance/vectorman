@@ -253,7 +253,7 @@ sum by (src_service, dst_service) (apm_edge_duration_micros{field="p95"})
 
 ### 共享存储能力变更
 
-#### LogStore 索引版本 v2
+#### LogStore 索引版本（当前 v3）
 
 现状缺陷（2026-09-23 代码）：`crates/dataplane-log` 的 schema 只有 `timestamp`、`level`、`message`、`id` 参与索引，`labels` 存为 `labels_json` 且注册为 `STORED`（非索引）。`search` 的实现是先按时间/level/message 取 `TopDocs`（上限常量 `MAX_LIMIT = 1000`），再在应用层对 `labels` 做 post-filter。因此按 `trace_id` 拉一个 trace 的全部 span 在实现上不可行：命中的 span 会被 TopDocs 截断，且扫描上限与 trace 的 span 数无关。`delete_matching` 走 `DELETE_SCAN_LIMIT = 100_000` 的同一条 post-filter 路径。
 
@@ -261,12 +261,12 @@ v2 变更：
 
 | 变更 | 内容 |
 | --- | --- |
-| 新增索引字段 | `trace_id`、`service`、`data_id`，三者均为 `STRING \| INDEXED \| STORED`；`data_id` 用于按采集项定位与保留期清理 |
+| 新增索引字段 | `trace_id`、`data_type`、`service`、`data_id`（均为 `STRING \| STORED`，文本字段默认建倒排）；`data_id` 用于按采集项定位与保留期清理，`data_type` 用于按类型清理（`logs`/`traces`/`ebpf`），没有它就只能走 post-filter 并受 `DELETE_SCAN_LIMIT` 约束 |
 | 新增 trait 方法 | `async fn search_indexed(&self, filter: IndexedLogFilter) -> Result<Vec<LogRecord>, DataplaneError>`，全部条件走倒排索引，不做 post-filter |
 | 时间排序 | `IndexedLogFilter.order` 支持 `asc` / `desc`（瀑布图与列表用 asc，检索页用 desc）；实现用 `TopDocs::with_limit(n).order_by_fast_field(timestamp)` |
 | 明细上限 | `IndexedLogFilter.limit` 默认 100、上限 10_000（trace 详情需要一次拉完一个 trace） |
-| 版本文件 | `{data_path}/logs/schema_version` 写入 `2`；打开时版本不符或文件缺失且目录已有索引 → 在 `{data_path}/logs-v2/` 新建索引，旧目录保留只读，stderr 输出一行 `log index schema upgraded: rebuilding into logs-v2, old index kept at logs` |
-| 不再静默降级 | 版本不符时不复用旧目录，避免 v2 字段 `get_field` 失败导致启动错误 |
+| 版本文件 | `{data_path}/logs/schema_version` 写入当前版本；打开时版本不符或文件缺失且目录已有索引 → 在 `{data_path}/logs-v<版本>/` 新建索引（目录名带目标版本），旧目录保留只读，stderr 输出一行升级提示 |
+| 不再静默降级 | 版本不符时不复用旧目录，避免新字段 `get_field` 失败导致启动错误 |
 
 ```rust
 struct IndexedLogFilter {

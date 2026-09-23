@@ -205,9 +205,25 @@
 5. THE `apm_service_endpoint` 的保留期 SHALL 独立配置为 30 天，不随 trace 明细清理。
 6. WHEN 采集项被删除，THE `dataserver` SHALL 复用既有 `retain/{item_id}` 机制，把该条目的明细按原保留期到期后清理，摘要与明细同时删除。
 7. THE 聚合指标（`apm_service_*`、`apm_edge_*`）的清理 SHALL 依赖同期交付的 `/.monkeycode/specs/dataplane-ts-retention/`：THE 全局保留期 SHALL 取 `ts_retention_days`（默认 30 天）；聚合指标不随 trace 明细的 3 天保留期删除。
+7a. THE APM 明细与摘要的默认保留期 SHALL 为 `apm_retention_days_default`（缺省 3 天），端点表为 `apm_endpoint_retention_days`（缺省 30 天）。
 8. WHEN 某采集项配置了短于全局窗口的保留期，THE `dataserver` SHALL 由 `dataplane-ts-retention` 的时序清理任务按 `item_id` matcher 删除该采集项的超期指标点。
 9. THE 保留执行（`ts_retention_enforced`）SHALL 缺省开启；写入超窗聚合点时 THE `dataserver` SHALL 记入接入应答 `failures` 并向自监控口暴露计数。
 8. THE 清理任务 SHALL 向标准输出记录一行，含删除的明细条数、摘要行数与耗时。
+
+### Requirement 11b: 全局容量上限与最久远优先淘汰
+
+**User Story:** AS 运维人员, I want 给数据目录设一个容量上限并在超限时淘汰最久远的数据, so that 磁盘不会被观测数据写满。
+
+#### Acceptance Criteria
+
+1. THE `dataserver` SHALL 提供配置项 `apm_max_bytes`（字节，缺省 0 表示不限）；非 0 时对所有观测数据生效。
+2. THE 计量范围 SHALL 为 `data_path` 下的全部数据（本进程唯一的落盘目录，磁盘告急时告急的是整个目录），由递归目录大小得出。
+3. WHEN 计量值超过 `apm_max_bytes`，THE 保留策略 SHALL 按「最久远优先」淘汰 **APM 数据**：抬高删除时间界并逐轮删除 span 明细、trace 摘要、边摘要、聚合点（`apm_*` measurement 墓碑）。
+4. THE 淘汰步长 SHALL 至少为「保存窗口 / 最大轮数」与 `evict_step_secs` 的较大值，保证在 `max_rounds` 轮内能覆盖整个窗口（否则近期数据永远不会落在删除界之内）。
+5. THE 淘汰 SHALL 不涉及日志、eBPF 与自监控指标；若 APM 数据已无可删而仍超限，THE `dataserver` SHALL 以 `stopped_reason=no_apm_data_left` 记录并输出标准错误提示，SHALL NOT 越权删除其它类型的数据。
+6. THE 每轮淘汰 SHALL 调用 `LogStore::reclaim_space`（合并/清理不再被引用的段文件）；时序库的墓碑空间由底层 compaction 回收，SHALL NOT 承诺立即释放。
+7. THE `dataserver` SHALL 输出一行标准输出，含各类删除条数、`bytes_before`/`bytes_after`、淘汰轮数与停止原因。
+8. THE 保留策略 SHALL 按 `apm_clean_interval_secs`（缺省 3600）周期执行，且任一步失败时记录错误、下一轮继续。
 
 ### Requirement 12: 查询 API 与错误码
 

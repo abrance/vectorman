@@ -15,6 +15,10 @@ ts_clean_interval_secs = 3600
 apm_enabled = true
 apm_endpoint_retention_days = 30
 apm_agg_interval_secs = 60
+apm_retention_days_default = 3
+# 全局容量上限（字节）；0 = 不限。超限时按最久远优先淘汰 APM 数据。
+apm_max_bytes = 0
+apm_clean_interval_secs = 3600
 
 [sql_http]
 listen = "0.0.0.0:8081"
@@ -90,6 +94,15 @@ pub struct Config {
     /// RED 与边指标的聚合周期（秒）。
     #[serde(default = "default_apm_agg_interval")]
     pub apm_agg_interval_secs: u64,
+    /// APM 明细/摘要/边摘要的默认保留天数。
+    #[serde(default = "default_apm_retention_days")]
+    pub apm_retention_days_default: u32,
+    /// `data_path` 全局容量上限（字节）；0 表示不限。超限时按最久远优先淘汰 APM 数据。
+    #[serde(default)]
+    pub apm_max_bytes: u64,
+    /// APM 保留策略执行周期（秒）。
+    #[serde(default = "default_apm_clean_interval")]
+    pub apm_clean_interval_secs: u64,
 }
 
 impl Default for Config {
@@ -114,6 +127,9 @@ impl Default for Config {
             apm_enabled: true,
             apm_endpoint_retention_days: default_apm_endpoint_retention_days(),
             apm_agg_interval_secs: default_apm_agg_interval(),
+            apm_retention_days_default: default_apm_retention_days(),
+            apm_max_bytes: 0,
+            apm_clean_interval_secs: default_apm_clean_interval(),
         }
     }
 }
@@ -181,6 +197,21 @@ impl Config {
         if let Ok(v) = std::env::var("DATASERVER_APM_ENABLED") {
             self.apm_enabled = v.eq_ignore_ascii_case("true") || v == "1";
         }
+        if let Ok(v) = std::env::var("DATASERVER_APM_RETENTION_DAYS") {
+            if let Ok(n) = v.parse() {
+                self.apm_retention_days_default = n;
+            }
+        }
+        if let Ok(v) = std::env::var("DATASERVER_APM_MAX_BYTES") {
+            if let Ok(n) = v.parse() {
+                self.apm_max_bytes = n;
+            }
+        }
+        if let Ok(v) = std::env::var("DATASERVER_APM_CLEAN_INTERVAL") {
+            if let Ok(n) = v.parse() {
+                self.apm_clean_interval_secs = n;
+            }
+        }
         if let Ok(v) = std::env::var("DATASERVER_APM_AGG_INTERVAL") {
             if let Ok(n) = v.parse() {
                 self.apm_agg_interval_secs = n;
@@ -237,6 +268,14 @@ fn default_apm_endpoint_retention_days() -> u32 {
 
 fn default_apm_agg_interval() -> u64 {
     60
+}
+
+fn default_apm_retention_days() -> u32 {
+    3
+}
+
+fn default_apm_clean_interval() -> u64 {
+    3600
 }
 
 fn nonempty_opt(v: String) -> Option<String> {

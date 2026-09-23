@@ -21,6 +21,7 @@ pub mod aggregator;
 pub mod edge;
 pub mod query;
 pub mod red;
+pub mod retention;
 
 pub mod endpoint;
 pub mod sink;
@@ -36,6 +37,7 @@ pub use query::{
     ServiceRow, TraceDetail, TraceSearchPage, TraceSearchQuery, TraceSummary,
 };
 pub use red::{ClosedSamples, RedSamples};
+pub use retention::{dir_size, ApmRetention, ApmRetentionConfig, RetentionReport};
 pub use sink::{ApmSink, FlushReport};
 
 /// 当前 Unix 微秒。

@@ -403,6 +403,20 @@ max_end_ts INTEGER NOT NULL DEFAULT 0
 
 `start_ts` 语义为「该 trace 全部 span 的最小 start」（而非仅根 span 的 start），`duration_micros` 在 flush 时按 `max_end_ts - start_ts` 重算。
 
+### ApmRetention：过期 + 容量上限淘汰
+
+```rust
+struct ApmRetentionConfig {
+    default_retention_days: u32,   // 3
+    endpoint_retention_days: u32,  // 30
+    max_bytes: u64,                // 0 = 不限
+    evict_step_secs: i64,          // 3600（最小步长）
+    max_rounds: usize,             // 24
+}
+```
+
+每轮先按天过期（明细/摘要/边摘要/端点/聚合墓碑），再处理容量上限：计量 `data_path` 递归大小，超限时**抬高**删除时间界（删除条件是 `ts < cutoff`，抬高才会删更多），步长取 `max(保存窗口 / max_rounds, evict_step_secs)`，逐轮删除 APM 数据并重新计量，直到回到预算内、或时间界推进到 `now`（`no_apm_data_left`）、或轮数用尽（`max_rounds_reached`）。只删 APM 数据；日志/eBPF/自监控不在删除范围内，超限删不动时如实上报而不是越权删除。
+
 ### 清理
 
 | 数据 | 保留期 | 清理方式 |
@@ -483,6 +497,7 @@ max_end_ts INTEGER NOT NULL DEFAULT 0
 - 兜底边不要试图在 `observe` 阶段就产生：此时无法区分「对端还没到」与「对端不存在」，会把每一条正常调用的边都写成 `unknown*`。
 - `TsPoint.field_name` **不是序列身份**：同 measurement + labels 的两条点即使 `field_name` 不同也会互相覆盖（实测 instant 查询只剩最后写入的值）。多值指标必须把区分维度放在 label（本设计用 `field`），或拆成不同 measurement。
 - 写同一 measurement 的多组点时，先确认 label 集能区分它们：`apm_service_duration_micros` 的 labels 里没有 `status`，所以按 `status` 分组写入就会互相覆盖——这类冲突不会报错，只表现为「值不对/随机」。
+- 容量淘汰的方向容易写反：删除条件是 `ts < cutoff`，所以超限时必须把 cutoff **抬高**向 `now` 推进；往下推只会删得更少（我第一版就是 `cutoff -= step`，表现为「报 no_apm_data_left 但一行都没删」）。同时步长必须能覆盖整个保存窗口，否则近期数据永远在界外。
 - 删除/统计类接口不能靠 `RelationalStore::execute` 的返回行数：`DELETE` 不返回行，受影响行数要用同一连接上的 `SELECT changes()` 取（`sqlite` 的 `changes()` 是连接级状态）。
 - 根 span 判定不要用「`parent_span_id` 为空且是第一个到达」，必须按 `start_ts` 比较，否则乱序到达时摘要不稳定。
 - `LogStore::append` **不按 id 幂等**：同一 `id` 追加两次会产生两个文档（只有 `delete_term(id)` 才清掉）。所以 `traces` 分支的顺序固定为「写明细 → 派生数据（best effort）→ KvStore 标记去重」，且派生数据失败不能当成整批失败；同样原因，接入重试不能依赖「明细会被去重」，幂等完全靠 KvStore 的 `ingest/{record_id}` 先于写入的判断。
