@@ -112,7 +112,7 @@
     - 状态：已实现（PR #40）
   - [x] 12.0.3 `list_services` 返回端点实例明细（pod/node/host_ip/listen_port/collector/first_seen）
     - 状态：已实现（PR #40）
-- [ ] 12. 前端 `@vectorman/dataplane`（trace 列表/详情 #41、拓扑与 APM 指标 #42 已交付；服务名映射页与存储状态卡片待做）
+- [x] 12. 前端 `@vectorman/dataplane`（trace 列表/详情 #41、拓扑与 APM 指标 #43、映射页与存储状态卡片 #44 已交付）
     - 状态：已实现（PR #38）：请求体构造单测（`--min-duration-ms` 转微秒、只下发显式提供的过滤字段）+ 错误码经既有 `ureq_err_str` 透传
   - [x] 12.1 `src/features/apm/` 客户端：trace 列表、详情、边、服务清单封装，复用既有 HttpClient
   - [x] 12.2 `/traces` 列表页：过滤、排序切换、分页、空态、行点击进详情
@@ -137,12 +137,18 @@
     - 对应设计前端实现约束；后端不加任何 echarts 相关逻辑
     - 状态：已评估并调整（PR #41）：**不引入 echarts**，改为复用既有手绘 SVG（`ui/line-chart.tsx` 复用、新增 `ui/waterfall.tsx`），坐标计算抽到 `features/apm/layout.ts` 纯函数并单测
   - [x] 12.7 路由与导航接入既有 SPA；vitest 断言参数拼装、构树比例、`source` 切换表达式、跳转 URL
-  - [ ] 12.8 `/settings/service-aliases` 页：列表（启用开关/编辑/删除）、新建表单、批量导入（显示新增与覆盖条数）
+  - [x] 12.8 `/settings/service-aliases` 页：列表（启用开关/编辑/删除）、新建表单、批量导入（显示新增与覆盖条数）
     - 对应需求 17.8-17.10
     - 状态：部分实现（PR #41）：路由与菜单接入（`/traces`、`/traces/:traceId`）；vitest 覆盖列表渲染 + 行点击进详情 + 瀑布图 + 抽屉页签；layout 纯函数 8 个用例
-  - [ ] 12.9 `/topology` 页的「为该节点建立映射」快捷入口（预填 `cidr` 或 `pod_prefix`）
+    - 状态：已实现（PR #44）：`/settings/service-aliases` 页（列表、启用开关、编辑、删除确认、批量导入含新增/覆盖预览与非法行计数、URL 预填匹配条件）
+  - [x] 12.9 `/topology` 页的「为该节点建立映射」快捷入口（预填 `cidr` 或 `pod_prefix`）
     - 对应需求 17.10
 - [ ] 13. 集成验证
+    - 状态：已实现（PR #44）：拓扑边列表对 `unknown-*` 目标提供「建映射」入口，跳转映射页并预填 `cidr`（自动补 `/32`）
   - [ ] 13.1 起 gse-server + dataserver + agent + OTLP 桩应用，断言列表可见、详情条数一致、Prom 可查 `apm_service_requests_total`
   - [ ] 13.2 混合场景：otlp 与 ebpf 桩同时写边指标，`sum by (src_service,dst_service)` 等于两者之和
   - [ ] 13.3 回改 `.monkeycode/specs/gse-dataplane-ingest/design.md` 的交叉引用与 `trace_id` 过滤描述准确性
+  - [x] 12.6 补充项
+    - 状态：已实现（PR #44）：日志页新增 `服务`(labels.service) 与 `trace_id` 过滤、命中记录带 `trace_id` 时提供「查看链路」；trace 详情页提供「查看该服务日志」（带根服务与 trace 时间窗）
+  - [x] 12.10 补充项
+    - 状态：已实现（PR #44）：`/settings` 新增「存储与运行状态」卡片（时序序列数/内存/WAL/保留期/降级 + APM 数据目录占用、保留任务轮数、已删明细/摘要/边、限流批次、已配对边、待配对 span 自监控读数）

@@ -151,7 +151,32 @@ export function TopologyPage() {
                   locale={{ emptyText: "该时间窗没有调用边（检查是否有 trace 上报）" }}
                   columns={[
                     { title: "源服务", dataIndex: "src", width: 150 },
-                    { title: "目标服务", dataIndex: "dst", width: 150 },
+                    {
+                      title: "目标服务",
+                      dataIndex: "dst",
+                      width: 190,
+                      render: (value: string, row: (typeof summary)[number]) =>
+                        value.startsWith("unknown") ? (
+                          <Space size="small">
+                            <Tag color="orange">{value}</Tag>
+                            <Button
+                              size="small"
+                              type="link"
+                              onClick={() =>
+                                navigate(
+                                  `/settings/service-aliases?match_kind=cidr&match_value=${encodeURIComponent(
+                                    value.replace(/^unknown[-:]/, ""),
+                                  )}`,
+                                )
+                              }
+                            >
+                              建映射
+                            </Button>
+                          </Space>
+                        ) : (
+                          value
+                        ),
+                    },
                     { title: "kind", dataIndex: "spanKind", width: 80 },
                     { title: "调用", dataIndex: "calls", width: 80 },
                     {

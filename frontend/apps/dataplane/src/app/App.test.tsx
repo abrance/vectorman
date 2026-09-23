@@ -42,6 +42,25 @@ class FakeHttp implements HttpClient {
         ] as T,
       };
     }
+    if (url.startsWith("/api/v1/query") && decodeURIComponent(url).includes("dataserver_")) {
+      const expr = decodeURIComponent(url).match(/query=([^&]+)/)?.[1] ?? "";
+      const value = expr.includes("apm_data_bytes")
+        ? 1_048_576
+        : expr.includes("ts_series_count")
+          ? 42
+          : expr.includes("details_deleted")
+            ? 7
+            : expr.includes("ingest_throttled")
+              ? 2
+              : 0;
+      return {
+        status: 200,
+        body: {
+          status: "success",
+          data: { resultType: "vector", result: [{ metric: {}, value: [1_710_000_000_000, value] }] },
+        } as T,
+      };
+    }
     if (url.startsWith("/api/v1/query_range") || url.startsWith("/api/v1/query")) {
       // APM 指标查询返回一小段矩阵，供 `/apm` 页渲染曲线与读数。
       if (url.includes("apm_service_")) {
@@ -73,7 +92,20 @@ class FakeHttp implements HttpClient {
       return { status: 200, body: { status: "success", data: { resultType: "matrix", result: [] } } as T };
     }
     if (url === "/v1/logs/search") {
-      return { status: 200, body: { records: [] } as T };
+      return {
+        status: 200,
+        body: {
+          records: [
+            {
+              id: "log-1",
+              timestamp: 1_710_000_000_000_000,
+              level: "error",
+              message: "upstream timeout",
+              labels: { trace_id: "b".repeat(32), service: "payment" },
+            },
+          ],
+        } as T,
+      };
     }
     if (url === "/v1/edges/search") {
       return {
@@ -108,6 +140,46 @@ class FakeHttp implements HttpClient {
           ],
         } as T,
       };
+    }
+    if (url === "/v1/ts/stats") {
+      return {
+        status: 200,
+        body: {
+          series_count: 42,
+          memory_used_bytes: 2_048,
+          memory_budget_bytes: 4_096,
+          wal_size_bytes: 1_024,
+          retention_days: 30,
+          retention_enforced: true,
+          expired_segments_total: 3,
+          future_skew_points_total: 0,
+          background_errors_total: 0,
+          degraded: false,
+          last_background_error: null,
+          sampled_at_ts: 1_710_000_000_000_000,
+        } as T,
+      };
+    }
+    if (url.startsWith("/v1/apm/service-aliases")) {
+      if (req.method === "GET") {
+        return {
+          status: 200,
+          body: {
+            aliases: [
+              {
+                alias_id: "pod_prefix:order-api",
+                match_kind: "pod_prefix",
+                match_value: "order-api",
+                service: "order-api",
+                enabled: true,
+                note: "订单服务",
+                updated_ts: 1_710_000_000_000_000,
+              },
+            ],
+          } as T,
+        };
+      }
+      return { status: 200, body: { alias_id: "cidr:10.0.0.0/8" } as T };
     }
     if (url === "/v1/apm/services") {
       return {
@@ -347,6 +419,61 @@ describe("topology and apm pages", () => {
     expect(await screen.findByText(/错误率 100\.00%/)).toBeTruthy();
     expect(await screen.findByText(/p95 15ms/)).toBeTruthy();
     apm.unmount();
+  });
+});
+
+describe("trace and log correlation", () => {
+  it("jumps from a log record to its trace and back to service logs", async () => {
+    const logs = renderAt("/logs");
+    expect(await screen.findByText("upstream timeout")).toBeTruthy();
+    const link = screen.getByRole("link", { name: "查看链路" });
+    expect(link.getAttribute("href")).toBe(`/traces/${"b".repeat(32)}`);
+    logs.unmount();
+
+    // 详情页反向跳转：带上根服务与 trace 的时间窗。
+    const detail = renderAt(`/traces/${"b".repeat(32)}`);
+    const back = await screen.findByRole("link", { name: "查看该服务日志" });
+    const href = back.getAttribute("href") ?? "";
+    expect(href).toContain("/logs?service=payment");
+    expect(href).toContain("from_ts=1710000000000000");
+    detail.unmount();
+  });
+});
+
+describe("settings page", () => {
+  it("shows storage stats, alias list and bulk import preview", async () => {
+    const view = renderAt("/settings");
+    // 存储卡片：时序统计 + 自监控读数（目录占用 1 MiB、序列数取自 self-metric）。
+    expect(await screen.findByText("时序存储（聚合指标）")).toBeTruthy();
+    expect(screen.getByText("APM 保留与淘汰（自监控读数）")).toBeTruthy();
+    expect(await screen.findByText("1.0 MiB")).toBeTruthy();
+    expect(screen.getByText("30 天")).toBeTruthy();
+
+    // 映射页签：列表 + 批量导入预览（新增/覆盖计数）。
+    fireEvent.click(screen.getByText("服务名映射"));
+    expect(await screen.findByText("pod_prefix")).toBeTruthy();
+    fireEvent.click(screen.getByText("批量导入"));
+    const textarea = await screen.findByPlaceholderText(/pod_prefix,order-api,order-api/);
+    fireEvent.change(textarea, {
+      target: {
+        value: [
+          "pod_prefix,order-api,order-api",
+          "cidr,10.0.0.0/8,legacy",
+          "nope,x,y",
+        ].join("\n"),
+      },
+    });
+    expect(await screen.findByText("将新增 1 条")).toBeTruthy();
+    expect(screen.getByText("将覆盖 1 条")).toBeTruthy();
+    expect(screen.getByText("非法行 1")).toBeTruthy();
+    view.unmount();
+  });
+
+  it("prefills the alias form from the topology unknown-node entry", async () => {
+    const view = renderAt("/settings/service-aliases?match_kind=cidr&match_value=10.0.0.9");
+    const input = await screen.findByDisplayValue("10.0.0.9/32");
+    expect(input).toBeTruthy();
+    view.unmount();
   });
 });
 

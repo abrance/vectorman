@@ -35,6 +35,15 @@ export function TraceDetailPage() {
         <Link to="/traces">
           <Button size="small">← 返回列表</Button>
         </Link>
+        {detail && (
+          <Link
+            to={`/logs?service=${encodeURIComponent(detail.summary.root_service)}&from_ts=${
+              detail.summary.start_ts
+            }&to_ts=${detail.summary.start_ts + Math.max(detail.summary.duration_micros, 1)}`}
+          >
+            <Button size="small">查看该服务日志</Button>
+          </Link>
+        )}
         <Button size="small" onClick={load} loading={result.status === "loading"}>
           刷新
         </Button>
