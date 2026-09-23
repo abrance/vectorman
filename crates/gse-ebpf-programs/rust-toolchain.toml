@@ -1,0 +1,4 @@
+# eBPF 目标依赖 nightly（`-Z build-std=core` 与 bpf target）。
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "llvm-tools"]

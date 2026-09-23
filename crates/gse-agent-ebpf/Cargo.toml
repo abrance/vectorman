@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ebpf-abi.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
