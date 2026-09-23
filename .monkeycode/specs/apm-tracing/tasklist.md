@@ -4,14 +4,15 @@
 
 实施顺序（四份 spec 的约定）：`LogStore` 索引 v2 → `dataplane-ts-retention` → 本 feature → `ebpf-observability`。
 
-- [ ] 1. 前置依赖：LogStore 索引版本 v2
-  - [ ] 1.1 `crates/dataplane-log` 新增索引字段 `trace_id`、`service`、`data_id`（`STRING | INDEXED | STORED`），`append` 内部从 `labels` 提升同名键
-    - 对应设计：共享模型「LogStore 索引版本 v2」；对既有调用方零 API 变更
-  - [ ] 1.2 新增 `IndexedLogFilter` 与 `LogStore::search_indexed`（全条件走倒排、支持 `order=asc/desc`、`limit` 上限 10_000）
-    - 对应需求 6.4 与设计「trace 详情查询」
-  - [ ] 1.3 索引版本文件 `{data_path}/logs/schema_version`，版本不符时新建 `logs-v2/` 并保留旧目录只读，stderr 一行
-    - 对应共享模型表格最后两行
-  - [ ] 1.4 单测：3 个 trace 各 5 条 span + 20 条普通日志，按 `trace_id` 只回 5 条且不截断；v1 目录启动后生成 `logs-v2/`
+- [x] 1. 前置依赖：LogStore 索引版本 v2
+  - [x] 1.1 `crates/dataplane-log` 新增索引字段 `trace_id`、`service`、`data_id`，`append` 内部从 `labels` 提升同名键
+    - 对应设计：共享模型「LogStore 索引版本 v2」；对既有调用方零 API 变更；已实现（PR #27）
+  - [x] 1.2 新增 `IndexedLogFilter` 与 `LogStore::search_indexed`（全条件走倒排、支持 `order=asc/desc`、`limit` 上限 10_000）
+    - 对应需求 6.4 与设计「trace 详情查询」；已实现（PR #27）
+  - [x] 1.3 索引版本文件 `<index_dir>/schema_version`，版本不符时新建 `*-v2/` 并保留旧目录只读，stderr 一行
+    - 对应共享模型表格最后两行；已实现（PR #27）；`delete_matching` 同时升级为索引路径（无 post-filter 扫描上限）
+  - [x] 1.4 单测：3 个 trace 各 5 条 span + 20 条普通日志，按 `trace_id` 只回 5 条且不截断；v1 目录启动后生成 `logs-v2/`
+    - 已实现（PR #27）：9 个单测全绿，含 1200 条越扫描上限的索引删除用例
 - [ ] 2. 前置依赖：sqlite 观测表与聚合指标保留接线
   - [ ] 2.1 `crates/dataplane-apm` 建表与版本检查：`obs_schema_meta`、`apm_trace_summary`（含 `max_end_ts`）、`apm_edge_summary`、`apm_service_endpoint`
     - 对应共享模型「sqlite 观测表」与本文 Data Models
