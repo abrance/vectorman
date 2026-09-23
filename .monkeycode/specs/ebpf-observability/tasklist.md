@@ -37,7 +37,7 @@
     - 状态：已实现（PR #48）：`EVENTS: RingBuf`（容量加载期覆盖）承载原始事件，`RawEvent` 布局在 `ebpf-abi`；`CFG: Array<u64>` 共 64 槽，下标见 `ebpf_abi::CfgIndex`，含版本号 `CFG_VERSION`，内核态版本不匹配直接不采集
   - [x] 2.6 `max_cpu_percent` 内核态令牌桶限流
     - 对应需求 9.5、12.1-12.2
-- [ ] 3. P1 用户态加载、差分与聚合（差分/聚合/过滤逻辑已完成，见 PR #46；aya 加载与挂载管理待做）
+- [ ] 3. P1 用户态加载、差分与聚合（差分/聚合/过滤已完成见 PR #46；运行期参数解析/退避/挂载计划已完成见 PR #49；aya 加载与挂载管理待做）
     - 状态：未实现（PR #48 不含）：`max_cpu_percent` 的内核态令牌桶限流未做；当前只有采集项配置里的上限字段（`config.rs`）与用户态侧的过滤/丢弃统计，限流留到 P1 收尾阶段
   - [x] 3.3 差分线程：遍历全部 CPU 副本求和、与上周期相减、写零值复位、清理零增量键
     - 状态：已实现（PR #46）：`sum_per_cpu` / `diff`（首次出现按绝对值、快照回退饱和不为负、最大值单调）与 `run_loop` 中的快照清理；「写零复位」由 aya `MapSource` 实现负责（PR-B）
@@ -51,8 +51,11 @@
     - 状态：部分实现（PR #46）：假快照驱动差分、过滤矩阵、桶对齐与分钟汇总、`record_id`、能力降级路径；退避序列与资源上限汇总随 aya loader（PR-B）
   - [ ] 3.1 aya 加载与挂载管理：幂等启停、detach→drop links→删 map、启动时清理遗留
     - 对应需求 1.6-1.8、16.2
-  - [ ] 3.2 加载失败退避重试（30 秒起、×2、上限 10 分钟，成功清零）
+    - 状态：**未做**。挂载计划（采集项类型 → 程序与挂载点集合）已在 PR #49 抽成纯数据 `attach.rs` 并能单测；
+      aya 的 `EbpfLoader`/attach/detach 本体随下一 PR（同时接 agent 采集项）
+  - [x] 3.2 加载失败退避重试（30 秒起、×2、上限 10 分钟，成功清零）
     - 对应需求 1.7
+    - 状态：已实现（PR #49）：`backoff.rs` 纯状态机（不碰时钟，调用方拿等待时长去 sleep），序列单测 `30/60/120/240/480/600/600`，成功清零后从 30 秒重来
   - [ ] 3.3 差分线程：遍历全部 CPU 副本求和、与上周期相减、写零值复位、清理零增量键
     - 对应需求 9.3-9.4 与设计 Pitfalls「不能只读 CPU 0」「必须写回 0」
   - [ ] 3.4 过滤：`cgroup`/`process`/`port` include-exclude、`include_loopback`
@@ -63,7 +66,18 @@
     - 对应需求 10.2 与设计指标产出映射表
   - [ ] 3.7 资源限制汇总与本地自监控计数（`agent_ebpf_*`）
     - 对应需求 12.1-12.6
+    - 状态：部分实现（PR #46 起）：`EbpfStats`/`EbpfSnapshot` 已有 flushes/edges/metrics/filtered/idle_keys/read_errors/map_overflow_dropped 计数与能力状态指标 `agent_ebpf_capability`；`agent_ebpf_*` 指标点与 CPU 占用采集随加载器（下一 PR）
   - [ ] 3.8 单测：假 map 快照驱动差分、过滤矩阵、桶对齐与 P95 近似、`record_id` 规则、退避序列、上限汇总
+- [x] 3.9 运行期参数解析与下发（实现期新增的子项，设计 Pitfalls 要求「不硬编码偏移与状态值」）
+  - [x] 3.9.1 `/sys/kernel/btf/vmlinux` 解析：自实现的极简 BTF 解析器（aya 用户态无 CO-RE 字段重定位，`aya-obj` 的成员信息不对外），
+        **递归穿过匿名 struct/union** 找成员偏移；本机用真实 6.1 vmlinux 验证（`skc_daddr`@0、`skc_rcv_saddr`@4、`sock.__sk_common`@0）
+    - 状态：已实现（PR #49）：`btf.rs`
+  - [x] 3.9.2 tracepoint `format` 解析：取 `inet_sock_set_state` 各字段偏移，读不到文件时用文档化兜底布局（并有单测保证兜底值与真实 format 一致）
+    - 状态：已实现（PR #49）：`tracepoint_format.rs`
+  - [x] 3.9.3 组装 `CFG: Array<u64>`：BTF 偏移 + tracepoint 偏移 + TCP 状态常量 + 开关，含版本号与「偏移为 0 / 超出合理范围」的拒绝校验
+    - 状态：已实现（PR #49）：`cfg.rs`
+    - 附：本机实测推翻了一条想当然的假设 —— 6.1 里 `skc_dport`(12) 与 `skc_num`(14) 是**顺序字段**而非同一个 union，所以内核态必须按 `CFG` 给的两个偏移分别读，不能只读一个再推算
+
 - [ ] 4. P1 Agent 采集项集成
   - [ ] 4.1 采集项类型 `ebpf_network`、`ebpf_process`、`ebpf_tcp` 与配置字段、GSE 侧校验
     - 对应需求 2.1-2.5

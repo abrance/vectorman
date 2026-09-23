@@ -405,6 +405,8 @@ Agent 侧产出（每 60 秒一批），严格按 `observability-data-model` 命
 - `tcp_sendmsg` 的返回值语义（入队字节 vs 实际发送）会导致 `bytes_sent` 与内核计数器有偏差，设计以返回值为准并在文档标注口径，不要试图与 `/proc/net/dev` 对齐。
 - `inet_sock_set_state` 的 state 常量与内核版本相关，不要硬编码数值；从 `aya` 的 BTF/常量映射或运行期探测取。
 - **实现期确定的做法**：内核态**完全不硬编码**结构体偏移与状态值 —— 用户态解析 `/sys/kernel/btf/vmlinux`（`struct sock_common`/`sock` 字段偏移）与 tracepoint 的 `format` 文件（字段偏移），连同 TCP 状态常量一起写入 `CFG: Array<u64>`（下标见 `ebpf_abi::CfgIndex`，带 `CFG_VERSION` 版本号，不匹配则不采集）。好处：内核态不需重新编译就能适配不同内核，状态语义留在可单测的用户态。
+- 结构体偏移与 tracepoint 字段偏移**两者都要在运行期解析**：前者来自 `/sys/kernel/btf/vmlinux`（自实现的极简 BTF 解析器，需递归穿过匿名 `struct`/`union` —— `sock_common` 的成员就藏在匿名 union 里），后者来自 `/sys/kernel/tracing/events/<cat>/<name>/format`（common 头之后的字段偏移随版本变化，例如 5.19 起追加 `cookie`）。tracepoint 文件不可读时用文档化兜底布局并记 warn。
+- 本机实测（6.1）推翻了一条想当然的假设：`skc_dport`@12 与 `skc_num`@14 是**顺序字段**，不是同一个 union。两个端口各按自己的偏移读，不要从一个推另一个。
 - kprobe 的参数在 kretprobe 里**拿不到**（返回时寄存器已变）：字节数/连接失败这类「入口建键 + 返回判值」的组合必须用 `ENTRY: HashMap<tid, ConnKey>` 暂存入口键，返回时取出并清除；kretprobe 未配对时跳过，不要用当前进程重新建键（会记到错误的连接上）。
 - `latency_hist` 的槽上界会低估长尾（例如槽 23 覆盖到 `2^24` 微秒以上），`p95` 近似值必须标注为近似，前端 tooltip 要写清楚。
 - 内核态程序的栈与循环受限（验证器），`latency_hist` 遍历必须用 `bpf_loop` 或展开的固定次数循环，不能用动态长度 `for`。
