@@ -158,7 +158,7 @@ struct OtlpReceiverConfig {
 | `message` | `"{service} {name} {duration_micros}us"`（与既有 `apm` 映射风格一致） |
 | `labels` | `data_type=traces`、`agent_id`、`data_id`、非空 `host_id`、`trace_id`、`span_id`、`parent_span_id`、`service`、`kind`、`status_code` |
 
-`LogRecord` 结构不变；索引字段 `trace_id`/`service`/`data_id` 由 `LogStore::append` 内部从 `labels` 提升（v2 行为），因此既有 logs/apm/ebpf 写入也自动获得按 `data_id` 的索引检索与更快的清理。
+`LogRecord.payload` 保存 span 原文（完整 OTel JSON），标签只做检索投影；索引字段 `trace_id`/`data_type`/`service`/`data_id` 由 `LogStore::append` 内部从 `labels` 提升，因此既有 logs/apm/ebpf 写入也自动获得按 `data_id` 的索引检索与更快的清理。
 
 5. 摘要：`TraceSummaryAccumulator::observe(span, agent_id, host_id, data_id)`（内存）。
 6. 端点：`EndpointRegistry::observe(&span.resource, &span.service)`（内存缓存 + 周期 upsert sqlite，60 秒或 500 条触发）。

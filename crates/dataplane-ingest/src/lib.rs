@@ -257,6 +257,7 @@ async fn apply_one(
                 level: rec.level,
                 message: rec.message,
                 labels,
+                payload: None,
             })
             .await
             .map_err(ApplyRecordError::Engine)?;
@@ -292,6 +293,7 @@ async fn apply_one(
                 level,
                 message,
                 labels,
+                payload: None,
             })
             .await
             .map_err(ApplyRecordError::Engine)?;
@@ -314,6 +316,7 @@ async fn apply_one(
                 level: "info".into(),
                 message: rec.message,
                 labels,
+                payload: None,
             })
             .await
             .map_err(ApplyRecordError::Engine)?;
@@ -943,6 +946,58 @@ mod tests {
             "超限原因应说明上限: {:?}",
             reply.failures
         );
+    }
+
+    #[tokio::test]
+    async fn traces_detail_keeps_full_span_payload() {
+        let e = engines();
+        let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let span_id = "00f067aa0ba902b7";
+        let mut raw = trace_span_json(trace_id, span_id, "");
+        raw["attributes"] =
+            json!({"http.request.method": "GET", "http.response.status_code": "200"});
+        raw["resource"] = json!({"service.name": "order-api", "k8s.pod.name": "order-api-1"});
+        raw["events"] = json!([{"name": "exception", "time_unix_nano": 1_710_000_000_005_000_000i64,
+                              "attributes": {"exception.type": "Timeout"}}]);
+        raw["links"] = json!([{"trace_id": "a".repeat(32), "span_id": "b".repeat(16)}]);
+        raw["status_message"] = json!("upstream timeout");
+        raw["dropped_events"] = json!(3);
+
+        let env = envelope("traces", vec![raw]);
+        apply(env, &e.ts, &e.log, &e.kv).await.unwrap();
+
+        let hits = search(
+            &e.log,
+            LogSearchQuery {
+                data_type: Some("traces".into()),
+                trace_id: Some(trace_id.into()),
+                ..LogSearchQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        let payload = hits[0].payload.as_deref().expect("span 原文应写入 payload");
+        let parsed: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(
+            parsed["attributes"]["http.request.method"],
+            json!("GET"),
+            "标签投影放不下的富字段必须能从原文还原"
+        );
+        assert_eq!(parsed["resource"]["k8s.pod.name"], json!("order-api-1"));
+        assert_eq!(parsed["events"][0]["name"], json!("exception"));
+        assert_eq!(
+            parsed["events"][0]["attributes"]["exception.type"],
+            json!("Timeout")
+        );
+        assert_eq!(parsed["links"][0]["span_id"], json!("b".repeat(16)));
+        assert_eq!(parsed["status_message"], json!("upstream timeout"));
+        assert_eq!(parsed["dropped_events"], json!(3));
+        assert_eq!(
+            parsed["start_unix_nano"],
+            json!(1_710_000_000_000_000_000i64)
+        );
+        assert_eq!(parsed["end_unix_nano"], json!(1_710_000_000_012_000_000i64));
     }
 
     #[tokio::test]
