@@ -234,6 +234,14 @@ pub fn to_log_record(span: &TraceSpan, envelope: &DataEnvelope) -> LogRecord {
 /// 明细已落库，重试整批只会造成明细重复。
 #[async_trait]
 pub trait TraceSink: Send + Sync {
+    /// 只写明细的耗时下限（微秒）。0 表示全部写明细。
+    ///
+    /// 策略由 sink（APM 配置）持有：明细是可选的高成本数据，摘要与聚合才是聚合口径的
+    /// 来源，因此低于阈值的 span 仍然 `observe_span`、只是不落 `LogStore`。
+    fn detail_min_duration_micros(&self) -> i64 {
+        0
+    }
+
     /// 观察一条已通过校验与归一化的 span。
     async fn observe_span(
         &self,

@@ -101,6 +101,7 @@ async fn main() -> ExitCode {
             Arc::clone(&sql),
             dataplane_apm::ApmSinkConfig {
                 endpoint_retention_days: cfg.apm_endpoint_retention_days,
+                detail_min_duration_micros: cfg.apm_min_duration_micros_for_detail,
                 ..dataplane_apm::ApmSinkConfig::default()
             },
             Arc::clone(&red_samples),
@@ -133,6 +134,10 @@ async fn main() -> ExitCode {
         gse_admin_url: cfg.gse_admin_url.clone(),
         metrics: Some(metrics.clone()),
         apm: apm.clone(),
+        apm_limiter: Some(Arc::new(dataserver::limits::BatchLimiter::new(
+            cfg.apm_ingest_max_batches_per_sec,
+        ))),
+        apm_detail_min_duration_micros: cfg.apm_min_duration_micros_for_detail,
     };
 
     let web_dir = cfg.http_web_dir.as_deref().map(std::path::Path::new);
@@ -396,12 +401,14 @@ async fn main() -> ExitCode {
     };
 
     println!(
-        "sql_http={} prom_http={} metrics_http={} ts_retention_days={} ts_retention_enforced={}",
+        "sql_http={} prom_http={} metrics_http={} ts_retention_days={} ts_retention_enforced={} apm_max_bytes={} apm_ingest_max_batches_per_sec={}",
         cfg.sql_http.listen,
         cfg.prom_http.listen,
         cfg.metrics_http.listen,
         cfg.ts_retention_days,
-        cfg.ts_retention_enforced
+        cfg.ts_retention_enforced,
+        cfg.apm_max_bytes,
+        cfg.apm_ingest_max_batches_per_sec
     );
 
     let sql_fut = axum::serve(sql_listener, sql_app);

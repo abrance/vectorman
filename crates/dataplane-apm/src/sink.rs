@@ -212,6 +212,10 @@ impl ApmSink {
 
 #[async_trait]
 impl TraceSink for ApmSink {
+    fn detail_min_duration_micros(&self) -> i64 {
+        self.config.detail_min_duration_micros
+    }
+
     async fn observe_span(
         &self,
         span: &TraceSpan,

@@ -19,6 +19,10 @@ apm_retention_days_default = 3
 # 全局容量上限（字节）；0 = 不限。超限时按最久远优先淘汰 APM 数据。
 apm_max_bytes = 0
 apm_clean_interval_secs = 3600
+# trace 接入限流（每秒批次数）；0 = 不限。
+apm_ingest_max_batches_per_sec = 0
+# 只写明细的耗时下限（微秒）；0 = 全部写明细。
+apm_min_duration_micros_for_detail = 0
 
 [sql_http]
 listen = "0.0.0.0:8081"
@@ -103,6 +107,12 @@ pub struct Config {
     /// APM 保留策略执行周期（秒）。
     #[serde(default = "default_apm_clean_interval")]
     pub apm_clean_interval_secs: u64,
+    /// trace 接入限流（每秒批次数）；0 表示不限。超限返回 429 + `unavailable`。
+    #[serde(default)]
+    pub apm_ingest_max_batches_per_sec: u64,
+    /// 只写明细的耗时下限（微秒）；0 表示全部写明细。低于该值的 trace 只写摘要与聚合。
+    #[serde(default)]
+    pub apm_min_duration_micros_for_detail: i64,
 }
 
 impl Default for Config {
@@ -130,6 +140,8 @@ impl Default for Config {
             apm_retention_days_default: default_apm_retention_days(),
             apm_max_bytes: 0,
             apm_clean_interval_secs: default_apm_clean_interval(),
+            apm_ingest_max_batches_per_sec: 0,
+            apm_min_duration_micros_for_detail: 0,
         }
     }
 }
@@ -205,6 +217,16 @@ impl Config {
         if let Ok(v) = std::env::var("DATASERVER_APM_MAX_BYTES") {
             if let Ok(n) = v.parse() {
                 self.apm_max_bytes = n;
+            }
+        }
+        if let Ok(v) = std::env::var("DATASERVER_APM_INGEST_MAX_BATCHES_PER_SEC") {
+            if let Ok(n) = v.parse() {
+                self.apm_ingest_max_batches_per_sec = n;
+            }
+        }
+        if let Ok(v) = std::env::var("DATASERVER_APM_MIN_DURATION_MICROS_FOR_DETAIL") {
+            if let Ok(n) = v.parse() {
+                self.apm_min_duration_micros_for_detail = n;
             }
         }
         if let Ok(v) = std::env::var("DATASERVER_APM_CLEAN_INTERVAL") {

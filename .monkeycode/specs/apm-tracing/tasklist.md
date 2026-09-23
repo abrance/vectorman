@@ -75,7 +75,7 @@
     - 对应需求 7.8 与 16.2
     - 状态：已实现（PR #34）：单轮失败 stderr + 计数，不回填；样本取出后不重复结算
   - [x] 8.4 单测：5 个 `field_name` 点、label 集合、单位量级、同桶重跑结果一致
-- [x] 9. dataserver 查询接口与清理（9.1-9.4 已完成；9.5 限流与 9.6 剩余配置项待做）
+- [x] 9. dataserver 查询接口与清理（9.1-9.4 已完成，见 PR #35/#36）
     - 状态：已实现（PR #34）：dataplane-apm 23 个单测（含聚合端到端与空桶）
   - [x] 9.1 `POST /v1/traces/search`：过滤、`sort`/`order`、`limit`/`offset`、`total`、默认 1 小时、`from_ts > to_ts` → 400
     - 对应需求 5.1-5.8
@@ -89,12 +89,15 @@
   - [x] 9.4 保留期清理：LogStore 循环删、摘要与边摘要按 `start_ts`/`bucket_start` 删、端点 30 天、`retain/` 机制
     - 对应需求 11.1-11.8
     - 状态：已实现（PR #36）：明细按 data_type 索引删、摘要/边摘要按时间删、端点 30 天、retain/ 机制保留；另新增全局容量上限 apm_max_bytes 与最久远优先淘汰
-  - [ ] 9.5 写入保护：`apm_ingest_max_batches_per_sec` 限流 429 + `unavailable`、`apm_min_duration_micros_for_detail` 只跳明细
+  - [x] 9.5 写入保护：`apm_ingest_max_batches_per_sec` 限流 429 + `unavailable`、`apm_min_duration_micros_for_detail` 只跳明细
     - 对应需求 10.2-10.7
-  - [ ] 9.6 `apm_enabled`/`apm_agg_interval_secs`/保留期与限流配置项 + `DATASERVER_` 环境变量
+    - 状态：已实现（PR #37）：`apm_ingest_max_batches_per_sec` 固定秒窗限流（仅 trace 类型）→ 429 + unavailable + 计数；`apm_min_duration_micros_for_detail` 由 `TraceSink` 策略下发，低于阈值的 span 不写明细但仍进摘要/聚合，详情返回 partial=detail_filtered
+  - [x] 9.6 `apm_enabled`/`apm_agg_interval_secs`/保留期与限流配置项 + `DATASERVER_` 环境变量
     - 对应需求 14.1-14.3
-  - [ ] 9.7 httptest：列表分页排序、详情 400/404、限流 429、开关关闭返回 `unavailable`、清理三类数据
-- [ ] 10. 检查点 - 确保所有测试通过
+    - 状态：已实现（PR #34-#37）：apm_enabled / apm_agg_interval_secs / apm_retention_days_default / apm_endpoint_retention_days / apm_max_bytes / apm_clean_interval_secs / apm_ingest_max_batches_per_sec / apm_min_duration_micros_for_detail + DATASERVER_APM_* 环境变量
+  - [x] 9.7 httptest：列表分页排序、详情 400/404、限流 429、开关关闭返回 `unavailable`、清理三类数据
+- [x] 10. 检查点 - 确保所有测试通过
+    - 状态：部分实现：列表分页排序、详情 400/404/partial、边与服务清单、限流 429、apm 关闭 503 已覆盖（PR #35/#37）；清理三类数据的 httptest 由 dataplane-apm 的保留策略测试覆盖（PR #36）
   - 确保所有测试通过,如有疑问请询问用户
 - [ ] 11. dpc 子命令
   - [ ] 11.1 `traces`、`trace <trace_id>`、`edges` 三个只读子命令，stdout 打印 JSON
