@@ -261,6 +261,34 @@ export function CollectPage() {
               </>
             )}
 
+            {kind === "apm_otlp" && (
+              <>
+                <Form.Item
+                  name="service_allowlist"
+                  label="服务白名单"
+                  tooltip="留空表示全收；逗号或换行分隔，按 span 的 service.name 匹配"
+                >
+                  <Input.TextArea rows={2} placeholder="order-api,payment" />
+                </Form.Item>
+                <Form.Item name="service_denylist" label="服务黑名单">
+                  <Input.TextArea rows={2} placeholder="debug-tool" />
+                </Form.Item>
+                <Form.Item
+                  name="attribute_allowlist"
+                  label="属性白名单"
+                  tooltip="留空表示保留全部 span 属性；填写后只保留名单内的属性键"
+                >
+                  <Input.TextArea rows={2} placeholder="http.request.method,http.response.status_code" />
+                </Form.Item>
+                <Form.Item name="batch_max_records" label="批次上限">
+                  <InputNumber min={1} max={5000} style={{ width: "100%" }} />
+                </Form.Item>
+                <Form.Item name="flush_interval_secs" label="上报间隔（秒）">
+                  <InputNumber min={1} max={60} style={{ width: "100%" }} />
+                </Form.Item>
+              </>
+            )}
+
             {(kind === "log_file" || kind === "log_k8s_stdout") && (
               <>
                 <Form.Item name="start_mode" label="开始标记">

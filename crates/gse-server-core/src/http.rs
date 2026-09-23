@@ -522,7 +522,7 @@ fn build_collect_item(item_id: &str, input: &CollectItemInput) -> Result<Collect
     }
     if !matches!(
         input.kind.as_str(),
-        "metrics_host" | "log_file" | "log_k8s_stdout"
+        "metrics_host" | "log_file" | "log_k8s_stdout" | "apm_otlp"
     ) {
         return Err(GseError::new(
             "invalid_argument",
@@ -548,6 +548,56 @@ fn build_collect_item(item_id: &str, input: &CollectItemInput) -> Result<Collect
                 "invalid_argument",
                 "log_file requires non-empty path_patterns",
             ));
+        }
+        "apm_otlp" => {
+            // OTLP 接收器：名单可选，但上限必须有界（Agent 侧同样夹取，这里是第一道闸）。
+            for key in [
+                "service_allowlist",
+                "service_denylist",
+                "attribute_allowlist",
+            ] {
+                if let Some(value) = input.collector.get(key) {
+                    if !value.is_array() {
+                        return Err(GseError::new(
+                            "invalid_argument",
+                            format!("apm_otlp {key} must be an array of strings"),
+                        ));
+                    }
+                    if value
+                        .as_array()
+                        .is_some_and(|items| items.iter().any(|item| !item.is_string()))
+                    {
+                        return Err(GseError::new(
+                            "invalid_argument",
+                            format!("apm_otlp {key} must contain only strings"),
+                        ));
+                    }
+                }
+            }
+            if let Some(batch) = input
+                .collector
+                .get("batch_max_records")
+                .and_then(|v| v.as_u64())
+            {
+                if batch == 0 || batch > 5_000 {
+                    return Err(GseError::new(
+                        "invalid_argument",
+                        "apm_otlp batch_max_records must be within 1..=5000",
+                    ));
+                }
+            }
+            if let Some(flush) = input
+                .collector
+                .get("flush_interval_secs")
+                .and_then(|v| v.as_u64())
+            {
+                if flush == 0 || flush > 60 {
+                    return Err(GseError::new(
+                        "invalid_argument",
+                        "apm_otlp flush_interval_secs must be within 1..=60",
+                    ));
+                }
+            }
         }
         "log_k8s_stdout" => {
             if !json_non_empty_str(&input.collector, "namespace") {
@@ -1628,6 +1678,50 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("path_patterns"), "{body}");
+
+        // apm_otlp：名单与攒批上限都要校验。
+        let (status, body) = send(
+            &mut app,
+            req(
+                "POST",
+                "/api/gse/collect-items",
+                Some(
+                    r#"{"name":"apm","kind":"apm_otlp","agent_ids":["a-1"],"collector":{"service_allowlist":"order-api"}}"#,
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("must be an array"), "{body}");
+
+        let (status, body) = send(
+            &mut app,
+            req(
+                "POST",
+                "/api/gse/collect-items",
+                Some(
+                    r#"{"name":"apm","kind":"apm_otlp","agent_ids":["a-1"],"collector":{"batch_max_records":9000}}"#,
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("1..=5000"), "{body}");
+
+        let (status, body) = send(
+            &mut app,
+            req(
+                "POST",
+                "/api/gse/collect-items",
+                Some(
+                    r#"{"name":"apm","kind":"apm_otlp","agent_ids":["a-1"],"collector":{"service_allowlist":["order-api"],"attribute_allowlist":["http.request.method"],"batch_max_records":50,"flush_interval_secs":10},"storage":{"retention_days":3}}"#,
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(body.contains("\"kind\":\"apm_otlp\""), "{body}");
+        assert!(body.contains("\"retention_days\":3"), "{body}");
 
         // 合法创建：目标去重去空白，storage 缺省回落 1 天。
         let create = r#"{"name":"cpu","kind":"metrics_host","agent_ids":["a-1","a-1"," a-2 ",""],"collector":{"interval_secs":15},"storage":{}}"#;

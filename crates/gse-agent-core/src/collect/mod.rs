@@ -11,6 +11,7 @@ pub mod k8s;
 pub mod kubeconfig;
 pub mod logfile;
 pub mod metrics;
+pub mod otlp;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,6 +43,12 @@ pub struct CollectShared {
     host_id: RwLock<Option<String>>,
     ingest_url: RwLock<Option<String>>,
     buffer: Buffer,
+    /// OTLP 接收器的进程级配置（来自 Agent 本地配置，非采集项下发）。
+    pub otlp_enabled: bool,
+    pub otlp_listen: String,
+    pub otlp_max_body_bytes: usize,
+    pub otlp_token: String,
+    pub otlp_allowed_cidrs: Vec<String>,
 }
 
 impl CollectShared {
@@ -51,7 +58,32 @@ impl CollectShared {
             host_id: RwLock::new(None),
             ingest_url: RwLock::new(None),
             buffer: Buffer::new(DEFAULT_MAX_RECORDS),
+            otlp_enabled: false,
+            otlp_listen: otlp::DEFAULT_LISTEN.to_string(),
+            otlp_max_body_bytes: otlp::DEFAULT_MAX_BODY_BYTES,
+            otlp_token: String::new(),
+            otlp_allowed_cidrs: Vec::new(),
         }
+    }
+
+    /// 设置 OTLP 接收器参数（Agent 启动时从本地配置调用）。
+    pub fn set_otlp_options(
+        &mut self,
+        enabled: bool,
+        listen: String,
+        max_body_bytes: usize,
+        token: String,
+        allowed_cidrs: Vec<String>,
+    ) {
+        self.otlp_enabled = enabled;
+        self.otlp_listen = if listen.trim().is_empty() {
+            otlp::DEFAULT_LISTEN.to_string()
+        } else {
+            listen
+        };
+        self.otlp_max_body_bytes = max_body_bytes.max(1_024);
+        self.otlp_token = token;
+        self.otlp_allowed_cidrs = allowed_cidrs;
     }
 
     pub async fn host_id(&self) -> Option<String> {
@@ -139,6 +171,16 @@ enum Control {
     PullAddr,
 }
 
+/// OTLP 接收器的进程级参数。
+#[derive(Debug, Clone, Default)]
+pub struct OtlpOptions {
+    pub enabled: bool,
+    pub listen: String,
+    pub max_body_bytes: usize,
+    pub token: String,
+    pub allowed_cidrs: Vec<String>,
+}
+
 /// 采集运行时句柄：持有共享状态，向 supervisor 投递采集项与地址拉取请求。
 #[derive(Clone)]
 pub struct CollectorHandle {
@@ -147,9 +189,26 @@ pub struct CollectorHandle {
 }
 
 impl CollectorHandle {
+    /// OTLP 接收器的进程级参数（来自 Agent 本地配置）。
+    pub fn new_with_otlp(agent_id: String, end: End, otlp: OtlpOptions) -> Self {
+        let mut shared = CollectShared::new(agent_id);
+        shared.set_otlp_options(
+            otlp.enabled,
+            otlp.listen,
+            otlp.max_body_bytes,
+            otlp.token,
+            otlp.allowed_cidrs,
+        );
+        Self::from_shared(shared, end)
+    }
+
     /// 创建句柄并启动 supervisor；上报循环随之启动。
     pub fn new(agent_id: String, end: End) -> Self {
-        let shared = Arc::new(CollectShared::new(agent_id));
+        Self::from_shared(CollectShared::new(agent_id), end)
+    }
+
+    fn from_shared(shared: CollectShared, end: End) -> Self {
+        let shared = Arc::new(shared);
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(supervise(shared.clone(), end, rx));
         Self { shared, tx }
@@ -265,6 +324,26 @@ fn spawn_collector(shared: Arc<CollectShared>, item: CollectItem) -> tokio::task
             "metrics_host" => metrics::run(shared, item.item_id, cfg.interval_secs).await,
             "log_file" => logfile::run(shared, item.item_id, cfg).await,
             "log_k8s_stdout" => k8s::run(shared, item.item_id, cfg).await,
+            "apm_otlp" => {
+                if !shared.otlp_enabled {
+                    eprintln!(
+                        "gse-agent: collect item {} is apm_otlp but otlp_enabled=false; skipped",
+                        item.item_id
+                    );
+                    return;
+                }
+                // OTLP 接收器的进程级参数来自 Agent 配置（listen/token/CIDR/上限），
+                // 采集项级参数（名单、攒批）来自 collector JSON。
+                let receiver = otlp::OtlpConfig::from_item(
+                    &item.item_id,
+                    &item.collector,
+                    &shared.otlp_listen,
+                    shared.otlp_max_body_bytes,
+                    &shared.otlp_token,
+                    &shared.otlp_allowed_cidrs,
+                );
+                otlp::run(shared, receiver).await
+            }
             other => eprintln!(
                 "gse-agent: unknown collect kind {other} for item {}",
                 item.item_id

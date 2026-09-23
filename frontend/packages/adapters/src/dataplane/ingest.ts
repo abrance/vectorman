@@ -3,7 +3,7 @@ import type { Agent } from "../gse/admin";
 import type { PromEnvelope } from "./prom";
 
 /// 采集项类型。
-export type CollectItemKind = "metrics_host" | "log_file" | "log_k8s_stdout";
+export type CollectItemKind = "metrics_host" | "log_file" | "log_k8s_stdout" | "apm_otlp";
 
 /// 清洗提取规则。
 export type ExtractRule = {

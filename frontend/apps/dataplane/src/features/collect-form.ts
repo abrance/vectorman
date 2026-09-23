@@ -20,12 +20,17 @@ export type CollectFormValues = {
   include_regex?: string;
   exclude_regex?: string;
   extract?: ExtractRule[];
+  /// apm_otlp：服务名单与属性白名单（逗号/换行分隔）。
+  service_allowlist?: string;
+  service_denylist?: string;
+  attribute_allowlist?: string;
 };
 
 export const COLLECT_KINDS: { value: CollectItemKind; label: string }[] = [
   { value: "metrics_host", label: "主机指标" },
   { value: "log_file", label: "文件日志" },
   { value: "log_k8s_stdout", label: "K8s 标准输出" },
+  { value: "apm_otlp", label: "APM（OTLP trace）" },
 ];
 
 const DEFAULT_INTERVAL = 15;
@@ -72,11 +77,28 @@ function logCommon(values: CollectFormValues): Record<string, unknown> {
   };
 }
 
+/// 逗号/换行分隔的名单 → 字符串数组（去空去重，保持顺序）。
+export function splitList(value: string | undefined): string[] {
+  const items = (value ?? "")
+    .split(/[,\n]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return items.filter((item, index) => items.indexOf(item) === index);
+}
+
 /// 表单值 → 采集项入参；按类型裁剪 `collector`，`retention_days` 缺省 1。
 export function toCollectItemInput(values: CollectFormValues): CollectItemInput {
   let collector: Record<string, unknown>;
   if (values.kind === "metrics_host") {
     collector = { interval_secs: positive(values.interval_secs, DEFAULT_INTERVAL) };
+  } else if (values.kind === "apm_otlp") {
+    collector = {
+      service_allowlist: splitList(values.service_allowlist),
+      service_denylist: splitList(values.service_denylist),
+      attribute_allowlist: splitList(values.attribute_allowlist),
+      batch_max_records: positive(values.batch_max_records, DEFAULT_BATCH_MAX),
+      flush_interval_secs: positive(values.flush_interval_secs, DEFAULT_FLUSH),
+    };
   } else if (values.kind === "log_file") {
     collector = {
       path_patterns: (values.path_patterns ?? []).map((p) => p.trim()).filter(Boolean),
@@ -104,6 +126,12 @@ export function toCollectItemInput(values: CollectFormValues): CollectItemInput 
 function str(collector: Record<string, unknown>, key: string): string | undefined {
   const v = collector[key];
   return typeof v === "string" ? v : undefined;
+}
+
+/// 字符串数组 → 逗号分隔文本（编辑表单回填）。
+function listStr(collector: Record<string, unknown>, key: string): string {
+  const value = collector[key];
+  return Array.isArray(value) ? value.filter((v) => typeof v === "string").join(",") : "";
 }
 
 function num(collector: Record<string, unknown>, key: string): number | undefined {
@@ -136,5 +164,8 @@ export function toCollectFormValues(item: CollectItem): CollectFormValues {
     include_regex: str(clean, "include_regex") ?? "",
     exclude_regex: str(clean, "exclude_regex") ?? "",
     extract: Array.isArray(clean.extract) ? (clean.extract as ExtractRule[]) : [],
+    service_allowlist: listStr(collector, "service_allowlist"),
+    service_denylist: listStr(collector, "service_denylist"),
+    attribute_allowlist: listStr(collector, "attribute_allowlist"),
   };
 }

@@ -16,3 +16,7 @@ ureq = { version = "2", features = ["json"] }
 regex = "1"
 sha2 = "0.10"
 base64 = "0.22"
+tiny_http = "0.12"
+flate2 = "1"
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "trace", "with-serde"] }
+prost = "0.14"

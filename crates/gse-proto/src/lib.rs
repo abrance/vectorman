@@ -276,7 +276,7 @@ pub struct CollectItem {
     pub item_id: String,
     pub agent_ids: Vec<String>,
     pub name: String,
-    /// metrics_host | log_file | log_k8s_stdout。
+    /// metrics_host | log_file | log_k8s_stdout | apm_otlp。
     pub kind: String,
     pub enabled: bool,
     pub collector: serde_json::Value,
