@@ -375,8 +375,9 @@ dpc edges --src gateway --dst order-api --source otlp
 
 实现约束：
 
-- 图表统一用 `echarts`（新增依赖，薄封装：一个 React 组件包 `useEffect` + `setOption`，不引额外的 React 绑定库）：指标页 QPS/错误率/P50/P95/P99 用 `line` series；拓扑页用 `graph` series 且 `layout: 'none'`，节点坐标由前端自行计算（按 `dst_service` 入度分层、同层按服务名字典序、层宽均分），避免力导向布局的随机性；瀑布图用 `custom` series 或直接 SVG。后端口径不变：只返回 Prom 形状的数据点（`api/v1/query_range` 的 matrix），前端负责转 series，后端不感知 echarts。
-- 拓扑页与瀑布图的坐标计算放在 `src/features/apm/layout.ts`，纯函数、可单测。
+- 图表复用仓库既有的**手绘 SVG** 方案，不引入图表库：`ui/line-chart.tsx` 已实现多序列折线 + 悬停读数（指标曲线直接复用），新增 `ui/waterfall.tsx` 画 span 瀑布图，拓扑图同样手绘 SVG。理由：仓库既有组件已覆盖曲线需求、拓扑与瀑布图都需要确定性坐标（图表库的默认布局反而要绕开）、且可避免 1 MB+ 的新依赖；后端口径不变，只返回 Prom 形状数据点与 span 原文。
+- 拓扑与瀑布图的坐标计算放在 `src/features/apm/layout.ts`（`waterfallRows` / `layeredTopology`），纯函数、可单测；`layeredTopology` 按「上游层号最大值 + 1」分层、层内按服务名字典序、坐标均分，同一份数据渲染结果完全一致。
+- 页面通过 `Runtime` 注入的 `ApmAdapter`（`@vectorman/adapters`）访问接口；时间戳一律用 `formatTimestamp(String(micros))`，耗时用 `formatDuration(micros)`。
 - 查询通过既有 `@vectorman/adapters` HttpClient，接口封装进 `src/features/apm/`，页面只做渲染与参数拼装。
 - 刷新由按钮显式触发（与既有指标页/日志页一致，无定时器）。
 - 空态与 `partial` 提示按 Requirement 13 第 11、13 条实现。

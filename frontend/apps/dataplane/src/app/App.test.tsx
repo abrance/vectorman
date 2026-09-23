@@ -8,7 +8,7 @@ import {
   MemoryNotifier,
   MemoryQueryStore,
 } from "@vectorman/primitives";
-import { DataplaneAdapter, FetchHttpClient, type CollectItem } from "@vectorman/adapters";
+import { ApmAdapter, DataplaneAdapter, FetchHttpClient, type CollectItem } from "@vectorman/adapters";
 import { App } from "./App";
 import { RuntimeProvider } from "./runtime";
 
@@ -48,6 +48,115 @@ class FakeHttp implements HttpClient {
     if (url === "/v1/logs/search") {
       return { status: 200, body: { records: [] } as T };
     }
+    if (url === "/v1/traces/search") {
+      return {
+        status: 200,
+        body: {
+          total: 2,
+          traces: [
+            {
+              trace_id: "b".repeat(32),
+              start_ts: 1_710_000_000_000_000,
+              duration_micros: 250_000,
+              root_service: "payment",
+              root_operation: "POST /pay",
+              span_count: 2,
+              error_count: 1,
+              status: "error",
+              services: ["payment", "db"],
+              collector: "otlp",
+              agent_id: "a-1",
+              host_id: "h-1",
+              data_id: "item-1",
+            },
+            {
+              trace_id: "a".repeat(32),
+              start_ts: 1_710_000_000_100_000,
+              duration_micros: 12_000,
+              root_service: "order-api",
+              root_operation: "GET /orders",
+              span_count: 1,
+              error_count: 0,
+              status: "ok",
+              services: ["order-api"],
+              collector: "otlp",
+              agent_id: "a-1",
+              host_id: "h-1",
+              data_id: "item-1",
+            },
+          ],
+        } as T,
+      };
+    }
+    if (req.method === "GET" && url.startsWith("/v1/traces/")) {
+      const traceId = url.split("/").pop()!;
+      return {
+        status: 200,
+        body: {
+          partial: false,
+          reason: null,
+          expected_span_count: 2,
+          summary: {
+            trace_id: traceId,
+            start_ts: 1_710_000_000_000_000,
+            duration_micros: 250_000,
+            root_service: "payment",
+            root_operation: "POST /pay",
+            span_count: 2,
+            error_count: 1,
+            status: "error",
+            services: ["payment", "db"],
+            collector: "otlp",
+            agent_id: "a-1",
+            host_id: "h-1",
+            data_id: "item-1",
+          },
+          spans: [
+            {
+              record_id: `${traceId}:root`,
+              trace_id: traceId,
+              span_id: "root",
+              parent_span_id: "",
+              name: "POST /pay",
+              kind: "server",
+              service: "payment",
+              status_code: "error",
+              status_message: "card declined",
+              start_unix_nano: 1_710_000_000_000_000_000,
+              end_unix_nano: 1_710_000_000_250_000_000,
+              duration_micros: 250_000,
+              attributes: { "http.request.method": "POST", "http.response.status_code": "500" },
+              resource: { "k8s.pod.name": "payment-1" },
+              events: [{ name: "exception", time_unix_nano: 1, attributes: { "exception.type": "CardDeclined" } }],
+              links: [{ trace_id: "c".repeat(32), span_id: "d".repeat(16), attributes: {} }],
+              dropped_events: 0,
+              dropped_attributes: 0,
+              dropped_links: 0,
+              collector: "otlp",
+            },
+            {
+              record_id: `${traceId}:child`,
+              trace_id: traceId,
+              span_id: "child",
+              parent_span_id: "root",
+              name: "INSERT payments",
+              kind: "client",
+              service: "db",
+              status_code: "ok",
+              status_message: "",
+              start_unix_nano: 1_710_000_000_050_000_000,
+              end_unix_nano: 1_710_000_000_120_000_000,
+              duration_micros: 70_000,
+              attributes: {},
+              resource: {},
+              events: [],
+              links: [],
+              collector: "otlp",
+            },
+          ],
+        } as T,
+      };
+    }
     return { status: 200, body: (this.items[0] ?? null) as T };
   }
 }
@@ -76,10 +185,13 @@ const items: CollectItem[] = [
 function renderAt(path: string) {
   const http = new FakeHttp(items);
   const adapter = new DataplaneAdapter(http);
+  const apm = new ApmAdapter(http);
   return {
     http,
     ...render(
-      <RuntimeProvider value={{ dataplane: adapter, query: new MemoryQueryStore(), notifier: new MemoryNotifier() }}>
+      <RuntimeProvider
+        value={{ dataplane: adapter, apm, query: new MemoryQueryStore(), notifier: new MemoryNotifier() }}
+      >
         <MemoryRouter initialEntries={[path]}>
           <App />
         </MemoryRouter>
@@ -90,6 +202,40 @@ function renderAt(path: string) {
 
 afterEach(() => {
   cleanup();
+});
+
+describe("trace pages", () => {
+  it("lists traces and opens the waterfall detail", async () => {
+    const view = renderAt("/traces");
+    // 列表：展示根服务与来源。
+    expect(await screen.findByText("payment")).toBeTruthy();
+    expect(screen.getByText("order-api")).toBeTruthy();
+    expect(screen.getAllByText("250ms").length).toBeGreaterThan(0);
+    expect(screen.getByText("trace 列表（共 2 条）")).toBeTruthy();
+
+    // 点击行进入详情：瀑布图渲染两个 span，摘要展示根服务与采集项。
+    fireEvent.click(screen.getByText("payment"));
+    expect(await screen.findByRole("img", { name: "trace span 瀑布图" })).toBeTruthy();
+    await waitFor(() => expect(screen.getByText("trace 摘要")).toBeTruthy());
+    expect(screen.getByText("payment · POST /pay")).toBeTruthy();
+    expect(screen.getByText("db · INSERT payments")).toBeTruthy();
+    expect(screen.getAllByText("250ms").length).toBeGreaterThan(0);
+
+    // 点击某个 span 打开抽屉：概览里有 status_message，切页签看属性/事件/链接。
+    fireEvent.click(screen.getByText("payment · POST /pay"));
+    expect(await screen.findByText("card declined")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("属性（2）"));
+    expect(await screen.findByText("http.request.method")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("事件（1）"));
+    expect(await screen.findByText("exception")).toBeTruthy();
+    expect(await screen.findByText("exception.type")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("链接（1）"));
+    expect(await screen.findByText("c".repeat(32))).toBeTruthy();
+    view.unmount();
+  });
 });
 
 describe("dataplane shell", () => {

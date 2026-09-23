@@ -258,7 +258,7 @@
 11. WHEN 详情响应 `partial=true`，THE 详情页 SHALL 顶部提示原因（索引重建窗口 / 明细已过保留期 / 明细被过滤）。
 12. THE 页面数据刷新 SHALL 由运维手动触发，不引入定时器。
 13. WHEN 查询结果为空，THE 页面 SHALL 给出与上下文相关的空态提示（例如采集项未启用、时间范围无数据）。
-14. THE 图表渲染 SHALL 使用 `echarts`（新增前端依赖，薄封装不引额外绑定库）；THE 后端 SHALL 只返回数据点（Prom 形状的 `query_range` 结果与折叠栈文本），不承担任何图表逻辑。拓扑图 SHALL 使用 `layout: 'none'` 与前端自算坐标，不使用力导向布局。
+14. THE 图表渲染 SHALL 复用 `@vectorman/dataplane` 既有的手绘 SVG 组件（`ui/line-chart.tsx` 用于时序曲线、`ui/waterfall.tsx` 用于 span 瀑布图、拓扑同样手绘 SVG），SHALL NOT 引入图表库依赖；THE 后端 SHALL 只返回数据点（Prom 形状的 `query_range` 结果与 span 原文），不承担任何图表逻辑。拓扑布局 SHALL 由前端纯函数确定性分层（`features/apm/layout.ts`），SHALL NOT 使用力导向布局。
 
 ### Requirement 14: 服务端配置与开关
 

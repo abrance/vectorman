@@ -1,0 +1,59 @@
+.waterfall {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.waterfall-empty {
+  padding: 16px 0;
+  color: rgba(0, 0, 0, 0.45);
+}
+
+.waterfall-scale {
+  display: flex;
+  justify-content: space-between;
+  padding: 0 0 4px 320px;
+  margin-right: 96px;
+  font-size: 12px;
+  color: rgba(0, 0, 0, 0.45);
+}
+
+.waterfall-row {
+  cursor: pointer;
+}
+
+.waterfall-hit {
+  fill: transparent;
+}
+
+.waterfall-row:hover .waterfall-hit {
+  fill: rgba(47, 107, 255, 0.06);
+}
+
+.waterfall-label {
+  font-size: 12px;
+  fill: rgba(0, 0, 0, 0.78);
+}
+
+.waterfall-label.error {
+  fill: #c4396e;
+  font-weight: 600;
+}
+
+.waterfall-duration {
+  font-size: 11px;
+  fill: rgba(0, 0, 0, 0.45);
+}
+
+.waterfall-bar {
+  fill: #2f6bff;
+}
+
+.waterfall-bar.error {
+  fill: #c4396e;
+}
+
+.waterfall-hint {
+  padding-top: 6px;
+  font-size: 12px;
+  color: rgba(0, 0, 0, 0.45);
+}

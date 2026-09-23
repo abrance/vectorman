@@ -1,9 +1,10 @@
 import { createContext, useContext } from "react";
-import type { DataplaneAdapter } from "@vectorman/adapters";
+import type { ApmAdapter, DataplaneAdapter } from "@vectorman/adapters";
 import type { Notifier, QueryStore } from "@vectorman/primitives";
 
 export type Runtime = {
   dataplane: DataplaneAdapter;
+  apm: ApmAdapter;
   query: QueryStore;
   notifier: Notifier;
 };
