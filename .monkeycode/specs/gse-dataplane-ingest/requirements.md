@@ -240,6 +240,7 @@ v1 可运行范围：以「采集项」为配置单元打通指标与日志（�
 4. THE 控制面现有认证、心跳、会话、作业下发与 `ping` 信令 SHALL 保持可用。
 5. THE 本 feature 的存储写入 SHALL 调用已有 `TimeSeriesStore` 与 `LogStore` 接口，沿用 `dataplane-layered-storage` 的本地引擎绑定。
 6. THE v1 GSE Server 在存在多个 `online` 数据面服务时 SHALL 将 `service_id` 排序后，用 `agent_id` 的哈希对个数取模选出一条 `ingest_url`；同一 `agent_id` 在同一 online 集合上得到同一实例。
+7. THE 后续范围内的 APM 采集器与 eBPF 采集器 SHALL 以 `/.monkeycode/specs/apm-tracing/`、`/.monkeycode/specs/ebpf-observability/`、共享的 `/.monkeycode/specs/observability-data-model/` 与存储侧的 `/.monkeycode/specs/dataplane-ts-retention/` 为设计基线；本 feature 的 Requirements 3、6、12 只定义 `apm`/`ebpf` 信封与兼容行为，新链路的记录模型、查询语义与聚合指标保留以上述四份设计为准。
 
 ### Requirement 16: dataserver 前端
 

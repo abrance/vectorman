@@ -1,0 +1,118 @@
+# 需求实施计划
+
+本期只交付设计，本清单为待实施拆分，全部未开工。P1/P2/P3 是交付阶段，阶段间可独立上线；P3 未开工不影响 P1/P2。
+
+实施顺序：本 feature 在 `apm-tracing` 之后（`LogStore` 索引 v2 → `dataplane-ts-retention` → `apm-tracing` → 本 feature）。服务名静态映射的 CRUD 由 `apm-tracing` 提供，本 feature 只消费。
+
+- [ ] 1. P1 前置：eBPF 构建链与前置校验
+  - [ ] 1.1 新增 `crates/gse-ebpf-programs`（`#![no_std]`，aya-bpf 风格），产出 `*.o`；CI 单独一步用 `bpfel-unknown-none` 构建，产物入库 `packaging/ebpf/`
+    - 对应需求 17.6 与设计 Pitfalls 第一条
+  - [ ] 1.2 新增 `crates/gse-agent-ebpf`：preflight（内核 ≥5.8、`/sys/kernel/btf/vmlinux`、`CapEff` bit 39/38 或 euid 0）
+    - 对应需求 1.1-1.3、1.4；失败只降级该项能力并在 Agent 日志输出 warn（含建议动作），不阻止 Agent 启动
+  - [ ] 1.3 校验结果上报：`agent_ebpf_capability` 指标点，链路页可读
+    - 对应需求 1.5
+  - [ ] 1.4 单测：注入式 `uname` / `/proc/self/status` 夹具，断言各检查项判定与错误文本
+- [ ] 2. P1 内核态程序（网络、TCP、进程）
+  - [ ] 2.1 `network.bpf.c`/`.rs`：`inet_sock_set_state`、`kretprobe/tcp_connect`、`kretprobe/inet_csk_accept`、`kretprobe/tcp_sendmsg`/`tcp_recvmsg`、`kprobe/tcp_close`
+    - 对应需求 3.1-3.8 与设计挂载点表
+  - [ ] 2.2 `CONN_AGG` per-CPU map（`ConnKey`/`ConnAgg`）与 log2 直方图槽、`OVERFLOW_SLOT` 累加
+    - 对应需求 9.1-9.4、9.7
+  - [ ] 2.3 `tcp.bpf.c`：`tcp_retransmit_skb`、`tcp_send_active_reset`
+    - 对应需求 5.1-5.6
+  - [ ] 2.4 `process.bpf.c`：`sched_process_exec`/`exit`/`fork`，`cmdline` 截断 512 字节
+    - 对应需求 4.1-4.6
+  - [ ] 2.5 `EVENTS` RingBuf 与 `CFG` Array map（运行期参数下发）
+    - 对应需求 9.5-9.7
+  - [ ] 2.6 `max_cpu_percent` 内核态令牌桶限流
+    - 对应需求 9.5、12.1-12.2
+- [ ] 3. P1 用户态加载、差分与聚合
+  - [ ] 3.1 aya 加载与挂载管理：幂等启停、detach→drop links→删 map、启动时清理遗留
+    - 对应需求 1.6-1.8、16.2
+  - [ ] 3.2 加载失败退避重试（30 秒起、×2、上限 10 分钟，成功清零）
+    - 对应需求 1.7
+  - [ ] 3.3 差分线程：遍历全部 CPU 副本求和、与上周期相减、写零值复位、清理零增量键
+    - 对应需求 9.3-9.4 与设计 Pitfalls「不能只读 CPU 0」「必须写回 0」
+  - [ ] 3.4 过滤：`cgroup`/`process`/`port` include-exclude、`include_loopback`
+    - 对应需求 3.7、4.7
+  - [ ] 3.5 `EbpfEdge` 组装与 10 秒桶对齐；跨桶时只输出整桶
+    - 对应需求 3.4-3.6、10.1、10.7
+  - [ ] 3.6 1 分钟指标汇总：保留最近 6 个 10 秒桶，输出 `ebpf_*` 与 `apm_edge_*`（`source=ebpf`）
+    - 对应需求 10.2 与设计指标产出映射表
+  - [ ] 3.7 资源限制汇总与本地自监控计数（`agent_ebpf_*`）
+    - 对应需求 12.1-12.6
+  - [ ] 3.8 单测：假 map 快照驱动差分、过滤矩阵、桶对齐与 P95 近似、`record_id` 规则、退避序列、上限汇总
+- [ ] 4. P1 Agent 采集项集成
+  - [ ] 4.1 采集项类型 `ebpf_network`、`ebpf_process`、`ebpf_tcp` 与配置字段、GSE 侧校验
+    - 对应需求 2.1-2.5
+  - [ ] 4.2 热更新：按 `item_id` 对齐启停；`enabled=false` 卸载程序
+    - 对应需求 2.6-2.8
+  - [ ] 4.3 原始事件抽样上行 `data_type=ebpf`（`raw_events_sample_ratio`）
+    - 对应需求 4.5、10.3
+  - [ ] 4.4 单测：采集项启停序列、抽样比例统计、既有采集器行为不受影响
+- [ ] 5. P1 dataserver 接入与查询
+  - [ ] 5.1 `crates/dataplane-ingest/src/edge.rs`：`EbpfEdge` DTO + JSON 往返测试
+    - 对应共享模型 `EbpfEdge` 定义
+  - [ ] 5.2 `DataType::EbpfEdges` 分支：幂等、字段校验（`failures <= connections`、`hist_slots`）、sqlite 主键覆盖写、流索引
+    - 对应需求 3.9、10.1、10.4-10.7
+  - [ ] 5.3 服务名反查接入 `EndpointRegistry`（固定顺序：静态映射 alias → `(dst_ip,dst_port)` → `dst_pod` → `unknown-<ip>`；命中与负面结果均缓存 60 秒）
+    - 对应需求 11.1-11.6 与共享模型反查顺序；alias 由 `apm-tracing` 的 `/v1/apm/service-aliases` 维护
+  - [ ] 5.4 `POST /v1/edges/search`：过滤、分页、`source` 为空时两路合并汇总
+    - 对应需求 13.1-13.3、13.5-13.6
+  - [ ] 5.5 `POST /v1/ebpf/events/search` 与 `GET /v1/ebpf/capability`
+    - 对应需求 13.4 与 1.5、12.6
+  - [ ] 5.6 保留期清理：`ebpf_edges` 分批删除、`data_type=ebpf` 循环删除、`retain/` 机制；聚合指标接入 `dataplane-ts-retention`（`ts_retention_days` 缺省 30 天）
+    - 对应需求 14.1-14.4
+  - [ ] 5.7 httptest：幂等重放、非法字段 `partial`、合并查询求和、清理三类数据、时间范围非法 400
+- [ ] 6. 检查点 - P1 在特权 runner 上跑通受控流量用例后再进入 P2
+  - 确保所有测试通过,如有疑问请询问用户
+- [ ] 7. P1 前端与 CLI
+  - [ ] 7.1 `/ebpf` 页「边」视图：过滤、表格列、手动刷新、降级标记、前置校验状态
+    - 对应需求 15.2-15.4、15.7-15.9；图表用 `echarts`（边指标曲线 line series，不用力导向布局）
+  - [ ] 7.2 `/ebpf` 页「事件」视图：`event_type`/`pid`/`process_name`/关键词过滤
+    - 对应需求 15.3
+  - [ ] 7.3 `/topology` 页 `source` 切换（全部 / otlp / ebpf）
+    - 对应需求 15.5、11.4-11.5
+  - [ ] 7.4 边行「查看该边 trace」跳转 `/traces`
+    - 对应需求 15.6
+  - [ ] 7.5 `dpc edges`、`dpc ebpf-events` 子命令
+    - 对应需求 13.7
+  - [ ] 7.6 vitest：两视图参数拼装、`source` 切换表达式、降级标记、跳转 URL
+- [ ] 8. P2 文件与 syscall、DNS
+  - [ ] 8.1 内核态：`sys_enter/sys_exit_openat|read|write|fsync` 延迟直方图与错误码计数
+    - 对应需求 6.1-6.6
+  - [ ] 8.2 内核态：`udp_sendmsg`/`udp_recvmsg` 端口 53 过滤与 `DNS_PENDING` 匹配
+    - 对应需求 7.1-7.5
+  - [ ] 8.3 用户态：`ebpf_syscall_duration_micros`、`ebpf_syscall_failures_total`、`ebpf_dns_duration_micros`、`ebpf_dns_timeouts_total`
+    - 对应需求 6.2-6.3、7.2-7.3
+  - [ ] 8.4 慢调用阈值与原始慢事件上行（`slow_threshold_micros`）
+    - 对应需求 6.5
+  - [ ] 8.5 采集项类型 `ebpf_syscall`、`ebpf_dns` 与 GSE 校验
+    - 对应需求 2.1-2.5
+  - [ ] 8.6 单测：直方图到 avg/p95、errno 分组、DNS 事务匹配与超时、路径截断
+- [ ] 9. P3 CPU profile 与火焰图
+  - [ ] 9.1 内核态：每 tid `perf_event_open`、`bpf_get_stackid(BPF_F_USER_STACK)`、`STACKS` map
+    - 对应需求 8.1-8.2
+  - [ ] 9.2 用户态符号化：`/proc/{pid}/maps` + build-id 查符号表，失败保留地址并标记
+    - 对应需求 8.3、8.7、16.4
+  - [ ] 9.3 折叠栈聚合与压缩上行 `EbpfProfile`（`data_type=ebpf_profiles`）
+    - 对应需求 8.4-8.5、17.3
+  - [ ] 9.4 `max_profiled_processes` 限制与计数
+    - 对应需求 8.6、12.1
+  - [ ] 9.5 dataserver：`EbpfProfile` DTO、`FileStore` 落盘、`ebpf_profile_index` 建表与写入、解压超限拒绝
+    - 对应需求 8.4 与设计 Data Models
+  - [ ] 9.6 `GET /v1/ebpf/profiles`、`GET /v1/ebpf/profiles/{record_id}` 与独立保留期清理
+    - 对应需求 14.5
+  - [ ] 9.7 前端 `/ebpf/profile` 火焰图页面替换占位空态
+    - 对应需求 15.2
+  - [ ] 9.8 单测：folded 往返、超 8 MiB/20 万行拒绝、幂等覆盖、产物与索引同时清理
+- [ ] 10. 检查点 - 确保所有测试通过
+  - 确保所有测试通过,如有疑问请询问用户
+- [ ] 11. 端到端与文档收尾
+  - [ ] 11.1 特权 runner 集成：受控流量断言边记录、回环开关、限流计数、卸载无残留
+    - 对应需求 16.2-16.3
+  - [ ] 11.2 混合场景：eBPF 边指标与 OTLP 边指标在同分钟合并求和一致
+    - 对应需求 11.5 与共享模型合并口径
+  - [ ] 11.3 降级与不可用场景：无 BTF / 无权限宿主机上链路页显示不可用且其余采集正常
+    - 对应需求 16.1、16.5-16.7
+  - [ ] 11.4 回改 `.monkeycode/specs/gse-dataplane-ingest/design.md` 与共享模型的交叉引用
+  - [ ] 11.5 回改 `observability-data-model/design.md`：聚合指标保留从「外部缺口」改为「依赖 `dataplane-ts-retention`」

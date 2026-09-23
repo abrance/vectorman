@@ -1,0 +1,107 @@
+# 需求实施计划
+
+本期只交付设计，本清单为待实施拆分，全部未开工。前置依赖（阶段 1）未完成时，阶段 4 起无法验证。
+
+实施顺序（四份 spec 的约定）：`LogStore` 索引 v2 → `dataplane-ts-retention` → 本 feature → `ebpf-observability`。
+
+- [ ] 1. 前置依赖：LogStore 索引版本 v2
+  - [ ] 1.1 `crates/dataplane-log` 新增索引字段 `trace_id`、`service`、`data_id`（`STRING | INDEXED | STORED`），`append` 内部从 `labels` 提升同名键
+    - 对应设计：共享模型「LogStore 索引版本 v2」；对既有调用方零 API 变更
+  - [ ] 1.2 新增 `IndexedLogFilter` 与 `LogStore::search_indexed`（全条件走倒排、支持 `order=asc/desc`、`limit` 上限 10_000）
+    - 对应需求 6.4 与设计「trace 详情查询」
+  - [ ] 1.3 索引版本文件 `{data_path}/logs/schema_version`，版本不符时新建 `logs-v2/` 并保留旧目录只读，stderr 一行
+    - 对应共享模型表格最后两行
+  - [ ] 1.4 单测：3 个 trace 各 5 条 span + 20 条普通日志，按 `trace_id` 只回 5 条且不截断；v1 目录启动后生成 `logs-v2/`
+- [ ] 2. 前置依赖：sqlite 观测表与聚合指标保留接线
+  - [ ] 2.1 `crates/dataplane-apm` 建表与版本检查：`obs_schema_meta`、`apm_trace_summary`（含 `max_end_ts`）、`apm_edge_summary`、`apm_service_endpoint`
+    - 对应共享模型「sqlite 观测表」与本文 Data Models
+  - [ ] 2.2 启动读到更高 `schema_version` 时以 `config_invalid` 退出
+  - [ ] 2.3 聚合指标保留：接入 `/.monkeycode/specs/dataplane-ts-retention/`，启动时传 `TsRetentionConfig`（`ts_retention_days` 缺省 30、`enforced` 缺省 true）
+    - 对应需求 11.7-11.9 与 15.3；不再回退到「启动打一行 ts retention disabled」的旧方案
+- [ ] 3. 检查点 - 前置依赖单测全绿后再进入接入实现
+  - 确保所有测试通过,如有疑问请询问用户
+- [ ] 4. 数据模型与接入分支
+  - [ ] 4.1 `crates/dataplane-ingest/src/trace.rs`：`TraceSpan`、`SpanEvent`、`SpanLink` DTO 与 JSON 往返测试
+    - 对应需求 2.1-2.4 与共享模型映射表
+  - [ ] 4.2 `DataType::Traces` 与 `apply` 分支：幂等去重、明细映射写 `LogStore`、摘要交 accumulator、端点交 registry、`stream/` 流索引
+    - 对应需求 4.1-4.9
+  - [ ] 4.3 明细映射单测：`level`/`message`/`labels` 逐字段断言，重复 `record_id` 不新增
+  - [ ] 4.4 非法记录：缺 `trace_id`/`span_id`、hex 长度不符、超 256 KiB → `status=partial` 且 `failures` 带 `code`
+- [ ] 5. Agent OTLP receiver
+  - [ ] 5.1 `crates/gse-agent-core/src/collect/otlp.rs`：`tiny_http` worker（默认监听 `0.0.0.0:4318`）、protobuf/JSON 解码、gzip、body 上限、可选 `Authorization: Bearer` 校验、`otlp_allowed_cidrs` 来源限制、空配置时 warn 一行
+    - 对应需求 1.1-1.5；依赖选型见设计 Pitfalls（避免构建期 `protoc`）
+  - [ ] 5.1b 部署形态验证：docker compose（宿主 IP / `host.docker.internal`）与同节点 k8s Pod（`status.hostIP`）两种接入路径各跑通一次
+    - 对应需求 1.3 与设计监听与网络形态表
+  - [ ] 5.2 OTLP → `TraceSpan` 转封：resource 展开、AnyValue 字符串化、`record_id`/`timestamp` 规则、大小写归一
+    - 对应需求 2.1-2.9
+  - [ ] 5.3 采集项类型 `apm_otlp`：`service_allowlist`/`denylist`、`attribute_allowlist`、攒批与 flush、`retention_days`
+    - 对应需求 3.1-3.8
+  - [ ] 5.4 采集项热更新：按 `item_id` 启停 worker，无启用项则不监听端口
+    - 对应需求 3.5-3.6
+  - [ ] 5.5 Agent 配置 `otlp_enabled`、`otlp_listen`（`0.0.0.0:4318`）、`otlp_max_body_bytes`、`otlp_token`、`otlp_allowed_cidrs` 与环境变量覆盖
+    - 对应需求 14.4-14.5
+  - [ ] 5.6 单测：protobuf/JSON/gzip/超限/非法体、过滤名单、映射表逐行、worker 启停
+- [ ] 6. 检查点 - 确保所有测试通过
+  - 确保所有测试通过,如有疑问请询问用户
+- [ ] 7. dataserver 摘要、端点与配对
+  - [ ] 7.1 `TraceSummaryAccumulator`：容量上限、按 `max_end_ts` 淘汰、每秒/500 项 flush、`ON CONFLICT` 合并、`services_json` 读改写、崩溃取舍
+    - 对应需求 4.3-4.5 与设计「TraceSummaryAccumulator」
+  - [ ] 7.2 冷启动回载 5 分钟内 trace；6 分钟前不回载
+  - [ ] 7.3 `EndpointRegistry`：upsert、`lookup_by_ip_port`/`lookup_by_pod`、60 秒缓存、30 天清理
+    - 对应需求 4.6 与共享模型「服务标识与反查」
+  - [ ] 7.4 span 配对与 `apm_edge_summary`：client→server 配对、反向补齐、`unknown:*` 兜底与端点归一
+    - 对应需求 8.1-8.6
+  - [ ] 7.5 单测：乱序 12 条 span 的摘要断言、根 span 取 `start_ts` 最小者、error 单调、配对三场景
+  - [ ] 7.6 静态服务名映射：`apm_service_alias` CRUD API（`/v1/apm/service-aliases`）、校验、缓存失效版本号、反查优先级（alias → endpoint → `unknown-<ip>`）
+    - 对应需求 17.1-17.7、17.11 与共享模型「服务名映射（alias）」
+- [ ] 8. dataserver 聚合任务
+  - [ ] 8.1 `ApmAggregator`：60 秒周期、桶对齐、服务维度与 span 维度、nearest-rank 分位数、空桶不写零值
+    - 对应需求 7.1-7.9
+  - [ ] 8.2 边指标聚合：`apm_edge_requests_total`/`errors`/`duration_micros`，label 与 `source=otlp`
+    - 对应需求 8.3-8.4 与共享模型命名表
+  - [ ] 8.3 失败处理与自监控计数：单轮失败 stderr 一行、不回填、计数 +1
+    - 对应需求 7.8 与 16.2
+  - [ ] 8.4 单测：5 个 `field_name` 点、label 集合、单位量级、同桶重跑结果一致
+- [ ] 9. dataserver 查询接口与清理
+  - [ ] 9.1 `POST /v1/traces/search`：过滤、`sort`/`order`、`limit`/`offset`、`total`、默认 1 小时、`from_ts > to_ts` → 400
+    - 对应需求 5.1-5.8
+  - [ ] 9.2 `GET /v1/traces/{trace_id}`：`summary` + `spans`、升序、`partial` 与 `reason`
+    - 对应需求 6.1-6.8
+  - [ ] 9.3 `POST /v1/edges/search`：`source` 过滤与跨源合并；`GET /v1/apm/services`
+    - 对应需求 12.2-12.3
+  - [ ] 9.4 保留期清理：LogStore 循环删、摘要与边摘要按 `start_ts`/`bucket_start` 删、端点 30 天、`retain/` 机制
+    - 对应需求 11.1-11.8
+  - [ ] 9.5 写入保护：`apm_ingest_max_batches_per_sec` 限流 429 + `unavailable`、`apm_min_duration_micros_for_detail` 只跳明细
+    - 对应需求 10.2-10.7
+  - [ ] 9.6 `apm_enabled`/`apm_agg_interval_secs`/保留期与限流配置项 + `DATASERVER_` 环境变量
+    - 对应需求 14.1-14.3
+  - [ ] 9.7 httptest：列表分页排序、详情 400/404、限流 429、开关关闭返回 `unavailable`、清理三类数据
+- [ ] 10. 检查点 - 确保所有测试通过
+  - 确保所有测试通过,如有疑问请询问用户
+- [ ] 11. dpc 子命令
+  - [ ] 11.1 `traces`、`trace <trace_id>`、`edges` 三个只读子命令，stdout 打印 JSON
+    - 对应需求 12.7
+  - [ ] 11.2 CLI 参数解析与错误码透传单测
+- [ ] 12. 前端 `@vectorman/dataplane`
+  - [ ] 12.1 `src/features/apm/` 客户端：trace 列表、详情、边、服务清单封装，复用既有 HttpClient
+  - [ ] 12.2 `/traces` 列表页：过滤、排序切换、分页、空态、行点击进详情
+    - 对应需求 13.3、13.12、13.13
+  - [ ] 12.3 `/traces/:trace_id` 详情页：`parent_span_id` 构树、纳秒对齐瀑布图、错误 span 高亮、span 详情抽屉、`partial` 提示
+    - 对应需求 13.4-13.5、13.11
+  - [ ] 12.4 `/topology` 拓扑页：`sum by (src_service,dst_service)` 查询、`source` 切换、确定性分层 SVG 布局、点击边跳列表
+    - 对应需求 13.6-13.7
+  - [ ] 12.5 `/apm` 指标页：服务与操作选择、QPS/错误率/P50/P95/P99、「查看 trace」跳转
+    - 对应需求 13.8-13.9
+  - [ ] 12.6 日志页 `trace_id` 跳转与无摘要提示；详情页「查看该服务日志」反向跳转
+    - 对应需求 9.1-9.6、13.10
+  - [ ] 12.6b 图表改用 `echarts`（薄封装：一个 React 组件包 `useEffect` + `setOption`）：指标页 line series、拓扑页 `graph` + `layout: 'none'`、瀑布图 custom series；布局计算抽成 `src/features/apm/layout.ts` 纯函数
+    - 对应设计前端实现约束；后端不加任何 echarts 相关逻辑
+  - [ ] 12.7 路由与导航接入既有 SPA；vitest 断言参数拼装、构树比例、`source` 切换表达式、跳转 URL
+  - [ ] 12.8 `/settings/service-aliases` 页：列表（启用开关/编辑/删除）、新建表单、批量导入（显示新增与覆盖条数）
+    - 对应需求 17.8-17.10
+  - [ ] 12.9 `/topology` 页的「为该节点建立映射」快捷入口（预填 `cidr` 或 `pod_prefix`）
+    - 对应需求 17.10
+- [ ] 13. 集成验证
+  - [ ] 13.1 起 gse-server + dataserver + agent + OTLP 桩应用，断言列表可见、详情条数一致、Prom 可查 `apm_service_requests_total`
+  - [ ] 13.2 混合场景：otlp 与 ebpf 桩同时写边指标，`sum by (src_service,dst_service)` 等于两者之和
+  - [ ] 13.3 回改 `.monkeycode/specs/gse-dataplane-ingest/design.md` 的交叉引用与 `trace_id` 过滤描述准确性
