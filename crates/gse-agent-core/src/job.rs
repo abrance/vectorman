@@ -323,25 +323,49 @@ async fn read_capped<R: AsyncRead + Unpin>(mut r: R, limit: usize) -> (String, b
 }
 
 fn write_script(cfg: &JobConfig, exec: &JobExec) -> std::io::Result<PathBuf> {
-    let base = cfg
-        .work_dir
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let dir = base.join("gse-jobs");
-    std::fs::create_dir_all(&dir)?;
+    let dir = script_dir(cfg)?;
     let ext = match exec.interpreter.as_str() {
         "python3" | "python" => "py",
         _ => "sh",
     };
     let path = dir.join(format!("{}.{}", sanitize(&exec.job_id), ext));
-    std::fs::write(&path, &exec.script)?;
+    // 错误里带上路径：目录不可写时的“Permission denied”本身看不出是哪个目录。
+    std::fs::write(&path, &exec.script)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("write {}: {e}", path.display())))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| std::io::Error::new(e.kind(), format!("chmod {}: {e}", path.display())))?;
     }
     Ok(path)
+}
+
+/// 作业脚本落地目录：`<work_dir 或系统临时目录>/gse-jobs-<uid>`。
+///
+/// 目录名必须带 uid：多用户主机上共享的 `gse-jobs` 一旦被其他用户（例如有人以
+/// root 跑过一次作业或测试）创建为不可写，本用户的所有作业都会以
+/// `Permission denied (os error 13)` 失败，而错误信息看不出是目录被占。
+fn script_dir(cfg: &JobConfig) -> std::io::Result<PathBuf> {
+    let base = cfg
+        .work_dir
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join(format!("gse-jobs-{}", current_uid()));
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    // SAFETY: `geteuid` 无参数、无副作用且线程安全。
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> u32 {
+    0
 }
 
 fn sanitize(job_id: &str) -> String {
@@ -448,12 +472,43 @@ mod tests {
         let e = exec("true", 30);
         let result = run_job(&cfg(&dir), e).await;
         assert_eq!(result.status, JobStatus::Succeeded);
-        let jobs_dir = dir.join("gse-jobs");
+        let jobs_dir = script_dir(&cfg(&dir)).unwrap();
         let remaining: Vec<_> = std::fs::read_dir(&jobs_dir)
             .unwrap()
             .filter_map(|r| r.ok())
             .collect();
         assert!(remaining.is_empty(), "temp script should be cleaned up");
+    }
+
+    #[test]
+    fn script_dir_is_per_user() {
+        let dir = temp_dir("peruser");
+        let jobs_dir = script_dir(&cfg(&dir)).unwrap();
+        let name = jobs_dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name, format!("gse-jobs-{}", current_uid()));
+        assert!(jobs_dir.is_dir());
+    }
+
+    /// 目录不可写时，错误信息必须包含目录路径，否则现场只能看到裸的
+    /// `Permission denied (os error 13)`，无法判断是哪个目录被占。
+    #[cfg(unix)]
+    #[test]
+    fn write_error_mentions_path() {
+        if current_uid() == 0 {
+            // root 绕过目录权限，无法构造该场景。
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("denied");
+        let jobs_dir = script_dir(&cfg(&dir)).unwrap();
+        std::fs::set_permissions(&jobs_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let err = write_script(&cfg(&dir), &exec("true", 30)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains(&jobs_dir.display().to_string()),
+            "error should mention the directory: {err}"
+        );
+        std::fs::set_permissions(&jobs_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[tokio::test]
