@@ -2,6 +2,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use dataplane_core::ErrorCode;
+use serde_json::json;
 
 #[derive(Parser)]
 #[command(
@@ -66,6 +67,32 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// 时序存储运行状态（保留窗口、基数、内存、WAL）
+    Ts {
+        #[command(subcommand)]
+        cmd: TsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum TsCommand {
+    /// 查询 `GET /v1/ts/stats`
+    Stats,
+    /// 按序列选择删除历史点，`POST /v1/ts/delete`
+    Delete {
+        /// 指标名（measurement）；省略表示不限
+        #[arg(long)]
+        metric: Option<String>,
+        /// label matcher，形如 `k=v`，可重复；`!=` 表示不等
+        #[arg(long = "matcher", value_name = "K=V")]
+        matchers: Vec<String>,
+        /// 时间范围起点（Unix 微秒，含）
+        #[arg(long)]
+        from_ts: i64,
+        /// 时间范围终点（Unix 微秒，不含）
+        #[arg(long)]
+        to_ts: i64,
+    },
 }
 
 #[derive(Debug)]
@@ -116,7 +143,56 @@ fn run(cli: &Cli) -> Result<(), DpcError> {
                 *limit,
             ),
         ),
+        Command::Ts { cmd } => match cmd {
+            TsCommand::Stats => cmd_ts_stats(&cli.sql_url),
+            TsCommand::Delete {
+                metric,
+                matchers,
+                from_ts,
+                to_ts,
+            } => cmd_ts_delete(
+                &cli.sql_url,
+                ts_delete_body(metric.as_deref(), matchers, *from_ts, *to_ts),
+            ),
+        },
     }
+}
+
+/// 拼 `/v1/ts/delete` 请求体。matcher 支持 `k=v` 与 `k!=v`。
+fn ts_delete_body(
+    metric: Option<&str>,
+    matchers: &[String],
+    from_ts: i64,
+    to_ts: i64,
+) -> Result<serde_json::Value, DpcError> {
+    let mut list = Vec::new();
+    for raw in matchers {
+        let (name, op, value) = if let Some((k, v)) = raw.split_once("!=") {
+            (k, "not_equal", v)
+        } else if let Some((k, v)) = raw.split_once('=') {
+            (k, "equal", v)
+        } else {
+            return Err(DpcError {
+                url: String::new(),
+                reason: format!("matcher must be K=V or K!=V: {raw}"),
+            });
+        };
+        if name.is_empty() || value.is_empty() {
+            return Err(DpcError {
+                url: String::new(),
+                reason: format!("matcher name/value must not be empty: {raw}"),
+            });
+        }
+        list.push(json!({ "name": name, "op": op, "value": value }));
+    }
+    let mut body = serde_json::Map::new();
+    if let Some(m) = metric {
+        body.insert("measurement".into(), m.into());
+    }
+    body.insert("matchers".into(), serde_json::Value::Array(list));
+    body.insert("from_ts".into(), from_ts.into());
+    body.insert("to_ts".into(), to_ts.into());
+    Ok(serde_json::Value::Object(body))
 }
 
 /// 过滤条件拼成 `/v1/logs/search` 请求体；未提供的字段不下发。
@@ -161,6 +237,38 @@ fn logs_body(
 
 fn cmd_logs(base: &str, body: serde_json::Value) -> Result<(), DpcError> {
     let url = format!("{base}/v1/logs/search");
+    let resp = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+        .map_err(|e| DpcError {
+            url: url.clone(),
+            reason: ureq_err_str(e),
+        })?;
+    let text = resp.into_string().map_err(|e| DpcError {
+        url,
+        reason: format!("read body: {e}"),
+    })?;
+    println!("{text}");
+    Ok(())
+}
+
+fn cmd_ts_stats(base: &str) -> Result<(), DpcError> {
+    let url = format!("{base}/v1/ts/stats");
+    let resp = ureq::get(&url).call().map_err(|e| DpcError {
+        url: url.clone(),
+        reason: ureq_err_str(e),
+    })?;
+    let text = resp.into_string().map_err(|e| DpcError {
+        url,
+        reason: format!("read body: {e}"),
+    })?;
+    println!("{text}");
+    Ok(())
+}
+
+fn cmd_ts_delete(base: &str, body: Result<serde_json::Value, DpcError>) -> Result<(), DpcError> {
+    let body = body?;
+    let url = format!("{base}/v1/ts/delete");
     let resp = ureq::post(&url)
         .set("Content-Type", "application/json")
         .send_string(&body.to_string())
@@ -274,7 +382,7 @@ fn ureq_err_str(e: ureq::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::logs_body;
+    use super::{logs_body, ts_delete_body};
     use serde_json::json;
 
     #[test]
@@ -296,5 +404,29 @@ mod tests {
             ),
             json!({"data_type": "logs", "agent_id": "agent-1", "message_query": "error", "limit": 50})
         );
+    }
+
+    #[test]
+    fn ts_delete_body_maps_matchers() {
+        assert_eq!(
+            ts_delete_body(
+                Some("apm_service_requests_total"),
+                &["service=order-api".to_string(), "agent_id!=a1".to_string()],
+                0,
+                100,
+            )
+            .unwrap(),
+            json!({
+                "measurement": "apm_service_requests_total",
+                "matchers": [
+                    {"name": "service", "op": "equal", "value": "order-api"},
+                    {"name": "agent_id", "op": "not_equal", "value": "a1"}
+                ],
+                "from_ts": 0,
+                "to_ts": 100
+            })
+        );
+        assert!(ts_delete_body(None, &["oops".to_string()], 0, 1).is_err());
+        assert!(ts_delete_body(None, &["=v".to_string()], 0, 1).is_err());
     }
 }

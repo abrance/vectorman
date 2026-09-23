@@ -17,7 +17,7 @@ use dataplane_ingest::{apply, search, DataEnvelope, LogSearchQuery, StreamIndex}
 use dataplane_kv::KvStore;
 use dataplane_log::LogStore;
 use dataplane_sql::RelationalStore;
-use dataplane_ts::{PromResult, PromResultType, TimeSeriesStore, TsPoint};
+use dataplane_ts::{PromResult, PromResultType, TimeSeriesStore, TsPoint, TsSeriesSelection};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tower_http::services::{ServeDir, ServeFile};
@@ -501,6 +501,36 @@ async fn agents_list(State(state): State<AppState>, uri: Uri) -> Response {
     forward_gse(&state, "GET", "/api/gse/agents", uri.query(), b"").await
 }
 
+async fn ts_delete(
+    State(state): State<AppState>,
+    body: Result<Json<TsSeriesSelection>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let selection = match body {
+        Ok(b) => b.0,
+        Err(_) => {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                DataplaneError::invalid_argument("invalid JSON body"),
+            )
+        }
+    };
+    match state.ts.delete_series(selection).await {
+        Ok(report) => Json(json!({
+            "matched_series": report.matched_series,
+            "tombstones_applied": report.tombstones_applied,
+        }))
+        .into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+async fn ts_stats(State(state): State<AppState>) -> Response {
+    match state.ts.storage_stats().await {
+        Ok(stats) => Json(stats).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
 fn api_routes(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -508,6 +538,8 @@ fn api_routes(state: AppState) -> Router {
         .route("/v1/ingest", post(ingest))
         .route("/v1/logs/search", post(logs_search))
         .route("/v1/streams", get(streams))
+        .route("/v1/ts/delete", post(ts_delete))
+        .route("/v1/ts/stats", get(ts_stats))
         .route("/api/v1/query", get(prom_query))
         .route("/api/v1/query_range", get(prom_query_range))
         .route("/v1/collect-items", get(collect_list).post(collect_create))
@@ -589,7 +621,7 @@ mod tests {
     use dataplane_kv::RedbKvStore;
     use dataplane_log::TantivyLogStore;
     use dataplane_sql::SqliteRelationalStore;
-    use dataplane_ts::TsinkTimeSeriesStore;
+    use dataplane_ts::{TsRetentionConfig, TsinkTimeSeriesStore};
     use http_body_util::BodyExt;
     use serde_json::json;
     use tower::ServiceExt;
@@ -613,7 +645,17 @@ mod tests {
         let kv: Arc<dyn KvStore> = Arc::new(RedbKvStore::new(&paths.kv).unwrap());
         let sql: Arc<dyn RelationalStore> =
             Arc::new(SqliteRelationalStore::new(&paths.sql).unwrap());
-        let ts: Arc<dyn TimeSeriesStore> = Arc::new(TsinkTimeSeriesStore::new(&paths.ts).unwrap());
+        // 测试用固定历史时间戳，关闭保留执行。
+        let ts: Arc<dyn TimeSeriesStore> = Arc::new(
+            TsinkTimeSeriesStore::new(
+                &paths.ts,
+                TsRetentionConfig {
+                    enforced: false,
+                    ..TsRetentionConfig::default()
+                },
+            )
+            .unwrap(),
+        );
         let log: Arc<dyn LogStore> = Arc::new(TantivyLogStore::new(&paths.logs).unwrap());
         TestEnv {
             state: AppState {
@@ -979,5 +1021,79 @@ mod tests {
             }),
             "{result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn ts_stats_and_delete_endpoints() {
+        let env = test_env(None);
+        let app = sql_router(env.state.clone(), None);
+
+        let (st, body) = send(&app, req("GET", "/v1/ts/stats", None)).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(v.get("retention_days").is_some(), "{body}");
+        assert!(v.get("retention_enforced").is_some(), "{body}");
+        assert!(v.get("sampled_at_ts").is_some(), "{body}");
+
+        // 时间范围非法 → 400 + invalid_argument
+        let (st, body) = send(
+            &app,
+            req(
+                "POST",
+                "/v1/ts/delete",
+                Some(r#"{"measurement":"m","matchers":[],"from_ts":10,"to_ts":10}"#),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("invalid_argument"), "{body}");
+
+        // 有效删除：按 item_id 删掉 [0, now) 的点
+        let now = now_micros();
+        let mut tags = std::collections::BTreeMap::new();
+        tags.insert("item_id".to_string(), "item-ts".to_string());
+        for timestamp in [now - 2 * 60 * 1_000_000, now - 60 * 1_000_000] {
+            env.state
+                .ts
+                .write(dataplane_ts::TsPoint {
+                    measurement: "ts_delete_probe".to_string(),
+                    tags: tags.clone(),
+                    field_name: "value".to_string(),
+                    field_value: 1.0,
+                    timestamp,
+                })
+                .await
+                .unwrap();
+        }
+        let (st, body) = send(
+            &app,
+            req(
+                "POST",
+                "/v1/ts/delete",
+                Some(&format!(
+                    r#"{{"measurement":"ts_delete_probe","matchers":[{{"name":"item_id","op":"equal","value":"item-ts"}}],"from_ts":0,"to_ts":{now}}}"#
+                )),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(v["matched_series"].as_u64().unwrap() >= 1, "{body}");
+        assert!(v["tombstones_applied"].as_u64().unwrap() >= 1, "{body}");
+
+        let after = env
+            .state
+            .ts
+            .query_instant("ts_delete_probe", Some(now - 30 * 1_000_000))
+            .await
+            .unwrap();
+        assert!(
+            after.result.iter().all(|s| s.value.is_none()),
+            "删除后不应再查到被删时间范围内的点"
+        );
+
+        // 非法 JSON body → 400
+        let (st, _) = send(&app, req("POST", "/v1/ts/delete", Some("not-json"))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
     }
 }

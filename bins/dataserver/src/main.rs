@@ -8,8 +8,8 @@ use dataplane_file::{DirFileStore, FileStore};
 use dataplane_kv::{KvStore, RedbKvStore};
 use dataplane_log::{LogStore, TantivyLogStore};
 use dataplane_sql::{RelationalStore, SqliteRelationalStore};
-use dataplane_ts::{TimeSeriesStore, TsinkTimeSeriesStore};
-use dataserver::cleanup::{now_micros, run_cleanup};
+use dataplane_ts::{TimeSeriesStore, TsRetentionConfig, TsinkTimeSeriesStore};
+use dataserver::cleanup::{now_micros, run_cleanup, TsCleanTracker};
 use dataserver::http::{prom_router, sql_router, AppState, LocalTsSink};
 use vectorman_metrics::SelfMetrics;
 
@@ -71,7 +71,14 @@ async fn main() -> ExitCode {
         Ok(s) => Arc::new(s),
         Err(e) => return exit_with("engine sql init failed", e),
     };
-    let ts: Arc<dyn TimeSeriesStore> = match TsinkTimeSeriesStore::new(&paths.ts) {
+    let ts_retention = TsRetentionConfig {
+        retention_days: cfg.ts_retention_days,
+        enforced: cfg.ts_retention_enforced,
+        cardinality_limit: cfg.ts_cardinality_limit,
+        memory_limit_bytes: cfg.ts_memory_limit_bytes,
+        wal_size_limit_bytes: cfg.ts_wal_size_limit_bytes,
+    };
+    let ts: Arc<dyn TimeSeriesStore> = match TsinkTimeSeriesStore::new(&paths.ts, ts_retention) {
         Ok(s) => Arc::new(s),
         Err(e) => return exit_with("engine ts init failed", e),
     };
@@ -113,19 +120,45 @@ async fn main() -> ExitCode {
     let metrics_app = metrics.clone().metrics_router();
 
     let cleanup_state = state.clone();
+    let cleanup_metrics = metrics.clone();
+    let global_ts_days = cfg.ts_retention_days;
+    let clean_interval = cfg.ts_clean_interval_secs.max(60);
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(3600));
+        let mut ticker = tokio::time::interval(Duration::from_secs(clean_interval));
+        let mut ts_tracker = TsCleanTracker::default();
         loop {
             ticker.tick().await;
-            if let Err(e) = run_cleanup(
+            match run_cleanup(
                 cleanup_state.log.as_ref(),
+                cleanup_state.ts.as_ref(),
                 cleanup_state.kv.as_ref(),
                 cleanup_state.gse_admin_url.as_deref(),
+                global_ts_days,
                 now_micros(),
+                &mut ts_tracker,
             )
             .await
             {
-                eprintln!("retention cleanup: {}: {}", e.code.as_str(), e.message);
+                Ok(report) => {
+                    cleanup_metrics.inc_counter("dataserver_ts_clean_runs_total", 1.0);
+                    if report.ts.tombstones_applied > 0 {
+                        cleanup_metrics.inc_counter(
+                            "dataserver_ts_tombstones_applied_total",
+                            report.ts.tombstones_applied as f64,
+                        );
+                    }
+                    println!(
+                        "retention cleanup: log_deleted={} ts_items={} ts_matched_series={} ts_tombstones={}",
+                        report.log_deleted,
+                        report.ts.items,
+                        report.ts.matched_series,
+                        report.ts.tombstones_applied
+                    );
+                }
+                Err(e) => {
+                    cleanup_metrics.inc_counter("dataserver_ts_clean_errors_total", 1.0);
+                    eprintln!("retention cleanup: {}: {}", e.code.as_str(), e.message);
+                }
             }
         }
     });
@@ -138,6 +171,34 @@ async fn main() -> ExitCode {
         let interval = Duration::from_secs(cfg.self_metrics_interval_secs);
         tokio::spawn(async move {
             vectorman_metrics::flush_loop(flush_metrics, sink, interval).await;
+        });
+
+        // 时序存储状态采样：`list_metrics` 昂贵，因此跟着自监控周期跑，不进写入路径。
+        let stats_state = state.clone();
+        let stats_metrics = metrics.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                let Ok(stats) = stats_state.ts.storage_stats().await else {
+                    continue;
+                };
+                stats_metrics.set_gauge("dataserver_ts_series_count", stats.series_count as f64);
+                stats_metrics.set_gauge(
+                    "dataserver_ts_memory_used_bytes",
+                    stats.memory_used_bytes as f64,
+                );
+                stats_metrics.set_gauge(
+                    "dataserver_ts_memory_budget_bytes",
+                    stats.memory_budget_bytes as f64,
+                );
+                stats_metrics
+                    .set_gauge("dataserver_ts_wal_size_bytes", stats.wal_size_bytes as f64);
+                stats_metrics.set_gauge(
+                    "dataserver_ts_degraded",
+                    if stats.degraded { 1.0 } else { 0.0 },
+                );
+            }
         });
     }
 
@@ -164,8 +225,12 @@ async fn main() -> ExitCode {
     };
 
     println!(
-        "sql_http={} prom_http={} metrics_http={}",
-        cfg.sql_http.listen, cfg.prom_http.listen, cfg.metrics_http.listen
+        "sql_http={} prom_http={} metrics_http={} ts_retention_days={} ts_retention_enforced={}",
+        cfg.sql_http.listen,
+        cfg.prom_http.listen,
+        cfg.metrics_http.listen,
+        cfg.ts_retention_days,
+        cfg.ts_retention_enforced
     );
 
     let sql_fut = axum::serve(sql_listener, sql_app);

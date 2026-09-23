@@ -1,4 +1,9 @@
-//! 保存周期清理：live 采集项按 retention_days 删旧日志；已删项读 retain/ 到期后删除。
+//! 保存周期清理：live 采集项按 retention_days 删旧日志与旧聚合指标；已删项读
+//! `retain/` 到期后删除。
+//!
+//! 顺序要求：同一个清理周期内必须先跑 [`apply_ts_retention`]（读取 `retain/` 但不删
+//! 键），再跑 [`apply_retention`]（删日志并在最后删除 `retain/` 键）。反过来会让
+//! 时序侧永远看不到已删项的到期时间。
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -6,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use dataplane_core::{DataplaneError, ErrorCode};
 use dataplane_kv::KvStore;
 use dataplane_log::{LogFilter, LogStore};
+use dataplane_ts::{TimeSeriesStore, TsMatcher, TsMatcherOp, TsSeriesSelection};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -178,17 +184,157 @@ fn data_id_filter(item_id: &str, to_ts: Option<i64>) -> LogFilter {
     }
 }
 
-/// 按 live 列表与 `retain/` 前缀删除到期日志。
+/// 时序聚合指标清理结果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[must_use]
+pub struct TsCleanReport {
+    /// 实际执行删除的采集项数。
+    pub items: u64,
+    pub matched_series: u64,
+    pub tombstones_applied: u64,
+}
+
+/// 一次清理周期的汇总。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[must_use]
+pub struct CleanupReport {
+    pub log_deleted: u64,
+    pub ts: TsCleanReport,
+}
+
+/// 连续零命中多少轮后提示一次。
+const ZERO_HIT_WARN_ROUNDS: u32 = 3;
+
+/// 记录每个采集项的“连续零命中”轮数，用于提示 matcher 写错。
+///
+/// 由常驻清理循环持有并跨轮传递；进程重启后归零，不影响正确性。
+#[derive(Debug, Default)]
+pub struct TsCleanTracker {
+    zero_hits: BTreeMap<String, u32>,
+}
+
+impl TsCleanTracker {
+    /// 记录一轮结果；连续 [`ZERO_HIT_WARN_ROUNDS`] 轮零命中时返回 `true`。
+    fn observe(&mut self, item_id: &str, matched_series: u64) -> bool {
+        if matched_series > 0 {
+            self.zero_hits.remove(item_id);
+            return false;
+        }
+        let rounds = self.zero_hits.entry(item_id.to_string()).or_insert(0);
+        *rounds += 1;
+        *rounds == ZERO_HIT_WARN_ROUNDS
+    }
+}
+
+/// 按采集项保留期删除时序聚合点。
+///
+/// tsink 的保留窗口是全局的（见 `ts_retention_enforced`），因此这里只处理两类
+/// 全局窗口盖不住的情况：
+///
+/// 1. 采集项自己的 `retention_days` 比全局窗口短；
+/// 2. 已删除的采集项（`retain/{item_id}`）已到 `until_micros`。
+///
+/// **不删除 `retain/` 键**：键的删除由 [`apply_retention`] 在日志清理后统一完成，
+/// 否则下一轮就看不到已删项的到期时间。
+///
+/// 单个采集项删除失败不阻断其余项：错误直接返回给调用方，已完成的部分保留
+/// （删除是幂等的，下一轮继续）。
+pub async fn apply_ts_retention(
+    ts: &dyn TimeSeriesStore,
+    kv: &dyn KvStore,
+    live: &[LiveItem],
+    global_days: u32,
+    now_micros: i64,
+    tracker: &mut TsCleanTracker,
+) -> Result<TsCleanReport, DataplaneError> {
+    let mut report = TsCleanReport::default();
+    let global_days = global_days.max(1);
+
+    for item in live {
+        let days = clamp_retention_days(item.retention_days);
+        // 全局窗口已经覆盖的采集项：无需单独写墓矴。
+        if days >= global_days {
+            continue;
+        }
+        let cutoff = now_micros.saturating_sub(i64::from(days) * MICROS_PER_DAY);
+        if cutoff <= 0 {
+            continue;
+        }
+        let started = std::time::Instant::now();
+        let r = ts
+            .delete_series(item_selection(&item.item_id, cutoff))
+            .await?;
+        report.items += 1;
+        report.matched_series += r.matched_series;
+        report.tombstones_applied += r.tombstones_applied;
+        println!(
+            "ts retention: item_id={} retention_days={} matched_series={} tombstones_applied={} elapsed_ms={}",
+            item.item_id,
+            days,
+            r.matched_series,
+            r.tombstones_applied,
+            started.elapsed().as_millis()
+        );
+        if tracker.observe(&item.item_id, r.matched_series) {
+            eprintln!(
+                "ts retention: item_id={} matched 0 series for {} rounds; check the item_id label or retention config",
+                item.item_id, ZERO_HIT_WARN_ROUNDS
+            );
+        }
+    }
+
+    let rows = kv.scan_prefix(RETAIN_PREFIX).await?;
+    for (key, value) in rows {
+        let key_s = String::from_utf8_lossy(&key);
+        let Some(item_id) = key_s.strip_prefix("retain/") else {
+            continue;
+        };
+        if item_id.is_empty() {
+            continue;
+        }
+        let Ok(meta) = serde_json::from_slice::<RetainValue>(&value) else {
+            continue;
+        };
+        if now_micros < meta.until_micros || meta.until_micros <= 0 {
+            continue;
+        }
+        let r = ts
+            .delete_series(item_selection(item_id, meta.until_micros))
+            .await?;
+        report.items += 1;
+        report.matched_series += r.matched_series;
+        report.tombstones_applied += r.tombstones_applied;
+    }
+    Ok(report)
+}
+
+/// 按 `item_id` matcher 选一个采集项的 `[0, to_ts)`。
+fn item_selection(item_id: &str, to_ts: i64) -> TsSeriesSelection {
+    TsSeriesSelection {
+        measurement: None,
+        matchers: vec![TsMatcher {
+            name: "item_id".to_string(),
+            op: TsMatcherOp::Equal,
+            value: item_id.to_string(),
+        }],
+        from_ts: 0,
+        to_ts,
+    }
+}
+
+/// 按 live 列表与 `retain/` 前缀删除到期日志，返回删除条数。
 pub async fn apply_retention(
     log: &dyn LogStore,
     kv: &dyn KvStore,
     live: &[LiveItem],
     now_micros: i64,
-) -> Result<(), DataplaneError> {
+) -> Result<u64, DataplaneError> {
+    let mut deleted = 0u64;
     for item in live {
         let days = clamp_retention_days(item.retention_days) as i64;
         let cutoff = now_micros.saturating_sub(days * MICROS_PER_DAY);
-        log.delete_matching(data_id_filter(&item.item_id, Some(cutoff)))
+        deleted += log
+            .delete_matching(data_id_filter(&item.item_id, Some(cutoff)))
             .await?;
     }
 
@@ -207,19 +353,22 @@ pub async fn apply_retention(
         if now_micros < meta.until_micros {
             continue;
         }
-        log.delete_matching(data_id_filter(item_id, None)).await?;
+        deleted += log.delete_matching(data_id_filter(item_id, None)).await?;
         kv.delete(&key).await?;
     }
-    Ok(())
+    Ok(deleted)
 }
 
 /// 拉 live 列表（若已配 GSE）并执行清理。
 pub async fn run_cleanup(
     log: &dyn LogStore,
+    ts: &dyn TimeSeriesStore,
     kv: &dyn KvStore,
     gse_admin_url: Option<&str>,
+    global_ts_days: u32,
     now_micros: i64,
-) -> Result<(), DataplaneError> {
+    tracker: &mut TsCleanTracker,
+) -> Result<CleanupReport, DataplaneError> {
     let live = match gse_admin_url {
         Some(url) => match fetch_live_items(url).await {
             Ok(items) => items,
@@ -234,5 +383,177 @@ pub async fn run_cleanup(
         },
         None => Vec::new(),
     };
-    apply_retention(log, kv, &live, now_micros).await
+    // 时序先于日志：`apply_retention` 会删除 `retain/` 键。
+    let ts_report = apply_ts_retention(ts, kv, &live, global_ts_days, now_micros, tracker).await?;
+    let log_deleted = apply_retention(log, kv, &live, now_micros).await?;
+    Ok(CleanupReport {
+        log_deleted,
+        ts: ts_report,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dataplane_ts::{TimeSeriesStore, TsPoint, TsRetentionConfig, TsinkTimeSeriesStore};
+
+    fn store(dir: &std::path::Path) -> TsinkTimeSeriesStore {
+        TsinkTimeSeriesStore::new(
+            dir.join("ts"),
+            TsRetentionConfig {
+                enforced: false,
+                ..TsRetentionConfig::default()
+            },
+        )
+        .unwrap()
+    }
+
+    async fn instant(ts: &dyn TimeSeriesStore, ts_micros: i64) -> usize {
+        ts.query_instant("m", Some(ts_micros))
+            .await
+            .unwrap()
+            .result
+            .into_iter()
+            .filter(|s| s.value.is_some())
+            .count()
+    }
+
+    #[tokio::test]
+    async fn shorter_item_window_is_deleted_global_window_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = store(dir.path());
+        let kv = dataplane_kv::RedbKvStore::new(dir.path().join("kv.redb")).unwrap();
+        let now = now_micros();
+
+        let mut tags = BTreeMap::new();
+        tags.insert("item_id".to_string(), "item-short".to_string());
+        ts.write(TsPoint {
+            measurement: "m".to_string(),
+            tags: tags.clone(),
+            field_name: "value".to_string(),
+            field_value: 1.0,
+            timestamp: now - 2 * MICROS_PER_DAY,
+        })
+        .await
+        .unwrap();
+        ts.write(TsPoint {
+            measurement: "m".to_string(),
+            tags: tags.clone(),
+            field_name: "value".to_string(),
+            field_value: 2.0,
+            timestamp: now - 60_000_000,
+        })
+        .await
+        .unwrap();
+        let mut long_tags = BTreeMap::new();
+        long_tags.insert("item_id".to_string(), "item-long".to_string());
+        ts.write(TsPoint {
+            measurement: "m".to_string(),
+            tags: long_tags,
+            field_name: "value".to_string(),
+            field_value: 3.0,
+            timestamp: now - 2 * MICROS_PER_DAY,
+        })
+        .await
+        .unwrap();
+
+        let live = vec![
+            LiveItem {
+                item_id: "item-short".to_string(),
+                retention_days: 1,
+            },
+            LiveItem {
+                item_id: "item-long".to_string(),
+                retention_days: 30,
+            },
+        ];
+        let report = apply_ts_retention(&ts, &kv, &live, 30, now, &mut TsCleanTracker::default())
+            .await
+            .unwrap();
+        assert_eq!(report.items, 1, "只有短保留期的采集项参与删除");
+        assert!(report.tombstones_applied >= 1);
+
+        assert_eq!(
+            instant(&ts, now - 2 * MICROS_PER_DAY).await,
+            1,
+            "长保留期的旧点应保留（只剩 item-long 那条）"
+        );
+        assert!(
+            ts.query_instant("m{item_id=\"item-short\"}", Some(now - 2 * MICROS_PER_DAY))
+                .await
+                .unwrap()
+                .result
+                .is_empty(),
+            "短保留期的旧点应被删除"
+        );
+        assert_eq!(
+            instant(&ts, now - 60_000_000).await,
+            1,
+            "窗口内的新点应保留"
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_deleted_item_is_cleaned_without_removing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = store(dir.path());
+        let kv = dataplane_kv::RedbKvStore::new(dir.path().join("kv.redb")).unwrap();
+        let now = now_micros();
+        let mut tags = BTreeMap::new();
+        tags.insert("item_id".to_string(), "item-gone".to_string());
+        ts.write(TsPoint {
+            measurement: "m".to_string(),
+            tags,
+            field_name: "value".to_string(),
+            field_value: 1.0,
+            timestamp: now - 10 * MICROS_PER_DAY,
+        })
+        .await
+        .unwrap();
+        let until = now - MICROS_PER_DAY;
+        kv.set(
+            retain_key("item-gone").as_bytes(),
+            format!("{{\"until_micros\":{until}}}").as_bytes(),
+        )
+        .await
+        .unwrap();
+
+        let report = apply_ts_retention(&ts, &kv, &[], 30, now, &mut TsCleanTracker::default())
+            .await
+            .unwrap();
+        assert_eq!(report.items, 1);
+        assert!(report.tombstones_applied >= 1);
+        assert!(
+            !kv.get(retain_key("item-gone").as_bytes())
+                .await
+                .unwrap()
+                .is_empty(),
+            "apply_ts_retention 不应删除 retain/ 键（由 apply_retention 负责）"
+        );
+
+        // 未到期的 retain/ 不做处理。
+        // 先模拟 `apply_retention` 已删除到期键，否则 item-gone 会被幂等地再处理一次。
+        kv.delete(retain_key("item-gone").as_bytes()).await.unwrap();
+        kv.set(
+            retain_key("item-later").as_bytes(),
+            format!("{{\"until_micros\":{}}}", now + MICROS_PER_DAY).as_bytes(),
+        )
+        .await
+        .unwrap();
+        let report = apply_ts_retention(&ts, &kv, &[], 30, now, &mut TsCleanTracker::default())
+            .await
+            .unwrap();
+        assert_eq!(report.items, 0, "未到期的已删项不参与删除");
+    }
+
+    #[test]
+    fn tracker_warns_once_after_three_zero_hit_rounds() {
+        let mut tracker = TsCleanTracker::default();
+        assert!(!tracker.observe("item", 0));
+        assert!(!tracker.observe("item", 0));
+        assert!(tracker.observe("item", 0), "第 3 轮零命中应提示");
+        assert!(!tracker.observe("item", 0), "同一段零命中只提示一次");
+        assert!(!tracker.observe("item", 5), "有命中后清零");
+        assert!(!tracker.observe("item", 0), "清零后重新计数");
+    }
 }
