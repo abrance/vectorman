@@ -238,6 +238,12 @@ ON CONFLICT(trace_id) DO UPDATE SET
 - 静态映射只影响 eBPF 边与 `unknown-*` 归一，不覆盖 OTLP span 自带的 `service`。
 - 保留期：`apm_endpoint_retention_days`（默认 30），每小时清理 `last_seen_ts < now - retention` 的行。
 
+### dataserver：接入保护
+
+- **限流**：`BatchLimiter`（固定秒窗计数）只作用于 `data_type=traces` 批次；超限回 HTTP 429 + `code=unavailable`，Agent 按既有退避重试（不丢批）；计数进 `dataserver_apm_ingest_throttled_batches_total` / `_throttled_records_total`。`apm_ingest_max_batches_per_sec=0` 表示不限。锁中毒时保守放行（宁可写入也不静默丢观测数据）。
+- **明细阈值**：策略由 `TraceSink::detail_min_duration_micros`（即 `ApmSinkConfig.detail_min_duration_micros`）持有，ingest 侧只执行——低于阈值的 span **仍然** `observe_span`（进摘要与聚合），只是不落 `LogStore`。详情页据此把「一条明细都没有」区分为 `detail_filtered`（trace 自身耗时低于阈值）或 `retention_expired`。
+- 采样仍由应用侧 SDK 决定，两侧都不改动 `trace_flags`，也不因过滤破坏幂等（去重键仍是 `ingest/{record_id}`）。
+
 ### dataserver：ApmAggregator
 
 每 `apm_agg_interval_secs`（默认 60）运行一轮，处理「上一分钟桶」，只读 sqlite 与内存：

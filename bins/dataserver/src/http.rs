@@ -15,7 +15,7 @@ use dataplane_core::{
 };
 use dataplane_file::FileStore;
 use dataplane_ingest::{
-    apply, apply_with_trace_sink, search, DataEnvelope, LogSearchQuery, StreamIndex,
+    apply, apply_with_trace_sink, search, DataEnvelope, DataType, LogSearchQuery, StreamIndex,
 };
 use dataplane_kv::KvStore;
 use dataplane_log::LogStore;
@@ -43,6 +43,10 @@ pub struct AppState {
     pub metrics: Option<Arc<vectorman_metrics::SelfMetrics>>,
     /// APM 派生数据（trace 摘要、服务端点半）；`apm_enabled=false` 时为 `None`。
     pub apm: Option<Arc<ApmSink>>,
+    /// trace 接入限流；`apm_ingest_max_batches_per_sec` 为 0 时仍存在但不生效。
+    pub apm_limiter: Option<Arc<crate::limits::BatchLimiter>>,
+    /// 只写明细的耗时下限（微秒），供详情页判断 `partial` 原因。
+    pub apm_detail_min_duration_micros: i64,
 }
 
 fn json_err(status: StatusCode, e: DataplaneError) -> Response {
@@ -313,6 +317,31 @@ async fn ingest(
             );
         }
     };
+    // 接入保护：只对 trace 批次限流（采样仍由应用侧决定）。
+    if envelope.data_type == DataType::Traces {
+        if let Some(limiter) = state.apm_limiter.as_ref() {
+            if !limiter.allow(now_micros()) {
+                if let Some(metrics) = state.metrics.as_ref() {
+                    metrics.inc_counter("dataserver_apm_ingest_throttled_batches_total", 1.0);
+                    metrics.inc_counter(
+                        "dataserver_apm_ingest_throttled_records_total",
+                        envelope.records.len() as f64,
+                    );
+                }
+                return json_err(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    DataplaneError::new(
+                        ErrorCode::Unavailable,
+                        format!(
+                            "trace ingest throttled (apm_ingest_max_batches_per_sec={})",
+                            limiter.max_per_sec()
+                        ),
+                    ),
+                );
+            }
+        }
+    }
+
     let reply = match state.apm.as_ref() {
         Some(sink) => {
             apply_with_trace_sink(
@@ -559,7 +588,14 @@ async fn trace_detail(
     if let Some(resp) = apm_unavailable(&state) {
         return resp;
     }
-    match dataplane_apm::get_trace(state.sql.as_ref(), state.log.as_ref(), &trace_id).await {
+    match dataplane_apm::get_trace(
+        state.sql.as_ref(),
+        state.log.as_ref(),
+        &trace_id,
+        state.apm_detail_min_duration_micros,
+    )
+    .await
+    {
         Ok(detail) => Json(detail).into_response(),
         Err(e) => map_err(e),
     }
@@ -736,6 +772,15 @@ mod tests {
     }
 
     async fn test_env(gse_admin_url: Option<String>) -> TestEnv {
+        test_env_full(gse_admin_url, 0, 0).await
+    }
+
+    /// 可指定限流与明细阈值的测试环境。
+    async fn test_env_full(
+        gse_admin_url: Option<String>,
+        max_batches_per_sec: u64,
+        detail_min_duration_micros: i64,
+    ) -> TestEnv {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("data");
         std::fs::create_dir_all(&root).unwrap();
@@ -772,9 +817,16 @@ mod tests {
                 metrics: None,
                 apm: Some(Arc::new(ApmSink::new(
                     sql_for_apm,
-                    dataplane_apm::ApmSinkConfig::default(),
+                    dataplane_apm::ApmSinkConfig {
+                        detail_min_duration_micros,
+                        ..dataplane_apm::ApmSinkConfig::default()
+                    },
                     Arc::new(dataplane_apm::RedSamples::new(1_000)),
                 ))),
+                apm_limiter: Some(Arc::new(crate::limits::BatchLimiter::new(
+                    max_batches_per_sec,
+                ))),
+                apm_detail_min_duration_micros: detail_min_duration_micros,
             },
             _dir: dir,
         }
@@ -1484,5 +1536,122 @@ mod tests {
             assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
             assert!(body.contains("unavailable"), "{body}");
         }
+    }
+
+    fn trace_envelope_json(trace_id: &str, span_id: &str, duration_micros: i64) -> String {
+        let now = now_micros();
+        json!({
+            "batch_id": "b-thr",
+            "data_type": "traces",
+            "data_id": "apm-1",
+            "agent_id": "agent-1",
+            "host_id": "host-1",
+            "sent_at_micros": now,
+            "records": [{
+                "record_id": format!("{trace_id}:{span_id}"),
+                "timestamp": now,
+                "trace_id": trace_id,
+                "span_id": span_id,
+                "parent_span_id": "",
+                "name": "GET /orders",
+                "kind": "server",
+                "start_unix_nano": now * 1000,
+                "end_unix_nano": now * 1000 + duration_micros * 1000,
+                "status_code": "ok",
+                "service": "order-api",
+                "collector": "otlp",
+                "labels": {}
+            }]
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn trace_ingest_is_throttled_with_unavailable() {
+        let env = test_env_full(None, 1, 0).await;
+        let app = sql_router(env.state.clone(), None);
+
+        let first = trace_envelope_json(
+            "4bf92f3577b34da6a3ce929d0e0e4736",
+            "00f067aa0ba902b7",
+            5_000,
+        );
+        let (st, body) = send(&app, req("POST", "/v1/ingest", Some(&first))).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+
+        // 上限 1 批/秒：紧随其后的批次会被限流（429 + unavailable）。限流按固定秒窗计数，
+        // 因此用「多批里必然出现限流」来断言，避开恰好跨秒造成的偶发。
+        let mut throttled: Option<String> = None;
+        for i in 0..5 {
+            let body = trace_envelope_json(
+                "5bf92f3577b34da6a3ce929d0e0e4737",
+                &format!("00f067aa0ba902b{i}"),
+                5_000,
+            );
+            let (st, resp) = send(&app, req("POST", "/v1/ingest", Some(&body))).await;
+            if st == StatusCode::TOO_MANY_REQUESTS {
+                throttled = Some(resp);
+                break;
+            }
+            assert_eq!(st, StatusCode::OK, "{resp}");
+        }
+        let body = throttled.expect("上限 1 批/秒时应出现限流");
+        assert!(body.contains("unavailable"), "{body}");
+        assert!(body.contains("throttled"), "{body}");
+
+        // 非 trace 类型不受该限流影响。
+        let (st, body) = send(&app, req("POST", "/v1/ingest", Some(&metrics_envelope()))).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+
+        // 限流为 0 时不再拦截。
+        let unlimited = test_env_full(None, 0, 0).await;
+        let app = sql_router(unlimited.state.clone(), None);
+        for _ in 0..3 {
+            let body = trace_envelope_json(
+                "4bf92f3577b34da6a3ce929d0e0e4736",
+                "00f067aa0ba902b7",
+                5_000,
+            );
+            let (st, resp) = send(&app, req("POST", "/v1/ingest", Some(&body))).await;
+            assert_eq!(st, StatusCode::OK, "{resp}");
+        }
+    }
+
+    #[tokio::test]
+    async fn detail_threshold_skips_details_but_keeps_summary() {
+        // 阈值 10ms，样本 span 只有 5ms → 不写明细。
+        let env = test_env_full(None, 0, 10_000).await;
+        let app = sql_router(env.state.clone(), None);
+        let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let span_id = "00f067aa0ba902b7";
+        let body = trace_envelope_json(trace_id, span_id, 5_000);
+
+        let (st, resp) = send(&app, req("POST", "/v1/ingest", Some(&body))).await;
+        assert_eq!(st, StatusCode::OK, "{resp}");
+        assert!(resp.contains("\"accepted\":1"), "{resp}");
+
+        let sink = env.state.apm.as_ref().expect("apm sink").clone();
+        sink.flush_now(now_micros()).await.unwrap();
+
+        // 摘要仍然写入（聚合口径不受明细阈值影响）。
+        let rows = env
+            .state
+            .sql
+            .execute(
+                "SELECT span_count, duration_micros FROM apm_trace_summary WHERE trace_id = ?1",
+                &[dataplane_core::SqlValue::Text(trace_id.to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows.len(), 1, "摘要应写入");
+        assert_eq!(rows.rows[0][0], dataplane_core::SqlValue::Integer(1));
+
+        // 明细被跳过，详情返回 partial + detail_filtered。
+        let (st, body) = send(&app, req("GET", &format!("/v1/traces/{trace_id}"), None)).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let detail: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(detail["spans"].as_array().unwrap().len(), 0);
+        assert_eq!(detail["partial"], true);
+        assert_eq!(detail["reason"], "detail_filtered");
     }
 }

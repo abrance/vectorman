@@ -39,6 +39,8 @@ pub struct ApmSinkConfig {
     pub reload_window_secs: i64,
     /// 边配对时待配对 span 的内存上限（缺省 `max_live_traces * 8`）。
     pub edge_pending_capacity: usize,
+    /// 只写明细的耗时下限（微秒）；0 表示全部写明细。
+    pub detail_min_duration_micros: i64,
 }
 
 impl Default for ApmSinkConfig {
@@ -51,6 +53,7 @@ impl Default for ApmSinkConfig {
             endpoint_cache_ttl_secs: 60,
             reload_window_secs: 300,
             edge_pending_capacity: 160_000,
+            detail_min_duration_micros: 0,
         }
     }
 }

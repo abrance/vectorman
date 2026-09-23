@@ -121,6 +121,8 @@ async fn register_probe_collect_ingest_and_query() {
             dataplane_apm::ApmSinkConfig::default(),
             Arc::new(dataplane_apm::RedSamples::new(1_000)),
         ))),
+        apm_limiter: None,
+        apm_detail_min_duration_micros: 0,
     };
     let ds_url = spawn(sql_router(state.clone(), None)).await;
     let prom_url = spawn(prom_router(state)).await;

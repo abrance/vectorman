@@ -236,6 +236,7 @@ pub async fn get_trace(
     sql: &dyn RelationalStore,
     log: &dyn LogStore,
     trace_id: &str,
+    detail_min_duration_micros: i64,
 ) -> Result<TraceDetail, DataplaneError> {
     if trace_id.len() != 32 || !trace_id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(DataplaneError::invalid_argument(format!(
@@ -267,10 +268,17 @@ pub async fn get_trace(
     let partial = (spans.len() as i64) < expected;
     let reason = if partial {
         Some(if spans.is_empty() {
-            // 摘要还在但明细一条都没有：最常见的是明细已过保留期（明细短于摘要）。
-            "retention_expired".to_string()
+            // 一条明细都没有时有两种可能：整条 trace 都没到明细阈值（trace 自身耗时
+            // 低于阈值），或明细已过保留期（明细短于摘要）。
+            if detail_min_duration_micros > 0
+                && summary.duration_micros < detail_min_duration_micros
+            {
+                "detail_filtered".to_string()
+            } else {
+                "retention_expired".to_string()
+            }
         } else {
-            // 索引重建窗口，或 `apm_min_duration_micros_for_detail` 只写了部分明细。
+            // 部分写入：索引重建窗口，或只有部分 span 达到明细阈值。
             "detail_filtered".to_string()
         })
     } else {

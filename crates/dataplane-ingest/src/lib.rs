@@ -347,10 +347,13 @@ async fn apply_one(
             if already_accepted(kv, &span.record_id).await? {
                 return Ok(());
             }
-            // 明细是权威数据，先落库；派生数据失败不回退整批（重试会造成明细重复）。
-            log.append(trace::to_log_record(&span, envelope))
-                .await
-                .map_err(ApplyRecordError::Engine)?;
+            // 明细是可选的高成本数据：低于阈值时只走摘要与聚合（阈值由 sink 提供）。
+            let detail_min = trace_sink.map_or(0, |sink| sink.detail_min_duration_micros());
+            if span.duration_micros() >= detail_min {
+                log.append(trace::to_log_record(&span, envelope))
+                    .await
+                    .map_err(ApplyRecordError::Engine)?;
+            }
             if let Some(sink) = trace_sink {
                 if let Err(e) = sink.observe_span(&span, envelope).await {
                     eprintln!(
@@ -793,10 +796,15 @@ mod tests {
     struct RecordingSink {
         spans: std::sync::Mutex<Vec<String>>,
         fail: bool,
+        detail_min: i64,
     }
 
     #[async_trait::async_trait]
     impl TraceSink for RecordingSink {
+        fn detail_min_duration_micros(&self) -> i64 {
+            self.detail_min
+        }
+
         async fn observe_span(
             &self,
             span: &TraceSpan,
@@ -934,6 +942,64 @@ mod tests {
             reply.failures.iter().any(|f| f.message.contains("256 KiB")),
             "超限原因应说明上限: {:?}",
             reply.failures
+        );
+    }
+
+    #[tokio::test]
+    async fn traces_detail_threshold_skips_detail_but_keeps_sink() {
+        let e = engines();
+        let sink = RecordingSink {
+            detail_min: 10_000,
+            ..RecordingSink::default()
+        };
+        let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let span_id = "00f067aa0ba902b7";
+        // span 耗时 12_000us >= 阈值 → 写明细。
+        let env = envelope("traces", vec![trace_span_json(trace_id, span_id, "")]);
+        apply_with_trace_sink(env, &e.ts, &e.log, &e.kv, Some(&sink as &dyn TraceSink))
+            .await
+            .unwrap();
+        assert_eq!(
+            search(
+                &e.log,
+                LogSearchQuery {
+                    data_type: Some("traces".into()),
+                    trace_id: Some(trace_id.into()),
+                    ..LogSearchQuery::default()
+                },
+            )
+            .await
+            .unwrap()
+            .len(),
+            1
+        );
+
+        // 低于阈值 → 只走 sink（摘要/聚合），不写明细。
+        let mut short = trace_span_json("5bf92f3577b34da6a3ce929d0e0e4737", "00f067aa0ba902b8", "");
+        short["end_unix_nano"] = json!(1_710_000_000_001_000_000i64);
+        let env = envelope("traces", vec![short]);
+        let reply = apply_with_trace_sink(env, &e.ts, &e.log, &e.kv, Some(&sink as &dyn TraceSink))
+            .await
+            .unwrap();
+        assert_eq!(reply.status, "ok", "{reply:?}");
+        assert_eq!(reply.accepted, 1);
+        assert_eq!(
+            sink.spans.lock().unwrap().len(),
+            2,
+            "sink 仍然收到两条 span"
+        );
+        assert!(
+            search(
+                &e.log,
+                LogSearchQuery {
+                    trace_id: Some("5bf92f3577b34da6a3ce929d0e0e4737".into()),
+                    ..LogSearchQuery::default()
+                },
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "低于阈值的 span 不写明细"
         );
     }
 
