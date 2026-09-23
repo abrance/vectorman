@@ -692,6 +692,7 @@ mod tests {
                 apm: Some(Arc::new(ApmSink::new(
                     sql_for_apm,
                     dataplane_apm::ApmSinkConfig::default(),
+                    Arc::new(dataplane_apm::RedSamples::new(1_000)),
                 ))),
             },
             _dir: dir,

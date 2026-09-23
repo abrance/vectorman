@@ -9,6 +9,7 @@ use dataplane_ingest::{DataEnvelope, DataType};
 use dataplane_sql::{RelationalStore, SqliteRelationalStore};
 
 use crate::accumulator::TraceSummaryAccumulator;
+use crate::red::RedSamples;
 use crate::sink::ApmSink;
 use crate::{bootstrap, tables, ApmSinkConfig};
 
@@ -358,6 +359,7 @@ async fn sink_registers_endpoints_and_looks_them_up() {
             endpoint_cache_ttl_secs: 0,
             ..ApmSinkConfig::default()
         },
+        Arc::new(RedSamples::new(1_000)),
     );
     use dataplane_ingest::trace::TraceSink;
 
@@ -465,7 +467,11 @@ async fn missing_endpoint_resource_is_ignored() {
     let dir = tempfile::tempdir().unwrap();
     let sql = store(dir.path());
     bootstrap(sql.as_ref()).await.unwrap();
-    let sink = ApmSink::new(sql, ApmSinkConfig::default());
+    let sink = ApmSink::new(
+        sql,
+        ApmSinkConfig::default(),
+        Arc::new(RedSamples::new(1_000)),
+    );
     let mut s = span(
         "aaaa0000000000000000000000000007",
         "0000000000000001",
@@ -533,7 +539,7 @@ async fn edge_pairs_client_and_server_in_both_orders() {
     let dir = tempfile::tempdir().unwrap();
     let sql = store(dir.path());
     bootstrap(sql.as_ref()).await.unwrap();
-    let edges = crate::edge::EdgeAccumulator::new(1_000);
+    let edges = crate::edge::EdgeAccumulator::new(1_000, Arc::new(RedSamples::new(1_000)));
     let env = envelope();
     let trace = "bbbb0000000000000000000000000001";
 
@@ -623,7 +629,7 @@ async fn edge_counts_one_call_when_client_has_many_servers() {
     let dir = tempfile::tempdir().unwrap();
     let sql = store(dir.path());
     bootstrap(sql.as_ref()).await.unwrap();
-    let edges = crate::edge::EdgeAccumulator::new(1_000);
+    let edges = crate::edge::EdgeAccumulator::new(1_000, Arc::new(RedSamples::new(1_000)));
     let env = envelope();
     let trace = "bbbb0000000000000000000000000003";
     // 两个 server span 先到，同一个 client 后到。
@@ -669,7 +675,7 @@ async fn edge_falls_back_to_unknown_and_normalizes_via_resolver() {
     let dir = tempfile::tempdir().unwrap();
     let sql = store(dir.path());
     bootstrap(sql.as_ref()).await.unwrap();
-    let edges = crate::edge::EdgeAccumulator::new(1_000);
+    let edges = crate::edge::EdgeAccumulator::new(1_000, Arc::new(RedSamples::new(1_000)));
     let env = envelope();
 
     // 配对不到且没有可用对端标识 → unknown。
@@ -740,7 +746,7 @@ async fn edge_dedupes_replayed_spans_and_bounds_pending() {
     let dir = tempfile::tempdir().unwrap();
     let sql = store(dir.path());
     bootstrap(sql.as_ref()).await.unwrap();
-    let edges = crate::edge::EdgeAccumulator::new(2);
+    let edges = crate::edge::EdgeAccumulator::new(2, Arc::new(RedSamples::new(1_000)));
     let env = envelope();
     let trace = "bbbb0000000000000000000000000006";
     let client = edge_span(
@@ -797,4 +803,190 @@ async fn edge_dedupes_replayed_spans_and_bounds_pending() {
         edges.pending_len()
     );
     assert!(edges.dropped_pending() > 0);
+}
+
+fn ts_store(dir: &std::path::Path) -> Arc<dyn dataplane_ts::TimeSeriesStore> {
+    Arc::new(
+        dataplane_ts::TsinkTimeSeriesStore::new(
+            dir.join("ts"),
+            dataplane_ts::TsRetentionConfig {
+                enforced: false,
+                ..dataplane_ts::TsRetentionConfig::default()
+            },
+        )
+        .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn aggregator_writes_service_red_and_edge_metrics() {
+    use crate::aggregator::ApmAggregator;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sql = store(dir.path());
+    bootstrap(sql.as_ref()).await.unwrap();
+    let ts = ts_store(dir.path());
+    let samples = Arc::new(RedSamples::new(1_000));
+
+    // 已关闭的两个分钟桶：B1 是目标桶。
+    let b1 = NOW - 120_000_000;
+    let b2 = NOW - 60_000_000;
+    samples.observe_span(b1, "order-api", "GET /orders", "server", "ok", 100);
+    samples.observe_span(b1, "order-api", "GET /orders", "server", "ok", 200);
+    samples.observe_span(b1, "order-api", "GET /orders", "server", "error", 900);
+    // 非 server span 不进 apm_service_*。
+    samples.observe_span(b1, "order-api", "db.query", "internal", "ok", 50);
+    samples.observe_span(b2, "payment", "POST /pay", "server", "ok", 300);
+    // 边样本（p95 来源）。
+    samples.observe_edge(b1, "gateway", "order-api", "server", "ok", 400);
+    samples.observe_edge(b1, "gateway", "order-api", "server", "ok", 600);
+    samples.observe_edge(b1, "gateway", "order-api", "server", "error", 1_000);
+
+    // 边摘要有权威计数。
+    sql.execute(
+        &format!(
+            "INSERT INTO {} (bucket_start, src_service, dst_service, span_kind, calls, errors,
+                duration_sum, duration_max, agent_id, data_id)
+             VALUES (?1, 'gateway', 'order-api', 'server', 3, 1, 2000, 1000, 'agent-1', 'apm-1')",
+            tables::EDGE_SUMMARY
+        ),
+        &[SqlValue::Integer(b1)],
+    )
+    .await
+    .unwrap();
+
+    let aggregator = ApmAggregator::new(sql.clone(), ts.clone(), samples.clone());
+    let report = aggregator.run_once(NOW).await.unwrap();
+    assert!(
+        report.service_points > 0 && report.edge_points > 0,
+        "{report:?}"
+    );
+    assert!(report.buckets.contains(&b1), "{report:?}");
+
+    let requests = ts
+        .query_instant(
+            "apm_service_requests_total{service=\"order-api\",status=\"ok\"}",
+            Some(b1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        requests
+            .result
+            .first()
+            .and_then(|s| s.value)
+            .map(|(_, v)| v),
+        Some(2.0),
+        "server span 计数：{requests:?}"
+    );
+
+    let errors = ts
+        .query_instant("apm_service_errors_total{service=\"order-api\"}", Some(b1))
+        .await
+        .unwrap();
+    assert_eq!(
+        errors.result.first().and_then(|s| s.value).map(|(_, v)| v),
+        Some(1.0)
+    );
+
+    let internal = ts
+        .query_instant(
+            "apm_service_requests_total{operation=\"db.query\"}",
+            Some(b1),
+        )
+        .await
+        .unwrap();
+    assert!(
+        internal.result.iter().all(|s| s.value.is_none()),
+        "internal span 不应产生 apm_service_*: {internal:?}"
+    );
+
+    let duration_p95 = ts
+        .query_instant(
+            "apm_service_duration_micros{service=\"order-api\",field=\"p95\"}",
+            Some(b1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        duration_p95
+            .result
+            .first()
+            .and_then(|s| s.value)
+            .map(|(_, v)| v),
+        Some(900.0),
+        "p95 由 label field 区分: {duration_p95:?}"
+    );
+    let duration_all = ts
+        .query_instant(
+            "apm_service_duration_micros{service=\"order-api\"}",
+            Some(b1),
+        )
+        .await
+        .unwrap();
+    let mut values: Vec<f64> = duration_all
+        .result
+        .iter()
+        .filter_map(|s| s.value.map(|(_, v)| v))
+        .collect();
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // avg=400, p50=200, p95=900, p99=900, max=900
+    assert_eq!(
+        values,
+        vec![200.0, 400.0, 900.0, 900.0, 900.0],
+        "avg/p50/p95/p99/max 应各自成为一条序列: {duration_all:?}"
+    );
+
+    let edge_calls = ts
+        .query_instant("apm_edge_requests_total{src_service=\"gateway\"}", Some(b1))
+        .await
+        .unwrap();
+    assert_eq!(
+        edge_calls
+            .result
+            .first()
+            .and_then(|s| s.value)
+            .map(|(_, v)| v),
+        Some(3.0),
+        "边 calls 取 sqlite 权威值: {edge_calls:?}"
+    );
+    let edge_p95 = ts
+        .query_instant(
+            "apm_edge_duration_micros{src_service=\"gateway\"}",
+            Some(b1),
+        )
+        .await
+        .unwrap();
+    let mut edge_values: Vec<f64> = edge_p95
+        .result
+        .iter()
+        .filter_map(|s| s.value.map(|(_, v)| v))
+        .collect();
+    edge_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(edge_values, vec![666.6666666666666, 1000.0], "avg + p95");
+
+    // 样本取出后不重复结算。
+    let second = aggregator.run_once(NOW).await.unwrap();
+    assert_eq!(second.service_points, 0, "同批样本只结算一次");
+    assert_eq!(second.edge_points, 0, "边样本也只结算一次");
+}
+
+#[tokio::test]
+async fn aggregator_empty_bucket_writes_nothing() {
+    use crate::aggregator::ApmAggregator;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sql = store(dir.path());
+    bootstrap(sql.as_ref()).await.unwrap();
+    let ts = ts_store(dir.path());
+    let samples = Arc::new(RedSamples::new(1_000));
+    let aggregator = ApmAggregator::new(sql, ts.clone(), samples);
+    let report = aggregator.run_once(NOW).await.unwrap();
+    assert_eq!(report.service_points, 0);
+    assert_eq!(report.edge_points, 0);
+    let any = ts
+        .query_instant("apm_service_requests_total", Some(NOW))
+        .await
+        .unwrap();
+    assert!(any.result.is_empty(), "空桶不写零值: {any:?}");
 }

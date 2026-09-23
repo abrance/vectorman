@@ -625,6 +625,7 @@ dependencies = [
  "dataplane-core",
  "dataplane-ingest",
  "dataplane-sql",
+ "dataplane-ts",
  "serde_json",
  "tempfile",
  "tokio",

@@ -246,7 +246,10 @@ ON CONFLICT(trace_id) DO UPDATE SET
 2. 服务维度：`SELECT root_service, root_operation, span_count, error_count, duration_micros, status FROM apm_trace_summary WHERE start_ts >= ? AND start_ts < ?`。注意此处粒度是 trace 级，因此 `apm_service_*` 的 `operation` 用 `root_operation`，`span_kind` 固定 `server`（根 span 语义）。
 3. span 维度（用于 `span_kind`/`status` 更细的 RED 与 P50/P95/P99）：从 `TraceSummaryAccumulator` 的分钟快照取；accumulator 在 flush 时按分钟桶把 `(service, operation, kind, status, duration_micros)` 样本累加到内存直方图（`Vec<i64>`，每组上限 20_000 样本，超限按蓄水池采样，桶结束时丢弃）。
 4. 边维度：`SELECT ... FROM apm_edge_summary WHERE bucket_start = ?`（表见 Data Models），由 span 配对产生。
-5. 写点：每个 measurement 一个 `TsPoint`；`timestamp = bucket_start`；`field_name` 与 label 严格按共享模型命名表；`source=otlp`。
+5. 写点：每个 measurement 一个 `TsPoint`；`timestamp = bucket_start`；**多值指标用 label `field` 区分**（`field_name` 固定 `value`），其余 label 严格按共享模型命名表；`source=otlp`。
+   - 服务计数按 `status` 拆分写入 `apm_service_requests_total{status}`；
+   - **服务耗时按 `(service, operation, span_kind)` 合并**（labels 里没有 `status`，按状态分别写会互相覆盖），错误率由计数侧体现；
+   - 边计数/耗时和取 `apm_edge_summary`（跨重启不丢），`p95` 取内存边样本。
 6. 失败处理：单轮失败记 stderr 一行并跳过该桶，不回填；下一轮照常。自监控指标累加失败次数。
 
 分位数算法：排序后取最近秩（nearest-rank），P50/P95/P99 分别为 `ceil(p/100 * n) - 1` 下标；样本数为 0 时不写该 `field_name`。
@@ -478,6 +481,8 @@ max_end_ts INTEGER NOT NULL DEFAULT 0
 - `apm_service_*` 的 `operation` 用根 span 的 `name`，而 `span_kind` 固定 `server`；若后续要按内部 span 统计，需要新增 measurement，不要改写既有语义。
 - 边 P95 依赖聚合任务与 accumulator 同进程的内存直方图；不要把样本写进 sqlite 再算，规模会失控。
 - 兜底边不要试图在 `observe` 阶段就产生：此时无法区分「对端还没到」与「对端不存在」，会把每一条正常调用的边都写成 `unknown*`。
+- `TsPoint.field_name` **不是序列身份**：同 measurement + labels 的两条点即使 `field_name` 不同也会互相覆盖（实测 instant 查询只剩最后写入的值）。多值指标必须把区分维度放在 label（本设计用 `field`），或拆成不同 measurement。
+- 写同一 measurement 的多组点时，先确认 label 集能区分它们：`apm_service_duration_micros` 的 labels 里没有 `status`，所以按 `status` 分组写入就会互相覆盖——这类冲突不会报错，只表现为「值不对/随机」。
 - 删除/统计类接口不能靠 `RelationalStore::execute` 的返回行数：`DELETE` 不返回行，受影响行数要用同一连接上的 `SELECT changes()` 取（`sqlite` 的 `changes()` 是连接级状态）。
 - 根 span 判定不要用「`parent_span_id` 为空且是第一个到达」，必须按 `start_ts` 比较，否则乱序到达时摘要不稳定。
 - `LogStore::append` **不按 id 幂等**：同一 `id` 追加两次会产生两个文档（只有 `delete_term(id)` 才清掉）。所以 `traces` 分支的顺序固定为「写明细 → 派生数据（best effort）→ KvStore 标记去重」，且派生数据失败不能当成整批失败；同样原因，接入重试不能依赖「明细会被去重」，幂等完全靠 KvStore 的 `ingest/{record_id}` 先于写入的判断。

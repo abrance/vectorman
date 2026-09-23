@@ -301,13 +301,13 @@ struct EbpfProfile {
 
 Agent 侧产出（每 60 秒一批），严格按 `observability-data-model` 命名表：
 
-| measurement | 来源字段 | field_name | 备注 |
+| measurement | 来源字段 | `field` label | 备注 |
 | --- | --- | --- | --- |
 | `ebpf_edge_connections_total` | `EbpfEdge.connections` | `value` | 按分钟桶求和 |
 | `ebpf_edge_bytes_total` | `bytes_sent` / `bytes_recv` | `value` | 两个方向分别一条点，`labels.direction` 区分 |
 | `apm_edge_requests_total` | `connections` | `value` | `source=ebpf`，与 OTLP 侧同 measurement |
 | `apm_edge_errors_total` | `failures` | `value` | `source=ebpf` |
-| `apm_edge_duration_micros` | `duration_sum` / 连接数 | `avg` | `p95` 由直方图槽中位近似（取累积到 95% 的槽上界） |
+| `apm_edge_duration_micros` | `duration_sum` / 连接数 | `avg` | `p95` 由直方图槽上界近似（取累积到 95% 的槽） |
 | `ebpf_tcp_retrans_total` | `tcp_retrans` | `value` | 按 `src_service`/`dst_service` 汇总 |
 | `ebpf_tcp_failures_total` | `failures` + `failure_reason` | `value` | 按 `reason` 分组 |
 | `ebpf_process_exec_total` / `_exit_total` | `ProcAgg` | `value` | 按 `process_name`/`service` |
