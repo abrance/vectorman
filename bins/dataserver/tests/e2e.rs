@@ -9,7 +9,7 @@ use dataplane_file::{DirFileStore, FileStore};
 use dataplane_kv::{KvStore, RedbKvStore};
 use dataplane_log::{LogStore, TantivyLogStore};
 use dataplane_sql::{RelationalStore, SqliteRelationalStore};
-use dataplane_ts::{TimeSeriesStore, TsinkTimeSeriesStore};
+use dataplane_ts::{TimeSeriesStore, TsRetentionConfig, TsinkTimeSeriesStore};
 use dataserver::{prom_router, sql_router, AppState};
 use gse_server_core::{http_router, probe_once, AdminState, DataplaneService, Ledger};
 
@@ -76,7 +76,17 @@ async fn register_probe_collect_ingest_and_query() {
     let kv: Arc<dyn KvStore> = Arc::new(RedbKvStore::new(&paths.kv).expect("kv"));
     let sql: Arc<dyn RelationalStore> =
         Arc::new(SqliteRelationalStore::new(&paths.sql).expect("sql"));
-    let ts: Arc<dyn TimeSeriesStore> = Arc::new(TsinkTimeSeriesStore::new(&paths.ts).expect("ts"));
+    // 测试用固定历史时间戳，关闭保留执行。
+    let ts: Arc<dyn TimeSeriesStore> = Arc::new(
+        TsinkTimeSeriesStore::new(
+            &paths.ts,
+            TsRetentionConfig {
+                enforced: false,
+                ..TsRetentionConfig::default()
+            },
+        )
+        .expect("ts"),
+    );
     let log: Arc<dyn LogStore> = Arc::new(TantivyLogStore::new(&paths.logs).expect("log"));
 
     // 2. GSE 控制面：台账 + HTTP 管理端口。

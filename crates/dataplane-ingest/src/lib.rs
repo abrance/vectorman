@@ -419,7 +419,7 @@ mod tests {
     use super::*;
     use dataplane_kv::RedbKvStore;
     use dataplane_log::TantivyLogStore;
-    use dataplane_ts::TsinkTimeSeriesStore;
+    use dataplane_ts::{TsRetentionConfig, TsinkTimeSeriesStore};
     use serde_json::json;
 
     struct Engines {
@@ -435,7 +435,15 @@ mod tests {
         let log_dir = dir.path().join("log");
         std::fs::create_dir_all(&ts_dir).unwrap();
         std::fs::create_dir_all(&log_dir).unwrap();
-        let ts = TsinkTimeSeriesStore::new(&ts_dir).unwrap();
+        // 测试用固定历史时间戳，关闭保留执行。
+        let ts = TsinkTimeSeriesStore::new(
+            &ts_dir,
+            TsRetentionConfig {
+                enforced: false,
+                ..TsRetentionConfig::default()
+            },
+        )
+        .unwrap();
         let log = TantivyLogStore::new(&log_dir).unwrap();
         let kv = RedbKvStore::new(dir.path().join("kv.redb")).unwrap();
         Engines {

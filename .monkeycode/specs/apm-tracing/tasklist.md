@@ -17,8 +17,8 @@
   - [ ] 2.1 `crates/dataplane-apm` 建表与版本检查：`obs_schema_meta`、`apm_trace_summary`（含 `max_end_ts`）、`apm_edge_summary`、`apm_service_endpoint`
     - 对应共享模型「sqlite 观测表」与本文 Data Models
   - [ ] 2.2 启动读到更高 `schema_version` 时以 `config_invalid` 退出
-  - [ ] 2.3 聚合指标保留：接入 `/.monkeycode/specs/dataplane-ts-retention/`，启动时传 `TsRetentionConfig`（`ts_retention_days` 缺省 30、`enforced` 缺省 true）
-    - 对应需求 11.7-11.9 与 15.3；不再回退到「启动打一行 ts retention disabled」的旧方案
+  - [x] 2.3 聚合指标保留：接入 `/.monkeycode/specs/dataplane-ts-retention/`，启动时传 `TsRetentionConfig`（`ts_retention_days` 缺省 30、`enforced` 缺省 true）
+    - 对应需求 11.7-11.9 与 15.3；已实现（PR #29）
 - [ ] 3. 检查点 - 前置依赖单测全绿后再进入接入实现
   - 确保所有测试通过,如有疑问请询问用户
 - [ ] 4. 数据模型与接入分支

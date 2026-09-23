@@ -4,6 +4,15 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_CONFIG_TOML: &str = r#"data_path = "./data"
 self_metrics_interval_secs = 60
 
+# 时序聚合指标的全局保留窗口（天）与是否执行；每个采集项更短的保留期由定时
+# 删除任务（ts_clean_interval_secs）补齐。
+ts_retention_days = 30
+ts_retention_enforced = true
+ts_cardinality_limit = 2000000
+# ts_memory_limit_bytes = 0
+# ts_wal_size_limit_bytes = 0
+ts_clean_interval_secs = 3600
+
 [sql_http]
 listen = "0.0.0.0:8081"
 
@@ -51,6 +60,24 @@ pub struct Config {
     pub metrics_http: HttpListenConfig,
     #[serde(default = "default_self_metrics_interval")]
     pub self_metrics_interval_secs: u64,
+    /// 时序聚合指标的全局保留窗口（天）。0 表示不设窗口（需关闭执行）。
+    #[serde(default = "default_ts_retention_days")]
+    pub ts_retention_days: u32,
+    /// 是否真正拒绝/过滤超出保留窗口的时序点。
+    #[serde(default = "default_true")]
+    pub ts_retention_enforced: bool,
+    /// 时序序列数上限，0 表示不限。
+    #[serde(default = "default_ts_cardinality_limit")]
+    pub ts_cardinality_limit: usize,
+    /// 时序内存预算（字节），0 表示不限。
+    #[serde(default)]
+    pub ts_memory_limit_bytes: usize,
+    /// 时序 WAL 字节上限，0 表示不限。
+    #[serde(default)]
+    pub ts_wal_size_limit_bytes: usize,
+    /// 时序按采集项保留期的清理周期（秒），0 表示不清理。
+    #[serde(default = "default_ts_clean_interval")]
+    pub ts_clean_interval_secs: u64,
 }
 
 impl Default for Config {
@@ -66,6 +93,12 @@ impl Default for Config {
             gse_admin_url: None,
             metrics_http: default_metrics_http(),
             self_metrics_interval_secs: default_self_metrics_interval(),
+            ts_retention_days: default_ts_retention_days(),
+            ts_retention_enforced: true,
+            ts_cardinality_limit: default_ts_cardinality_limit(),
+            ts_memory_limit_bytes: 0,
+            ts_wal_size_limit_bytes: 0,
+            ts_clean_interval_secs: default_ts_clean_interval(),
         }
     }
 }
@@ -107,6 +140,34 @@ impl Config {
                 self.self_metrics_interval_secs = n;
             }
         }
+        if let Ok(v) = std::env::var("DATASERVER_TS_RETENTION_DAYS") {
+            if let Ok(n) = v.parse() {
+                self.ts_retention_days = n;
+            }
+        }
+        if let Ok(v) = std::env::var("DATASERVER_TS_RETENTION_ENFORCED") {
+            self.ts_retention_enforced = v.eq_ignore_ascii_case("true") || v == "1";
+        }
+        if let Ok(v) = std::env::var("DATASERVER_TS_CARDINALITY_LIMIT") {
+            if let Ok(n) = v.parse() {
+                self.ts_cardinality_limit = n;
+            }
+        }
+        if let Ok(v) = std::env::var("DATASERVER_TS_MEMORY_LIMIT_BYTES") {
+            if let Ok(n) = v.parse() {
+                self.ts_memory_limit_bytes = n;
+            }
+        }
+        if let Ok(v) = std::env::var("DATASERVER_TS_WAL_SIZE_LIMIT_BYTES") {
+            if let Ok(n) = v.parse() {
+                self.ts_wal_size_limit_bytes = n;
+            }
+        }
+        if let Ok(v) = std::env::var("DATASERVER_TS_CLEAN_INTERVAL") {
+            if let Ok(n) = v.parse() {
+                self.ts_clean_interval_secs = n;
+            }
+        }
         self.normalize();
     }
 
@@ -124,6 +185,22 @@ fn default_metrics_http() -> HttpListenConfig {
 
 fn default_self_metrics_interval() -> u64 {
     60
+}
+
+fn default_ts_retention_days() -> u32 {
+    30
+}
+
+fn default_ts_cardinality_limit() -> usize {
+    2_000_000
+}
+
+fn default_ts_clean_interval() -> u64 {
+    3600
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn nonempty_opt(v: String) -> Option<String> {

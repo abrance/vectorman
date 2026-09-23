@@ -1,12 +1,19 @@
 use std::collections::BTreeMap;
 
-use dataplane_ts::{TimeSeriesStore, TsPoint, TsinkTimeSeriesStore};
+use dataplane_ts::{TimeSeriesStore, TsPoint, TsRetentionConfig, TsinkTimeSeriesStore};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = std::env::temp_dir().join(format!("dp-ts-smoke-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let store = TsinkTimeSeriesStore::new(&dir)?;
+    // 示例使用固定的历史时间戳，因此关闭保留执行。
+    let store = TsinkTimeSeriesStore::new(
+        &dir,
+        TsRetentionConfig {
+            enforced: false,
+            ..TsRetentionConfig::default()
+        },
+    )?;
 
     let mut tags = BTreeMap::new();
     tags.insert("host".to_string(), "h1".to_string());
