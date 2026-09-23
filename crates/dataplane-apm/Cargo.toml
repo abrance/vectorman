@@ -9,7 +9,9 @@ dataplane-core.workspace = true
 dataplane-sql.workspace = true
 dataplane-ingest.workspace = true
 dataplane-ts.workspace = true
+dataplane-log.workspace = true
 async-trait.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]

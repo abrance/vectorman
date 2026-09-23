@@ -19,6 +19,7 @@ use dataplane_sql::RelationalStore;
 pub mod accumulator;
 pub mod aggregator;
 pub mod edge;
+pub mod query;
 pub mod red;
 
 pub mod endpoint;
@@ -30,6 +31,10 @@ pub use accumulator::{ApmSinkConfig, TraceSummaryAccumulator};
 pub use aggregator::{AggReport, ApmAggregator};
 pub use edge::{EdgeAccumulator, ServiceResolver};
 pub use endpoint::{Endpoint, EndpointRegistry};
+pub use query::{
+    get_trace, list_services, search_edges, search_traces, EdgeSearchPage, EdgeSearchQuery,
+    ServiceRow, TraceDetail, TraceSearchPage, TraceSearchQuery, TraceSummary,
+};
 pub use red::{ClosedSamples, RedSamples};
 pub use sink::{ApmSink, FlushReport};
 

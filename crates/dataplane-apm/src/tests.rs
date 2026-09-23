@@ -990,3 +990,22 @@ async fn aggregator_empty_bucket_writes_nothing() {
         .unwrap();
     assert!(any.result.is_empty(), "空桶不写零值: {any:?}");
 }
+
+#[test]
+fn query_limit_and_window_helpers() {
+    use crate::query::{
+        clamp_limit, resolve_window, DEFAULT_LIMIT, DEFAULT_WINDOW_MICROS, MAX_LIMIT,
+    };
+
+    assert_eq!(clamp_limit(None), DEFAULT_LIMIT);
+    assert_eq!(clamp_limit(Some(0)), 1);
+    assert_eq!(clamp_limit(Some(10)), 10);
+    assert_eq!(clamp_limit(Some(usize::MAX)), MAX_LIMIT);
+
+    let (from, to) = resolve_window(None, None, NOW).unwrap();
+    assert_eq!(to, NOW);
+    assert_eq!(from, NOW - DEFAULT_WINDOW_MICROS, "缺省最近 1 小时");
+    let (from, to) = resolve_window(Some(1), None, NOW).unwrap();
+    assert_eq!((from, to), (1, NOW));
+    assert!(resolve_window(Some(10), Some(1), NOW).is_err());
+}
