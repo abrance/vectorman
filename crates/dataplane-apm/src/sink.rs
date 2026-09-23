@@ -13,6 +13,7 @@ use dataplane_ingest::DataEnvelope;
 use dataplane_sql::RelationalStore;
 
 use crate::accumulator::{ApmSinkConfig, TraceSummaryAccumulator};
+use crate::edge::{EdgeAccumulator, ServiceResolver};
 use crate::endpoint::EndpointRegistry;
 
 pub use crate::accumulator::ApmSinkConfig as Config;
@@ -22,6 +23,7 @@ pub use crate::accumulator::ApmSinkConfig as Config;
 pub struct FlushReport {
     pub traces: usize,
     pub endpoints: usize,
+    pub edges: usize,
 }
 
 /// dataserver 侧 APM 派生数据的聚合入口。
@@ -30,6 +32,32 @@ pub struct ApmSink {
     config: ApmSinkConfig,
     accumulator: TraceSummaryAccumulator,
     endpoints: EndpointRegistry,
+    edges: EdgeAccumulator,
+}
+
+/// 把端点表适配成边目标归一用的解析器（需要同时拿到 sql 与 registry）。
+struct EndpointResolver<'a> {
+    sql: &'a dyn RelationalStore,
+    registry: &'a EndpointRegistry,
+}
+
+#[async_trait]
+impl ServiceResolver for EndpointResolver<'_> {
+    async fn resolve(
+        &self,
+        host_ip: &str,
+        port: i64,
+        pod_name: &str,
+    ) -> Result<Option<String>, DataplaneError> {
+        if let Some(service) = self
+            .registry
+            .lookup_by_ip_port(self.sql, host_ip, port)
+            .await?
+        {
+            return Ok(Some(service));
+        }
+        self.registry.lookup_by_pod(self.sql, pod_name).await
+    }
 }
 
 impl ApmSink {
@@ -39,11 +67,13 @@ impl ApmSink {
             config.endpoint_retention_days,
             config.endpoint_cache_ttl_secs,
         );
+        let edges = EdgeAccumulator::new(config.edge_pending_capacity);
         Self {
             sql,
             accumulator: TraceSummaryAccumulator::new(config.clone()),
             config,
             endpoints,
+            edges,
         }
     }
 
@@ -63,14 +93,37 @@ impl ApmSink {
         } else {
             0
         };
-        Ok(FlushReport { traces, endpoints })
+        let edges = self.flush_edges(now_ts).await?;
+        Ok(FlushReport {
+            traces,
+            endpoints,
+            edges,
+        })
     }
 
     /// 立即落地（进程退出前或测试使用）。
     pub async fn flush_now(&self, now_ts: i64) -> Result<FlushReport, DataplaneError> {
         let traces = self.accumulator.flush(self.sql.as_ref(), now_ts).await?;
         let endpoints = self.endpoints.flush(self.sql.as_ref()).await?;
-        Ok(FlushReport { traces, endpoints })
+        let edges = self.flush_edges(now_ts).await?;
+        Ok(FlushReport {
+            traces,
+            endpoints,
+            edges,
+        })
+    }
+
+    async fn flush_edges(&self, now_ts: i64) -> Result<usize, DataplaneError> {
+        if self.edges.dirty_len() == 0 {
+            return Ok(0);
+        }
+        let resolver = EndpointResolver {
+            sql: self.sql.as_ref(),
+            registry: &self.endpoints,
+        };
+        self.edges
+            .flush(self.sql.as_ref(), now_ts, Some(&resolver))
+            .await
     }
 
     /// 清理超过保留期的端点。
@@ -125,6 +178,21 @@ impl ApmSink {
     }
 
     #[must_use]
+    pub fn edges(&self) -> &EdgeAccumulator {
+        &self.edges
+    }
+
+    #[must_use]
+    pub fn paired_edges(&self) -> u64 {
+        self.edges.paired_edges()
+    }
+
+    #[must_use]
+    pub fn pending_spans(&self) -> usize {
+        self.edges.pending_len()
+    }
+
+    #[must_use]
     pub fn endpoints(&self) -> &EndpointRegistry {
         &self.endpoints
     }
@@ -140,6 +208,7 @@ impl TraceSink for ApmSink {
         let now_ts = crate::now_micros();
         self.accumulator.observe(span, envelope);
         self.endpoints.observe(span, now_ts);
+        self.edges.observe(span, envelope);
         Ok(())
     }
 }

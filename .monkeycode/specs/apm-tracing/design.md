@@ -259,8 +259,10 @@ ON CONFLICT(trace_id) DO UPDATE SET
 - 收到 `kind=client` 的 span 时，查 `parent_index` 取 `(trace_id, span_id)` 匹配的 server span：
   - 命中：边 `src_service = client.service`、`dst_service = server.service`。
   - 未命中：用 `attributes["server.address"]` / `["net.peer.name"]` / `["net.peer.ip"]` 兜底，值前缀 `unknown:`；都缺失用 `unknown`。
-- 边摘要写 sqlite `apm_edge_summary`（每分钟桶聚合一行，含 `calls`、`errors`、`duration_micros_sum`、`durations_hist` 或样本列表的中间表）。为控制表规模，样本列表不入库，只存 `calls`/`errors`/`sum`/`max`，P95 用「accumulator 内存直方图」在聚合任务里算，因此边指标要求聚合任务与 accumulator 在同一进程（本设计成立）。
-- server span 与 client span 到达顺序不保证，因此 `parent_index` 的查找允许「反向补齐」：收到 server span 时回查已存在的 client 记录并补一条边（`parent_index` 同时保存两个方向的最近窗口）。
+- 边摘要写 sqlite `apm_edge_summary`（每分钟桶聚合一行，含 `calls`、`errors`、`duration_sum`、`duration_max`）。为控制表规模，样本列表不入库，只存 `calls`/`errors`/`sum`/`max`，P95 用「accumulator 内存直方图」在聚合任务里算，因此边指标要求聚合任务与 accumulator 在同一进程（本设计成立）。
+- server span 与 client span 到达顺序不保证，因此配对索引两个方向都保留：client 先到则按 `(trace_id, span_id)` 等 server，server 先到则按 `(trace_id, parent_span_id)` 等 client（反向补齐）。
+- **兜底边的判定时机是「桶关闭」**：配对是异步的，只有等 client 所在的分钟桶结束（`timestamp + 60s <= now`）才能判定「找不到对端」。因此 `unknown*` 目标在 flush 时产生；同一 client 一旦计数就进入去重集合，晚到的 server 不会再产生第二条边（一次调用只计一次，代价是这一条边的目标名可能是 `unknown*`）。
+- 待配对 span 与去重记录都有 TTL（120 秒）与容量上限，超限按时间淘汰并计数；跨 TTL 晚到的 server 属于已放弃的配对。
 
 ### dataserver：HTTP 路由
 
@@ -475,6 +477,7 @@ max_end_ts INTEGER NOT NULL DEFAULT 0
 - `LogStore` 索引字段提升必须在 `append` 内部实现（对既有调用方零改动），否则同一份日志写入路径会出现两套行为。
 - `apm_service_*` 的 `operation` 用根 span 的 `name`，而 `span_kind` 固定 `server`；若后续要按内部 span 统计，需要新增 measurement，不要改写既有语义。
 - 边 P95 依赖聚合任务与 accumulator 同进程的内存直方图；不要把样本写进 sqlite 再算，规模会失控。
+- 兜底边不要试图在 `observe` 阶段就产生：此时无法区分「对端还没到」与「对端不存在」，会把每一条正常调用的边都写成 `unknown*`。
 - 删除/统计类接口不能靠 `RelationalStore::execute` 的返回行数：`DELETE` 不返回行，受影响行数要用同一连接上的 `SELECT changes()` 取（`sqlite` 的 `changes()` 是连接级状态）。
 - 根 span 判定不要用「`parent_span_id` 为空且是第一个到达」，必须按 `start_ts` 比较，否则乱序到达时摘要不稳定。
 - `LogStore::append` **不按 id 幂等**：同一 `id` 追加两次会产生两个文档（只有 `delete_term(id)` 才清掉）。所以 `traces` 分支的顺序固定为「写明细 → 派生数据（best effort）→ KvStore 标记去重」，且派生数据失败不能当成整批失败；同样原因，接入重试不能依赖「明细会被去重」，幂等完全靠 KvStore 的 `ingest/{record_id}` 先于写入的判断。

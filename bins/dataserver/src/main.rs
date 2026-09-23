@@ -195,7 +195,7 @@ async fn main() -> ExitCode {
             loop {
                 ticker.tick().await;
                 match sink.flush_due(now_micros()).await {
-                    Ok(report) if report.traces > 0 || report.endpoints > 0 => {
+                    Ok(report) if report.traces > 0 || report.endpoints > 0 || report.edges > 0 => {
                         flush_metrics.inc_counter(
                             "dataserver_apm_trace_summaries_flushed_total",
                             report.traces as f64,
@@ -204,6 +204,8 @@ async fn main() -> ExitCode {
                             "dataserver_apm_endpoints_flushed_total",
                             report.endpoints as f64,
                         );
+                        flush_metrics
+                            .inc_counter("dataserver_apm_edges_flushed_total", report.edges as f64);
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -213,6 +215,9 @@ async fn main() -> ExitCode {
                 }
                 flush_metrics.set_gauge("dataserver_apm_live_traces", sink.live_traces() as f64);
                 flush_metrics.set_gauge("dataserver_apm_dirty_traces", sink.dirty_traces() as f64);
+                flush_metrics.set_gauge("dataserver_apm_paired_edges", sink.paired_edges() as f64);
+                flush_metrics
+                    .set_gauge("dataserver_apm_pending_spans", sink.pending_spans() as f64);
             }
         });
     }

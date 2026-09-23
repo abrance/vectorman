@@ -485,7 +485,316 @@ async fn missing_endpoint_resource_is_ignored() {
     assert_eq!(report.traces, 1);
 }
 
-#[allow(dead_code)]
-fn assert_error_code(e: DataplaneError, code: &str) {
-    assert_eq!(e.code.as_str(), code);
+#[allow(clippy::too_many_arguments)]
+fn edge_span(
+    trace_id: &str,
+    span_id: &str,
+    parent: &str,
+    kind: &str,
+    service: &str,
+    start_ts: i64,
+    duration_micros: i64,
+    status: &str,
+    attrs: &[(&str, &str)],
+) -> TraceSpan {
+    let mut span = span(
+        trace_id,
+        span_id,
+        parent,
+        service,
+        "op",
+        start_ts,
+        duration_micros,
+        status,
+    );
+    span.kind = kind.to_string();
+    for (k, v) in attrs {
+        span.attributes.insert((*k).to_string(), (*v).to_string());
+    }
+    span
+}
+
+async fn edge_rows(sql: &dyn RelationalStore) -> Vec<Vec<SqlValue>> {
+    sql.execute(
+        &format!(
+            "SELECT bucket_start, src_service, dst_service, calls, errors, duration_sum, duration_max
+             FROM {} ORDER BY src_service, dst_service",
+            tables::EDGE_SUMMARY
+        ),
+        &[],
+    )
+    .await
+    .unwrap()
+    .rows
+}
+
+#[tokio::test]
+async fn edge_pairs_client_and_server_in_both_orders() {
+    let dir = tempfile::tempdir().unwrap();
+    let sql = store(dir.path());
+    bootstrap(sql.as_ref()).await.unwrap();
+    let edges = crate::edge::EdgeAccumulator::new(1_000);
+    let env = envelope();
+    let trace = "bbbb0000000000000000000000000001";
+
+    // 场景 1：client 先到，server 后到。
+    edges.observe(
+        &edge_span(
+            trace,
+            "0000000000000001",
+            "0000000000000000",
+            "client",
+            "gateway",
+            NOW,
+            900,
+            "ok",
+            &[],
+        ),
+        &env,
+    );
+    assert_eq!(edges.pending_len(), 1, "client 在等 server");
+    assert!(edges.observe(
+        &edge_span(
+            trace,
+            "0000000000000002",
+            "0000000000000001",
+            "server",
+            "order-api",
+            NOW + 10,
+            800,
+            "ok",
+            &[]
+        ),
+        &env
+    ));
+    assert_eq!(edges.pending_len(), 0, "配对后不再悬挂");
+
+    // 场景 2：server 先到，client 后到（反向补齐）。
+    let trace2 = "bbbb0000000000000000000000000002";
+    edges.observe(
+        &edge_span(
+            trace2,
+            "0000000000000003",
+            "0000000000000004",
+            "server",
+            "payment",
+            NOW + 20,
+            700,
+            "ok",
+            &[],
+        ),
+        &env,
+    );
+    assert_eq!(edges.pending_len(), 1, "server 在等 client");
+    assert!(edges.observe(
+        &edge_span(
+            trace2,
+            "0000000000000004",
+            "0000000000000000",
+            "client",
+            "gateway",
+            NOW + 25,
+            1_100,
+            "error",
+            &[]
+        ),
+        &env
+    ));
+
+    let written = edges.flush(sql.as_ref(), NOW, None).await.unwrap();
+    assert_eq!(written, 2);
+    let rows = edge_rows(sql.as_ref()).await;
+    assert_eq!(rows.len(), 2);
+    // 边方向固定 client → server。
+    assert_eq!(as_text(&rows[0][1]), "gateway");
+    assert_eq!(as_text(&rows[0][2]), "order-api");
+    assert_eq!(as_i64(&rows[0][3]), 1, "calls");
+    assert_eq!(as_i64(&rows[0][4]), 0, "errors");
+    assert_eq!(as_i64(&rows[0][5]), 900, "duration_sum 取 client 耗时");
+    assert_eq!(as_text(&rows[1][2]), "payment");
+    assert_eq!(as_i64(&rows[1][4]), 1, "client status=error 计入 errors");
+    assert_eq!(as_i64(&rows[1][5]), 1_100);
+    // 桶按 client 时间戳落到整分钟。
+    assert_eq!(as_i64(&rows[0][0]) % (60 * 1_000_000), 0);
+}
+
+#[tokio::test]
+async fn edge_counts_one_call_when_client_has_many_servers() {
+    let dir = tempfile::tempdir().unwrap();
+    let sql = store(dir.path());
+    bootstrap(sql.as_ref()).await.unwrap();
+    let edges = crate::edge::EdgeAccumulator::new(1_000);
+    let env = envelope();
+    let trace = "bbbb0000000000000000000000000003";
+    // 两个 server span 先到，同一个 client 后到。
+    for id in ["0000000000000011", "0000000000000012"] {
+        edges.observe(
+            &edge_span(
+                trace,
+                id,
+                "0000000000000010",
+                "server",
+                "order-api",
+                NOW + 5,
+                100,
+                "ok",
+                &[],
+            ),
+            &env,
+        );
+    }
+    edges.observe(
+        &edge_span(
+            trace,
+            "0000000000000010",
+            "0000000000000000",
+            "client",
+            "gateway",
+            NOW,
+            950,
+            "ok",
+            &[],
+        ),
+        &env,
+    );
+    edges.flush(sql.as_ref(), NOW, None).await.unwrap();
+    let rows = edge_rows(sql.as_ref()).await;
+    assert_eq!(rows.len(), 1, "同一逻辑边只有一行");
+    assert_eq!(as_i64(&rows[0][3]), 1, "多条 server 只算一次调用");
+    assert_eq!(as_i64(&rows[0][5]), 950);
+}
+
+#[tokio::test]
+async fn edge_falls_back_to_unknown_and_normalizes_via_resolver() {
+    let dir = tempfile::tempdir().unwrap();
+    let sql = store(dir.path());
+    bootstrap(sql.as_ref()).await.unwrap();
+    let edges = crate::edge::EdgeAccumulator::new(1_000);
+    let env = envelope();
+
+    // 配对不到且没有可用对端标识 → unknown。
+    edges.observe(
+        &edge_span(
+            "bbbb0000000000000000000000000004",
+            "0000000000000021",
+            "0000000000000000",
+            "client",
+            "gateway",
+            NOW,
+            500,
+            "ok",
+            &[],
+        ),
+        &env,
+    );
+    // 配对不到但有 server.address → unknown:<addr>，由 resolver 归一。
+    edges.observe(
+        &edge_span(
+            "bbbb0000000000000000000000000005",
+            "0000000000000022",
+            "0000000000000000",
+            "client",
+            "gateway",
+            NOW,
+            600,
+            "ok",
+            &[("server.address", "10.0.0.9"), ("server.port", "8080")],
+        ),
+        &env,
+    );
+
+    struct FixedResolver;
+    #[async_trait::async_trait]
+    impl crate::edge::ServiceResolver for FixedResolver {
+        async fn resolve(
+            &self,
+            host_ip: &str,
+            port: i64,
+            _pod: &str,
+        ) -> Result<Option<String>, DataplaneError> {
+            if (host_ip, port) == ("10.0.0.9", 8080) {
+                return Ok(Some("order-api".to_string()));
+            }
+            Ok(None)
+        }
+    }
+    // 配对要等桶关闭才能判定「找不到对端」，因此用桶结束后的时间 flush。
+    edges
+        .flush(sql.as_ref(), NOW + 61_000_000, Some(&FixedResolver))
+        .await
+        .unwrap();
+    let rows = edge_rows(sql.as_ref()).await;
+    let dsts: Vec<String> = rows.iter().map(|r| as_text(&r[2])).collect();
+    assert!(
+        dsts.contains(&"order-api".to_string()),
+        "归一后落真实服务名: {dsts:?}"
+    );
+    assert!(
+        dsts.contains(&"unknown".to_string()),
+        "无可解析目标时落 unknown: {dsts:?}"
+    );
+}
+
+#[tokio::test]
+async fn edge_dedupes_replayed_spans_and_bounds_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let sql = store(dir.path());
+    bootstrap(sql.as_ref()).await.unwrap();
+    let edges = crate::edge::EdgeAccumulator::new(2);
+    let env = envelope();
+    let trace = "bbbb0000000000000000000000000006";
+    let client = edge_span(
+        trace,
+        "0000000000000031",
+        "0000000000000000",
+        "client",
+        "gw",
+        NOW,
+        100,
+        "ok",
+        &[],
+    );
+    let server = edge_span(
+        trace,
+        "0000000000000032",
+        "0000000000000031",
+        "server",
+        "svc",
+        NOW + 1,
+        90,
+        "ok",
+        &[],
+    );
+    edges.observe(&client, &env);
+    edges.observe(&server, &env);
+    // 重放同样的 client+server：不得重复计数。
+    edges.observe(&client, &env);
+    edges.observe(&server, &env);
+    edges.flush(sql.as_ref(), NOW, None).await.unwrap();
+    let rows = edge_rows(sql.as_ref()).await;
+    assert_eq!(as_i64(&rows[0][3]), 1, "重放不重复计数");
+
+    // 容量上限：塞入超过容量的待配对 span。
+    for i in 0..5 {
+        edges.observe(
+            &edge_span(
+                &format!("bbbb0000000000000000000000001{i:02x}"),
+                &format!("00000000000001{i:02x}"),
+                "0000000000000000",
+                "client",
+                "gw",
+                NOW,
+                10,
+                "ok",
+                &[],
+            ),
+            &env,
+        );
+    }
+    assert!(
+        edges.pending_len() <= 2,
+        "容量上限生效: {}",
+        edges.pending_len()
+    );
+    assert!(edges.dropped_pending() > 0);
 }
