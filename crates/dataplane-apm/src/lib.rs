@@ -17,6 +17,7 @@ use dataplane_core::{DataplaneError, ErrorCode, SqlValue};
 use dataplane_sql::RelationalStore;
 
 pub mod accumulator;
+pub mod edge;
 
 pub mod endpoint;
 pub mod sink;
@@ -24,6 +25,7 @@ pub mod sink;
 mod tests;
 
 pub use accumulator::{ApmSinkConfig, TraceSummaryAccumulator};
+pub use edge::{EdgeAccumulator, ServiceResolver};
 pub use endpoint::{Endpoint, EndpointRegistry};
 pub use sink::{ApmSink, FlushReport};
 

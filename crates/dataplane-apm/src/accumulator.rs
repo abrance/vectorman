@@ -37,6 +37,8 @@ pub struct ApmSinkConfig {
     pub endpoint_cache_ttl_secs: u64,
     /// 冷启动回载窗口（秒）：`max_end_ts` 在此窗口内的 trace 会被重新载入。
     pub reload_window_secs: i64,
+    /// 边配对时待配对 span 的内存上限（缺省 `max_live_traces * 8`）。
+    pub edge_pending_capacity: usize,
 }
 
 impl Default for ApmSinkConfig {
@@ -48,6 +50,7 @@ impl Default for ApmSinkConfig {
             endpoint_retention_days: 30,
             endpoint_cache_ttl_secs: 60,
             reload_window_secs: 300,
+            edge_pending_capacity: 160_000,
         }
     }
 }
