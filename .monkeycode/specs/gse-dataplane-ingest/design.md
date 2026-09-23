@@ -162,7 +162,7 @@ RecordFailure { record_id: String, code: String, message: String }
 
 公共 labels（覆盖同名）：`data_type`、`agent_id`、`data_id`，以及非空 `host_id`。
 
-`search(log, query) -> Vec<LogRecord>`：把 HTTP 过滤条件编成 `LogFilter`。扩展 `LogFilter` 增加 `limit: usize`（默认 100，上限 1000）；实现侧在 tantivy `TopDocs` 使用该值。`trace_id` / `event_type` / `data_type` 等走 `labels` 精确匹配。
+`search(log, query) -> Vec<LogRecord>`：把 HTTP 过滤条件编成 `LogFilter`。扩展 `LogFilter` 增加 `limit: usize`（默认 100，上限 1000）；实现侧在 tantivy `TopDocs` 使用该值。当前 `labels` 以 `labels_json` 存储且未建索引，`trace_id` / `event_type` / `data_type` 等 label 条件是在取回 `TopDocs` 之后在应用层 post-filter 的，因此命中条数受 `MAX_LIMIT`（1000）扫描上限约束，只适合「过滤少量结果」，不适合「按 `trace_id` 取回一个 trace 的全部 span」。该缺陷与修复方案（索引字段提升 + `search_indexed` + 索引版本 v2）见 `/.monkeycode/specs/observability-data-model/design.md` 的「LogStore 索引版本 v2」，由 `apm-tracing` 实现。
 
 `LogStore` 增加 `delete_matching(filter) -> u64`：按时间上界与 labels（至少 `data_id`）删除。dataserver 每小时拉一次 `collect_items`，对每项用 `retention_days` 调用删除；指标页默认 `query_range` 窗口不超过该周期。
 
@@ -485,7 +485,7 @@ DataplaneService {
 }
 ```
 
-APM / eBPF 记录字段与 requirements Requirement 3 一致；v1 Agent 不产出这两类。
+APM / eBPF 记录字段与 requirements Requirement 3 一致；v1 Agent 不产出这两类。这两类的端到端设计（OTLP 接入、trace 存储与查询、eBPF 采集与聚合、拓扑合并）见 `/.monkeycode/specs/apm-tracing/` 与 `/.monkeycode/specs/ebpf-observability/`，共用数据模型见 `/.monkeycode/specs/observability-data-model/`。
 
 ## Correctness Properties
 
@@ -545,6 +545,9 @@ APM / eBPF 记录字段与 requirements Requirement 3 一致；v1 Agent 不产�
 [^2]: 存储层设计 - 当前工作区 `/.monkeycode/specs/dataplane-layered-storage/design.md`
 [^3]: GSE 会话与 RPC - 当前工作区 `/.monkeycode/specs/gse-server-agent/design.md`
 [^4]: 台账 HTTP - 当前工作区 `crates/gse-server-core/src/http.rs`
+[^5]: 共享可观测数据模型 - 当前工作区 `/.monkeycode/specs/observability-data-model/design.md`
+[^6]: APM trace 采集与查询 - 当前工作区 `/.monkeycode/specs/apm-tracing/design.md`
+[^7]: eBPF 可观测采集 - 当前工作区 `/.monkeycode/specs/ebpf-observability/design.md`
 | DELETE | `/v1/collect-items/{item_id}` | `DELETE .../collect-items/{item_id}` |
 | GET | `/v1/agents` | `GET {gse_admin_url}/api/gse/agents`（前端多选 Agent） |
 `DELETE` 先读该项 `retention_days`，写入 KvStore `retain/{item_id}` = JSON `{"until_micros": now + days}`，再转发 GSE。清理任务扫描 live `collect_items` 与 `retain/` 前缀：对每个 `item_id` 删除 `timestamp < now - retention`（live）或 `timestamp < until_micros`（已删项）的日志；到期后删 `retain/` 键。停用（`enabled=false`）不写 `retain/`，该项仍在 live 列表里按 `retention_days` 清理。

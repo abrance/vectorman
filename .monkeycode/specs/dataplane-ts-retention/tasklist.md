@@ -1,0 +1,50 @@
+# 需求实施计划
+
+本 feature 是 `apm-tracing` 与 `ebpf-observability` 聚合指标可清理的前置依赖，应先于两份观测 spec 的聚合落地。本期只交付设计，本清单为待实施拆分。
+
+- [ ] 1. 类型与 trait 扩展
+  - [ ] 1.1 `TsRetentionConfig`、`TsMatcher`/`TsMatcherOp`、`TsSeriesSelection`、`TsDeleteReport`、`TsStorageStats`
+    - 对应需求 1.1、2.1-2.3、5.1-5.2 与设计类型定义
+  - [ ] 1.2 `TimeSeriesStore` 新增 `delete_series`（默认返回 `query_failed`）与 `storage_stats`（默认零值）
+    - 对应需求 6.3
+  - [ ] 1.3 桩测试：只实现既有三方法的存储，断言默认实现行为
+- [ ] 2. tsink 适配
+  - [ ] 2.1 `TsinkTimeSeriesStore::new(data_path, TsRetentionConfig)`，按「先 `with_retention`、后 `with_retention_enforced`」顺序配置
+    - 对应需求 1.1-1.3 与设计 Pitfalls 第二条
+  - [ ] 2.2 上限透传：`with_cardinality_limit` / `with_memory_limit` / `with_wal_size_limit`（0 表示不传）
+    - 对应需求 4.1-4.2
+  - [ ] 2.3 `delete_series` 适配：`TsSeriesSelection` → `tsink::SeriesSelection`（必填双端时间范围）→ `DeleteSeriesResult` 投影
+    - 对应需求 2.4、2.8-2.9
+  - [ ] 2.4 错误映射：`InvalidTimeRange` → `invalid_argument`；`delete_series is not implemented` 与墓碑落盘失败 → `query_failed`；超窗写入 → `invalid_argument`；基数拒绝 → `query_failed` 含 `cardinality`
+    - 对应需求 1.5、2.5-2.7、4.3
+  - [ ] 2.5 `storage_stats` 适配：`observability_snapshot()` 字段投影 + 本地配置回显 + `list_metrics()` 按需采样
+    - 对应需求 5.2 与设计来源映射表
+  - [ ] 2.6 单测：超窗点被拒/被拒消息、`enforced=false` 兼容、删除生效与范围外不受影响、重复删除幂等、非法范围、基数上限达峰后的行为、统计字段一致性
+- [ ] 3. 检查点 - 确保所有测试通过
+  - 确保所有测试通过,如有疑问请询问用户
+- [ ] 4. dataserver 接线
+  - [ ] 4.1 配置项 `ts_retention_days`（30）、`ts_retention_enforced`（true）、`ts_cardinality_limit`（2_000_000）、`ts_memory_limit_bytes`、`ts_wal_size_limit_bytes`、`ts_clean_interval_secs`（3600）+ `DATASERVER_` 环境变量
+    - 对应需求 1.4、4.1
+  - [ ] 4.2 启动校验：`retention_days=0` 且 `enforced=true` 时以 `config_invalid` 退出
+    - 对应设计 Error Handling 第一行
+  - [ ] 4.3 `TsCleanTask`：按采集项 `retention_days` 与 `retain/` 键调用删除、每小时运行、幂等、日志统计、matcher 长期零命中提示
+    - 对应需求 3.1-3.6、4.5
+  - [ ] 4.4 HTTP：`POST /v1/ts/delete`、`GET /v1/ts/stats`（含 `sampled_at_ts`）
+    - 对应需求 2.10、5.4
+  - [ ] 4.5 自监控指标 `dataserver_ts_*`（series_count / memory / wal / tombstones / clean runs / degraded）与 `degraded` 标记
+    - 对应需求 5.3、5.5
+  - [ ] 4.6 httptest：删除正常与非法范围、统计形状、健康检查在 `degraded` 时的表现、既有 SQL/Prom/日志检索不受影响
+- [ ] 5. 检查点 - 确保所有测试通过
+  - 确保所有测试通过,如有疑问请询问用户
+- [ ] 6. dpc 与观测接线
+  - [ ] 6.1 `dpc ts stats`、`dpc ts delete --metric --matcher --from-ts --to-ts`
+    - 对应需求 5.6
+  - [ ] 6.2 回改 `observability-data-model/design.md`：把「TimeSeriesStore 保留缺口」改为「本期交付」，指向本 spec
+  - [ ] 6.3 回改 `apm-tracing` 与 `ebpf-observability` 的需求与设计：聚合指标清理从「外部依赖」改为「依赖本 spec」
+- [ ] 7. 集成验证
+  - [ ] 7.1 写入 `apm_service_requests_total` 旧点 → 跑清理 → `GET /api/v1/query` 不再命中
+  - [ ] 7.2 打开保留执行后跑一遍既有指标采集链路，确认近实时写入不受影响；构造补传历史点场景确认返回 `invalid_argument`
+  - [ ] 7.3 基数上限压测：逼近上限时 `dataserver_ts_series_count` 可见、写入失败消息含 `cardinality`
+- [ ] 8. 发布说明
+  - [ ] 8.1 标注行为变更：`ts_retention_enforced` 缺省 true，升级后超窗点写入会失败；`ts_retention_days` 缺省 30 天
+    - 对应需求 7.4
