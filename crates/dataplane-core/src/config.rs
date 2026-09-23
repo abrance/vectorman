@@ -12,6 +12,8 @@ ts_cardinality_limit = 2000000
 # ts_memory_limit_bytes = 0
 # ts_wal_size_limit_bytes = 0
 ts_clean_interval_secs = 3600
+apm_enabled = true
+apm_endpoint_retention_days = 30
 
 [sql_http]
 listen = "0.0.0.0:8081"
@@ -78,6 +80,12 @@ pub struct Config {
     /// 时序按采集项保留期的清理周期（秒），0 表示不清理。
     #[serde(default = "default_ts_clean_interval")]
     pub ts_clean_interval_secs: u64,
+    /// 是否启用 APM（trace 摘要、服务端点半、后续的聚合任务）。
+    #[serde(default = "default_true")]
+    pub apm_enabled: bool,
+    /// 服务端点半保留期（天）。
+    #[serde(default = "default_apm_endpoint_retention_days")]
+    pub apm_endpoint_retention_days: u32,
 }
 
 impl Default for Config {
@@ -99,6 +107,8 @@ impl Default for Config {
             ts_memory_limit_bytes: 0,
             ts_wal_size_limit_bytes: 0,
             ts_clean_interval_secs: default_ts_clean_interval(),
+            apm_enabled: true,
+            apm_endpoint_retention_days: default_apm_endpoint_retention_days(),
         }
     }
 }
@@ -163,6 +173,14 @@ impl Config {
                 self.ts_wal_size_limit_bytes = n;
             }
         }
+        if let Ok(v) = std::env::var("DATASERVER_APM_ENABLED") {
+            self.apm_enabled = v.eq_ignore_ascii_case("true") || v == "1";
+        }
+        if let Ok(v) = std::env::var("DATASERVER_APM_ENDPOINT_RETENTION_DAYS") {
+            if let Ok(n) = v.parse() {
+                self.apm_endpoint_retention_days = n;
+            }
+        }
         if let Ok(v) = std::env::var("DATASERVER_TS_CLEAN_INTERVAL") {
             if let Ok(n) = v.parse() {
                 self.ts_clean_interval_secs = n;
@@ -201,6 +219,10 @@ fn default_ts_clean_interval() -> u64 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_apm_endpoint_retention_days() -> u32 {
+    30
 }
 
 fn nonempty_opt(v: String) -> Option<String> {

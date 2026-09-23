@@ -11,11 +11,46 @@
 //! 版本策略：`obs_schema_meta` 的 `schema_version` 高于本代码支持的版本时以
 //! `config_invalid` 退出（不做自动降级）；低于或缺失时按当前版本补齐。
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use dataplane_core::{DataplaneError, ErrorCode, SqlValue};
 use dataplane_sql::RelationalStore;
 
+pub mod accumulator;
+
+pub mod endpoint;
+pub mod sink;
+#[cfg(test)]
+mod tests;
+
+pub use accumulator::{ApmSinkConfig, TraceSummaryAccumulator};
+pub use endpoint::{Endpoint, EndpointRegistry};
+pub use sink::{ApmSink, FlushReport};
+
+/// 当前 Unix 微秒。
+#[must_use]
+pub fn now_micros() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+
 /// 本代码支持的观测表 schema 版本。
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// v1 → v2：`apm_trace_summary` 增加 `root_start_ts`。摘要按「根 span 取 `start_ts`
+/// 最小者」维护，而根可能比普通 span 晚到、也可能跨多次 flush 才到，因此必须把
+/// 当前根的开始时间也存下来，否则无法在后续 flush 中比较出更早的根。
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// 版本迁移：`(目标版本, 语句)`，仅在当前版本低于目标版本时执行。
+///
+/// 新建库的 `CREATE TABLE` 已包含新列，因此迁移语句对「缺少该列」与「已有该列」
+/// 两种情况都要能容忍（重复列错误被忽略）。
+pub const MIGRATIONS: &[(i64, &str)] = &[(
+    2,
+    "ALTER TABLE apm_trace_summary ADD COLUMN root_start_ts INTEGER NOT NULL DEFAULT 0",
+)];
 
 /// 版本行的键名。
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -47,6 +82,7 @@ pub const DDL: &[&str] = &[
         duration_micros  INTEGER NOT NULL,
         root_service     TEXT NOT NULL,
         root_operation   TEXT NOT NULL,
+        root_start_ts    INTEGER NOT NULL DEFAULT 0,
         span_count       INTEGER NOT NULL,
         error_count      INTEGER NOT NULL,
         status           TEXT NOT NULL,
@@ -120,19 +156,50 @@ pub async fn bootstrap(sql: &dyn RelationalStore) -> Result<(), DataplaneError> 
                  upgrade dataserver instead of downgrading the database"
             ),
         )),
+        Some(v) if v < SCHEMA_VERSION => {
+            for (target, statement) in MIGRATIONS.iter().filter(|(t, _)| *t > v) {
+                apply_migration(sql, *target, statement).await?;
+            }
+            write_version(sql, SCHEMA_VERSION).await
+        }
         Some(_) => Ok(()),
-        None => {
-            sql.execute(
-                &format!("INSERT INTO {} (key, value) VALUES (?1, ?2)", tables::META),
-                &[
-                    SqlValue::Text(SCHEMA_VERSION_KEY.to_string()),
-                    SqlValue::Text(SCHEMA_VERSION.to_string()),
-                ],
-            )
-            .await?;
-            Ok(())
+        None => write_version(sql, SCHEMA_VERSION).await,
+    }
+}
+
+/// 执行一条迁移语句；「重复列」等已应用过的错误视为成功。
+async fn apply_migration(
+    sql: &dyn RelationalStore,
+    target: i64,
+    statement: &str,
+) -> Result<(), DataplaneError> {
+    if let Err(e) = sql.execute(statement, &[]).await {
+        let already_applied = e.message.contains("duplicate column name");
+        if !already_applied {
+            return Err(DataplaneError::new(
+                ErrorCode::ConfigInvalid,
+                format!("obs schema migration to v{target} failed: {}", e.message),
+            ));
         }
     }
+    Ok(())
+}
+
+/// 写入/覆盖版本行。
+async fn write_version(sql: &dyn RelationalStore, version: i64) -> Result<(), DataplaneError> {
+    sql.execute(
+        &format!(
+            "INSERT INTO {} (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            tables::META
+        ),
+        &[
+            SqlValue::Text(SCHEMA_VERSION_KEY.to_string()),
+            SqlValue::Text(version.to_string()),
+        ],
+    )
+    .await?;
+    Ok(())
 }
 
 /// 读取 `schema_version`；缺失返回 `None`。
@@ -168,7 +235,7 @@ pub async fn read_version(sql: &dyn RelationalStore) -> Result<Option<i64>, Data
 }
 
 #[cfg(test)]
-mod tests {
+mod schema_tests {
     use super::*;
     use dataplane_sql::SqliteRelationalStore;
 

@@ -302,6 +302,7 @@ CREATE TABLE IF NOT EXISTS apm_trace_summary (
   duration_micros  INTEGER NOT NULL,
   root_service     TEXT NOT NULL,
   root_operation   TEXT NOT NULL,
+  root_start_ts    INTEGER NOT NULL DEFAULT 0, -- 当前根 span 的 start，用于跨 flush 比较
   span_count       INTEGER NOT NULL,
   error_count      INTEGER NOT NULL,
   status           TEXT NOT NULL,       -- ok | error
@@ -345,6 +346,12 @@ CREATE INDEX IF NOT EXISTS ebpf_edges_svc ON ebpf_edges(src_service, dst_service
 ```
 
 `obs_schema_meta` 的版本在满足以下任一条件时递增：列增删、主键变化、语义变化。dataserver 启动读到更高版本时以 `config_invalid` 退出，不做自动降级。
+
+已发生的版本变更：
+
+| 版本 | 变更 | 原因 |
+| --- | --- | --- |
+| 2 | `apm_trace_summary` 增加 `root_start_ts` | 摘要按「根 span 取 `start_ts` 最小者」维护，根可能晚到或跨多次 flush 才到，必须把当前根的 start 也存下来才能比较；`ALTER TABLE ... ADD COLUMN` 由 dataserver 启动时的迁移步骤执行（新库的 CREATE 已含该列，重复列错误被忽略） |
 
 #### TimeSeriesStore 保留能力（本期交付）
 
