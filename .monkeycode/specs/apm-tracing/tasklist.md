@@ -77,12 +77,15 @@
   - [x] 8.4 单测：5 个 `field_name` 点、label 集合、单位量级、同桶重跑结果一致
 - [ ] 9. dataserver 查询接口与清理
     - 状态：已实现（PR #34）：dataplane-apm 23 个单测（含聚合端到端与空桶）
-  - [ ] 9.1 `POST /v1/traces/search`：过滤、`sort`/`order`、`limit`/`offset`、`total`、默认 1 小时、`from_ts > to_ts` → 400
+  - [x] 9.1 `POST /v1/traces/search`：过滤、`sort`/`order`、`limit`/`offset`、`total`、默认 1 小时、`from_ts > to_ts` → 400
     - 对应需求 5.1-5.8
-  - [ ] 9.2 `GET /v1/traces/{trace_id}`：`summary` + `spans`、升序、`partial` 与 `reason`
+    - 状态：已实现（PR #35）：过滤、sort/order 白名单、limit 上限 500、offset、total、缺省最近 1 小时、非法时间范围 → invalid_argument
+  - [x] 9.2 `GET /v1/traces/{trace_id}`：`summary` + `spans`、升序、`partial` 与 `reason`
     - 对应需求 6.1-6.8
-  - [ ] 9.3 `POST /v1/edges/search`：`source` 过滤与跨源合并；`GET /v1/apm/services`
+    - 状态：已实现（PR #35）：summary + spans（LogStore v2 索引）、升序、partial 与 reason、非法 id → 400、无摘要 → 404
+  - [x] 9.3 `POST /v1/edges/search`：`source` 过滤与跨源合并；`GET /v1/apm/services`
     - 对应需求 12.2-12.3
+    - 状态：已实现（PR #35）：边列表（otlp；ebpf 待接入返回空集）+ 服务清单；apm_enabled=false → unavailable
   - [ ] 9.4 保留期清理：LogStore 循环删、摘要与边摘要按 `start_ts`/`bucket_start` 删、端点 30 天、`retain/` 机制
     - 对应需求 11.1-11.8
   - [ ] 9.5 写入保护：`apm_ingest_max_batches_per_sec` 限流 429 + `unavailable`、`apm_min_duration_micros_for_detail` 只跳明细

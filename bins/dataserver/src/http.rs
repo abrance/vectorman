@@ -520,6 +520,83 @@ async fn agents_list(State(state): State<AppState>, uri: Uri) -> Response {
     forward_gse(&state, "GET", "/api/gse/agents", uri.query(), b"").await
 }
 
+fn apm_unavailable(state: &AppState) -> Option<Response> {
+    if state.apm.is_none() {
+        return Some(json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            unavailable("apm is disabled (apm_enabled=false)"),
+        ));
+    }
+    None
+}
+
+async fn traces_search(
+    State(state): State<AppState>,
+    body: Result<Json<dataplane_apm::TraceSearchQuery>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Some(resp) = apm_unavailable(&state) {
+        return resp;
+    }
+    let query = match body {
+        Ok(b) => b.0,
+        Err(_) => {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                DataplaneError::invalid_argument("invalid JSON body"),
+            )
+        }
+    };
+    match dataplane_apm::search_traces(state.sql.as_ref(), &query).await {
+        Ok(page) => Json(page).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+async fn trace_detail(
+    State(state): State<AppState>,
+    PathParam(trace_id): PathParam<String>,
+) -> Response {
+    if let Some(resp) = apm_unavailable(&state) {
+        return resp;
+    }
+    match dataplane_apm::get_trace(state.sql.as_ref(), state.log.as_ref(), &trace_id).await {
+        Ok(detail) => Json(detail).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+async fn edges_search(
+    State(state): State<AppState>,
+    body: Result<Json<dataplane_apm::EdgeSearchQuery>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Some(resp) = apm_unavailable(&state) {
+        return resp;
+    }
+    let query = match body {
+        Ok(b) => b.0,
+        Err(_) => {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                DataplaneError::invalid_argument("invalid JSON body"),
+            )
+        }
+    };
+    match dataplane_apm::search_edges(state.sql.as_ref(), &query).await {
+        Ok(page) => Json(page).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+async fn apm_services(State(state): State<AppState>) -> Response {
+    if let Some(resp) = apm_unavailable(&state) {
+        return resp;
+    }
+    match dataplane_apm::list_services(state.sql.as_ref()).await {
+        Ok(services) => Json(json!({ "services": services })).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
 async fn ts_delete(
     State(state): State<AppState>,
     body: Result<Json<TsSeriesSelection>, axum::extract::rejection::JsonRejection>,
@@ -557,6 +634,10 @@ fn api_routes(state: AppState) -> Router {
         .route("/v1/ingest", post(ingest))
         .route("/v1/logs/search", post(logs_search))
         .route("/v1/streams", get(streams))
+        .route("/v1/traces/search", post(traces_search))
+        .route("/v1/traces/{trace_id}", get(trace_detail))
+        .route("/v1/edges/search", post(edges_search))
+        .route("/v1/apm/services", get(apm_services))
         .route("/v1/ts/delete", post(ts_delete))
         .route("/v1/ts/stats", get(ts_stats))
         .route("/api/v1/query", get(prom_query))
@@ -1215,5 +1296,193 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK, "{body}");
         assert!(body.contains("\"accepted\":1"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn apm_query_routes_cover_list_detail_edges_and_services() {
+        use dataplane_core::SqlValue;
+
+        let env = test_env(None).await;
+        let app = sql_router(env.state.clone(), None);
+        let now = now_micros();
+        let trace_a = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let trace_b = "5bf92f3577b34da6a3ce929d0e0e4737";
+        let span_a = "00f067aa0ba902b7";
+
+        // 两条 trace 摘要 + 一条边摘要 + 一个端点。
+        for (trace, start, duration, service, status, span_count) in [
+            (trace_a, now - 10_000_000, 12_000, "order-api", "ok", 1i64),
+            (trace_b, now - 9_000_000, 250_000, "payment", "error", 2),
+        ] {
+            env.state
+                .sql
+                .execute(
+                    "INSERT INTO apm_trace_summary (trace_id, start_ts, max_end_ts, duration_micros,
+                        root_service, root_operation, root_start_ts, span_count, error_count, status,
+                        services_json, collector, agent_id, host_id, data_id, updated_ts)
+                     VALUES (?1,?2,?3,?4,?5,'OP',?2,?6,0,?7,'[\"x\"]','otlp','agent-1','host-1','item-1',?2)",
+                    &[
+                        SqlValue::Text(trace.to_string()),
+                        SqlValue::Integer(start),
+                        SqlValue::Integer(start + duration),
+                        SqlValue::Integer(duration),
+                        SqlValue::Text(service.to_string()),
+                        SqlValue::Integer(span_count),
+                        SqlValue::Text(status.to_string()),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+        env.state
+            .sql
+            .execute(
+                "INSERT INTO apm_edge_summary (bucket_start, src_service, dst_service, span_kind,
+                    calls, errors, duration_sum, duration_max, agent_id, data_id)
+                 VALUES (?1,'gateway','order-api','server',3,1,2000,1000,'agent-1','item-1')",
+                &[SqlValue::Integer(now - 60_000_000)],
+            )
+            .await
+            .unwrap();
+        env.state
+            .sql
+            .execute(
+                "INSERT INTO apm_service_endpoint (service, instance_id, pod_name, node_name,
+                    host_ip, listen_port, collector, first_seen_ts, last_seen_ts)
+                 VALUES ('order-api','order-api-1','order-api-7c9f','node-1','10.0.0.9',8080,'otlp',?1,?1)",
+                &[SqlValue::Integer(now)],
+            )
+            .await
+            .unwrap();
+
+        // 列表：默认时间窗内两条；按耗时降序时最慢的在前。
+        let (st, body) = send(
+            &app,
+            req(
+                "POST",
+                "/v1/traces/search",
+                Some(r#"{"sort":"duration_micros","order":"desc"}"#),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let page: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(page["total"], 2);
+        assert_eq!(page["traces"][0]["trace_id"], trace_b, "最慢的在前");
+        assert_eq!(page["traces"][0]["status"], "error");
+        assert_eq!(page["traces"][0]["services"], json!(["x"]));
+
+        // 过滤 + 分页。
+        let (st, body) = send(
+            &app,
+            req(
+                "POST",
+                "/v1/traces/search",
+                Some(r#"{"service":"order-api","limit":1}"#),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let page: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["traces"].as_array().unwrap().len(), 1);
+
+        // 非法时间范围 → 400。
+        let (st, body) = send(
+            &app,
+            req(
+                "POST",
+                "/v1/traces/search",
+                Some(r#"{"from_ts":100,"to_ts":10}"#),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("invalid_argument"), "{body}");
+
+        // 详情：明细缺失 → partial=retention_expired。
+        let (st, body) = send(&app, req("GET", &format!("/v1/traces/{trace_a}"), None)).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let detail: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(detail["summary"]["trace_id"], trace_a);
+        assert_eq!(detail["partial"], true);
+        assert_eq!(detail["reason"], "retention_expired");
+        assert_eq!(detail["expected_span_count"], 1);
+
+        // 详情：trace_id 非法 → 400；不存在 → 404。
+        let (st, body) = send(&app, req("GET", "/v1/traces/nothex", None)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+        let (st, _) = send(
+            &app,
+            req("GET", "/v1/traces/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", None),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // 有明细时 partial=false。
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("trace_id".to_string(), trace_a.to_string());
+        labels.insert("service".to_string(), "order-api".to_string());
+        labels.insert("data_id".to_string(), "item-1".to_string());
+        env.state
+            .log
+            .append(dataplane_log::LogRecord {
+                id: format!("{trace_a}:{span_a}"),
+                timestamp: now - 10_000_000,
+                level: "info".into(),
+                message: "order-api GET /orders 12000us".into(),
+                labels,
+            })
+            .await
+            .unwrap();
+        let (st, body) = send(&app, req("GET", &format!("/v1/traces/{trace_a}"), None)).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let detail: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(detail["partial"], false);
+        assert_eq!(detail["spans"].as_array().unwrap().len(), 1);
+
+        // 边列表：otlp 有数据，ebpf 目前为空集。
+        let (st, body) = send(
+            &app,
+            req("POST", "/v1/edges/search", Some(r#"{"source":"otlp"}"#)),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let edges: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(edges["total"], 1);
+        assert_eq!(edges["edges"][0]["src_service"], "gateway");
+        assert_eq!(edges["edges"][0]["calls"], 3);
+        assert_eq!(edges["edges"][0]["source"], "otlp");
+
+        let (st, body) = send(
+            &app,
+            req("POST", "/v1/edges/search", Some(r#"{"source":"ebpf"}"#)),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let edges: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(edges["total"], 0, "ebpf 数据源尚未接入");
+
+        // 服务清单。
+        let (st, body) = send(&app, req("GET", "/v1/apm/services", None)).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let services: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(services["services"][0]["service"], "order-api");
+        assert_eq!(services["services"][0]["instance_count"], 1);
+
+        // apm_enabled=false → 查询路由返回 unavailable。
+        let mut state = env.state.clone();
+        state.apm = None;
+        let app = sql_router(state, None);
+        for (method, uri) in [
+            ("POST", "/v1/traces/search"),
+            ("GET", &format!("/v1/traces/{trace_a}")),
+            ("POST", "/v1/edges/search"),
+            ("GET", "/v1/apm/services"),
+        ] {
+            let (st, body) = send(&app, req(method, uri, None)).await;
+            assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
+            assert!(body.contains("unavailable"), "{body}");
+        }
     }
 }
