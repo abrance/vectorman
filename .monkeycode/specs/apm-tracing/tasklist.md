@@ -112,7 +112,7 @@
     - 状态：已实现（PR #40）
   - [x] 12.0.3 `list_services` 返回端点实例明细（pod/node/host_ip/listen_port/collector/first_seen）
     - 状态：已实现（PR #40）
-- [ ] 12. 前端 `@vectorman/dataplane`（trace 列表/详情已交付，见 PR #41；拓扑、APM 指标、服务名映射、存储状态卡片待做）
+- [ ] 12. 前端 `@vectorman/dataplane`（trace 列表/详情 #41、拓扑与 APM 指标 #42 已交付；服务名映射页与存储状态卡片待做）
     - 状态：已实现（PR #38）：请求体构造单测（`--min-duration-ms` 转微秒、只下发显式提供的过滤字段）+ 错误码经既有 `ureq_err_str` 透传
   - [x] 12.1 `src/features/apm/` 客户端：trace 列表、详情、边、服务清单封装，复用既有 HttpClient
   - [x] 12.2 `/traces` 列表页：过滤、排序切换、分页、空态、行点击进详情
@@ -122,12 +122,17 @@
   - [x] 12.3 `/traces/:trace_id` 详情页：`parent_span_id` 构树、纳秒对齐瀑布图、错误 span 高亮、span 详情抽屉、`partial` 提示
     - 对应需求 13.4-13.5、13.11
     - 状态：已实现（PR #41）：`/traces/:traceId` 详情（摘要 + `ui/waterfall.tsx` 瀑布图 + span 抽屉：概览/属性/资源/事件/链接、`partial` 提示与原因）
-  - [ ] 12.4 `/topology` 拓扑页：`sum by (src_service,dst_service)` 查询、`source` 切换、确定性分层 SVG 布局、点击边跳列表
+  - [x] 12.4 `/topology` 拓扑页：`sum by (src_service,dst_service)` 查询、`source` 切换、确定性分层 SVG 布局、点击边跳列表
     - 对应需求 13.6-13.7
-  - [ ] 12.5 `/apm` 指标页：服务与操作选择、QPS/错误率/P50/P95/P99、「查看 trace」跳转
+    - 状态：已实现（PR #42）：`/topology`（时间窗/源服务/目标服务/最小调用/来源切换 + 「拓扑图 / 边列表」两个视图；线宽=调用量、颜色=错误率、点击边跳 trace 列表；未知服务虚线区分）
+    - 状态：已实现（PR #42）：`/topology` 图 + 「边列表」标签页（calls/errors/错误率/平均/最大/分钟桶/来源/Agent 聚合展示），`source` 切换 all/otlp/ebpf，点击边跳 trace 列表
+  - [x] 12.5 `/apm` 指标页：服务与操作选择、QPS/错误率/P50/P95/P99、「查看 trace」跳转
     - 对应需求 13.8-13.9
-  - [ ] 12.6 日志页 `trace_id` 跳转与无摘要提示；详情页「查看该服务日志」反向跳转
+    - 状态：已实现（PR #42）：`/apm`（服务与操作选择 + 请求量按状态、错误数、延迟 avg/p50/p95/p99/max 曲线；错误率由两份查询读数相除；复用既有 LineChart）
+    - 状态：已实现（PR #42）：`/apm` 请求量（按 status）、错误数、延迟分位（label `field`），错误率与分位读数在前端由读数相除/提取；复用既有 `ui/line-chart.tsx`
+  - [x] 12.6 日志页 `trace_id` 跳转与无摘要提示；详情页「查看该服务日志」反向跳转
     - 对应需求 9.1-9.6、13.10
+    - 状态：部分实现（PR #42）：拓扑边点击跳 trace 列表；日志页 `trace_id` 跳转与详情页「查看该服务日志」仍待做
   - [x] 12.6b 图表改用 `echarts`（薄封装：一个 React 组件包 `useEffect` + `setOption`）：指标页 line series、拓扑页 `graph` + `layout: 'none'`、瀑布图 custom series；布局计算抽成 `src/features/apm/layout.ts` 纯函数
     - 对应设计前端实现约束；后端不加任何 echarts 相关逻辑
     - 状态：已评估并调整（PR #41）：**不引入 echarts**，改为复用既有手绘 SVG（`ui/line-chart.tsx` 复用、新增 `ui/waterfall.tsx`），坐标计算抽到 `features/apm/layout.ts` 纯函数并单测

@@ -22,9 +22,13 @@ export function promLabel(metric: Record<string, string>, index: number): string
   return seriesLabel(metric, index);
 }
 
-/// 从 `PromEnvelope.data` 取绘图序列；形状不符时返回空数组。
+/// 从 Prom 响应中取出绘图序列。
+///
+/// 兼容两种入参：适配器返回的**信封**（`{status, data: {result}}`）与裸的 `data`
+/// 段（`{result}`）。此前只接受后者，而调用方传的是前者，导致曲线永远为空。
 export function promSeries(data: unknown): MetricSeries[] {
-  const d = data as PromData | undefined;
+  const raw = data as (PromData & { data?: PromData }) | undefined;
+  const d = raw && Array.isArray(raw.result) ? raw : raw?.data;
   if (!d || !Array.isArray(d.result)) {
     return [];
   }

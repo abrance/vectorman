@@ -1,11 +1,20 @@
 import { useCallback } from "react";
-import type { TraceDetail, TraceSearchPage, TraceSearchRequest } from "@vectorman/adapters";
+import type {
+  EdgeSearchPage,
+  EdgeSearchRequest,
+  ServiceRow,
+  TraceDetail,
+  TraceSearchPage,
+  TraceSearchRequest,
+} from "@vectorman/adapters";
 import { useRuntime } from "../../app/runtime";
 import { toAppError } from "../errors";
 import { useQueryRecord } from "../use-query";
 
 const TRACE_LIST = "apm.traces";
 const TRACE_DETAIL = "apm.trace";
+const EDGES = "apm.edges";
+const SERVICES = "apm.services";
 
 /// trace 列表：手动触发 `POST /v1/traces/search`。
 export function useTraces() {
@@ -25,6 +34,47 @@ export function useTraces() {
     },
     [apm, query, notifier],
   );
+
+  return { result, run };
+}
+
+/// 服务拓扑边：`POST /v1/edges/search`。
+export function useEdges() {
+  const { apm, query, notifier } = useRuntime();
+  const result = useQueryRecord<EdgeSearchPage>(query, EDGES);
+
+  const run = useCallback(
+    async (req: EdgeSearchRequest) => {
+      query.setLoading(EDGES);
+      try {
+        query.setSuccess(EDGES, await apm.searchEdges(req));
+      } catch (e) {
+        const err = toAppError(e);
+        query.setError(EDGES, err);
+        notifier.error(err);
+      }
+    },
+    [apm, query, notifier],
+  );
+
+  return { result, run };
+}
+
+/// 服务清单（含端点实例）：`GET /v1/apm/services`。
+export function useServices() {
+  const { apm, query, notifier } = useRuntime();
+  const result = useQueryRecord<ServiceRow[]>(query, SERVICES);
+
+  const run = useCallback(async () => {
+    query.setLoading(SERVICES);
+    try {
+      query.setSuccess(SERVICES, await apm.listServices());
+    } catch (e) {
+      const err = toAppError(e);
+      query.setError(SERVICES, err);
+      notifier.error(err);
+    }
+  }, [apm, query, notifier]);
 
   return { result, run };
 }

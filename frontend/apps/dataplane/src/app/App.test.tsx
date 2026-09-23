@@ -43,10 +43,97 @@ class FakeHttp implements HttpClient {
       };
     }
     if (url.startsWith("/api/v1/query_range") || url.startsWith("/api/v1/query")) {
+      // APM 指标查询返回一小段矩阵，供 `/apm` 页渲染曲线与读数。
+      if (url.includes("apm_service_")) {
+        const isDuration = url.includes("duration_micros");
+        const metric = isDuration
+          ? { field: "p95" }
+          : url.includes("errors_total")
+            ? {}
+            : { status: "ok" };
+        return {
+          status: 200,
+          body: {
+            status: "success",
+            data: {
+              resultType: "matrix",
+              result: [
+                {
+                  metric,
+                  values: [
+                    [1_710_000_000_000, isDuration ? 12_000 : 3],
+                    [1_710_000_060_000, isDuration ? 15_000 : 4],
+                  ],
+                },
+              ],
+            },
+          } as T,
+        };
+      }
       return { status: 200, body: { status: "success", data: { resultType: "matrix", result: [] } } as T };
     }
     if (url === "/v1/logs/search") {
       return { status: 200, body: { records: [] } as T };
+    }
+    if (url === "/v1/edges/search") {
+      return {
+        status: 200,
+        body: {
+          total: 2,
+          edges: [
+            {
+              bucket_ts: 1_710_000_000_000_000,
+              src_service: "gateway",
+              dst_service: "order-api",
+              span_kind: "server",
+              calls: 6,
+              errors: 1,
+              duration_sum: 6_000,
+              duration_max: 3_000,
+              source: "otlp",
+              agent_id: "a-1",
+            },
+            {
+              bucket_ts: 1_710_000_000_000_000,
+              src_service: "order-api",
+              dst_service: "db",
+              span_kind: "server",
+              calls: 2,
+              errors: 0,
+              duration_sum: 400,
+              duration_max: 250,
+              source: "otlp",
+              agent_id: "a-1",
+            },
+          ],
+        } as T,
+      };
+    }
+    if (url === "/v1/apm/services") {
+      return {
+        status: 200,
+        body: {
+          services: [
+            {
+              service: "order-api",
+              instance_count: 1,
+              last_seen_ts: 1_710_000_000_000_000,
+              instances: [
+                {
+                  instance_id: "order-api-1",
+                  pod_name: "order-api-7c9f",
+                  node_name: "node-1",
+                  host_ip: "10.0.0.9",
+                  listen_port: 8080,
+                  collector: "otlp",
+                  first_seen_ts: 1_710_000_000_000_000,
+                  last_seen_ts: 1_710_000_000_000_000,
+                },
+              ],
+            },
+          ],
+        } as T,
+      };
     }
     if (url === "/v1/traces/search") {
       return {
@@ -186,12 +273,12 @@ function renderAt(path: string) {
   const http = new FakeHttp(items);
   const adapter = new DataplaneAdapter(http);
   const apm = new ApmAdapter(http);
+  const query = new MemoryQueryStore();
   return {
     http,
+    query,
     ...render(
-      <RuntimeProvider
-        value={{ dataplane: adapter, apm, query: new MemoryQueryStore(), notifier: new MemoryNotifier() }}
-      >
+      <RuntimeProvider value={{ dataplane: adapter, apm, query, notifier: new MemoryNotifier() }}>
         <MemoryRouter initialEntries={[path]}>
           <App />
         </MemoryRouter>
@@ -235,6 +322,31 @@ describe("trace pages", () => {
     fireEvent.click(screen.getByText("链接（1）"));
     expect(await screen.findByText("c".repeat(32))).toBeTruthy();
     view.unmount();
+  });
+});
+
+describe("topology and apm pages", () => {
+  it("renders the service topology, edge list and RED metrics", async () => {
+    const topology = renderAt("/topology");
+    // 拓扑图：两个服务节点进入 SVG，边上有调用次数。
+    expect(await screen.findByRole("img", { name: "服务拓扑图" })).toBeTruthy();
+    expect(screen.getByText("gateway")).toBeTruthy();
+    expect(screen.getByText("order-api")).toBeTruthy();
+    // 边列表页签展示聚合后的调用/错误/平均耗时。
+    fireEvent.click(screen.getByText("边列表（2）"));
+    expect(await screen.findByText(/16\.7%/)).toBeTruthy();
+    expect(screen.getByText("1ms")).toBeTruthy();
+    topology.unmount();
+
+    const apm = renderAt("/apm");
+    expect(await screen.findByText("请求量（每分钟，按状态）")).toBeTruthy();
+    expect(screen.getByText("延迟（平均值与分位）")).toBeTruthy();
+    expect(screen.getByText("错误数（每分钟）")).toBeTruthy();
+    // 读数：错误率由两份查询相除得到（4/4 → 100%），分位标签取自 label field
+    // （`field=p95` 由服务端命名规范给出）；查询是异步的，用 findBy 等待落定。
+    expect(await screen.findByText(/错误率 100\.00%/)).toBeTruthy();
+    expect(await screen.findByText(/p95 15ms/)).toBeTruthy();
+    apm.unmount();
   });
 });
 
