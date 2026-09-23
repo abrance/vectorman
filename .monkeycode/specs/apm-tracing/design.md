@@ -378,6 +378,8 @@ dpc edges --src gateway --dst order-api --source otlp
 - 图表复用仓库既有的**手绘 SVG** 方案，不引入图表库：`ui/line-chart.tsx` 已实现多序列折线 + 悬停读数（指标曲线直接复用），新增 `ui/waterfall.tsx` 画 span 瀑布图，拓扑图同样手绘 SVG。理由：仓库既有组件已覆盖曲线需求、拓扑与瀑布图都需要确定性坐标（图表库的默认布局反而要绕开）、且可避免 1 MB+ 的新依赖；后端口径不变，只返回 Prom 形状数据点与 span 原文。
 - 拓扑与瀑布图的坐标计算放在 `src/features/apm/layout.ts`（`waterfallRows` / `layeredTopology`），纯函数、可单测；`layeredTopology` 按「上游层号最大值 + 1」分层、层内按服务名字典序、坐标均分，同一份数据渲染结果完全一致。
 - 页面通过 `Runtime` 注入的 `ApmAdapter`（`@vectorman/adapters`）访问接口；时间戳一律用 `formatTimestamp(String(micros))`，耗时用 `formatDuration(micros)`。
+- 拓扑页的边来源是 `/v1/edges/search`（sqlite 边摘要，含 agent 与分钟桶），而不是 PromQL 的 `apm_edge_*`：同一份数据少一层聚合、还能显示 agent 与桶数；`features/apm/aggregate.ts` 负责把分钟桶合并成逻辑边（调用量/错误率/平均与最大耗时），并在前端算错误率（服务端 PromQL 子集不做除法）。
+- 注意指标曲线必须用 `promSeries(record.data?.data)`（envelope 内层），传外层会得到空序列、表现为「图表没数据」而非报错。
 - 查询通过既有 `@vectorman/adapters` HttpClient，接口封装进 `src/features/apm/`，页面只做渲染与参数拼装。
 - 刷新由按钮显式触发（与既有指标页/日志页一致，无定时器）。
 - 空态与 `partial` 提示按 Requirement 13 第 11、13 条实现。

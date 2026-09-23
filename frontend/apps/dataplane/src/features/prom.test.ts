@@ -46,6 +46,19 @@ describe("promSeries", () => {
     });
     expect(series).toEqual([{ label: "gs", points: [[1, 12.5]] }]);
   });
+
+  it("accepts the envelope as well as the inner data段", () => {
+    const inner = {
+      resultType: "matrix",
+      result: [{ metric: { status: "ok" }, values: [[1_710_000_000_000, 3]] }],
+    };
+    // 适配器返回的是信封，调用方也可能直接传内层 data；两种都要能出序列，
+    // 否则曲线会静默为空（看起来像「没有采集数据」）。
+    expect(promSeries({ status: "success", data: inner })).toHaveLength(1);
+    expect(promSeries(inner)).toHaveLength(1);
+    expect(promSeries(undefined)).toEqual([]);
+    expect(promSeries({ status: "success" })).toEqual([]);
+  });
 });
 
 describe("latestValue", () => {
