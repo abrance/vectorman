@@ -657,6 +657,7 @@ dependencies = [
 name = "dataplane-ingest"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "dataplane-core",
  "dataplane-kv",
  "dataplane-log",

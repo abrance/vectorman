@@ -22,13 +22,15 @@
     - 对应需求 11.7-11.9 与 15.3；已实现（PR #29）
 - [ ] 3. 检查点 - 前置依赖单测全绿后再进入接入实现
   - 确保所有测试通过,如有疑问请询问用户
-- [ ] 4. 数据模型与接入分支
-  - [ ] 4.1 `crates/dataplane-ingest/src/trace.rs`：`TraceSpan`、`SpanEvent`、`SpanLink` DTO 与 JSON 往返测试
-    - 对应需求 2.1-2.4 与共享模型映射表
-  - [ ] 4.2 `DataType::Traces` 与 `apply` 分支：幂等去重、明细映射写 `LogStore`、摘要交 accumulator、端点交 registry、`stream/` 流索引
-    - 对应需求 4.1-4.9
-  - [ ] 4.3 明细映射单测：`level`/`message`/`labels` 逐字段断言，重复 `record_id` 不新增
-  - [ ] 4.4 非法记录：缺 `trace_id`/`span_id`、hex 长度不符、超 256 KiB → `status=partial` 且 `failures` 带 `code`
+- [x] 4. 数据模型与接入分支
+  - [x] 4.1 `crates/dataplane-ingest/src/trace.rs`：`TraceSpan`、`SpanEvent`、`SpanLink` DTO 与 JSON 往返测试
+    - 对应需求 2.1-2.4 与共享模型映射表；已实现（PR #31），含 `normalize`/`validate`/`exceeds_size_limit`/`to_log_record` 与 4 个单测
+  - [x] 4.2 `DataType::Traces` 与 `apply` 分支：幂等去重、明细映射写 `LogStore`、摘要交 accumulator、端点交 registry、`stream/` 流索引
+    - 对应需求 4.1-4.9；已实现（PR #31）：`apply_with_trace_sink` 新增 `TraceSink` 钩子，派生数据失败不影响接入应答（明细权威、重试会重复）
+  - [x] 4.3 明细映射单测：`level`/`message`/`labels` 逐字段断言，重复 `record_id` 不新增
+    - 已实现（PR #31）：含 sink 回调次数断言（重复记录不再回调）
+  - [x] 4.4 非法记录：缺 `trace_id`/`span_id`、hex 长度不符、超 256 KiB → `status=partial` 且 `failures` 带 `code`
+    - 已实现（PR #31）；大小写归一与 `timestamp` 派生在同一批用例中覆盖
 - [ ] 5. Agent OTLP receiver
   - [ ] 5.1 `crates/gse-agent-core/src/collect/otlp.rs`：`tiny_http` worker（默认监听 `0.0.0.0:4318`）、protobuf/JSON 解码、gzip、body 上限、可选 `Authorization: Bearer` 校验、`otlp_allowed_cidrs` 来源限制、空配置时 warn 一行
     - 对应需求 1.1-1.5；依赖选型见设计 Pitfalls（避免构建期 `protoc`）

@@ -431,7 +431,7 @@ max_end_ts INTEGER NOT NULL DEFAULT 0
 | `service` 被名单过滤 | Agent 丢弃并计数，不上报 |
 | 单条 span 超 256 KiB | dataserver 记 `failures`，不截断 |
 | 限流（`apm_ingest_max_batches_per_sec` 超限） | HTTP 429 + `code=unavailable`，Agent 退避重试不丢批 |
-| sqlite 写失败（摘要/端点） | 明细已写，返回 `query_failed`，Agent 退避重试；幂等去重避免重复明细；accumulator 保留 `dirty` 标记等待下轮 flush |
+| sqlite 写失败（摘要/端点） | 不回退接入应答：明细已写入且是权威数据，整批重试只会造成明细重复（`LogStore::append` 不按 id 幂等）。改为 stderr 一行 + 自监控计数；accumulator 保留 `dirty` 标记等下轮 flush |
 | 内存 accumulator 超 `max_live_traces` | 强制 flush 最旧项；仍不足则丢弃最旧项并向 stderr 记录一行 |
 | 配对未命中 server span | 用 `server.address` 等属性兜底为 `unknown:*`，再由端点半反查归一；仍失败落 `unknown` |
 | 端点反查失败 | 保留 `unknown:*` 原值，前端拓扑图例单列「未识别」 |
@@ -474,6 +474,8 @@ max_end_ts INTEGER NOT NULL DEFAULT 0
 - `apm_service_*` 的 `operation` 用根 span 的 `name`，而 `span_kind` 固定 `server`；若后续要按内部 span 统计，需要新增 measurement，不要改写既有语义。
 - 边 P95 依赖聚合任务与 accumulator 同进程的内存直方图；不要把样本写进 sqlite 再算，规模会失控。
 - 根 span 判定不要用「`parent_span_id` 为空且是第一个到达」，必须按 `start_ts` 比较，否则乱序到达时摘要不稳定。
+- `LogStore::append` **不按 id 幂等**：同一 `id` 追加两次会产生两个文档（只有 `delete_term(id)` 才清掉）。所以 `traces` 分支的顺序固定为「写明细 → 派生数据（best effort）→ KvStore 标记去重」，且派生数据失败不能当成整批失败；同样原因，接入重试不能依赖「明细会被去重」，幂等完全靠 KvStore 的 `ingest/{record_id}` 先于写入的判断。
+- 归一化必须同时处理 `record_id`：只小写 `trace_id`/`span_id` 而保留入参的 `record_id` 会让「record_id == trace_id:span_id」校验失败，看起来像 Agent 发错了。
 - 前端拓扑页不要用 echarts 的力导向布局（`layout: 'force'`）：布局随机性会让同一份数据每次渲染不同，拓扑页用 `layout: 'none'` 加前端自算坐标。
 - OTLP 默认监听 `0.0.0.0:4318`。上线前必须确认宿主机防火墙与集群网络策略，否则等于对同网段开了一个无鉴权的写入端点；生产至少配 `otlp_allowed_cidrs`。
 - k8s 场景不要默认给 Agent 开 `hostNetwork` 来“解决”网络问题：那会改变 Agent 的各类采集语义（`log_k8s_stdout`、`metrics_host` 的 `host.ip`）。用节点 IP + 监听 `0.0.0.0` 即可。
