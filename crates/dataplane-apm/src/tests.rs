@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use serde_json::json;
+
 use dataplane_core::{DataplaneError, SqlValue};
 use dataplane_ingest::trace::TraceSpan;
 use dataplane_ingest::{DataEnvelope, DataType};
@@ -1058,6 +1060,7 @@ async fn seed_trace_detail(log: &dyn LogStore, id: &str, ts: i64) {
         level: "info".into(),
         message: "span".into(),
         labels,
+        payload: None,
     })
     .await
     .unwrap();
@@ -1073,6 +1076,7 @@ async fn seed_log_line(log: &dyn LogStore, id: &str, ts: i64) {
         level: "info".into(),
         message: "line".into(),
         labels,
+        payload: None,
     })
     .await
     .unwrap();
@@ -1413,4 +1417,159 @@ async fn edge_target_normalization_prefers_alias_over_endpoint() {
         dsts.contains(&"alias-svc".to_string()),
         "静态映射优先于端点表: {dsts:?}"
     );
+}
+
+async fn seed_summary_full(sql: &dyn RelationalStore, trace_id: &str, start_ts: i64) {
+    sql.execute(
+        "INSERT OR REPLACE INTO apm_trace_summary (trace_id, start_ts, max_end_ts, duration_micros,
+            root_service, root_operation, root_start_ts, span_count, error_count, status,
+            services_json, collector, agent_id, host_id, data_id, updated_ts)
+         VALUES (?1,?2,?2,1,'order-api','GET /orders',?2,1,0,'ok','[\"order-api\"]','otlp','agent-1','host-1','item-1',?2)",
+        &[
+            SqlValue::Text(trace_id.to_string()),
+            SqlValue::Integer(start_ts),
+        ],
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn trace_list_exposes_origin_fields() {
+    use crate::query::{search_traces, TraceSearchQuery};
+
+    let dir = tempfile::tempdir().unwrap();
+    let sql = store(dir.path());
+    bootstrap(sql.as_ref()).await.unwrap();
+    seed_summary_full(sql.as_ref(), &"a".repeat(32), NOW - 60_000_000).await;
+
+    let page = search_traces(
+        sql.as_ref(),
+        &TraceSearchQuery {
+            from_ts: Some(NOW - 120_000_000),
+            to_ts: Some(NOW),
+            ..TraceSearchQuery::default()
+        },
+    )
+    .await
+    .unwrap();
+    let row = &page.traces[0];
+    assert_eq!(row.collector, "otlp");
+    assert_eq!(row.agent_id, "agent-1");
+    assert_eq!(row.host_id, "host-1");
+    assert_eq!(
+        row.data_id, "item-1",
+        "列表要能看到来源与归属，便于定位采集项"
+    );
+}
+
+#[tokio::test]
+async fn trace_detail_prefers_full_payload_and_derives_duration() {
+    use crate::query::get_trace;
+    use dataplane_log::TantivyLogStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sql = store(dir.path());
+    bootstrap(sql.as_ref()).await.unwrap();
+    let log = TantivyLogStore::new(dir.path().join("logs")).unwrap();
+    let trace_id = "a".repeat(32);
+    let span_id = "b".repeat(16);
+    seed_summary_full(sql.as_ref(), &trace_id, NOW - 60_000_000).await;
+    seed_summary_full(sql.as_ref(), &trace_id, NOW - 60_000_000).await;
+
+    // 一条带完整原文的 span 明细。
+    let mut labels = std::collections::BTreeMap::new();
+    labels.insert("data_type".to_string(), "traces".to_string());
+    labels.insert("trace_id".to_string(), trace_id.clone());
+    labels.insert("service".to_string(), "order-api".to_string());
+    labels.insert("data_id".to_string(), "item-1".to_string());
+    let payload = json!({
+        "record_id": format!("{trace_id}:{span_id}"),
+        "trace_id": trace_id,
+        "span_id": span_id,
+        "parent_span_id": "",
+        "name": "GET /orders",
+        "kind": "server",
+        "service": "order-api",
+        "status_code": "error",
+        "status_message": "upstream timeout",
+        "start_unix_nano": 1_700_000_000_000_000_000i64,
+        "end_unix_nano": 1_700_000_000_012_000_000i64,
+        "attributes": {"http.request.method": "GET"},
+        "events": [{"name": "exception", "time_unix_nano": 1i64, "attributes": {}}],
+        "links": [],
+        "resource": {"k8s.pod.name": "order-api-1"},
+        "dropped_events": 2
+    });
+    log.append(dataplane_log::LogRecord {
+        id: format!("{trace_id}:{span_id}"),
+        timestamp: NOW - 60_000_000,
+        level: "error".into(),
+        message: "order-api GET /orders 12000us".into(),
+        labels,
+        payload: Some(payload.to_string()),
+    })
+    .await
+    .unwrap();
+
+    let detail = get_trace(sql.as_ref(), &log, &trace_id, 0).await.unwrap();
+    assert!(!detail.partial, "明细齐全时不应 partial");
+    let span = &detail.spans[0];
+    assert_eq!(
+        span["duration_micros"],
+        json!(12_000),
+        "瀑布图需要直接可用的耗时: {span}"
+    );
+    assert_eq!(span["attributes"]["http.request.method"], json!("GET"));
+    assert_eq!(span["events"][0]["name"], json!("exception"));
+    assert_eq!(span["resource"]["k8s.pod.name"], json!("order-api-1"));
+    assert_eq!(span["status_message"], json!("upstream timeout"));
+    assert_eq!(span["dropped_events"], json!(2));
+    assert_eq!(span["parent_span_id"], json!(""), "原文保留父 span 关系");
+}
+
+#[tokio::test]
+async fn service_list_includes_endpoint_instances() {
+    use crate::query::list_services;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sql = store(dir.path());
+    bootstrap(sql.as_ref()).await.unwrap();
+    for (instance, pod, host, port) in [
+        ("order-api-1", "order-api-7c9f", "10.0.0.9", 8080i64),
+        ("order-api-2", "order-api-8d0a", "10.0.0.10", 8080),
+    ] {
+        sql.execute(
+            "INSERT INTO apm_service_endpoint (service, instance_id, pod_name, node_name, host_ip,
+                listen_port, collector, first_seen_ts, last_seen_ts)
+             VALUES ('order-api',?1,?2,'node-1',?3,?4,'otlp',?5,?5)",
+            &[
+                SqlValue::Text(instance.to_string()),
+                SqlValue::Text(pod.to_string()),
+                SqlValue::Text(host.to_string()),
+                SqlValue::Integer(port),
+                SqlValue::Integer(NOW),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    let services = list_services(sql.as_ref()).await.unwrap();
+    assert_eq!(services.len(), 1);
+    let row = &services[0];
+    assert_eq!(row.service, "order-api");
+    assert_eq!(row.instance_count, 2);
+    assert_eq!(row.instances.len(), 2, "端点实例要能下钻查看");
+    let instance = row
+        .instances
+        .iter()
+        .find(|i| i.instance_id == "order-api-1")
+        .unwrap();
+    assert_eq!(instance.pod_name, "order-api-7c9f");
+    assert_eq!(instance.node_name, "node-1");
+    assert_eq!(instance.host_ip, "10.0.0.9");
+    assert_eq!(instance.listen_port, 8080);
+    assert_eq!(instance.collector, "otlp");
+    assert_eq!(instance.first_seen_ts, NOW);
 }

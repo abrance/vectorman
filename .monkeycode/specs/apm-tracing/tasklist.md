@@ -105,6 +105,13 @@
     - 对应需求 12.7
     - 状态：已实现（PR #38）：`dpc traces`（service/operation/status/min-duration-ms/agent_id/data_id/sort/order/时间窗/limit）、`dpc trace <trace_id>`、`dpc edges`（src/dst/source/min-requests），stdout 打印 JSON；复用 `--sql-url`
   - [x] 11.2 CLI 参数解析与错误码透传单测
+- [x] 12.0 前端前置：数据与接口补齐
+  - [x] 12.0.1 `LogStore` 索引 v3 → v4：新增仅存储字段 `payload`，traces 明细写入完整 span 原文；`get_trace` 优先返回原文并补派生 `duration_micros`
+    - 状态：已实现（PR #40）。此前标签投影丢弃了耗时/`attributes`/`events`/`links`，瀑布图与 span 详情拿不到数据
+  - [x] 12.0.2 `search_traces` 返回 `collector`/`agent_id`/`host_id`/`data_id`（列表可见来源与归属）
+    - 状态：已实现（PR #40）
+  - [x] 12.0.3 `list_services` 返回端点实例明细（pod/node/host_ip/listen_port/collector/first_seen）
+    - 状态：已实现（PR #40）
 - [ ] 12. 前端 `@vectorman/dataplane`
     - 状态：已实现（PR #38）：请求体构造单测（`--min-duration-ms` 转微秒、只下发显式提供的过滤字段）+ 错误码经既有 `ureq_err_str` 透传
   - [ ] 12.1 `src/features/apm/` 客户端：trace 列表、详情、边、服务清单封装，复用既有 HttpClient

@@ -60,6 +60,11 @@ pub struct TraceSummary {
     pub error_count: i64,
     pub status: String,
     pub services: Vec<String>,
+    /// `otlp` 或 `ebpf`。
+    pub collector: String,
+    pub agent_id: String,
+    pub host_id: String,
+    pub data_id: String,
 }
 
 /// 列表分页结果。
@@ -121,13 +126,32 @@ pub struct EdgeSearchPage {
     pub edges: Vec<EdgeRow>,
 }
 
-/// 服务清单的一行。
+/// 服务清单里的一个端点实例（来自端点半表）。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ServiceInstance {
+    pub instance_id: String,
+    pub pod_name: String,
+    pub node_name: String,
+    pub host_ip: String,
+    pub listen_port: i64,
+    pub collector: String,
+    pub first_seen_ts: i64,
+    pub last_seen_ts: i64,
+}
+
+/// 服务清单的一行：服务 + 其实例明细。
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ServiceRow {
     pub service: String,
     pub instance_count: i64,
     pub last_seen_ts: i64,
+    pub instances: Vec<ServiceInstance>,
 }
+
+/// 摘要行统一列清单（列表与详情共用，避免两处 SELECT 漂移）。
+const TRACE_SUMMARY_COLUMNS: &str =
+    "trace_id, start_ts, duration_micros, root_service, root_operation, span_count, error_count, \
+     status, services_json, collector, agent_id, host_id, data_id";
 
 /// trace 列表查询。
 pub async fn search_traces(
@@ -212,8 +236,7 @@ pub async fn search_traces(
     let result = sql
         .execute(
             &format!(
-                "SELECT trace_id, start_ts, duration_micros, root_service, root_operation,
-                        span_count, error_count, status, services_json
+                "SELECT {TRACE_SUMMARY_COLUMNS}
                  FROM {}{where_sql} ORDER BY {sort} {order} LIMIT ?{} OFFSET ?{}",
                 tables::TRACE_SUMMARY,
                 params.len() + 1,
@@ -246,9 +269,7 @@ pub async fn get_trace(
     let result = sql
         .execute(
             &format!(
-                "SELECT trace_id, start_ts, duration_micros, root_service, root_operation,
-                        span_count, error_count, status, services_json
-                 FROM {} WHERE trace_id = ?1",
+                "SELECT {TRACE_SUMMARY_COLUMNS} FROM {} WHERE trace_id = ?1",
                 tables::TRACE_SUMMARY
             ),
             &[SqlValue::Text(trace_id.to_lowercase())],
@@ -400,25 +421,48 @@ pub async fn list_services(sql: &dyn RelationalStore) -> Result<Vec<ServiceRow>,
     let result = sql
         .execute(
             &format!(
-                "SELECT service, COUNT(*), MAX(last_seen_ts) FROM {}
-                 GROUP BY service ORDER BY service",
+                "SELECT service, instance_id, pod_name, node_name, host_ip, listen_port,
+                        collector, first_seen_ts, last_seen_ts
+                 FROM {} ORDER BY service, instance_id",
                 tables::SERVICE_ENDPOINT
             ),
             &[],
         )
         .await?;
-    Ok(result
-        .rows
-        .iter()
-        .filter_map(|row| match row.as_slice() {
-            [SqlValue::Text(service), count, SqlValue::Integer(last)] => Some(ServiceRow {
+
+    // 按服务归并实例；同时给出实例数与最近出现时间（与旧响应字段兼容）。
+    let mut rows: Vec<ServiceRow> = Vec::new();
+    for row in result.rows.iter() {
+        let [SqlValue::Text(service), SqlValue::Text(instance_id), SqlValue::Text(pod_name), SqlValue::Text(node_name), SqlValue::Text(host_ip), SqlValue::Integer(listen_port), SqlValue::Text(collector), SqlValue::Integer(first_seen), SqlValue::Integer(last_seen)] =
+            row.as_slice()
+        else {
+            continue;
+        };
+        let instance = ServiceInstance {
+            instance_id: instance_id.clone(),
+            pod_name: pod_name.clone(),
+            node_name: node_name.clone(),
+            host_ip: host_ip.clone(),
+            listen_port: *listen_port,
+            collector: collector.clone(),
+            first_seen_ts: *first_seen,
+            last_seen_ts: *last_seen,
+        };
+        match rows.last_mut() {
+            Some(current) if current.service == *service => {
+                current.instance_count += 1;
+                current.last_seen_ts = current.last_seen_ts.max(*last_seen);
+                current.instances.push(instance);
+            }
+            _ => rows.push(ServiceRow {
                 service: service.clone(),
-                instance_count: as_i64(count),
-                last_seen_ts: *last,
+                instance_count: 1,
+                last_seen_ts: *last_seen,
+                instances: vec![instance],
             }),
-            _ => None,
-        })
-        .collect())
+        }
+    }
+    Ok(rows)
 }
 
 /// 解析时间窗：缺省为最近 1 小时；起点晚于终点报 `invalid_argument`。
@@ -451,32 +495,67 @@ fn push_eq(where_sql: &mut String, params: &mut Vec<SqlValue>, column: &str, val
 }
 
 fn summary_from_row(row: &Vec<SqlValue>) -> Option<TraceSummary> {
-    match row.as_slice() {
-        [SqlValue::Text(trace_id), SqlValue::Integer(start_ts), SqlValue::Integer(duration), SqlValue::Text(root_service), SqlValue::Text(root_operation), span_count, error_count, SqlValue::Text(status), SqlValue::Text(services_json)] => {
-            Some(TraceSummary {
-                trace_id: trace_id.clone(),
-                start_ts: *start_ts,
-                duration_micros: *duration,
-                root_service: root_service.clone(),
-                root_operation: root_operation.clone(),
-                span_count: as_i64(span_count),
-                error_count: as_i64(error_count),
-                status: status.clone(),
-                services: serde_json::from_str(services_json).unwrap_or_default(),
-            })
-        }
-        _ => None,
-    }
+    let [SqlValue::Text(trace_id), SqlValue::Integer(start_ts), SqlValue::Integer(duration), SqlValue::Text(root_service), SqlValue::Text(root_operation), span_count, error_count, SqlValue::Text(status), SqlValue::Text(services_json), SqlValue::Text(collector), SqlValue::Text(agent_id), SqlValue::Text(host_id), SqlValue::Text(data_id)] =
+        row.as_slice()
+    else {
+        return None;
+    };
+    Some(TraceSummary {
+        trace_id: trace_id.clone(),
+        start_ts: *start_ts,
+        duration_micros: *duration,
+        root_service: root_service.clone(),
+        root_operation: root_operation.clone(),
+        span_count: as_i64(span_count),
+        error_count: as_i64(error_count),
+        status: status.clone(),
+        services: serde_json::from_str(services_json).unwrap_or_default(),
+        collector: collector.clone(),
+        agent_id: agent_id.clone(),
+        host_id: host_id.clone(),
+        data_id: data_id.clone(),
+    })
 }
 
+/// span 详情：优先返回写入时的完整 OTel 原文，并补一个派生字段 `duration_micros`
+/// （原文只有纳秒起止；瀑布图需要直接可用的耗时）。没有原文（v3 之前的索引、
+/// 或写入时序列化失败）时退化为标签投影。
 fn span_to_json(record: &LogRecord) -> Value {
-    json!({
-        "id": record.id,
-        "timestamp": record.timestamp,
-        "level": record.level,
-        "message": record.message,
-        "labels": record.labels,
-    })
+    let mut value = record
+        .payload
+        .as_deref()
+        .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| {
+            json!({
+                "id": record.id,
+                "timestamp": record.timestamp,
+                "level": record.level,
+                "message": record.message,
+                "labels": record.labels,
+            })
+        });
+    if let Some(object) = value.as_object_mut() {
+        let duration = match (
+            object.get("start_unix_nano").and_then(Value::as_i64),
+            object.get("end_unix_nano").and_then(Value::as_i64),
+        ) {
+            (Some(start), Some(end)) if end >= start => Some((end - start) / 1_000),
+            _ => None,
+        };
+        if let Some(duration) = duration {
+            object.insert("duration_micros".to_string(), json!(duration));
+        } else {
+            object
+                .entry("duration_micros".to_string())
+                .or_insert(json!(0));
+        }
+        // 便于前端直接使用，原文里没有 record_id 时补上。
+        object
+            .entry("record_id".to_string())
+            .or_insert(json!(record.id));
+    }
+    value
 }
 
 async fn scalar_i64(

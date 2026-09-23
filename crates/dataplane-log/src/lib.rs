@@ -29,7 +29,11 @@ const DELETE_SCAN_LIMIT: usize = 100_000;
 ///
 /// v2 → v3：新增索引字段 `data_type`（按类型清理必需——没有它就只能靠 post-filter
 /// 扫全量，受 `DELETE_SCAN_LIMIT` 上限约束）。
-const SCHEMA_VERSION: u32 = 3;
+///
+/// v3 → v4：新增 **仅存储** 字段 `payload`，用于保存记录原文（trace span 的完整
+/// OTel JSON）。老的投影字段（labels/message）不足以还原 span 的耗时、attributes、
+/// events、links，瀑布图与 span 详情需要原文。
+const SCHEMA_VERSION: u32 = 4;
 const SCHEMA_VERSION_FILE: &str = "schema_version";
 /// `search_indexed` 的默认与上限，trace 详情需要一次拉全一个 trace 的 span。
 const INDEXED_DEFAULT_LIMIT: usize = 100;
@@ -44,11 +48,12 @@ const FIELD_LABELS_JSON: &str = "labels_json";
 const FIELD_ID: &str = "id";
 const FIELD_TRACE_ID: &str = "trace_id";
 const FIELD_DATA_TYPE: &str = "data_type";
+const FIELD_PAYLOAD: &str = "payload";
 const FIELD_SERVICE: &str = "service";
 const FIELD_DATA_ID: &str = "data_id";
 
 /// 一条日志记录。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct LogRecord {
     /// 记录 ID（append 时若为空则生成 UUID；接入侧可填 `record_id`）。
     pub id: String,
@@ -60,6 +65,9 @@ pub struct LogRecord {
     pub message: String,
     /// 附加标签。
     pub labels: BTreeMap<String, String>,
+    /// 记录原文（trace span 的完整 OTel JSON 等）。仅存储不索引，回读时原样返回。
+    #[allow(clippy::doc_markdown)]
+    pub payload: Option<String>,
 }
 
 /// 日志检索过滤条件。未指定的条件不过滤。
@@ -246,6 +254,7 @@ struct LogFields {
     data_type: Field,
     service: Field,
     data_id: Field,
+    payload: Field,
 }
 
 /// 解析实际使用的索引目录，处理 schema 版本切换。
@@ -299,6 +308,8 @@ fn build_schema() -> tantivy::schema::Schema {
     b.add_text_field(FIELD_DATA_TYPE, STRING | STORED);
     b.add_text_field(FIELD_SERVICE, STRING | STORED);
     b.add_text_field(FIELD_DATA_ID, STRING | STORED);
+    // 仅存储、不建倒排：原文只用于回读，不参与检索。
+    b.add_text_field(FIELD_PAYLOAD, STORED);
     b.build()
 }
 
@@ -354,6 +365,7 @@ impl TantivyLogStore {
             data_type: index.schema().get_field(FIELD_DATA_TYPE).map_err(dp_err)?,
             service: index.schema().get_field(FIELD_SERVICE).map_err(dp_err)?,
             data_id: index.schema().get_field(FIELD_DATA_ID).map_err(dp_err)?,
+            payload: index.schema().get_field(FIELD_PAYLOAD).map_err(dp_err)?,
         };
 
         // 版本文件在索引成功建立后写入，避免半成品目录被误判为 v2。
@@ -408,6 +420,9 @@ impl LogStore for TantivyLogStore {
             doc.add_text(fields.data_type, promoted(&record.labels, "data_type"));
             doc.add_text(fields.service, promoted(&record.labels, "service"));
             doc.add_text(fields.data_id, promoted(&record.labels, "data_id"));
+            if let Some(payload) = &record.payload {
+                doc.add_text(fields.payload, payload);
+            }
             guard.add_document(doc).map_err(dp_err)?;
             guard.commit().map_err(dp_err)?;
             Ok(())
@@ -623,12 +638,17 @@ fn doc_to_record(
         .and_then(|v| v.as_str())
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
+    let payload = doc
+        .get_first(fields.payload)
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     Ok(LogRecord {
         id,
         timestamp,
         level,
         message,
         labels,
+        payload,
     })
 }
 
@@ -725,6 +745,7 @@ mod tests {
             level: "info".into(),
             message: message.into(),
             labels,
+            payload: None,
         }
     }
 
@@ -741,6 +762,7 @@ mod tests {
             level: level.into(),
             message: format!("{service} op 10us"),
             labels,
+            payload: None,
         }
     }
 
@@ -951,6 +973,42 @@ mod tests {
         let hits = reopened.search(LogFilter::default()).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "v2");
+    }
+
+    #[tokio::test]
+    async fn payload_round_trips_and_does_not_affect_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TantivyLogStore::new(dir.path()).unwrap();
+        let mut record = rec("p1", 10, "span", "item-1");
+        record.labels.insert("data_type".into(), "traces".into());
+        record.payload = Some(r#"{"attributes":{"http.method":"GET"},"events":[]}"#.into());
+        store.append(record).await.unwrap();
+        store
+            .append(rec("p2", 11, "plain", "item-1"))
+            .await
+            .unwrap();
+
+        let hits = store
+            .search_indexed(IndexedLogFilter {
+                data_id: Some("item-1".into()),
+                ..IndexedLogFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        let with_payload = hits.iter().find(|r| r.id == "p1").unwrap();
+        assert_eq!(
+            with_payload.payload.as_deref(),
+            Some(r#"{"attributes":{"http.method":"GET"},"events":[]}"#)
+        );
+        assert!(
+            hits.iter()
+                .find(|r| r.id == "p2")
+                .unwrap()
+                .payload
+                .is_none(),
+            "没有原文的记录 payload 为空"
+        );
     }
 
     #[tokio::test]

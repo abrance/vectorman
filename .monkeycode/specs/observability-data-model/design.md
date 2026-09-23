@@ -261,6 +261,7 @@ v2 变更：
 
 | 变更 | 内容 |
 | --- | --- |
+| 新增仅存储字段 | v4 增加 `payload`（STORED、不建倒排）：保存记录原文（trace span 的完整 OTel JSON）。标签投影不足以还原 span 的耗时、`attributes`、`events`、`links`，瀑布图与 span 详情必须依赖原文 |
 | 新增索引字段 | `trace_id`、`data_type`、`service`、`data_id`（均为 `STRING \| STORED`，文本字段默认建倒排）；`data_id` 用于按采集项定位与保留期清理，`data_type` 用于按类型清理（`logs`/`traces`/`ebpf`），没有它就只能走 post-filter 并受 `DELETE_SCAN_LIMIT` 约束 |
 | 新增 trait 方法 | `async fn search_indexed(&self, filter: IndexedLogFilter) -> Result<Vec<LogRecord>, DataplaneError>`，全部条件走倒排索引，不做 post-filter |
 | 时间排序 | `IndexedLogFilter.order` 支持 `asc` / `desc`（瀑布图与列表用 asc，检索页用 desc）；实现用 `TopDocs::with_limit(n).order_by_fast_field(timestamp)` |

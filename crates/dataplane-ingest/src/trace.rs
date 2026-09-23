@@ -225,6 +225,9 @@ pub fn to_log_record(span: &TraceSpan, envelope: &DataEnvelope) -> LogRecord {
             span.duration_micros()
         ),
         labels,
+        // 明细原文：标签只投影了少量字段，耗时/attributes/events/links 只能从原文还原
+        // （瀑布图与 span 详情依赖它）。序列化失败时退化为「只有标签」，不阻断接入。
+        payload: serde_json::to_string(span).ok(),
     }
 }
 

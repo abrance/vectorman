@@ -1428,7 +1428,7 @@ mod tests {
             Some("order-api".to_string())
         );
 
-        // 明细走 LogStore v2 的 trace_id 索引，可一次取回。
+        // 明细走 LogStore 的 trace_id 索引，可一次取回，且带完整 span 原文。
         let hits = env
             .state
             .log
@@ -1438,6 +1438,22 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].level, "info");
         assert_eq!(hits[0].labels.get("service").unwrap(), "order-api");
+        let payload = hits[0].payload.as_deref().expect("span 原文写入 payload");
+        assert!(payload.contains("server.port"), "{payload}");
+        assert!(payload.contains("k8s.pod.name"), "{payload}");
+        assert!(payload.contains("start_unix_nano"), "{payload}");
+
+        // 详情接口要把原文里的富字段与派生耗时一起返回（瀑布图依赖）。
+        let (st, body) = send(&app, req("GET", &format!("/v1/traces/{trace_id}"), None)).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let detail: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(detail["partial"], false, "{body}");
+        let span = &detail["spans"][0];
+        assert_eq!(span["duration_micros"], json!(12_000), "{span}");
+        assert_eq!(span["kind"], json!("server"));
+        assert_eq!(span["attributes"]["server.port"], json!("8080"));
+        assert_eq!(span["resource"]["k8s.pod.name"], json!("order-api-1"));
+        assert_eq!(span["parent_span_id"], json!(""));
 
         // apm_enabled=false 时接入仍可用（退回无钩子路径）。
         let mut state = env.state.clone();
@@ -1525,6 +1541,10 @@ mod tests {
         assert_eq!(page["traces"][0]["trace_id"], trace_b, "最慢的在前");
         assert_eq!(page["traces"][0]["status"], "error");
         assert_eq!(page["traces"][0]["services"], json!(["x"]));
+        assert_eq!(page["traces"][0]["collector"], "otlp");
+        assert_eq!(page["traces"][0]["agent_id"], "agent-1");
+        assert_eq!(page["traces"][0]["host_id"], "host-1");
+        assert_eq!(page["traces"][0]["data_id"], "item-1");
 
         // 过滤 + 分页。
         let (st, body) = send(
@@ -1586,6 +1606,7 @@ mod tests {
                 level: "info".into(),
                 message: "order-api GET /orders 12000us".into(),
                 labels,
+                payload: None,
             })
             .await
             .unwrap();
@@ -1617,12 +1638,24 @@ mod tests {
         let edges: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(edges["total"], 0, "ebpf 数据源尚未接入");
 
-        // 服务清单。
+        // 服务清单（含端点实例明细，便于排查未识别服务）。
         let (st, body) = send(&app, req("GET", "/v1/apm/services", None)).await;
         assert_eq!(st, StatusCode::OK, "{body}");
         let services: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(services["services"][0]["service"], "order-api");
         assert_eq!(services["services"][0]["instance_count"], 1);
+        assert_eq!(
+            services["services"][0]["instances"][0]["pod_name"],
+            json!("order-api-7c9f")
+        );
+        assert_eq!(
+            services["services"][0]["instances"][0]["listen_port"],
+            json!(8080)
+        );
+        assert_eq!(
+            services["services"][0]["instances"][0]["collector"],
+            json!("otlp")
+        );
 
         // apm_enabled=false → 查询路由返回 unavailable。
         let mut state = env.state.clone();
