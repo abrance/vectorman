@@ -91,6 +91,26 @@ async fn main() -> ExitCode {
         Err(e) => return exit_with("engine log init failed", e),
     };
 
+    // APM 派生数据：摘要累加器 + 服务端点半。`apm_enabled=false` 时不创建，
+    // 接入路径退回无钩子的 `apply`（既有行为）。
+    let apm = if cfg.apm_enabled {
+        let sink = Arc::new(dataplane_apm::ApmSink::new(
+            sql.clone(),
+            dataplane_apm::ApmSinkConfig {
+                endpoint_retention_days: cfg.apm_endpoint_retention_days,
+                ..dataplane_apm::ApmSinkConfig::default()
+            },
+        ));
+        match sink.reload(now_micros()).await {
+            Ok(n) if n > 0 => println!("apm: reloaded {n} live traces"),
+            Ok(_) => {}
+            Err(e) => eprintln!("apm: reload failed: {}: {}", e.code.as_str(), e.message),
+        }
+        Some(sink)
+    } else {
+        None
+    };
+
     let metrics = match SelfMetrics::new("dataserver", &cfg.sql_http.listen) {
         Ok(m) => m,
         Err(e) => {
@@ -108,6 +128,7 @@ async fn main() -> ExitCode {
         auth: Arc::new(NoopAuth),
         gse_admin_url: cfg.gse_admin_url.clone(),
         metrics: Some(metrics.clone()),
+        apm: apm.clone(),
     };
 
     let web_dir = cfg.http_web_dir.as_deref().map(std::path::Path::new);
@@ -166,6 +187,35 @@ async fn main() -> ExitCode {
             }
         }
     });
+
+    if let Some(sink) = apm.clone() {
+        let flush_metrics = metrics.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                match sink.flush_due(now_micros()).await {
+                    Ok(report) if report.traces > 0 || report.endpoints > 0 => {
+                        flush_metrics.inc_counter(
+                            "dataserver_apm_trace_summaries_flushed_total",
+                            report.traces as f64,
+                        );
+                        flush_metrics.inc_counter(
+                            "dataserver_apm_endpoints_flushed_total",
+                            report.endpoints as f64,
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        flush_metrics.inc_counter("dataserver_apm_flush_errors_total", 1.0);
+                        eprintln!("apm: flush failed: {}: {}", e.code.as_str(), e.message);
+                    }
+                }
+                flush_metrics.set_gauge("dataserver_apm_live_traces", sink.live_traces() as f64);
+                flush_metrics.set_gauge("dataserver_apm_dirty_traces", sink.dirty_traces() as f64);
+            }
+        });
+    }
 
     if cfg.self_metrics_interval_secs > 0 {
         let sink: Arc<dyn vectorman_metrics::MetricsSink> = Arc::new(LocalTsSink {

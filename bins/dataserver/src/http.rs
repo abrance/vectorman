@@ -8,12 +8,15 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use dataplane_apm::ApmSink;
 use dataplane_core::{
     json_params_to_sql_values, sql_value_to_json, AuthN, DataplaneError, ErrorCode, RequestMeta,
     SqlResult,
 };
 use dataplane_file::FileStore;
-use dataplane_ingest::{apply, search, DataEnvelope, LogSearchQuery, StreamIndex};
+use dataplane_ingest::{
+    apply, apply_with_trace_sink, search, DataEnvelope, LogSearchQuery, StreamIndex,
+};
 use dataplane_kv::KvStore;
 use dataplane_log::LogStore;
 use dataplane_sql::RelationalStore;
@@ -38,6 +41,8 @@ pub struct AppState {
     pub auth: Arc<dyn AuthN>,
     pub gse_admin_url: Option<String>,
     pub metrics: Option<Arc<vectorman_metrics::SelfMetrics>>,
+    /// APM 派生数据（trace 摘要、服务端点半）；`apm_enabled=false` 时为 `None`。
+    pub apm: Option<Arc<ApmSink>>,
 }
 
 fn json_err(status: StatusCode, e: DataplaneError) -> Response {
@@ -308,14 +313,28 @@ async fn ingest(
             );
         }
     };
-    match apply(
-        envelope,
-        state.ts.as_ref(),
-        state.log.as_ref(),
-        state.kv.as_ref(),
-    )
-    .await
-    {
+    let reply = match state.apm.as_ref() {
+        Some(sink) => {
+            apply_with_trace_sink(
+                envelope,
+                state.ts.as_ref(),
+                state.log.as_ref(),
+                state.kv.as_ref(),
+                Some(sink.as_ref() as &dyn dataplane_ingest::trace::TraceSink),
+            )
+            .await
+        }
+        None => {
+            apply(
+                envelope,
+                state.ts.as_ref(),
+                state.log.as_ref(),
+                state.kv.as_ref(),
+            )
+            .await
+        }
+    };
+    match reply {
         Ok(reply) => {
             if let Some(m) = &state.metrics {
                 m.inc_counter(
@@ -635,7 +654,7 @@ mod tests {
         _dir: tempfile::TempDir,
     }
 
-    fn test_env(gse_admin_url: Option<String>) -> TestEnv {
+    async fn test_env(gse_admin_url: Option<String>) -> TestEnv {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("data");
         std::fs::create_dir_all(&root).unwrap();
@@ -657,6 +676,9 @@ mod tests {
             .unwrap(),
         );
         let log: Arc<dyn LogStore> = Arc::new(TantivyLogStore::new(&paths.logs).unwrap());
+        // 与生产启动一致：APM 观测表必须先建好。
+        dataplane_apm::bootstrap(sql.as_ref()).await.unwrap();
+        let sql_for_apm = sql.clone();
         TestEnv {
             state: AppState {
                 file,
@@ -667,6 +689,10 @@ mod tests {
                 auth: Arc::new(NoopAuth),
                 gse_admin_url,
                 metrics: None,
+                apm: Some(Arc::new(ApmSink::new(
+                    sql_for_apm,
+                    dataplane_apm::ApmSinkConfig::default(),
+                ))),
             },
             _dir: dir,
         }
@@ -737,7 +763,7 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_prom_logs_streams_and_health() {
-        let env = test_env(None);
+        let env = test_env(None).await;
         let app = sql_router(env.state.clone(), None);
 
         let (st, body) = send(&app, req("GET", "/health", None)).await;
@@ -810,7 +836,7 @@ mod tests {
 
     #[tokio::test]
     async fn collect_items_unavailable_without_gse_url() {
-        let env = test_env(None);
+        let env = test_env(None).await;
         let app = sql_router(env.state.clone(), None);
         let (st, body) = send(&app, req("GET", "/v1/collect-items", None)).await;
         assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{body}");
@@ -820,7 +846,7 @@ mod tests {
     #[tokio::test]
     async fn proxy_collect_items_and_agents() {
         let (gse_url, handle) = spawn_mock_gse().await;
-        let env = test_env(Some(gse_url));
+        let env = test_env(Some(gse_url)).await;
         let app = sql_router(env.state.clone(), None);
 
         let (st, body) = send(
@@ -843,7 +869,7 @@ mod tests {
     #[tokio::test]
     async fn delete_writes_retain_and_cleanup_drops_logs() {
         let (gse_url, handle) = spawn_mock_gse().await;
-        let env = test_env(Some(gse_url));
+        let env = test_env(Some(gse_url)).await;
         let app = sql_router(env.state.clone(), None);
 
         let (st, body) = send(
@@ -895,7 +921,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_retention_deletes_old_logs() {
-        let env = test_env(None);
+        let env = test_env(None).await;
         let app = sql_router(env.state.clone(), None);
         let (st, body) = send(
             &app,
@@ -947,7 +973,7 @@ mod tests {
         std::fs::write(dir.join("index.html"), "<html>spa-root</html>").unwrap();
         std::fs::write(dir.join("assets/app.js"), "console.log(1)").unwrap();
 
-        let env = test_env(None);
+        let env = test_env(None).await;
         let app = sql_router(env.state.clone(), Some(&dir));
 
         let (st, body) = send(&app, req("GET", "/assets/app.js", None)).await;
@@ -1000,7 +1026,7 @@ mod tests {
 
     #[tokio::test]
     async fn flush_writes_self_metrics_queryable() {
-        let env = test_env(None);
+        let env = test_env(None).await;
         let metrics = vectorman_metrics::SelfMetrics::new("dataserver", "0.0.0.0:8081").unwrap();
         let sink = LocalTsSink {
             ts: env.state.ts.clone(),
@@ -1025,7 +1051,7 @@ mod tests {
 
     #[tokio::test]
     async fn ts_stats_and_delete_endpoints() {
-        let env = test_env(None);
+        let env = test_env(None).await;
         let app = sql_router(env.state.clone(), None);
 
         let (st, body) = send(&app, req("GET", "/v1/ts/stats", None)).await;
@@ -1095,5 +1121,98 @@ mod tests {
         // 非法 JSON body → 400
         let (st, _) = send(&app, req("POST", "/v1/ts/delete", Some("not-json"))).await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn traces_ingest_updates_summary_endpoint_and_detail() {
+        use dataplane_core::SqlValue;
+        use dataplane_log::IndexedLogFilter;
+
+        let env = test_env(None).await;
+        let app = sql_router(env.state.clone(), None);
+        let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let span_id = "00f067aa0ba902b7";
+        let now = now_micros();
+        let envelope_json = json!({
+            "batch_id": "b-trace",
+            "data_type": "traces",
+            "data_id": "apm-1",
+            "agent_id": "agent-1",
+            "host_id": "host-1",
+            "sent_at_micros": now,
+            "records": [{
+                "record_id": format!("{trace_id}:{span_id}"),
+                "timestamp": now,
+                "trace_id": trace_id,
+                "span_id": span_id,
+                "parent_span_id": "",
+                "name": "GET /orders",
+                "kind": "server",
+                "start_unix_nano": now * 1000,
+                "end_unix_nano": now * 1000 + 12_000_000,
+                "status_code": "ok",
+                "service": "order-api",
+                "collector": "otlp",
+                "resource": {"host.ip": "10.0.0.9", "k8s.pod.name": "order-api-1"},
+                "attributes": {"server.port": "8080"}
+            }]
+        })
+        .to_string();
+
+        let (st, body) = send(
+            &app,
+            req("POST", "/v1/ingest", Some(&envelope_json.to_string())),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert!(body.contains("\"accepted\":1"), "{body}");
+
+        // 主进程每秒 flush；测试里手动触发。
+        let sink = env.state.apm.as_ref().expect("apm sink").clone();
+        let report = sink.flush_now(now).await.unwrap();
+        assert_eq!(report.traces, 1);
+        assert_eq!(report.endpoints, 1);
+
+        let rows = env
+            .state
+            .sql
+            .execute(
+                "SELECT span_count, root_service, root_operation FROM apm_trace_summary WHERE trace_id = ?1",
+                &[SqlValue::Text(trace_id.to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows.len(), 1, "摘要应写入一行");
+        assert_eq!(rows.rows[0][0], SqlValue::Integer(1));
+        assert_eq!(rows.rows[0][1], SqlValue::Text("order-api".to_string()));
+
+        // 端点反查（eBPF 边归一与拓扑兜底会用到）。
+        assert_eq!(
+            sink.lookup_service("10.0.0.9", 8080, "").await.unwrap(),
+            Some("order-api".to_string())
+        );
+
+        // 明细走 LogStore v2 的 trace_id 索引，可一次取回。
+        let hits = env
+            .state
+            .log
+            .search_indexed(IndexedLogFilter::by_trace_id(trace_id))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].level, "info");
+        assert_eq!(hits[0].labels.get("service").unwrap(), "order-api");
+
+        // apm_enabled=false 时接入仍可用（退回无钩子路径）。
+        let mut state = env.state.clone();
+        state.apm = None;
+        let app = sql_router(state, None);
+        let (st, body) = send(
+            &app,
+            req("POST", "/v1/ingest", Some(&envelope_json.to_string())),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert!(body.contains("\"accepted\":1"), "{body}");
     }
 }

@@ -47,18 +47,23 @@
   - [ ] 5.6 单测：protobuf/JSON/gzip/超限/非法体、过滤名单、映射表逐行、worker 启停
 - [ ] 6. 检查点 - 确保所有测试通过
   - 确保所有测试通过,如有疑问请询问用户
-- [ ] 7. dataserver 摘要、端点与配对
-  - [ ] 7.1 `TraceSummaryAccumulator`：容量上限、按 `max_end_ts` 淘汰、每秒/500 项 flush、`ON CONFLICT` 合并、`services_json` 读改写、崩溃取舍
+- [ ] 7. dataserver 摘要、端点与配对（7.1-7.3 与 7.5 部分已完成，见 PR #32；7.4 配对待做）
+  - [x] 7.1 `TraceSummaryAccumulator`：容量上限、按 `max_end_ts` 淘汰、每秒/500 项 flush、`ON CONFLICT` 合并、`services_json` 读改写、崩溃取舍
     - 对应需求 4.3-4.5 与设计「TraceSummaryAccumulator」
-  - [ ] 7.2 冷启动回载 5 分钟内 trace；6 分钟前不回载
-  - [ ] 7.3 `EndpointRegistry`：upsert、`lookup_by_ip_port`/`lookup_by_pod`、60 秒缓存、30 天清理
+    - 状态：已实现（PR #32）：增量语义 + 读改写 + `root_start_ts`（schema v2）+ 容量淘汰
+  - [x] 7.2 冷启动回载 5 分钟内 trace；6 分钟前不回载
+    - 状态：已实现（PR #32）：超出回载窗口的 trace 不再载入，测试断言 6 分钟前为 0
+  - [x] 7.3 `EndpointRegistry`：upsert、`lookup_by_ip_port`/`lookup_by_pod`、60 秒缓存、30 天清理
     - 对应需求 4.6 与共享模型「服务标识与反查」
+    - 状态：已实现（PR #32）：upsert、两级反查、含未命中的负面缓存、清理用 `SELECT changes()` 计数
   - [ ] 7.4 span 配对与 `apm_edge_summary`：client→server 配对、反向补齐、`unknown:*` 兜底与端点归一
     - 对应需求 8.1-8.6
-  - [ ] 7.5 单测：乱序 12 条 span 的摘要断言、根 span 取 `start_ts` 最小者、error 单调、配对三场景
+  - [x] 7.5 单测：乱序 12 条 span 的摘要断言、根 span 取 `start_ts` 最小者、error 单调、配对三场景
+    - 状态：部分实现（PR #32）：乱序极值合并、根取最小、跨 flush 替换根、error 单调、幂等 flush、容量淘汰、冷启动回载、端点反查与清理、v1→v2 迁移；**配对三场景随 7.4 待做**
   - [ ] 7.6 静态服务名映射：`apm_service_alias` CRUD API（`/v1/apm/service-aliases`）、校验、缓存失效版本号、反查优先级（alias → endpoint → `unknown-<ip>`）
     - 对应需求 17.1-17.7、17.11 与共享模型「服务名映射（alias）」
 - [ ] 8. dataserver 聚合任务
+    - 状态：部分实现（PR #32）：乱序摘要、根取 start 最小、跨 flush 替换根、error 单调、幂等 flush、容量淘汰、回载、端点反查；配对三场景随 7.4 待做
   - [ ] 8.1 `ApmAggregator`：60 秒周期、桶对齐、服务维度与 span 维度、nearest-rank 分位数、空桶不写零值
     - 对应需求 7.1-7.9
   - [ ] 8.2 边指标聚合：`apm_edge_requests_total`/`errors`/`duration_micros`，label 与 `source=otlp`

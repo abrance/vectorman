@@ -104,15 +104,22 @@ async fn register_probe_collect_ingest_and_query() {
     .await;
 
     // 3. dataserver：SQL 口反代 GSE，Prom 口独立托管。
+    dataplane_apm::bootstrap(sql.as_ref())
+        .await
+        .expect("apm schema");
     let state = AppState {
         file,
         kv,
-        sql,
+        sql: sql.clone(),
         ts,
         log,
         auth: Arc::new(NoopAuth),
         gse_admin_url: Some(gse_url.clone()),
         metrics: None,
+        apm: Some(Arc::new(dataplane_apm::ApmSink::new(
+            sql.clone(),
+            dataplane_apm::ApmSinkConfig::default(),
+        ))),
     };
     let ds_url = spawn(sql_router(state.clone(), None)).await;
     let prom_url = spawn(prom_router(state)).await;

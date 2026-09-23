@@ -186,7 +186,9 @@ struct TraceAcc {
 }
 ```
 
-- 容量上限 `max_live_traces`（默认 20_000），超限时按 `max_end_ts` 升序强制 flush 最旧项，防止长尾 trace 占满内存。
+- 容量上限 `max_live_traces`（默认 20_000）：超限时先 flush，再按 `max_end_ts` 升序淘汰**已落库的干净条目**（淘汰安全：flush 是「读回已有行 + 合并内存增量」，条目重建后从库里的绝对值继续累加）。
+- 根 span 的 `start_ts` 必须落库（`apm_trace_summary.root_start_ts`，schema v2）：根可能比普通 span 晚到，也可能跨多次 flush 才到，只存 `root_service`/`root_operation` 无法比较出更早的根。
+- 端点表的 `last_seen_ts` 用**墙上时钟**（观察时刻），而摘要用 span 时间戳：两者的清理窗口语义不同，不要混用同一个「now」。
 - flush 触发：每 1 秒、或累计 500 个 `dirty` 项、或进程退出（best effort）。
 - flush 语句（`max_end_ts` 列见本文 Data Models，共享模型 DDL 同步）：
 
@@ -473,6 +475,7 @@ max_end_ts INTEGER NOT NULL DEFAULT 0
 - `LogStore` 索引字段提升必须在 `append` 内部实现（对既有调用方零改动），否则同一份日志写入路径会出现两套行为。
 - `apm_service_*` 的 `operation` 用根 span 的 `name`，而 `span_kind` 固定 `server`；若后续要按内部 span 统计，需要新增 measurement，不要改写既有语义。
 - 边 P95 依赖聚合任务与 accumulator 同进程的内存直方图；不要把样本写进 sqlite 再算，规模会失控。
+- 删除/统计类接口不能靠 `RelationalStore::execute` 的返回行数：`DELETE` 不返回行，受影响行数要用同一连接上的 `SELECT changes()` 取（`sqlite` 的 `changes()` 是连接级状态）。
 - 根 span 判定不要用「`parent_span_id` 为空且是第一个到达」，必须按 `start_ts` 比较，否则乱序到达时摘要不稳定。
 - `LogStore::append` **不按 id 幂等**：同一 `id` 追加两次会产生两个文档（只有 `delete_term(id)` 才清掉）。所以 `traces` 分支的顺序固定为「写明细 → 派生数据（best effort）→ KvStore 标记去重」，且派生数据失败不能当成整批失败；同样原因，接入重试不能依赖「明细会被去重」，幂等完全靠 KvStore 的 `ingest/{record_id}` 先于写入的判断。
 - 归一化必须同时处理 `record_id`：只小写 `trace_id`/`span_id` 而保留入参的 `record_id` 会让「record_id == trace_id:span_id」校验失败，看起来像 Agent 发错了。
