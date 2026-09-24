@@ -450,7 +450,10 @@ async fn v1_database_is_migrated_to_v2() {
     .unwrap();
 
     bootstrap(sql.as_ref()).await.unwrap();
-    assert_eq!(crate::read_version(sql.as_ref()).await.unwrap(), Some(2));
+    assert_eq!(
+        crate::read_version(sql.as_ref()).await.unwrap(),
+        Some(crate::SCHEMA_VERSION)
+    );
 
     // 迁移后可以写入 root_start_ts，且重复 bootstrap 幂等。
     let acc = TraceSummaryAccumulator::new(ApmSinkConfig::default());
@@ -463,6 +466,129 @@ async fn v1_database_is_migrated_to_v2() {
     let row = summary_row(sql.as_ref(), trace).await;
     assert_eq!(as_i64(&row[5]), NOW);
     bootstrap(sql.as_ref()).await.unwrap();
+}
+
+/// eBPF 边：反查顺序（静态映射 → 端点表 `(ip,port)` → Pod → `unknown-<ip>`）与覆盖写幂等。
+#[tokio::test]
+async fn ebpf_edge_upsert_and_resolve_order() {
+    use dataplane_ingest::{DataEnvelope, DataType, EbpfEdge, EdgeSink};
+
+    let dir = tempfile::tempdir().unwrap();
+    let sql = store(dir.path());
+    crate::bootstrap(sql.as_ref()).await.unwrap();
+    // `EndpointRegistry::observe/flush` 都是 `&self`（内部可变），一个实例即可。
+    let endpoints = std::sync::Arc::new(crate::endpoint::EndpointRegistry::new(30, 60));
+    let aliases = std::sync::Arc::new(crate::alias::AliasCache::new(60));
+    let sink = crate::ebpf_edge::EbpfEdgeSink::new(sql.clone(), endpoints.clone(), aliases.clone());
+
+    let envelope = DataEnvelope {
+        batch_id: "b1".into(),
+        data_type: DataType::EbpfEdges,
+        data_id: "item-ebpf".into(),
+        agent_id: "agent-1".into(),
+        host_id: "host-1".into(),
+        sent_at_micros: NOW,
+        records: Vec::new(),
+    };
+
+    let mut edge: EbpfEdge = serde_json::from_value(serde_json::json!({
+        "record_id": "agent-1:1:a",
+        "timestamp": NOW,
+        "bucket_micros": 10_000_000i64,
+        "protocol": "tcp",
+        "src_ip": "10.0.0.5",
+        "src_port": 40000,
+        "dst_ip": "10.0.0.9",
+        "dst_port": 8080,
+        "src_process": "java",
+        "connections": 2,
+        "bytes_sent": 10,
+        "bytes_recv": 20,
+        "duration_micros_sum": 5,
+        "duration_micros_max": 5,
+        "tcp_retrans": 0,
+        "tcp_resets": 0,
+        "failures": 0,
+        "latency_hist": [1]
+    }))
+    .unwrap();
+
+    // 两边都没命中：落 unknown-<ip>。
+    assert_eq!(sink.resolve_src(&edge).await.unwrap(), "unknown-10.0.0.5");
+    assert_eq!(sink.resolve_dst(&edge).await.unwrap(), "unknown-10.0.0.9");
+
+    // 静态映射命中进程名（优先级最高）。缓存必须显式失效才看得到新配置
+    // （生产路径由 `ApmSink::upsert_alias` 触发，这条断言同时锁住该契约）。
+    crate::alias::upsert_alias(
+        sql.as_ref(),
+        &crate::alias::AliasUpsert {
+            match_kind: "process_name".into(),
+            match_value: "java".into(),
+            service: "order-api".into(),
+            enabled: Some(true),
+            note: None,
+        },
+        NOW,
+    )
+    .await
+    .unwrap();
+    aliases.invalidate();
+    assert_eq!(sink.resolve_src(&edge).await.unwrap(), "order-api");
+
+    // 目标侧靠端点表 (ip, port) 命中。上面那次未命中的查询已把负面结果缓存 60 秒，
+    // 所以这里换一个**新缓存**的写入器来验证命中路径，同时断言旧实例仍返回未识别。
+    let mut span = span(
+        "bbbb0000000000000000000000000001",
+        "0000000000000001",
+        "",
+        "pay-api",
+        "GET /pay",
+        NOW,
+        5,
+        "ok",
+    );
+    span.resource.insert("host.ip".into(), "10.0.0.9".into());
+    // 监听端口取自 span 属性（`server.port` 优先，其次 `net.host.port`）。
+    span.attributes.insert("server.port".into(), "8080".into());
+    endpoints.observe(&span, NOW);
+    endpoints.flush(sql.as_ref()).await.unwrap();
+    assert_eq!(
+        sink.resolve_dst(&edge).await.unwrap(),
+        "unknown-10.0.0.9",
+        "负面结果在 TTL 内保持（设计里明确要求缓存未命中，避免每批查 sqlite）"
+    );
+    let sink = crate::ebpf_edge::EbpfEdgeSink::new(
+        sql.clone(),
+        std::sync::Arc::new(crate::endpoint::EndpointRegistry::new(30, 60)),
+        aliases.clone(),
+    );
+    assert_eq!(sink.resolve_dst(&edge).await.unwrap(), "pay-api");
+
+    // Agent 已填写的服务名不被覆盖。
+    edge.src_service = "given-src".into();
+    assert_eq!(sink.resolve_src(&edge).await.unwrap(), "given-src");
+
+    // 落库 + 覆盖写幂等。
+    edge.src_service.clear();
+    EdgeSink::observe_edge(&sink, &edge, &envelope)
+        .await
+        .unwrap();
+    EdgeSink::observe_edge(&sink, &edge, &envelope)
+        .await
+        .unwrap();
+    assert_eq!(sink.written(), 2, "两次写入都记数，但表里只有一行");
+    let rows = sql
+        .execute(
+            "SELECT src_service, dst_service, connections, latency_hist FROM ebpf_edges",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.rows.len(), 1, "record_id 主键覆盖写");
+    assert_eq!(as_text(&rows.rows[0][0]), "order-api");
+    assert_eq!(as_text(&rows.rows[0][1]), "pay-api");
+    assert_eq!(as_i64(&rows.rows[0][2]), 2);
+    assert_eq!(as_text(&rows.rows[0][3]), "[1]");
 }
 
 #[tokio::test]

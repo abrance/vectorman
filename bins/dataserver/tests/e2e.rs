@@ -221,3 +221,136 @@ async fn register_probe_collect_ingest_and_query() {
     assert!(body.contains("agent-1"), "{body}");
     assert!(body.contains(&item_id), "{body}");
 }
+
+/// eBPF 边接入：字段校验（整条拒绝而非截断）、幂等重放、落库与未识别服务归一。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ebpf_edge_ingest_validates_and_lands() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("data");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    let paths = resolve_data_paths(root.to_str().unwrap()).expect("paths");
+    paths.ensure_dirs().expect("ensure dirs");
+    let file: Arc<dyn FileStore> = Arc::new(DirFileStore::new(paths.files.clone()));
+    let kv: Arc<dyn KvStore> = Arc::new(RedbKvStore::new(&paths.kv).expect("kv"));
+    let sql: Arc<dyn RelationalStore> =
+        Arc::new(SqliteRelationalStore::new(&paths.sql).expect("sql"));
+    let ts: Arc<dyn TimeSeriesStore> = Arc::new(
+        TsinkTimeSeriesStore::new(
+            &paths.ts,
+            TsRetentionConfig {
+                enforced: false,
+                ..TsRetentionConfig::default()
+            },
+        )
+        .expect("ts"),
+    );
+    let log: Arc<dyn LogStore> = Arc::new(TantivyLogStore::new(&paths.logs).expect("log"));
+    dataplane_apm::bootstrap(sql.as_ref())
+        .await
+        .expect("apm schema");
+
+    let state = AppState {
+        file,
+        kv,
+        sql: sql.clone(),
+        ts,
+        log,
+        auth: Arc::new(NoopAuth),
+        gse_admin_url: None,
+        metrics: None,
+        apm: Some(Arc::new(dataplane_apm::ApmSink::new(
+            sql.clone(),
+            dataplane_apm::ApmSinkConfig::default(),
+            Arc::new(dataplane_apm::RedSamples::new(1_000)),
+        ))),
+        apm_limiter: None,
+        apm_detail_min_duration_micros: 0,
+    };
+    let ds_url = spawn(sql_router(state, None)).await;
+
+    let edge = |record_id: &str, connections: u64, failures: u64, hist: serde_json::Value| {
+        serde_json::json!({
+            "record_id": record_id,
+            "timestamp": TS,
+            "bucket_micros": 10_000_000i64,
+            "protocol": "tcp",
+            "src_ip": "10.0.0.5",
+            "src_port": 40000,
+            "dst_ip": "10.0.0.9",
+            "dst_port": 8080,
+            "src_process": "java",
+            "connections": connections,
+            "bytes_sent": 100,
+            "bytes_recv": 200,
+            "duration_micros_sum": 10,
+            "duration_micros_max": 10,
+            "tcp_retrans": 0,
+            "tcp_resets": 0,
+            "failures": failures,
+            "failure_reason": if failures > 0 { "refused" } else { "" },
+            "latency_hist": hist
+        })
+    };
+
+    let envelope = serde_json::json!({
+        "batch_id": "b-ebpf-1",
+        "data_type": "ebpf_edges",
+        "data_id": "item-ebpf",
+        "agent_id": "agent-1",
+        "host_id": "host-1",
+        "sent_at_micros": TS,
+        "records": [
+            edge("agent-1:1:a", 2, 1, serde_json::json!([1, 2])),
+            // failures > connections：整条拒绝。
+            edge("agent-1:1:b", 1, 5, serde_json::json!([1])),
+            // 直方图超槽：整条拒绝。
+            edge("agent-1:1:c", 1, 0, serde_json::json!(vec![0u64; 33])),
+        ]
+    })
+    .to_string();
+    let (status, body) = http("POST", &format!("{ds_url}/v1/ingest"), Some(envelope)).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"status\":\"partial\""), "{body}");
+    assert!(body.contains("\"accepted\":1"), "{body}");
+    assert!(body.contains("connections"), "{body}");
+    assert!(body.contains("latency_hist"), "{body}");
+
+    // 重放同一批：已受理的记录不再重复落库，非法记录依旧报 partial。
+    let (status, body) = http(
+        "POST",
+        &format!("{ds_url}/v1/ingest"),
+        Some(
+            serde_json::json!({
+                "batch_id": "b-ebpf-2",
+                "data_type": "ebpf_edges",
+                "data_id": "item-ebpf",
+                "agent_id": "agent-1",
+                "host_id": "host-1",
+                "sent_at_micros": TS,
+                "records": [edge("agent-1:1:a", 2, 1, serde_json::json!([1, 2]))]
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"status\":\"ok\""), "{body}");
+
+    // 落库：只有一行，未识别服务归一为 unknown-<ip>。
+    let rows = sql
+        .execute(
+            "SELECT record_id, src_service, dst_service, connections, latency_hist FROM ebpf_edges",
+            &[],
+        )
+        .await
+        .expect("select ebpf_edges");
+    assert_eq!(rows.rows.len(), 1, "非法记录不落库，重放不新增行");
+    let text = |row: &Vec<dataplane_core::SqlValue>, index: usize| match row.get(index) {
+        Some(dataplane_core::SqlValue::Text(s)) => s.clone(),
+        other => panic!("expected text at {index}: {other:?}"),
+    };
+    assert_eq!(text(&rows.rows[0], 0), "agent-1:1:a");
+    assert_eq!(text(&rows.rows[0], 1), "unknown-10.0.0.5");
+    assert_eq!(text(&rows.rows[0], 2), "unknown-10.0.0.9");
+    assert_eq!(text(&rows.rows[0], 4), "[1,2]");
+}

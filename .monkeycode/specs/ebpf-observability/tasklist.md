@@ -97,12 +97,19 @@
     - 状态：部分实现（PR #50）：抽样比例统计（含 0/1/0.1/极端小值）、原始事件字段映射与未知类型、进程分钟汇总（只输出已关闭桶）、
       空对象文件的错误提示、GSE 侧校验（非法端口/范围/比例 + 合法创建）。**未覆盖**：真实启停序列与「既有采集器不受影响」（需要特权环境）
 - [ ] 5. P1 dataserver 接入与查询
-  - [ ] 5.1 `crates/dataplane-ingest/src/edge.rs`：`EbpfEdge` DTO + JSON 往返测试
+  - [x] 5.1 `crates/dataplane-ingest/src/edge.rs`：`EbpfEdge` DTO + JSON 往返测试
     - 对应共享模型 `EbpfEdge` 定义
-  - [ ] 5.2 `DataType::EbpfEdges` 分支：幂等、字段校验（`failures <= connections`、`hist_slots`）、sqlite 主键覆盖写、流索引
+    - 状态：已实现（PR #51）：`EbpfEdge` DTO 与 Agent 侧逐字段一致（可选字段同样带 `#[serde(default)]`，避免一次字段裁剪让整条变 `partial`）；
+      `EdgeSink` trait + JSON 往返/缺省值/校验规则单测
+  - [x] 5.2 `DataType::EbpfEdges` 分支：幂等、字段校验（`failures <= connections`、`hist_slots`）、sqlite 主键覆盖写、流索引
     - 对应需求 3.9、10.1、10.4-10.7
-  - [ ] 5.3 服务名反查接入 `EndpointRegistry`（固定顺序：静态映射 alias → `(dst_ip,dst_port)` → `dst_pod` → `unknown-<ip>`；命中与负面结果均缓存 60 秒）
+    - 状态：已实现（PR #51）：`apply_with_sinks` 新增 `ebpf_edges` 分支（`apply_with_trace_sink` 保持原签名，供既有调用点与测试复用）；
+      校验不合法整条记 `partial` 不落库；`record_id` 已受理则跳过（少一次反查与 sqlite 写）；落库 `INSERT OR REPLACE` 主键覆盖写；受理后计入流索引（沿用通用路径）
+  - [x] 5.3 服务名反查接入 `EndpointRegistry`（固定顺序：静态映射 alias → `(dst_ip,dst_port)` → `dst_pod` → `unknown-<ip>`；命中与负面结果均缓存 60 秒）
     - 对应需求 11.1-11.6 与共享模型反查顺序；alias 由 `apm-tracing` 的 `/v1/apm/service-aliases` 维护
+    - 状态：已实现（PR #51）：`dataplane-apm/src/ebpf_edge.rs` 按固定顺序反查（Agent 已填写的服务名不覆盖），
+      复用 `AliasCache`（快照 + 显式失效）与 `EndpointRegistry`（命中/负面都缓存 60 秒）；未命中落 `unknown-<ip>` 且**不**写端点表。
+      单测覆盖：两面均未识别、静态映射命中（含缓存失效契约）、端点表 `(ip,port)` 命中、负面缓存 TTL 内仍返回未识别、覆盖写幂等
   - [ ] 5.4 `POST /v1/edges/search`：过滤、分页、`source` 为空时两路合并汇总
     - 对应需求 13.1-13.3、13.5-13.6
   - [ ] 5.5 `POST /v1/ebpf/events/search` 与 `GET /v1/ebpf/capability`
@@ -110,6 +117,15 @@
   - [ ] 5.6 保留期清理：`ebpf_edges` 分批删除、`data_type=ebpf` 循环删除、`retain/` 机制；聚合指标接入 `dataplane-ts-retention`（`ts_retention_days` 缺省 30 天）
     - 对应需求 14.1-14.4
   - [ ] 5.7 httptest：幂等重放、非法字段 `partial`、合并查询求和、清理三类数据、时间范围非法 400
+    - 状态：部分实现（PR #51）：dataserver e2e 覆盖「1 条合法 + 2 条非法 → `partial` 且只落 1 行、重放幂等、未识别服务归一为 `unknown-<ip>`」。
+      **未覆盖**：合并查询求和、清理三类数据、时间范围非法 400（随查询与保留期一起做）
+- [ ] 5.8 边指标由 dataserver 派生（实现期新增子项）
+  - [ ] 状态：未做（PR #51 先落库）。**口径决定**：Agent 侧当前也会产出 `ebpf_*` 边指标，但那些点缺少
+    `src_service`/`dst_service`（Agent 无法解析全局服务表），与共享模型的指标维度不符，且会与 dataserver
+    派生出的同名序列形成两套。下一 PR 改为：Agent 只发 `agent_ebpf_capability`、进程指标与原始事件；
+    `ebpf_edge_*`/`ebpf_tcp_*`/`apm_edge_*{source=ebpf}` 全部由 dataserver 从 `ebpf_edges` 表按分钟派生
+    （直方图在边上，`p95` 由槽上界近似，口径与 APM 侧一致地标注为近似）
+
 - [ ] 6. 检查点 - P1 在特权 runner 上跑通受控流量用例后再进入 P2
   - 确保所有测试通过,如有疑问请询问用户
 - [ ] 7. P1 前端与 CLI

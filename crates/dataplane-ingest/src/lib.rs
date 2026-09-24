@@ -13,8 +13,10 @@ use dataplane_ts::{TimeSeriesStore, TsPoint};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod edge;
 pub mod trace;
 
+pub use edge::{EbpfEdge, EdgeSink};
 pub use trace::{SpanEvent, SpanLink, TraceSink, TraceSpan};
 
 /// 采集类型。
@@ -25,6 +27,8 @@ pub enum DataType {
     Logs,
     Apm,
     Ebpf,
+    /// eBPF 边聚合（与 `Ebpf` 原始事件区分：这是聚合，不是明细）。
+    EbpfEdges,
     Traces,
 }
 
@@ -35,6 +39,7 @@ impl DataType {
             Self::Logs => "logs",
             Self::Apm => "apm",
             Self::Ebpf => "ebpf",
+            Self::EbpfEdges => "ebpf_edges",
             Self::Traces => "traces",
         }
     }
@@ -165,16 +170,28 @@ pub async fn apply(
     apply_with_trace_sink(envelope, ts, log, kv, None).await
 }
 
-/// 接入一批记录，并把 `traces` 的派生数据交给 `trace_sink`。
-///
-/// `trace_sink` 的失败**不影响**接入应答：明细已落库，重试整批只会造成明细重复，
-/// 因此只记录到标准错误并由自监控计数（见 `apm-tracing` 设计「错误处理」）。
+/// 接入一批记录，并把 `traces` 的派生数据交给 `trace_sink`（不计 eBPF 边）。
 pub async fn apply_with_trace_sink(
     envelope: DataEnvelope,
     ts: &dyn TimeSeriesStore,
     log: &dyn LogStore,
     kv: &dyn KvStore,
     trace_sink: Option<&dyn TraceSink>,
+) -> Result<IngestReply, DataplaneError> {
+    apply_with_sinks(envelope, ts, log, kv, trace_sink, None).await
+}
+
+/// 接入一批记录，并把派生数据交给各自的出口（`traces` → `trace_sink`，`ebpf_edges` → `edge_sink`）。
+///
+/// 出口的失败**不影响**接入应答：明细已落库，重试整批只会造成明细重复，
+/// 因此只记录到标准错误并由自监控计数（见 `apm-tracing` 设计「错误处理」）。
+pub async fn apply_with_sinks(
+    envelope: DataEnvelope,
+    ts: &dyn TimeSeriesStore,
+    log: &dyn LogStore,
+    kv: &dyn KvStore,
+    trace_sink: Option<&dyn TraceSink>,
+    edge_sink: Option<&dyn EdgeSink>,
 ) -> Result<IngestReply, DataplaneError> {
     if envelope.agent_id.trim().is_empty() {
         return Err(DataplaneError::invalid_argument("agent_id is required"));
@@ -189,7 +206,7 @@ pub async fn apply_with_trace_sink(
     let mut failures = Vec::new();
 
     for raw in &envelope.records {
-        match apply_one(&envelope, raw, ts, log, kv, trace_sink).await {
+        match apply_one(&envelope, raw, ts, log, kv, trace_sink, edge_sink).await {
             Ok(()) => accepted += 1,
             Err(ApplyRecordError::Invalid(failure)) => failures.push(failure),
             Err(ApplyRecordError::Engine(e)) => return Err(e),
@@ -221,6 +238,7 @@ async fn apply_one(
     log: &dyn LogStore,
     kv: &dyn KvStore,
     trace_sink: Option<&dyn TraceSink>,
+    edge_sink: Option<&dyn EdgeSink>,
 ) -> Result<(), ApplyRecordError> {
     match envelope.data_type {
         DataType::Metrics => {
@@ -368,6 +386,32 @@ async fn apply_one(
                 }
             }
             mark_ingested(kv, &span.record_id).await
+        }
+        DataType::EbpfEdges => {
+            let edge: edge::EbpfEdge = parse_record(raw)?;
+            if let Err(reason) = edge.validate() {
+                return Err(ApplyRecordError::Invalid(RecordFailure {
+                    record_id: edge.record_id.clone(),
+                    code: "invalid_argument".into(),
+                    message: reason,
+                }));
+            }
+            // 幂等：同 `record_id` 重发直接受理（边记录按 record_id 覆盖写，重放是安全的，
+            // 但仍先挡一次，避免重复做反查与 sqlite 写）。
+            if already_accepted(kv, &edge.record_id).await? {
+                return Ok(());
+            }
+            if let Some(sink) = edge_sink {
+                if let Err(e) = sink.observe_edge(&edge, envelope).await {
+                    eprintln!(
+                        "ebpf: observe_edge failed for {}: {}: {}",
+                        edge.record_id,
+                        e.code.as_str(),
+                        e.message
+                    );
+                }
+            }
+            mark_ingested(kv, &edge.record_id).await
         }
     }
 }
@@ -822,6 +866,124 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    /// 记录型边 sink：断言 `ebpf_edges` 分支调用与失败隔离。
+    #[derive(Default)]
+    struct RecordingEdgeSink {
+        edges: std::sync::Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl edge::EdgeSink for RecordingEdgeSink {
+        async fn observe_edge(
+            &self,
+            edge: &edge::EbpfEdge,
+            envelope: &DataEnvelope,
+        ) -> Result<(), DataplaneError> {
+            self.edges
+                .lock()
+                .unwrap()
+                .push(format!("{}@{}", edge.record_id, envelope.data_id));
+            if self.fail {
+                return Err(DataplaneError::new(ErrorCode::QueryFailed, "sink boom"));
+            }
+            Ok(())
+        }
+    }
+
+    fn ebpf_edge_json(record_id: &str, connections: u64, failures: u64) -> Value {
+        json!({
+            "record_id": record_id,
+            "timestamp": 1_710_000_000_000_000i64,
+            "bucket_micros": 10_000_000i64,
+            "protocol": "tcp",
+            "src_ip": "10.0.0.5",
+            "src_port": 40000,
+            "dst_ip": "10.0.0.9",
+            "dst_port": 8080,
+            "src_process": "java",
+            "connections": connections,
+            "bytes_sent": 100,
+            "bytes_recv": 200,
+            "duration_micros_sum": 10,
+            "duration_micros_max": 10,
+            "tcp_retrans": 0,
+            "tcp_resets": 0,
+            "failures": failures,
+            "failure_reason": if failures > 0 { "refused" } else { "" },
+            "latency_hist": [1]
+        })
+    }
+
+    #[tokio::test]
+    async fn ebpf_edges_go_to_edge_sink_and_validate() {
+        let e = engines();
+        let sink = RecordingEdgeSink::default();
+        let env = envelope(
+            "ebpf_edges",
+            vec![
+                ebpf_edge_json("agent-1:1:a", 2, 1),
+                // failures > connections：整条拒绝。
+                ebpf_edge_json("agent-1:1:b", 1, 5),
+            ],
+        );
+        let reply = apply_with_sinks(
+            env,
+            &e.ts,
+            &e.log,
+            &e.kv,
+            None,
+            Some(&sink as &dyn edge::EdgeSink),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.accepted, 1);
+        assert_eq!(reply.status, "partial");
+        assert_eq!(reply.failures.len(), 1);
+        assert_eq!(reply.failures[0].record_id, "agent-1:1:b");
+        assert!(reply.failures[0].message.contains("failures"));
+
+        let seen = sink.edges.lock().unwrap().clone();
+        assert_eq!(seen, vec!["agent-1:1:a@item-1".to_string()]);
+
+        // 幂等重放：同一条不再进 sink。
+        let env = envelope("ebpf_edges", vec![ebpf_edge_json("agent-1:1:a", 2, 1)]);
+        let reply = apply_with_sinks(
+            env,
+            &e.ts,
+            &e.log,
+            &e.kv,
+            None,
+            Some(&sink as &dyn edge::EdgeSink),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.accepted, 1);
+        assert_eq!(sink.edges.lock().unwrap().len(), 1, "重放不重复反查/落库");
+    }
+
+    #[tokio::test]
+    async fn edge_sink_failure_does_not_fail_batch() {
+        let e = engines();
+        let sink = RecordingEdgeSink {
+            fail: true,
+            ..Default::default()
+        };
+        let env = envelope("ebpf_edges", vec![ebpf_edge_json("agent-1:2:a", 1, 0)]);
+        let reply = apply_with_sinks(
+            env,
+            &e.ts,
+            &e.log,
+            &e.kv,
+            None,
+            Some(&sink as &dyn edge::EdgeSink),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.status, "ok", "sink 失败不影响接入应答");
+        assert_eq!(reply.accepted, 1);
     }
 
     fn trace_span_json(trace_id: &str, span_id: &str, parent: &str) -> Value {
