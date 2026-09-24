@@ -9,11 +9,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dataplane_core::DataplaneError;
 use dataplane_ingest::trace::{TraceSink, TraceSpan};
-use dataplane_ingest::DataEnvelope;
+use dataplane_ingest::{DataEnvelope, EbpfEdge, EdgeSink};
 use dataplane_sql::RelationalStore;
 
 use crate::accumulator::{ApmSinkConfig, TraceSummaryAccumulator};
 use crate::alias::{AliasCache, AliasRecord, AliasUpsert};
+use crate::ebpf_edge::EbpfEdgeSink;
 use crate::edge::{EdgeAccumulator, ServiceResolver};
 use crate::endpoint::EndpointRegistry;
 use crate::red::RedSamples;
@@ -33,10 +34,12 @@ pub struct ApmSink {
     sql: Arc<dyn RelationalStore>,
     config: ApmSinkConfig,
     accumulator: TraceSummaryAccumulator,
-    endpoints: EndpointRegistry,
+    endpoints: Arc<EndpointRegistry>,
     edges: EdgeAccumulator,
     samples: Arc<RedSamples>,
-    aliases: AliasCache,
+    aliases: Arc<AliasCache>,
+    /// eBPF 边写入器（与摘要共用同一份端点表与静态映射缓存）。
+    ebpf_edges: EbpfEdgeSink,
 }
 
 /// 把静态映射与端点表适配成边目标归一用的解析器。
@@ -82,8 +85,13 @@ impl ApmSink {
         samples: Arc<RedSamples>,
     ) -> Self {
         let cache_ttl_secs = config.endpoint_cache_ttl_secs;
-        let endpoints = EndpointRegistry::new(config.endpoint_retention_days, cache_ttl_secs);
+        let endpoints = Arc::new(EndpointRegistry::new(
+            config.endpoint_retention_days,
+            cache_ttl_secs,
+        ));
+        let aliases = Arc::new(AliasCache::new(cache_ttl_secs));
         let edges = EdgeAccumulator::new(config.edge_pending_capacity, samples.clone());
+        let ebpf_edges = EbpfEdgeSink::new(sql.clone(), endpoints.clone(), aliases.clone());
         Self {
             sql,
             accumulator: TraceSummaryAccumulator::new(config.clone()),
@@ -91,8 +99,15 @@ impl ApmSink {
             endpoints,
             edges,
             samples,
-            aliases: AliasCache::new(cache_ttl_secs),
+            aliases,
+            ebpf_edges,
         }
+    }
+
+    /// eBPF 边写入器（自监控用）。
+    #[must_use]
+    pub fn ebpf_edges(&self) -> &EbpfEdgeSink {
+        &self.ebpf_edges
     }
 
     /// 冷启动回载仍在写入的 trace。
@@ -270,6 +285,22 @@ impl ApmSink {
     #[must_use]
     pub fn endpoints(&self) -> &EndpointRegistry {
         &self.endpoints
+    }
+}
+
+/// eBPF 边：反查服务名 → 覆盖写 `ebpf_edges`（与 trace 摘要共用端点表与静态映射缓存）。
+#[async_trait]
+impl EdgeSink for ApmSink {
+    async fn observe_edge(
+        &self,
+        edge: &EbpfEdge,
+        envelope: &DataEnvelope,
+    ) -> Result<(), DataplaneError> {
+        self.ebpf_edges.observe_edge(edge, envelope).await
+    }
+
+    fn written_edges(&self) -> u64 {
+        self.ebpf_edges.written()
     }
 }
 

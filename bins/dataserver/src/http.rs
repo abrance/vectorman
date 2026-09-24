@@ -15,7 +15,7 @@ use dataplane_core::{
 };
 use dataplane_file::FileStore;
 use dataplane_ingest::{
-    apply, apply_with_trace_sink, search, DataEnvelope, DataType, LogSearchQuery, StreamIndex,
+    apply, apply_with_sinks, search, DataEnvelope, DataType, LogSearchQuery, StreamIndex,
 };
 use dataplane_kv::KvStore;
 use dataplane_log::LogStore;
@@ -344,12 +344,16 @@ async fn ingest(
 
     let reply = match state.apm.as_ref() {
         Some(sink) => {
-            apply_with_trace_sink(
+            // 同一个 sink 同时充当 trace 与 eBPF 边的出口（共用端点表与静态映射缓存）。
+            let trace_sink = sink.as_ref() as &dyn dataplane_ingest::trace::TraceSink;
+            let edge_sink = sink.as_ref() as &dyn dataplane_ingest::EdgeSink;
+            apply_with_sinks(
                 envelope,
                 state.ts.as_ref(),
                 state.log.as_ref(),
                 state.kv.as_ref(),
-                Some(sink.as_ref() as &dyn dataplane_ingest::trace::TraceSink),
+                Some(trace_sink),
+                Some(edge_sink),
             )
             .await
         }

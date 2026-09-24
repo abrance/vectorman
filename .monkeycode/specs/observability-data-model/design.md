@@ -165,6 +165,10 @@ struct EbpfEdge {
 
 不变量：`record_id` 在同一 Agent 内唯一且幂等（同桶重发被 KvStore 去重）；`connections >= 1`；`failures <= connections`；`latency_hist` 槽位下标上限由 Agent 采集项 `hist_slots` 控制（默认 24）。
 
+实现期补充：这些不变量在**接入侧**就挡住（不合法整条记 `partial`、不落库），而不是留到查询或前端；
+`latency_hist` 超过 32 槽同样整条拒绝。落库是 `INSERT OR REPLACE` + `record_id` 主键覆盖写，因此
+接入侧只需一次幂等标记，不必做计数合并（与 `apm_edge_summary` 的「读回累加」不同）。
+
 ### 服务标识与反查
 
 OTLP 与 eBPF 两路数据的服务名对齐依赖一张端点半表，由 dataserver 维护，是拓扑合并的唯一依据。

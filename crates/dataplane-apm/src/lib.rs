@@ -19,6 +19,7 @@ use dataplane_sql::RelationalStore;
 pub mod accumulator;
 pub mod aggregator;
 pub mod alias;
+pub mod ebpf_edge;
 pub mod edge;
 pub mod query;
 pub mod red;
@@ -56,8 +57,11 @@ pub fn now_micros() -> i64 {
 /// v1 → v2：`apm_trace_summary` 增加 `root_start_ts`。摘要按「根 span 取 `start_ts`
 /// 最小者」维护，而根可能比普通 span 晚到、也可能跨多次 flush 才到，因此必须把
 /// 当前根的开始时间也存下来，否则无法在后续 flush 中比较出更早的根。
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
+/// v2 → v3：新增 `ebpf_edges`（eBPF 边聚合）。只加表，没有列变更，因此没有 `ALTER` 迁移语句
+/// （`CREATE TABLE IF NOT EXISTS` 已在 `DDL` 里，启动即建）。
+///
 /// 版本迁移：`(目标版本, 语句)`，仅在当前版本低于目标版本时执行。
 ///
 /// 新建库的 `CREATE TABLE` 已包含新列，因此迁移语句对「缺少该列」与「已有该列」
@@ -77,6 +81,7 @@ pub mod tables {
     pub const EDGE_SUMMARY: &str = "apm_edge_summary";
     pub const SERVICE_ENDPOINT: &str = "apm_service_endpoint";
     pub const SERVICE_ALIAS: &str = "apm_service_alias";
+    pub const EBPF_EDGES: &str = "ebpf_edges";
 }
 
 /// 建表与索引语句，按执行顺序排列。
@@ -151,6 +156,38 @@ pub const DDL: &[&str] = &[
         updated_ts    INTEGER NOT NULL
     )",
     "CREATE INDEX IF NOT EXISTS apm_service_alias_match ON apm_service_alias(match_kind, match_value)",
+    // eBPF 边聚合：一条记录 = 一个桶内的一条连接边，主键是 Agent 生成的 `record_id`
+    // （重发即覆盖写，因此接入侧只做一次幂等标记，不必做计数合并）。
+    "CREATE TABLE IF NOT EXISTS ebpf_edges (
+        record_id        TEXT PRIMARY KEY,
+        bucket_start     INTEGER NOT NULL,
+        bucket_micros    INTEGER NOT NULL,
+        protocol         TEXT NOT NULL,
+        src_ip           TEXT NOT NULL,
+        src_port         INTEGER NOT NULL,
+        dst_ip           TEXT NOT NULL,
+        dst_port         INTEGER NOT NULL,
+        src_pod          TEXT NOT NULL DEFAULT '',
+        src_container_id TEXT NOT NULL DEFAULT '',
+        src_process      TEXT NOT NULL DEFAULT '',
+        src_service      TEXT NOT NULL,
+        dst_service      TEXT NOT NULL,
+        connections      INTEGER NOT NULL,
+        bytes_sent       INTEGER NOT NULL,
+        bytes_recv       INTEGER NOT NULL,
+        duration_sum     INTEGER NOT NULL,
+        duration_max     INTEGER NOT NULL,
+        tcp_retrans      INTEGER NOT NULL,
+        tcp_resets       INTEGER NOT NULL,
+        failures         INTEGER NOT NULL,
+        failure_reason   TEXT NOT NULL DEFAULT '',
+        latency_hist     TEXT NOT NULL DEFAULT '[]',
+        agent_id         TEXT NOT NULL DEFAULT '',
+        data_id          TEXT NOT NULL DEFAULT ''
+    )",
+    "CREATE INDEX IF NOT EXISTS ebpf_edges_bucket ON ebpf_edges(bucket_start)",
+    "CREATE INDEX IF NOT EXISTS ebpf_edges_svc ON ebpf_edges(src_service, dst_service, bucket_start)",
+    "CREATE INDEX IF NOT EXISTS ebpf_edges_dst ON ebpf_edges(dst_ip, dst_port, bucket_start)",
 ];
 
 /// 建表并校验版本；可在每次进程启动时调用，幂等。
