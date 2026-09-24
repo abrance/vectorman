@@ -15,7 +15,7 @@
     - 状态：已实现（PR #46）：新 crate `crates/gse-agent-ebpf` 的 `preflight`（内核 ≥5.8、`/sys/kernel/btf/vmlinux`、root 或 `CAP_BPF`+`CAP_PERFMON`/`CAP_SYS_ADMIN`），读取路径可注入
   - [x] 1.3 校验结果上报：`agent_ebpf_capability` 指标点，链路页可读
     - 对应需求 1.5
-    - 状态：部分实现（PR #46）：`agent_ebpf_capability` 指标点（含 kernel/btf/capability 与 reason 标签）已就绪，Agent 侧接线随 aya loader 一起做（PR-B）
+    - 状态：已实现（PR #50）：Agent 采集项启动时先做前置校验，通过/失败都会上报一次 `agent_ebpf_capability`（含 kernel/btf/capability 与 reason 标签），链路页据此区分「eBPF 不可用」与「没有数据」
   - [x] 1.4 单测：注入式 `uname` / `/proc/self/status` 夹具，断言各检查项判定与错误文本
 - [x] 2. P1 内核态程序（网络、TCP、进程）
     - 状态：已实现（PR #48）：三个 bin 类型检查通过（`scripts/build-ebpf.sh --check`）；`.o` 待带 bpf-linker 的环境生成。
@@ -49,10 +49,11 @@
     - 状态：部分实现（PR #46）：`MinuteAccumulator` 按分钟汇总 10 秒桶并只输出已关闭桶，产出 `ebpf_edge_connections_total`/`ebpf_edge_bytes_total{direction}`/`ebpf_edge_duration_micros{avg,max}`/`ebpf_tcp_retrans_total`/`ebpf_tcp_failures_total`；**`apm_edge_*{source=ebpf}` 改由服务端在服务名反查后产生**（Agent 不知道全局服务表），已同步到设计文档
   - [x] 3.8 单测：假 map 快照驱动差分、过滤矩阵、桶对齐与 P95 近似、`record_id` 规则、退避序列、上限汇总
     - 状态：部分实现（PR #46）：假快照驱动差分、过滤矩阵、桶对齐与分钟汇总、`record_id`、能力降级路径；退避序列与资源上限汇总随 aya loader（PR-B）
-  - [ ] 3.1 aya 加载与挂载管理：幂等启停、detach→drop links→删 map、启动时清理遗留
+  - [x] 3.1 aya 加载与挂载管理：幂等启停、detach→drop links→删 map、启动时清理遗留
     - 对应需求 1.6-1.8、16.2
-    - 状态：**未做**。挂载计划（采集项类型 → 程序与挂载点集合）已在 PR #49 抽成纯数据 `attach.rs` 并能单测；
-      aya 的 `EbpfLoader`/attach/detach 本体随下一 PR（同时接 agent 采集项）
+    - 状态：已实现（PR #50）：`loader.rs` 用 `EbpfLoader` 加载并按挂载计划 attach，容量按采集项覆盖；
+      卸载走 `LoadedItem::unload`（`Ebpf` drop 先 detach link 再删 map），采集项停用/改配置时由框架 abort 任务 → drop → detach，重复启停幂等。
+      **遗留**：启动时清理上一次崩溃留下的 pin（当前没有 pin，`Ebpf` drop 已覆盖；若后续引入 pin 需补）
   - [x] 3.2 加载失败退避重试（30 秒起、×2、上限 10 分钟，成功清零）
     - 对应需求 1.7
     - 状态：已实现（PR #49）：`backoff.rs` 纯状态机（不碰时钟，调用方拿等待时长去 sleep），序列单测 `30/60/120/240/480/600/600`，成功清零后从 30 秒重来
@@ -79,13 +80,22 @@
     - 附：本机实测推翻了一条想当然的假设 —— 6.1 里 `skc_dport`(12) 与 `skc_num`(14) 是**顺序字段**而非同一个 union，所以内核态必须按 `CFG` 给的两个偏移分别读，不能只读一个再推算
 
 - [ ] 4. P1 Agent 采集项集成
-  - [ ] 4.1 采集项类型 `ebpf_network`、`ebpf_process`、`ebpf_tcp` 与配置字段、GSE 侧校验
+  - [x] 4.1 采集项类型 `ebpf_network`、`ebpf_process`、`ebpf_tcp` 与配置字段、GSE 侧校验
     - 对应需求 2.1-2.5
-  - [ ] 4.2 热更新：按 `item_id` 对齐启停；`enabled=false` 卸载程序
+    - 状态：部分实现（PR #50）：Agent 侧三个类型已在 `spawn_collector` 注册（`collect/ebpf.rs`），配置由 `EbpfConfig::from_value` 解析并夹取；
+      GSE 侧 `build_collect_item` 加入类型白名单并校验端口数组、`bucket_secs`/`flush_interval_secs` 范围、`raw_events_sample_ratio` 范围（e2e 用例覆盖非法值与合法值）。
+      **遗留**：前端采集项表单尚未提供 eBPF 类型的字段（只能走接口创建），留下一个 PR
+  - [x] 4.2 热更新：按 `item_id` 对齐启停；`enabled=false` 卸载程序
     - 对应需求 2.6-2.8
-  - [ ] 4.3 原始事件抽样上行 `data_type=ebpf`（`raw_events_sample_ratio`）
+    - 状态：已实现（PR #50）：复用既有 `reconcile`（按 `item_id` + 指纹比对）——配置变更或 `enabled=false` 会 abort 采集任务，
+      任务被 drop 时 `LoadedItem`/`AyaMapSource` 一并 drop，从而 detach 并删 map；`LoadedItem::unload` 幂等
+  - [x] 4.3 原始事件抽样上行 `data_type=ebpf`（`raw_events_sample_ratio`）
     - 对应需求 4.5、10.3
+    - 状态：部分实现（PR #50）：进程项的 `exec`/`exit`/`fork` 原始事件经 RingBuf 读取后按比例抽样上行（`sample()` 单测覆盖 0/1/0.1 与极端值）；
+      未知事件类型不丢弃，按 `unknown_<n>` 上报便于新内核排障。**network/tcp 的原始事件内核态尚未发出**，故只有进程项有明细
   - [ ] 4.4 单测：采集项启停序列、抽样比例统计、既有采集器行为不受影响
+    - 状态：部分实现（PR #50）：抽样比例统计（含 0/1/0.1/极端小值）、原始事件字段映射与未知类型、进程分钟汇总（只输出已关闭桶）、
+      空对象文件的错误提示、GSE 侧校验（非法端口/范围/比例 + 合法创建）。**未覆盖**：真实启停序列与「既有采集器不受影响」（需要特权环境）
 - [ ] 5. P1 dataserver 接入与查询
   - [ ] 5.1 `crates/dataplane-ingest/src/edge.rs`：`EbpfEdge` DTO + JSON 往返测试
     - 对应共享模型 `EbpfEdge` 定义

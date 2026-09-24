@@ -5,6 +5,7 @@
 pub mod buffer;
 pub mod clean;
 pub mod config;
+pub mod ebpf;
 pub mod envelope;
 pub mod glob;
 pub mod k8s;
@@ -25,6 +26,7 @@ use tokio::sync::{mpsc, RwLock};
 use buffer::{Buffer, DEFAULT_MAX_RECORDS};
 use config::CollectorConfig;
 use envelope::{DataEnvelope, IngestReply};
+use gse_agent_ebpf::attach::EbpfItemKind;
 use gse_proto::{CollectItem, CollectItemsReply, DataplaneAddrReply, DataplaneAddrRequest};
 
 /// 当前时间（微秒）。
@@ -343,6 +345,11 @@ fn spawn_collector(shared: Arc<CollectShared>, item: CollectItem) -> tokio::task
                     &shared.otlp_allowed_cidrs,
                 );
                 otlp::run(shared, receiver).await
+            }
+            // eBPF 采集项：三个类型共用加载/挂载/差分层，行为差异由类型决定。
+            kind if EbpfItemKind::parse(kind).is_some() => {
+                let ebpf_kind = EbpfItemKind::parse(kind).expect("已判断");
+                ebpf::run_item(shared, item.item_id, ebpf_kind, item.collector).await
             }
             other => eprintln!(
                 "gse-agent: unknown collect kind {other} for item {}",

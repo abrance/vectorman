@@ -16,25 +16,40 @@ pub mod backoff;
 pub mod btf;
 pub mod cfg;
 pub mod config;
+pub mod loader;
 pub mod preflight;
 pub mod tracepoint_format;
 
+use aggregate::ipv4_of;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 pub use aggregate::{
-    bucket_start, conn_view, diff, edge_record, is_empty, reason_str, sum_per_cpu, ConnAgg,
-    ConnKey, ConnView, EbpfEdgeRecord, MinuteAccumulator, ProcessContext,
+    bucket_start, conn_view, diff, edge_record, is_empty, reason_str, sum_per_cpu, view_per_cpu,
+    ConnAgg, ConnKey, ConnView, EbpfEdgeRecord, MinuteAccumulator, ProcessContext,
 };
 pub use attach::{AttachPlan, AttachPoint, EbpfItemKind};
 pub use backoff::Backoff;
 pub use cfg::CfgValues;
 pub use config::{EbpfConfig, FilterInput};
+pub use loader::{
+    object_bytes, objects_embedded, sum_process, AyaMapSource, ConnSource, LoadedItem,
+    ProcessSource,
+};
 pub use preflight::{PreflightEnv, PreflightReport};
 
-/// 一个周期内的 per-CPU 连接快照。
-pub type ConnSnapshot = Vec<(ConnKey, Vec<ConnAgg>)>;
+/// 一个周期内的 per-CPU 连接快照（原始内核态布局，求和见 [`aggregate::view_per_cpu`]）。
+pub type ConnSnapshot = Vec<(ConnKey, Vec<ebpf_abi::ConnAggWire>)>;
+
+/// 一个周期内的 per-CPU 进程快照。
+pub type ProcSnapshot = Vec<(ebpf_abi::ProcKey, Vec<ebpf_abi::ProcAggWire>)>;
+
+/// 进程计数三元组（exec/exit/fork）。
+pub type ProcCounts = (u64, u64, u64);
+
+/// 进程差分基准键：`(pid, cgroup_id, comm)`。
+type ProcSeenKey = (u32, u64, [u8; ebpf_abi::TASK_COMM_LEN]);
 
 /// 内核态 map 的读取接口。
 ///
@@ -62,6 +77,9 @@ pub trait EbpfSink: Send + Sync {
 
     /// `data_type=metrics` 的指标记录。
     fn metrics(&self, item_id: &str, records: Vec<serde_json::Value>);
+
+    /// `data_type=ebpf` 的原始事件（默认关闭，按比例抽样）。
+    fn raw_events(&self, item_id: &str, records: Vec<serde_json::Value>);
 }
 
 /// 运行统计。
@@ -173,7 +191,7 @@ pub async fn run_loop(
 
         let mut edges = Vec::new();
         for (key, per_cpu) in snapshot {
-            let current = sum_per_cpu(&per_cpu);
+            let current = view_per_cpu(&per_cpu);
             let delta = diff(previous.get(&key), &current);
             previous.insert(key, current);
             if is_empty(&delta) {
@@ -234,6 +252,207 @@ pub async fn run_loop(
         if !metrics.is_empty() {
             sink.metrics(&item_id, metrics);
         }
+    }
+}
+
+/// 进程采集项的主循环：按分钟出 `ebpf_process_*` 指标 + 按比例上行原始事件。
+///
+/// 与连接型采集项不同，进程项没有「边」的概念，只出指标（需求 4.6）。
+pub async fn run_process_loop(
+    mut source: AyaMapSource,
+    sink: Arc<dyn EbpfSink>,
+    cfg: EbpfConfig,
+    item_id: String,
+    agent_id: String,
+    stats: Arc<EbpfStats>,
+) {
+    let mut seen: std::collections::BTreeMap<ProcSeenKey, ProcCounts> =
+        std::collections::BTreeMap::new();
+    let mut minute = ProcessMinuteAccumulator::default();
+    let interval = Duration::from_secs(cfg.flush_interval_secs.max(1));
+    let mut sample_cursor = 0u64;
+
+    loop {
+        tokio::time::sleep(interval).await;
+        let snapshot = match source.drain_process() {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => Vec::new(),
+            Err(reason) => {
+                stats.read_errors.fetch_add(1, Ordering::Relaxed);
+                eprintln!("gse-agent: ebpf item {item_id} drain failed: {reason}");
+                continue;
+            }
+        };
+        stats.flushes.fetch_add(1, Ordering::Relaxed);
+        let bucket_ts = bucket_start(now_micros(), cfg.bucket_secs);
+
+        for (key, per_cpu) in snapshot {
+            let (exec, exit, fork) = sum_process(&per_cpu);
+            let current = (exec, exit, fork);
+            let delta = match seen.get(&(key.pid, key.cgroup_id, key.comm)) {
+                Some(prev) => (
+                    exec.saturating_sub(prev.0),
+                    exit.saturating_sub(prev.1),
+                    fork.saturating_sub(prev.2),
+                ),
+                None => current,
+            };
+            seen.insert((key.pid, key.cgroup_id, key.comm), current);
+            if delta == (0, 0, 0) {
+                stats.idle_keys.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            minute.observe(&key, delta, bucket_ts);
+        }
+        seen.retain(|_, v| *v != (0, 0, 0));
+
+        // 原始事件：默认关闭；开启时按 `raw_events_sample_ratio` 抽样（需求 4.5、10.3）。
+        if cfg.raw_events_enabled {
+            let events = source.drain_raw_events();
+            let mut records = Vec::new();
+            for event in events {
+                sample_cursor = sample_cursor.wrapping_add(1);
+                if !sample(sample_cursor, cfg.raw_events_sample_ratio) {
+                    continue;
+                }
+                records.push(raw_event_record(&agent_id, &event));
+            }
+            if !records.is_empty() {
+                stats
+                    .metrics
+                    .fetch_add(records.len() as u64, Ordering::Relaxed);
+                sink.raw_events(&item_id, records);
+            }
+        }
+
+        let metrics = minute.drain_closed(now_micros(), &agent_id);
+        stats
+            .metrics
+            .fetch_add(metrics.len() as u64, Ordering::Relaxed);
+        if !metrics.is_empty() {
+            sink.metrics(&item_id, metrics);
+        }
+    }
+}
+
+/// 抽样判定：按 1/ratio 的整数间隔抽样，保证长期比例接近配置值且不引入随机数依赖。
+#[must_use]
+pub fn sample(cursor: u64, ratio: f64) -> bool {
+    if ratio >= 1.0 {
+        return true;
+    }
+    if ratio <= 0.0 {
+        return false;
+    }
+    let step = (1.0 / ratio).round().max(1.0) as u64;
+    cursor.is_multiple_of(step)
+}
+
+/// 原始事件 → `data_type=ebpf` 记录。
+#[must_use]
+pub fn raw_event_record(agent_id: &str, event: &ebpf_abi::RawEvent) -> serde_json::Value {
+    let kind = match event.kind {
+        ebpf_abi::EVENT_KIND_CONNECT => "connect",
+        ebpf_abi::EVENT_KIND_ACCEPT => "accept",
+        ebpf_abi::EVENT_KIND_CLOSE => "close",
+        ebpf_abi::EVENT_KIND_PROCESS_EXEC => "process_exec",
+        ebpf_abi::EVENT_KIND_PROCESS_EXIT => "process_exit",
+        ebpf_abi::EVENT_KIND_PROCESS_FORK => "process_fork",
+        other => {
+            // 未知类型不丢：保留数值，便于新内核加事件类型时排障。
+            return serde_json::json!({
+                "record_id": format!("{agent_id}:{}:{}", event.timestamp_ns, event.kind),
+                "timestamp": (event.timestamp_ns / 1_000) as i64,
+                "kind": format!("unknown_{other}"),
+                "pid": event.pid,
+                "cgroup_id": event.cgroup_id,
+            });
+        }
+    };
+    let comm = comm_str(&event.comm);
+    serde_json::json!({
+        "record_id": format!(
+            "{agent_id}:{}:{kind}:{}:{}",
+            event.timestamp_ns, event.pid, event.saddr
+        ),
+        "timestamp": (event.timestamp_ns / 1_000) as i64,
+        "kind": kind,
+        "pid": event.pid,
+        "cgroup_id": event.cgroup_id,
+        "comm": comm,
+        "saddr": ipv4_of(event.saddr),
+        "daddr": ipv4_of(event.daddr),
+        "sport": event.sport,
+        "dport": event.dport,
+        "protocol": event.protocol,
+    })
+}
+
+/// 进程名（去掉结尾 NUL）。
+#[must_use]
+pub fn comm_str(comm: &[u8; ebpf_abi::TASK_COMM_LEN]) -> String {
+    let end = comm.iter().position(|b| *b == 0).unwrap_or(comm.len());
+    String::from_utf8_lossy(&comm[..end]).into_owned()
+}
+
+/// 每分钟汇总的进程计数（只输出已关闭的分钟桶）。
+#[derive(Default)]
+pub struct ProcessMinuteAccumulator {
+    buckets: std::collections::BTreeMap<(i64, ProcSeenKey), ProcCounts>,
+}
+
+impl ProcessMinuteAccumulator {
+    /// 记录一个周期桶。
+    pub fn observe(&mut self, key: &ebpf_abi::ProcKey, delta: (u64, u64, u64), bucket_ts: i64) {
+        let entry = self
+            .buckets
+            .entry((bucket_ts, (key.pid, key.cgroup_id, key.comm)))
+            .or_insert((0, 0, 0));
+        entry.0 = entry.0.saturating_add(delta.0);
+        entry.1 = entry.1.saturating_add(delta.1);
+        entry.2 = entry.2.saturating_add(delta.2);
+    }
+
+    /// 取出已关闭分钟桶（`now` 之前的整分钟），产出 `ebpf_process_*` 指标。
+    pub fn drain_closed(&mut self, now: i64, agent_id: &str) -> Vec<serde_json::Value> {
+        let current_minute = now - now.rem_euclid(60_000_000);
+        let closed: Vec<_> = self
+            .buckets
+            .keys()
+            .filter(|(ts, _)| *ts < current_minute)
+            .cloned()
+            .collect();
+        let mut out = Vec::new();
+        for key in closed {
+            let Some((exec, exit, fork)) = self.buckets.remove(&key) else {
+                continue;
+            };
+            let (ts, (pid, cgroup_id, comm)) = key;
+            let comm = comm_str(&comm);
+            for (measurement, value) in [
+                ("ebpf_process_exec_total", exec),
+                ("ebpf_process_exit_total", exit),
+                ("ebpf_process_fork_total", fork),
+            ] {
+                if value == 0 {
+                    continue;
+                }
+                out.push(serde_json::json!({
+                    "record_id": format!("{agent_id}:{pid}:{ts}:{measurement}"),
+                    "timestamp": ts,
+                    "measurement": measurement,
+                    "tags": {
+                        "agent_id": agent_id,
+                        "pid": pid.to_string(),
+                        "cgroup_id": cgroup_id.to_string(),
+                        "process_name": comm,
+                    },
+                    "field_name": "value",
+                    "field_value": value as f64,
+                }));
+            }
+        }
+        out
     }
 }
 
@@ -304,6 +523,7 @@ mod tests {
     struct RecordingSink {
         edges: Mutex<Vec<serde_json::Value>>,
         metrics: Mutex<Vec<serde_json::Value>>,
+        raw_events: Mutex<Vec<serde_json::Value>>,
     }
 
     impl EbpfSink for RecordingSink {
@@ -313,6 +533,10 @@ mod tests {
 
         fn metrics(&self, _item_id: &str, records: Vec<serde_json::Value>) {
             self.metrics.lock().unwrap().extend(records);
+        }
+
+        fn raw_events(&self, _item_id: &str, records: Vec<serde_json::Value>) {
+            self.raw_events.lock().unwrap().extend(records);
         }
     }
 
@@ -342,20 +566,20 @@ mod tests {
     /// 用真实时钟驱动一轮（把间隔压到 1 秒，测试里只等一轮）。
     #[tokio::test]
     async fn loop_emits_edges_from_fake_snapshots() {
-        let mut first = ConnAgg {
+        let mut first = ebpf_abi::ConnAggWire {
             connections: 2,
             bytes_sent: 100,
-            ..ConnAgg::default()
+            ..Default::default()
         };
-        first.latency_hist = vec![1];
-        let mut second = first.clone();
+        first.latency_hist[3] = 1;
+        let mut second = first;
         second.connections = 5;
         second.bytes_sent = 400;
 
         let source = Box::new(FakeSource {
             snapshots: Mutex::new(vec![
-                vec![(key(), vec![first.clone(), ConnAgg::default()])],
-                vec![(key(), vec![second, ConnAgg::default()])],
+                vec![(key(), vec![first, ebpf_abi::ConnAggWire::default()])],
+                vec![(key(), vec![second, ebpf_abi::ConnAggWire::default()])],
             ]),
             contexts: vec![Some(ProcessContext {
                 process_name: "java".into(),
@@ -394,6 +618,114 @@ mod tests {
                 .iter()
                 .any(|m| m["measurement"] == "agent_ebpf_capability"),
             "能力状态必须先上报"
+        );
+    }
+
+    #[test]
+    fn sampling_ratio_behaves() {
+        assert!(sample(1, 1.0) && sample(999, 1.0), "ratio=1 全采");
+        assert!(!sample(1, 0.0) && !sample(10, 0.0), "ratio=0 不采");
+        // 0.1 → 每 10 个取 1 个（cursor 从 1 开始计数）。
+        let hits = (1..=1000).filter(|c| sample(*c, 0.1)).count();
+        assert_eq!(hits, 100);
+        // 极端小比例不会除以 0：step 至少是 1，命中间隔等于 1/ratio。
+        assert!(sample(1_000_000_000, 1e-9));
+    }
+
+    #[test]
+    fn raw_event_records_map_kinds_and_keep_unknown() {
+        let mut comm = [0u8; ebpf_abi::TASK_COMM_LEN];
+        comm[..4].copy_from_slice(b"java");
+        let event = ebpf_abi::RawEvent {
+            kind: ebpf_abi::EVENT_KIND_PROCESS_EXEC,
+            pid: 42,
+            timestamp_ns: 1_700_000_000_123_456_789,
+            cgroup_id: 7,
+            saddr: u32::from_be_bytes([10, 0, 0, 5]),
+            daddr: u32::from_be_bytes([10, 0, 0, 9]),
+            sport: 40_000,
+            dport: 8_080,
+            protocol: 6,
+            comm,
+            ..Default::default()
+        };
+        let record = raw_event_record("agent-1", &event);
+        assert_eq!(record["kind"], "process_exec");
+        assert_eq!(record["comm"], "java");
+        assert_eq!(record["saddr"], "10.0.0.5");
+        assert_eq!(record["dport"], 8_080);
+        assert_eq!(
+            record["timestamp"].as_i64().unwrap(),
+            1_700_000_000_123_456i64
+        );
+
+        let unknown = ebpf_abi::RawEvent { kind: 99, ..event };
+        assert_eq!(raw_event_record("agent-1", &unknown)["kind"], "unknown_99");
+    }
+
+    #[test]
+    fn process_minute_accumulator_closes_by_minute() {
+        let base = 1_020_000_000i64; // 整分钟
+        let key = |pid: u32, name: &[u8]| {
+            let mut comm = [0u8; ebpf_abi::TASK_COMM_LEN];
+            comm[..name.len()].copy_from_slice(name);
+            ebpf_abi::ProcKey {
+                pid,
+                cgroup_id: 5,
+                comm,
+                ..Default::default()
+            }
+        };
+        let mut acc = ProcessMinuteAccumulator::default();
+        acc.observe(&key(1, b"java"), (2, 0, 1), base);
+        acc.observe(&key(1, b"java"), (1, 3, 0), base + 10_000_000);
+
+        assert!(acc.drain_closed(base + 30_000_000, "a1").is_empty());
+        let metrics = acc.drain_closed(base + 60_000_000, "a1");
+        // 两个 10 秒桶各自是一条指标点，这里按 measurement 求和再比对。
+        let value = |measurement: &str| -> f64 {
+            metrics
+                .iter()
+                .filter(|m| m["measurement"] == measurement)
+                .map(|m| m["field_value"].as_f64().unwrap())
+                .sum()
+        };
+        assert_eq!(value("ebpf_process_exec_total"), 3.0, "同一分钟累加");
+        assert_eq!(value("ebpf_process_exit_total"), 3.0);
+        assert_eq!(value("ebpf_process_fork_total"), 1.0);
+        let exec = metrics
+            .iter()
+            .find(|m| m["measurement"] == "ebpf_process_exec_total")
+            .unwrap();
+        assert_eq!(exec["tags"]["process_name"], "java");
+        assert_eq!(exec["tags"]["pid"], "1");
+        let ts = exec["timestamp"].as_i64().unwrap();
+        assert!(
+            ts == base || ts == base + 10_000_000,
+            "时间戳应是两个桶起点之一，实际 {ts}"
+        );
+        assert!(
+            acc.drain_closed(base + 60_000_000, "a1").is_empty(),
+            "取出不重复"
+        );
+    }
+
+    #[test]
+    fn objects_are_absent_until_built() {
+        // 仓库里没有 .o 时必须是空切片（保证可编译），而不是「假装可用」。
+        let expected = match std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/ebpf/network.o"
+        ))
+        .exists()
+        {
+            true => !object_bytes(EbpfItemKind::Network).is_empty(),
+            false => object_bytes(EbpfItemKind::Network).is_empty(),
+        };
+        assert!(expected);
+        assert_eq!(
+            objects_embedded(),
+            !object_bytes(EbpfItemKind::Tcp).is_empty()
         );
     }
 
