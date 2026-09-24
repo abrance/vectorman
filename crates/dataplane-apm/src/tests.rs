@@ -591,6 +591,164 @@ async fn ebpf_edge_upsert_and_resolve_order() {
     assert_eq!(as_text(&rows.rows[0][3]), "[1]");
 }
 
+/// eBPF 边指标派生：游标推进、迟到边被滞后窗口覆盖、重写同一点不翻倍。
+#[tokio::test]
+async fn ebpf_metrics_aggregation_uses_watermark_and_is_idempotent() {
+    use crate::ebpf_metrics::{read_watermark, write_watermark, EbpfMetricsAggregator, EdgeRow};
+
+    let dir = tempfile::tempdir().unwrap();
+    let sql = store(dir.path());
+    crate::bootstrap(sql.as_ref()).await.unwrap();
+    let ts = ts_store(dir.path());
+
+    // 首次运行只对齐游标，不回溯历史。
+    let agg = EbpfMetricsAggregator::new(sql.clone(), ts.clone(), 60);
+    let report = agg.run_once(NOW).await.unwrap();
+    assert_eq!(report.points, 0);
+    // 首次运行把游标对齐到「当前时间 − 滞后 60 秒」所在分钟。
+    let first = (NOW - 60_000_000) / 60_000_000 * 60_000_000;
+    assert_eq!(read_watermark(sql.as_ref()).await.unwrap(), Some(first));
+
+    // 造两条边：一条在滞后窗口内（会被处理），一条「迟到」到上一分钟。
+    let insert = |record_id: &str, bucket_start: i64| {
+        let sql = sql.clone();
+        let record_id = record_id.to_string();
+        async move {
+            sql.execute(
+                &format!(
+                    "INSERT OR REPLACE INTO {} (record_id, bucket_start, bucket_micros, protocol,
+                        src_ip, src_port, dst_ip, dst_port, src_service, dst_service,
+                        connections, bytes_sent, bytes_recv, duration_sum, duration_max,
+                        tcp_retrans, tcp_resets, failures, failure_reason, latency_hist,
+                        agent_id, data_id)
+                     VALUES (?1,?2,10000000,'tcp','10.0.0.5',40000,'10.0.0.9',8080,'order-api','pay-api',
+                        2,10,20,100,50,1,0,0,'','[0,2]','agent-1','item')",
+                    crate::tables::EBPF_EDGES
+                ),
+                &[
+                    dataplane_core::SqlValue::Text(record_id),
+                    dataplane_core::SqlValue::Integer(bucket_start),
+                ],
+            )
+            .await
+            .unwrap();
+        }
+    };
+    let later = NOW + 60_000_000; // 下一分钟
+    insert("e-2", later).await;
+
+    // 滞后 60 秒：现在只处理到 later - 60s，所以这条边还不该被处理。
+    let report = agg.run_once(later).await.unwrap();
+    assert_eq!(report.rows, 0, "滞后窗口内的桶不处理");
+
+    // 再往前推进一分钟，边被处理。
+    let report = agg.run_once(later + 60_000_000).await.unwrap();
+    assert_eq!(report.rows, 1);
+    assert!(
+        report.points >= 4,
+        "连接数/请求数/耗时等都要出点: {report:?}"
+    );
+
+    let bucket = later / 60_000_000 * 60_000_000;
+    /// `query_instant` 的 `eval_time` 单位是**微秒**（Prom HTTP 层才把秒换算成微秒）。
+    async fn value_of(
+        ts: &std::sync::Arc<dyn dataplane_ts::TimeSeriesStore>,
+        measurement: &str,
+        at_micros: i64,
+    ) -> f64 {
+        let result = ts
+            .query_instant(measurement, Some(at_micros))
+            .await
+            .unwrap_or_else(|e| panic!("query {measurement}: {}", e.message));
+        result
+            .result
+            .iter()
+            .filter_map(|series| series.value)
+            .map(|(_, value)| value)
+            .sum()
+    }
+    assert_eq!(
+        value_of(&ts, "ebpf_edge_connections_total", bucket).await,
+        2.0
+    );
+    assert_eq!(value_of(&ts, "apm_edge_requests_total", bucket).await, 2.0);
+    assert_eq!(value_of(&ts, "ebpf_tcp_retrans_total", bucket).await, 1.0);
+
+    // 重写同一批点（模拟「写完点后崩溃、游标未推进」）：值不翻倍。
+    let rows = vec![EdgeRow {
+        bucket_start: later,
+        src_service: "order-api".into(),
+        dst_service: "pay-api".into(),
+        src_ip: "10.0.0.5".into(),
+        src_port: 40_000,
+        dst_ip: "10.0.0.9".into(),
+        dst_port: 8_080,
+        protocol: "tcp".into(),
+        connections: 2,
+        bytes_sent: 10,
+        bytes_recv: 20,
+        duration_sum: 100,
+        tcp_retrans: 1,
+        tcp_resets: 0,
+        failures: 0,
+        failure_reason: String::new(),
+        latency_hist: vec![0, 2],
+    }];
+    for point in crate::ebpf_metrics::aggregate(&rows) {
+        ts.write(point).await.unwrap();
+    }
+    assert_eq!(
+        value_of(&ts, "ebpf_edge_connections_total", bucket).await,
+        2.0,
+        "TimeSeriesStore 对相同 measurement+labels+timestamp 是覆盖语义"
+    );
+
+    // 手动回退游标可重放：再跑一轮不报错，且值仍然不翻倍。
+    write_watermark(sql.as_ref(), bucket - 60_000_000)
+        .await
+        .unwrap();
+    let report = agg.run_once(later + 120_000_000).await.unwrap();
+    assert_eq!(report.rows, 1);
+    eprintln!("report2 = {report:?}");
+    // 自检：手工写一个点再查（隔离「存储本身是否可查」）。
+    ts.write(dataplane_ts::TsPoint {
+        measurement: "probe_metric".into(),
+        tags: std::collections::BTreeMap::new(),
+        field_name: "value".into(),
+        field_value: 7.0,
+        timestamp: bucket,
+    })
+    .await
+    .unwrap();
+    let probe = ts
+        .query_instant("probe_metric", Some(bucket / 1_000_000))
+        .await
+        .unwrap();
+    eprintln!("probe => {:?}", probe.result);
+    for measurement in [
+        "ebpf_edge_connections_total",
+        "ebpf_edge_connections",
+        "apm_edge_requests_total",
+        "apm_edge_requests",
+        "ebpf_tcp_retrans_total",
+        "apm_edge_duration_micros",
+    ] {
+        let result = ts
+            .query_instant(measurement, Some(bucket / 1_000_000))
+            .await
+            .unwrap();
+        eprintln!("{measurement} => {:?}", result.result);
+    }
+    assert_eq!(
+        value_of(&ts, "ebpf_edge_connections_total", bucket).await,
+        2.0
+    );
+    assert_eq!(
+        read_watermark(sql.as_ref()).await.unwrap(),
+        Some((later + 120_000_000 - 60_000_000) / 60_000_000 * 60_000_000)
+    );
+}
+
 #[tokio::test]
 async fn missing_endpoint_resource_is_ignored() {
     let dir = tempfile::tempdir().unwrap();

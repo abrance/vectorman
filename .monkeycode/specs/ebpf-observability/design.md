@@ -11,7 +11,11 @@ Updated: 2026-09-23
 
 - 数据模型、指标命名、服务名反查、拓扑合并口径取自 `observability-data-model`，本文不重复定义。
 - 技术选型 aya（纯 Rust）；内核基线 5.8 + BTF；Agent 需 root 或 `CAP_BPF`（+ `CAP_PERFMON`）。
-- 与 `apm-tracing` 的分工：eBPF 侧自己算出边指标与网络指标（因为增量在 Agent 手上），OTLP 侧的边指标由 dataserver 算；两侧写同一个 measurement，用 `source` label 区分。
+- 与 `apm-tracing` 的分工：两侧写同一个 measurement，用 `source` label 区分。
+  **实现期修正**：边指标（`ebpf_edge_*`、`ebpf_tcp_*`、`apm_edge_*{source=ebpf}`）**由 dataserver 从
+  `ebpf_edges` 按分钟派生**，不是 Agent 产 —— 这些点的 `src_service`/`dst_service` 维度只有 dataserver
+  能反查；Agent 侧若也发同名点会形成缺服务维度的第二套序列。Agent 只发边记录（`ebpf_edges`）、
+  能力状态（`agent_ebpf_capability`）、进程指标与（可选的）原始事件。
 - 聚合指标的保留与删除依赖同期交付的 `/.monkeycode/specs/dataplane-ts-retention/`：`TimeSeriesStore` 新增 `delete_series` 与全局保留窗口（`ts_retention_days` 缺省 30 天），不再是外部依赖。
 - 服务名归一首选静态映射表 `apm_service_alias`（由 `apm-tracing` 提供 CRUD，本 feature 只消费）。
 

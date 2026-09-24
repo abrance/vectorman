@@ -27,7 +27,7 @@ use std::time::Duration;
 
 pub use aggregate::{
     bucket_start, conn_view, diff, edge_record, is_empty, reason_str, sum_per_cpu, view_per_cpu,
-    ConnAgg, ConnKey, ConnView, EbpfEdgeRecord, MinuteAccumulator, ProcessContext,
+    ConnAgg, ConnKey, ConnView, EbpfEdgeRecord, ProcessContext,
 };
 pub use attach::{AttachPlan, AttachPoint, EbpfItemKind};
 pub use backoff::Backoff;
@@ -167,7 +167,6 @@ pub async fn run_loop(
     // 上一周期快照：键 → 绝对值（差分基准）。
     let mut previous: std::collections::BTreeMap<ConnKey, ConnAgg> =
         std::collections::BTreeMap::new();
-    let mut minute = MinuteAccumulator::default();
     let interval = Duration::from_secs(cfg.flush_interval_secs.max(1));
 
     // 首次上报能力状态，便于链路页显示不可用/可用。
@@ -224,7 +223,6 @@ pub async fn run_loop(
                 cfg.bucket_secs,
                 ctx.as_ref(),
             ) {
-                minute.observe(&record);
                 match serde_json::to_value(&record) {
                     Ok(value) => edges.push(value),
                     Err(e) => eprintln!("gse-agent: ebpf item {item_id} encode edge failed: {e}"),
@@ -245,13 +243,7 @@ pub async fn run_loop(
             sink.edges(&item_id, edges);
         }
 
-        let metrics = minute.drain_closed(now_micros(), &agent_id);
-        stats
-            .metrics
-            .fetch_add(metrics.len() as u64, Ordering::Relaxed);
-        if !metrics.is_empty() {
-            sink.metrics(&item_id, metrics);
-        }
+        // 边指标不由 Agent 产出（理由见 `aggregate` 末尾）：这里只产出边记录。
     }
 }
 
