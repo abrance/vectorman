@@ -11,8 +11,13 @@
 //!   逻辑都能用假快照测试，不需要特权环境。
 
 pub mod aggregate;
+pub mod attach;
+pub mod backoff;
+pub mod btf;
+pub mod cfg;
 pub mod config;
 pub mod preflight;
+pub mod tracepoint_format;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -22,6 +27,9 @@ pub use aggregate::{
     bucket_start, conn_view, diff, edge_record, is_empty, reason_str, sum_per_cpu, ConnAgg,
     ConnKey, ConnView, EbpfEdgeRecord, MinuteAccumulator, ProcessContext,
 };
+pub use attach::{AttachPlan, AttachPoint, EbpfItemKind};
+pub use backoff::Backoff;
+pub use cfg::CfgValues;
 pub use config::{EbpfConfig, FilterInput};
 pub use preflight::{PreflightEnv, PreflightReport};
 
