@@ -119,12 +119,23 @@
   - [ ] 5.7 httptest：幂等重放、非法字段 `partial`、合并查询求和、清理三类数据、时间范围非法 400
     - 状态：部分实现（PR #51）：dataserver e2e 覆盖「1 条合法 + 2 条非法 → `partial` 且只落 1 行、重放幂等、未识别服务归一为 `unknown-<ip>`」。
       **未覆盖**：合并查询求和、清理三类数据、时间范围非法 400（随查询与保留期一起做）
-- [ ] 5.8 边指标由 dataserver 派生（实现期新增子项）
-  - [ ] 状态：未做（PR #51 先落库）。**口径决定**：Agent 侧当前也会产出 `ebpf_*` 边指标，但那些点缺少
-    `src_service`/`dst_service`（Agent 无法解析全局服务表），与共享模型的指标维度不符，且会与 dataserver
-    派生出的同名序列形成两套。下一 PR 改为：Agent 只发 `agent_ebpf_capability`、进程指标与原始事件；
-    `ebpf_edge_*`/`ebpf_tcp_*`/`apm_edge_*{source=ebpf}` 全部由 dataserver 从 `ebpf_edges` 表按分钟派生
-    （直方图在边上，`p95` 由槽上界近似，口径与 APM 侧一致地标注为近似）
+- [x] 5.8 边指标由 dataserver 派生（实现期新增子项）
+  - [x] 状态：已实现（PR #52）。**口径**：边指标全部由 dataserver 从 `ebpf_edges` 按分钟派生，
+        Agent **不再**产出这些点（原有的 `MinuteAccumulator` 已删除）—— 指标的 `src_service`/`dst_service`
+        维度只有 dataserver 能填，Agent 若也发同名点会形成缺服务维度的第二套序列，前端无法合并。
+  - 产出：`ebpf_edge_connections_total{src_service,dst_service,dst_port}`、`ebpf_edge_bytes_total{...,direction,protocol}`、
+    `ebpf_tcp_retrans_total`、`ebpf_tcp_resets_total`、`ebpf_tcp_failures_total{reason}`、`apm_edge_requests_total{source=ebpf}`、
+    `apm_edge_errors_total{source=ebpf}`、`apm_edge_duration_micros{field=avg|p95,source=ebpf}`（p95 由槽上界近似，**必须标注为近似**）
+  - 幂等：游标 `ebpf_metrics_watermark`（`obs_schema_meta`）记录已处理到的分钟上界；只处理
+    `watermark < bucket <= floor(now - 60s)` 的行（60 秒滞后覆盖迟到边）；崩溃后重放同批点不翻倍
+    （`TimeSeriesStore` 对相同 measurement+labels+timestamp 是覆盖语义，已用测试锁住这个前提）
+  - **遗留**：进程指标 `ebpf_process_*` 仍由 Agent 产出，维度是 `pid`/`cgroup_id`/`process_name`；
+    共享模型里写了 `service`/`container_id` 维度，需要 dataserver 侧补一次 cgroup → 服务名归一（归入 5.9）
+
+- [ ] 5.9 进程指标的服务维度归一（实现期新增子项）
+  - [ ] 状态：未做。Agent 发的 `ebpf_process_*` 带 `process_name`/`pid`/`cgroup_id`，但共享模型要求
+    `service`/`container_id` 维度；dataserver 需要用静态映射（`process_name`）与 cgroup/Pod 反查补齐，
+    或者把进程计数也随边记录一起入库后再派生。需要与 `/ebpf` 页的展示需求一起定，避免先做错维度
 
 - [ ] 6. 检查点 - P1 在特权 runner 上跑通受控流量用例后再进入 P2
   - 确保所有测试通过,如有疑问请询问用户

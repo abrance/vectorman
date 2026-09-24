@@ -305,6 +305,42 @@ async fn main() -> ExitCode {
         });
     }
 
+    // eBPF 边指标：从 `ebpf_edges` 按分钟派生（Agent 不产这些点，理由见
+    // `dataplane-apm::ebpf_metrics`）。与 APM 聚合共用同一个节拍。
+    if cfg.apm_enabled && cfg.apm_agg_interval_secs > 0 {
+        let ebpf_agg = dataplane_apm::ebpf_metrics::EbpfMetricsAggregator::new(
+            Arc::clone(&sql),
+            Arc::clone(&ts),
+            dataplane_apm::ebpf_metrics::DEFAULT_LAG_SECS,
+        );
+        let ebpf_metrics = metrics.clone();
+        let interval = Duration::from_secs(cfg.apm_agg_interval_secs.max(1));
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                match ebpf_agg.run_once(now_micros()).await {
+                    Ok(report) => {
+                        if report.points > 0 {
+                            ebpf_metrics.inc_counter(
+                                "dataserver_ebpf_agg_points_total",
+                                report.points as f64,
+                            );
+                        }
+                        if let Some(bucket) = report.buckets.last() {
+                            ebpf_metrics
+                                .set_gauge("dataserver_ebpf_last_agg_bucket", *bucket as f64);
+                        }
+                    }
+                    Err(e) => {
+                        ebpf_metrics.inc_counter("dataserver_ebpf_agg_errors_total", 1.0);
+                        eprintln!("ebpf: aggregate failed: {}: {}", e.code.as_str(), e.message);
+                    }
+                }
+            }
+        });
+    }
+
     if let Some(sink) = apm.clone() {
         let flush_metrics = metrics.clone();
         tokio::spawn(async move {

@@ -13,7 +13,6 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 // 连接键的唯一权威定义在 `ebpf-abi`（内核态与用户态共用）；这里只重导出。
 use ebpf_abi::ConnAggWire;
@@ -288,144 +287,9 @@ pub fn edge_record(
     })
 }
 
-/// 分钟桶累计值（指标用）。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MinuteAgg {
-    pub connections: u64,
-    pub failures: u64,
-    pub bytes_sent: u64,
-    pub bytes_recv: u64,
-    pub duration_sum_us: u64,
-    pub duration_max_us: u64,
-    pub tcp_retrans: u64,
-    pub tcp_resets: u64,
-}
-
-impl MinuteAgg {
-    fn add(&mut self, delta: &ConnAgg) {
-        self.connections = self.connections.saturating_add(delta.connections);
-        self.failures = self.failures.saturating_add(delta.failures);
-        self.bytes_sent = self.bytes_sent.saturating_add(delta.bytes_sent);
-        self.bytes_recv = self.bytes_recv.saturating_add(delta.bytes_recv);
-        self.duration_sum_us = self.duration_sum_us.saturating_add(delta.duration_sum_us);
-        self.duration_max_us = self.duration_max_us.max(delta.duration_max_us);
-        self.tcp_retrans = self.tcp_retrans.saturating_add(delta.tcp_retrans);
-        self.tcp_resets = self.tcp_resets.saturating_add(delta.tcp_resets);
-    }
-}
-
-/// 分钟指标累加器：把 10 秒桶按分钟汇总，只输出已关闭的分钟桶（设计中的「最近 6 个桶」）。
-#[derive(Debug, Default)]
-pub struct MinuteAccumulator {
-    /// 键：`(分钟桶起点, src_ip, sport, dst_ip, dport, protocol)`。
-    buckets: BTreeMap<(i64, String, u16, String, u16, String), MinuteAgg>,
-}
-
-impl MinuteAccumulator {
-    /// 收集一个边记录的增量。
-    pub fn observe(&mut self, edge: &EbpfEdgeRecord) {
-        let minute = edge.timestamp.div_euclid(60_000_000) * 60_000_000;
-        let key = (
-            minute,
-            edge.src_ip.clone(),
-            edge.src_port,
-            edge.dst_ip.clone(),
-            edge.dst_port,
-            edge.protocol.clone(),
-        );
-        let delta = ConnAgg {
-            connections: edge.connections,
-            failures: edge.failures,
-            bytes_sent: edge.bytes_sent,
-            bytes_recv: edge.bytes_recv,
-            duration_sum_us: edge.duration_micros_sum,
-            duration_max_us: edge.duration_micros_max,
-            tcp_retrans: edge.tcp_retrans,
-            tcp_resets: edge.tcp_resets,
-            ..ConnAgg::default()
-        };
-        self.buckets.entry(key).or_default().add(&delta);
-    }
-
-    /// 取出所有已关闭的分钟桶（`bucket + 60s <= now`），每条指标一个 JSON 记录。
-    pub fn drain_closed(&mut self, now_micros: i64, agent_id: &str) -> Vec<Value> {
-        let closed: Vec<_> = self
-            .buckets
-            .keys()
-            .filter(|(minute, ..)| *minute + 60_000_000 <= now_micros)
-            .cloned()
-            .collect();
-        let mut out = Vec::new();
-        for key in closed {
-            let Some(agg) = self.buckets.remove(&key) else {
-                continue;
-            };
-            let (minute, src_ip, sport, dst_ip, dport, protocol) = key;
-            let mut push = |measurement: &str, field: &str, value: f64, extra: &[(&str, &str)]| {
-                let mut tags = BTreeMap::new();
-                tags.insert("agent_id".to_string(), agent_id.to_string());
-                tags.insert("src_ip".to_string(), src_ip.clone());
-                tags.insert("src_port".to_string(), sport.to_string());
-                tags.insert("dst_ip".to_string(), dst_ip.clone());
-                tags.insert("dst_port".to_string(), dport.to_string());
-                tags.insert("protocol".to_string(), protocol.clone());
-                for (k, v) in extra {
-                    tags.insert((*k).to_string(), (*v).to_string());
-                }
-                out.push(serde_json::json!({
-                    "record_id": format!("{agent_id}:{minute}:{measurement}:{field}:{src_ip}:{sport}:{dst_ip}:{dport}"),
-                    "timestamp": minute,
-                    "measurement": measurement,
-                    "tags": tags,
-                    "field_name": field,
-                    "field_value": value,
-                }));
-            };
-            push(
-                "ebpf_edge_connections_total",
-                "value",
-                agg.connections as f64,
-                &[],
-            );
-            push(
-                "ebpf_edge_bytes_total",
-                "value",
-                agg.bytes_sent as f64,
-                &[("direction", "sent")],
-            );
-            push(
-                "ebpf_edge_bytes_total",
-                "value",
-                agg.bytes_recv as f64,
-                &[("direction", "recv")],
-            );
-            push(
-                "ebpf_tcp_retrans_total",
-                "value",
-                agg.tcp_retrans as f64,
-                &[],
-            );
-            if agg.connections > 0 {
-                push(
-                    "ebpf_edge_duration_micros",
-                    "avg",
-                    agg.duration_sum_us as f64 / agg.connections as f64,
-                    &[],
-                );
-                push(
-                    "ebpf_edge_duration_micros",
-                    "max",
-                    agg.duration_max_us as f64,
-                    &[],
-                );
-            }
-            if agg.failures > 0 {
-                push("ebpf_tcp_failures_total", "value", agg.failures as f64, &[]);
-            }
-        }
-        out
-    }
-}
+// 边指标（`ebpf_edge_*` / `apm_edge_*{source=ebpf}`）**不由 Agent 产出**：这些点的维度里有
+// `src_service` / `dst_service`，而这两个名字只有 dataserver 能反查（Agent 看不到全局服务表）。
+// dataserver 从 `ebpf_edges` 按分钟派生，见 `dataplane-apm::ebpf_metrics`。
 
 #[cfg(test)]
 mod tests {
@@ -562,56 +426,5 @@ mod tests {
             "a1:60000000:10.0.0.5:40000:10.0.0.9:8080:tcp"
         );
         assert_eq!(record.latency_hist, vec![1, 2]);
-    }
-
-    #[test]
-    fn bucket_alignment_and_minute_metrics() {
-        assert_eq!(bucket_start(1_000_000_000, 10), 1_000_000_000);
-        assert_eq!(bucket_start(1_000_000_001, 10), 1_000_000_000);
-        assert_eq!(bucket_start(1_009_999_999, 10), 1_000_000_000);
-        assert_eq!(bucket_start(1_010_000_000, 10), 1_010_000_000);
-
-        let mut acc = MinuteAccumulator::default();
-        // 取一个整分钟起点，使两个 10 秒桶落在同一分钟。
-        let base = 1_020_000_000i64;
-        assert_eq!(base % 60_000_000, 0);
-        for (offset, connections, bytes) in [(0i64, 1u64, 100u64), (10_000_000, 2, 200)] {
-            let mut delta = agg(connections, bytes);
-            delta.duration_sum_us = 1_000 * connections;
-            delta.duration_max_us = 900;
-            let record =
-                edge_record("a1", &key(40000, 8080), &delta, base + offset, 10, None).unwrap();
-            acc.observe(&record);
-        }
-
-        // 未到分钟边界不输出。
-        assert!(acc.drain_closed(base + 30_000_000, "a1").is_empty());
-        let metrics = acc.drain_closed(base + 60_000_000, "a1");
-        let connections: Vec<&Value> = metrics
-            .iter()
-            .filter(|m| m["measurement"] == "ebpf_edge_connections_total")
-            .collect();
-        assert_eq!(connections.len(), 1);
-        assert_eq!(connections[0]["field_value"], 3.0, "跨 10 秒桶按分钟求和");
-        assert_eq!(connections[0]["timestamp"], base, "指标时间戳为分钟桶起点");
-        let bytes: Vec<&Value> = metrics
-            .iter()
-            .filter(|m| {
-                m["measurement"] == "ebpf_edge_bytes_total" && m["tags"]["direction"] == "sent"
-            })
-            .collect();
-        assert_eq!(bytes.len(), 1);
-        assert_eq!(bytes[0]["field_value"], 300.0);
-        let durations: Vec<&Value> = metrics
-            .iter()
-            .filter(|m| m["measurement"] == "ebpf_edge_duration_micros")
-            .collect();
-        assert_eq!(durations.len(), 2, "avg 与 max");
-        assert_eq!(
-            durations.iter().find(|m| m["field_name"] == "avg").unwrap()["field_value"],
-            1_000.0
-        );
-        // 取出后不重复输出。
-        assert!(acc.drain_closed(base + 60_000_000, "a1").is_empty());
     }
 }
