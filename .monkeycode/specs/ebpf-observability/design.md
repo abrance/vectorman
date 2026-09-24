@@ -99,6 +99,14 @@ graph TD
 
 权限形态：Agent 以 systemd 服务或普通进程运行，运维侧具备 sudo。设计上不要求 Agent 常驻 root：能力不足时 preflight 失败只降级 eBPF 采集（warn + 链路页标记），其它采集、作业与文件传输照常；日志中给出「以 root 或带 `CAP_BPF`+`CAP_PERFMON` 运行」的提示。
 
+### 用户态加载与采集循环（实现期补充）
+
+- **目标文件嵌入**：`packaging/ebpf/*.o` 由 `build.rs` 生成 `OUT_DIR/ebpf_objects.rs`（存在则 `include_bytes!` 绝对路径，不存在则空切片）。直接写 `include_bytes!` 会让「没构建过 eBPF 的仓库」编译失败，而空切片能让仓库始终可编译，同时运行时给出「先跑 `scripts/build-ebpf.sh`」的明确错误。注意区分这个错误与「内核不支持」（那是 preflight 的结论）。
+- **每个采集项一份 map**：`ebpf_network` 用 `CONN_AGG`、`ebpf_tcp` 用 `TCP_AGG`、`ebpf_process` 用 `PROC_AGG`。若两者共享同一 map，两个采集项会各读一次同一批增量 → 重复计数。同理 `ebpf_tcp` **只出指标不出边记录**：边记录按 `record_id` 覆盖写，两路都发会让同一连接的字段互相覆盖。
+- **`aya::Pod` 与孤儿规则**：`ebpf-abi` 是内核态共享 crate，不能依赖 `aya`；用户态用 `#[repr(transparent)]` 包装类型在本地实现 `aya::Pod`，读写时取出内层值。
+- **原始事件**：进程项经 `EVENTS` RingBuf 读取后按 `raw_events_sample_ratio` 等间隔抽样（不引随机数依赖，长期比例稳定）；未知事件类型按 `unknown_<n>` 上报而不是丢弃。
+- **热更新**：复用采集框架的 `reconcile`（按 `item_id` + 配置指纹）—— 配置变更或 `enabled=false` 会 abort 采集任务，任务 drop 时 `Ebpf` 随之 drop，从而 detach link 并删除 map。
+
 ### 内核态程序与挂载点
 
 | 信号 | 挂载点 | 采集内容 |

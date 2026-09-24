@@ -522,7 +522,13 @@ fn build_collect_item(item_id: &str, input: &CollectItemInput) -> Result<Collect
     }
     if !matches!(
         input.kind.as_str(),
-        "metrics_host" | "log_file" | "log_k8s_stdout" | "apm_otlp"
+        "metrics_host"
+            | "log_file"
+            | "log_k8s_stdout"
+            | "apm_otlp"
+            | "ebpf_network"
+            | "ebpf_tcp"
+            | "ebpf_process"
     ) {
         return Err(GseError::new(
             "invalid_argument",
@@ -595,6 +601,87 @@ fn build_collect_item(item_id: &str, input: &CollectItemInput) -> Result<Collect
                     return Err(GseError::new(
                         "invalid_argument",
                         "apm_otlp flush_interval_secs must be within 1..=60",
+                    ));
+                }
+            }
+        }
+        "ebpf_network" | "ebpf_tcp" | "ebpf_process" => {
+            // eBPF 采集项：Agent 侧会夹取（`EbpfConfig::from_value`），这里是第一道闸；
+            // 只校验「明显非法」的值，避免把 Agent 的夹取逻辑抄两遍产生口径分叉。
+            for key in [
+                "cgroup_include",
+                "cgroup_exclude",
+                "process_include",
+                "process_exclude",
+            ] {
+                if let Some(value) = input.collector.get(key) {
+                    if !value.is_array() {
+                        return Err(GseError::new(
+                            "invalid_argument",
+                            format!(
+                                "{kind} {key} must be an array of strings",
+                                kind = input.kind
+                            ),
+                        ));
+                    }
+                    if value
+                        .as_array()
+                        .is_some_and(|items| items.iter().any(|item| !item.is_string()))
+                    {
+                        return Err(GseError::new(
+                            "invalid_argument",
+                            format!("{kind} {key} must contain only strings", kind = input.kind),
+                        ));
+                    }
+                }
+            }
+            for key in ["port_include", "port_exclude"] {
+                if let Some(value) = input.collector.get(key) {
+                    let items = value.as_array().ok_or_else(|| {
+                        GseError::new(
+                            "invalid_argument",
+                            format!("{kind} {key} must be an array of ports", kind = input.kind),
+                        )
+                    })?;
+                    if items
+                        .iter()
+                        .any(|item| item.as_u64().is_none_or(|port| port > 65_535))
+                    {
+                        return Err(GseError::new(
+                            "invalid_argument",
+                            format!(
+                                "{kind} {key} must contain ports within 0..=65535",
+                                kind = input.kind
+                            ),
+                        ));
+                    }
+                }
+            }
+            for (key, min, max) in [("bucket_secs", 1u64, 60u64), ("flush_interval_secs", 1, 60)] {
+                if let Some(value) = input.collector.get(key).and_then(|v| v.as_u64()) {
+                    if value < min || value > max {
+                        return Err(GseError::new(
+                            "invalid_argument",
+                            format!(
+                                "{kind} {key} must be within {min}..={max}",
+                                kind = input.kind
+                            ),
+                        ));
+                    }
+                }
+            }
+            if let Some(ratio) = input
+                .collector
+                .get("raw_events_sample_ratio")
+                .and_then(|v| v.as_f64())
+            {
+                if !(0.0..=1.0).contains(&ratio) {
+                    return Err(GseError::new(
+                        "invalid_argument",
+                        format!(
+                            "{kind} raw_events_sample_ratio must be within 0..=1",
+                            kind = input.kind
+                        ),
                     ));
                 }
             }
@@ -1678,6 +1765,64 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("path_patterns"), "{body}");
+
+        // eBPF 采集项：类型白名单 + 明显非法的字段在第一道闸就拒掉。
+        let (status, body) = send(
+            &mut app,
+            req(
+                "POST",
+                "/api/gse/collect-items",
+                Some(
+                    r#"{"name":"ebpf","kind":"ebpf_network","agent_ids":["a-1"],"collector":{"port_include":"8080"}}"#,
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("array of ports"), "{body}");
+
+        let (status, body) = send(
+            &mut app,
+            req(
+                "POST",
+                "/api/gse/collect-items",
+                Some(
+                    r#"{"name":"ebpf","kind":"ebpf_tcp","agent_ids":["a-1"],"collector":{"bucket_secs":600}}"#,
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("1..=60"), "{body}");
+
+        let (status, body) = send(
+            &mut app,
+            req(
+                "POST",
+                "/api/gse/collect-items",
+                Some(
+                    r#"{"name":"ebpf","kind":"ebpf_process","agent_ids":["a-1"],"collector":{"raw_events_enabled":true,"raw_events_sample_ratio":1.5}}"#,
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("raw_events_sample_ratio"), "{body}");
+
+        // 合法配置要能创建成功（否则前端拿不到可用形态）。
+        let (status, body) = send(
+            &mut app,
+            req(
+                "POST",
+                "/api/gse/collect-items",
+                Some(
+                    r#"{"name":"ebpf-net","kind":"ebpf_network","agent_ids":["a-1"],"collector":{"bucket_secs":10,"flush_interval_secs":10,"port_include":[8080,8443],"include_loopback":false,"raw_events_enabled":false}}"#,
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(body.contains("ebpf_network"), "{body}");
 
         // apm_otlp：名单与攒批上限都要校验。
         let (status, body) = send(

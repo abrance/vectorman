@@ -72,6 +72,17 @@ impl CfgValues {
         &self.slots
     }
 
+    /// 由槽数组直接构造（长度必须是 [`CFG_LEN`]，测试与特殊场景用）。
+    pub fn from_slots(slots: Vec<u64>) -> Result<Self, String> {
+        if slots.len() != CFG_LEN as usize {
+            return Err(format!(
+                "CFG 槽数不符：期望 {CFG_LEN}，实际 {}",
+                slots.len()
+            ));
+        }
+        Ok(Self { slots })
+    }
+
     /// 取某个下标的值（用户态测试与排障用）。
     #[must_use]
     pub fn get(&self, index: CfgIndex) -> u64 {

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 gse-proto = { path = "../gse-proto" }
+gse-agent-ebpf = { path = "../gse-agent-ebpf" }
 geminio.workspace = true
 tokio.workspace = true
 serde.workspace = true
