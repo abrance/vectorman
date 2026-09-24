@@ -15,18 +15,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// 连接键：与内核态 `ConnKey` 一一对应（`#[repr(C)]` 布局）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[repr(C)]
-pub struct ConnKey {
-    pub pid: u32,
-    pub cgroup_id: u64,
-    pub saddr: u32,
-    pub daddr: u32,
-    pub sport: u16,
-    pub dport: u16,
-    pub protocol: u8,
-}
+// 连接键的唯一权威定义在 `ebpf-abi`（内核态与用户态共用）；这里只重导出。
+use ebpf_abi::ConnAggWire;
+pub use ebpf_abi::ConnKey;
 
 /// 连接聚合值：与内核态 `ConnAgg` 一一对应。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,13 +35,11 @@ pub struct ConnAgg {
     pub latency_hist: Vec<u64>,
 }
 
-/// 失败原因枚举（与内核态 `failure_reason` 数值对应）。
-pub const REASON_NONE: u32 = 0;
-pub const REASON_REFUSED: u32 = 1;
-pub const REASON_TIMEOUT: u32 = 2;
-pub const REASON_UNREACHABLE: u32 = 3;
-pub const REASON_RESET: u32 = 4;
-pub const REASON_OTHER: u32 = 5;
+/// 失败原因枚举（与内核态 `failure_reason` 数值对应，唯一定义在 `ebpf-abi`）。
+pub use ebpf_abi::{
+    reason_from_errno, REASON_NONE, REASON_OTHER, REASON_REFUSED, REASON_RESET, REASON_TIMEOUT,
+    REASON_UNREACHABLE,
+};
 
 /// 失败原因 → 稳定字符串。
 #[must_use]
@@ -63,6 +52,35 @@ pub fn reason_str(reason: u32) -> &'static str {
         REASON_OTHER => "other",
         _ => "",
     }
+}
+
+/// 内核态 per-CPU 值 → 用户态视图（跨 CPU 求和）。
+///
+/// 这是 aya `PerCpuHashMap` 读取后的第一步：内核态值类型是固定 32 槽的数组，
+/// 用户态视图用 `Vec` 以便后续差分时按槽数对齐。
+#[must_use]
+pub fn view_per_cpu(values: &[ConnAggWire]) -> ConnAgg {
+    let mut out = ConnAgg {
+        latency_hist: vec![0; ebpf_abi::HIST_SLOTS],
+        ..ConnAgg::default()
+    };
+    for value in values {
+        out.connections = out.connections.saturating_add(value.connections);
+        out.failures = out.failures.saturating_add(value.failures);
+        out.bytes_sent = out.bytes_sent.saturating_add(value.bytes_sent);
+        out.bytes_recv = out.bytes_recv.saturating_add(value.bytes_recv);
+        out.duration_sum_us = out.duration_sum_us.saturating_add(value.duration_sum_us);
+        out.duration_max_us = out.duration_max_us.max(value.duration_max_us);
+        out.tcp_retrans = out.tcp_retrans.saturating_add(value.tcp_retrans);
+        out.tcp_resets = out.tcp_resets.saturating_add(value.tcp_resets);
+        if value.failures > 0 {
+            out.failure_reason = out.failure_reason.max(value.failure_reason);
+        }
+        for (index, count) in value.latency_hist.iter().enumerate() {
+            out.latency_hist[index] = out.latency_hist[index].saturating_add(*count);
+        }
+    }
+    out
 }
 
 /// 所有 CPU 副本求和；直方图按位相加，槽数以最长者为准。
@@ -432,6 +450,38 @@ mod tests {
             latency_hist: vec![1, 2],
             ..ConnAgg::default()
         }
+    }
+
+    #[test]
+    fn view_per_cpu_sums_copies_and_keeps_histogram_shape() {
+        let mut cpu0 = ebpf_abi::ConnAggWire {
+            connections: 2,
+            bytes_sent: 100,
+            duration_sum_us: 1_000,
+            duration_max_us: 800,
+            ..Default::default()
+        };
+        cpu0.latency_hist[10] = 1;
+        let mut cpu1 = ebpf_abi::ConnAggWire {
+            connections: 3,
+            bytes_sent: 50,
+            failures: 1,
+            failure_reason: REASON_REFUSED,
+            duration_max_us: 900,
+            ..Default::default()
+        };
+        cpu1.latency_hist[10] = 2;
+
+        let view = view_per_cpu(&[cpu0, cpu1]);
+        assert_eq!(view.connections, 5);
+        assert_eq!(view.bytes_sent, 150);
+        assert_eq!(view.failures, 1);
+        assert_eq!(view.failure_reason, REASON_REFUSED);
+        assert_eq!(view.duration_sum_us, 1_000);
+        assert_eq!(view.duration_max_us, 900, "最大值取单调上界");
+        assert_eq!(view.latency_hist.len(), ebpf_abi::HIST_SLOTS);
+        assert_eq!(view.latency_hist[10], 3, "直方图逐槽相加");
+        assert_eq!(view_per_cpu(&[]).latency_hist.len(), ebpf_abi::HIST_SLOTS);
     }
 
     #[test]

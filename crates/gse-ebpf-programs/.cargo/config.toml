@@ -1,0 +1,7 @@
+# 内核态 eBPF 程序固定用 bpfel 目标 + core-only 构建（需要 nightly 的 -Z build-std）。
+[build]
+target = "bpfel-unknown-none"
+
+[unstable]
+build-std = ["core"]
+build-std-features = []

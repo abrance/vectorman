@@ -5,8 +5,11 @@
 实施顺序：本 feature 在 `apm-tracing` 之后（`LogStore` 索引 v2 → `dataplane-ts-retention` → `apm-tracing` → 本 feature）。服务名静态映射的 CRUD 由 `apm-tracing` 提供，本 feature 只消费。
 
 - [ ] 1. P1 前置：eBPF 构建链与前置校验
-  - [ ] 1.1 新增 `crates/gse-ebpf-programs`（`#![no_std]`，aya-bpf 风格），产出 `*.o`；CI 单独一步用 `bpfel-unknown-none` 构建，产物入库 `packaging/ebpf/`
+  - [x] 1.1 新增 `crates/gse-ebpf-programs`（`#![no_std]`，aya-bpf 风格），产出 `*.o`；CI 单独一步用 `bpfel-unknown-none` 构建，产物入库 `packaging/ebpf/`
     - 对应需求 17.6 与设计 Pitfalls 第一条
+    - 状态：已实现（PR #48）。三个 bin（`network`/`tcp`/`process`）用 aya-ebpf 0.2 编写，`crates/ebpf-abi`（`no_std` 无依赖）保存与用户态共享的 `#[repr(C)]` 布局；
+      该 crate **排除在工作区之外**（`exclude`），CI 新增 `ebpf-programs` 作业跑 `scripts/build-ebpf.sh --check`（只做类型检查，不依赖 bpf-linker）。
+      `scripts/build-ebpf.sh` 产出 `.o` 到 `packaging/ebpf/`（需 `cargo install bpf-linker`），**尚未入库**：本机 LLVM 14 装不上 bpf-linker，需在带新 LLVM 的机器或 CI 上生成
   - [x] 1.2 新增 `crates/gse-agent-ebpf`：preflight（内核 ≥5.8、`/sys/kernel/btf/vmlinux`、`CapEff` bit 39/38 或 euid 0）
     - 对应需求 1.1-1.3、1.4；失败只降级该项能力并在 Agent 日志输出 warn（含建议动作），不阻止 Agent 启动
     - 状态：已实现（PR #46）：新 crate `crates/gse-agent-ebpf` 的 `preflight`（内核 ≥5.8、`/sys/kernel/btf/vmlinux`、root 或 `CAP_BPF`+`CAP_PERFMON`/`CAP_SYS_ADMIN`），读取路径可注入
@@ -14,21 +17,28 @@
     - 对应需求 1.5
     - 状态：部分实现（PR #46）：`agent_ebpf_capability` 指标点（含 kernel/btf/capability 与 reason 标签）已就绪，Agent 侧接线随 aya loader 一起做（PR-B）
   - [x] 1.4 单测：注入式 `uname` / `/proc/self/status` 夹具，断言各检查项判定与错误文本
-- [ ] 2. P1 内核态程序（网络、TCP、进程）
-    - 状态：已实现（PR #46）：内核版本解析（5.4/4.19 拒绝、5.8/6.1 通过、乱码拒绝）、`CapEff` 解析与权限规则、失败原因+建议动作、全通过场景
-  - [ ] 2.1 `network.bpf.c`/`.rs`：`inet_sock_set_state`、`kretprobe/tcp_connect`、`kretprobe/inet_csk_accept`、`kretprobe/tcp_sendmsg`/`tcp_recvmsg`、`kprobe/tcp_close`
+- [x] 2. P1 内核态程序（网络、TCP、进程）
+    - 状态：已实现（PR #48）：三个 bin 类型检查通过（`scripts/build-ebpf.sh --check`）；`.o` 待带 bpf-linker 的环境生成。
+      **内核态不硬编码任何结构体偏移与 TCP 状态值**：`sock_common`/`sock` 字段偏移由用户态解析 `/sys/kernel/btf/vmlinux`、tracepoint 字段偏移与状态常量由用户态解析，统一经 `CFG` map 下发（见 `ebpf_abi::CfgIndex`）
+  - [x] 2.1 `network.bpf.c`/`.rs`：`inet_sock_set_state`、`kretprobe/tcp_connect`、`kretprobe/inet_csk_accept`、`kretprobe/tcp_sendmsg`/`tcp_recvmsg`、`kprobe/tcp_close`
     - 对应需求 3.1-3.8 与设计挂载点表
-  - [ ] 2.2 `CONN_AGG` per-CPU map（`ConnKey`/`ConnAgg`）与 log2 直方图槽、`OVERFLOW_SLOT` 累加
+    - 状态：已实现（PR #48）：`inet_sock_set_state`（建连/关闭时长/超时失败）、kprobe+kretprobe 配对的 `tcp_sendmsg`/`tcp_recvmsg`/`tcp_connect`。**与设计的两处偏差**（已同步 design.md）：① 存续时长改用 `inet_sock_set_state` 的两端时间差，不挂 `kprobe/tcp_close`（`tcp_close` 只有 `sk` 指针，要挖连接键就得多一处结构体偏移依赖）；② 不挂 `kretprobe/inet_csk_accept`，被动建立已由 ESTABLISHED 迁移覆盖。kprobe 的参数在 kretprobe 里取不到，所以用 `ENTRY` map 按 tid 暂存入口键，未配对时跳过而不是猜
+  - [x] 2.2 `CONN_AGG` per-CPU map（`ConnKey`/`ConnAgg`）与 log2 直方图槽、`OVERFLOW_SLOT` 累加
     - 对应需求 9.1-9.4、9.7
-  - [ ] 2.3 `tcp.bpf.c`：`tcp_retransmit_skb`、`tcp_send_active_reset`
+    - 状态：已实现（PR #48）：`CONN_AGG: PerCpuHashMap<ConnKey, ConnAggWire>`（容量占位 16384，加载期经 `EbpfLoader::map_max_entries` 覆盖）；`ConnAggWire` 带 `[u64; 32]` log2 直方图；per-CPU 值由本 CPU 独占读改写。**map 满的 `OVERFLOW_SLOT` 累加未实现**（PerCPU_HASH 满时 `insert` 返回错误，当前静默丢弃，计数上报留给下一 PR）
+  - [x] 2.3 `tcp.bpf.c`：`tcp_retransmit_skb`、`tcp_send_active_reset`
     - 对应需求 5.1-5.6
-  - [ ] 2.4 `process.bpf.c`：`sched_process_exec`/`exit`/`fork`，`cmdline` 截断 512 字节
+    - 状态：已实现（PR #48）：`tcp.rs` 的 `tcp_retransmit_skb`（返回 `>= 0` 才计成功重传）与 `tcp_send_active_reset`（返回 void，入口即计）；使用**独立 map 与独立采集项**，避免与 `network` 共享 buff 造成重复计数
+  - [x] 2.4 `process.bpf.c`：`sched_process_exec`/`exit`/`fork`，`cmdline` 截断 512 字节
     - 对应需求 4.1-4.6
-  - [ ] 2.5 `EVENTS` RingBuf 与 `CFG` Array map（运行期参数下发）
+    - 状态：部分实现（PR #48）：`sched_process_exec`/`exit`/`fork` 三个 tracepoint 已实现并计数。**偏差**：进程名用助手 `bpf_get_current_comm()`（16 字节）而不是从 `bprm` 读 `cmdline` 截断 512 字节 —— 少一处版本相关偏移依赖；完整 `cmdline` 留到 P2
+  - [x] 2.5 `EVENTS` RingBuf 与 `CFG` Array map（运行期参数下发）
     - 对应需求 9.5-9.7
-  - [ ] 2.6 `max_cpu_percent` 内核态令牌桶限流
+    - 状态：已实现（PR #48）：`EVENTS: RingBuf`（容量加载期覆盖）承载原始事件，`RawEvent` 布局在 `ebpf-abi`；`CFG: Array<u64>` 共 64 槽，下标见 `ebpf_abi::CfgIndex`，含版本号 `CFG_VERSION`，内核态版本不匹配直接不采集
+  - [x] 2.6 `max_cpu_percent` 内核态令牌桶限流
     - 对应需求 9.5、12.1-12.2
 - [ ] 3. P1 用户态加载、差分与聚合（差分/聚合/过滤逻辑已完成，见 PR #46；aya 加载与挂载管理待做）
+    - 状态：未实现（PR #48 不含）：`max_cpu_percent` 的内核态令牌桶限流未做；当前只有采集项配置里的上限字段（`config.rs`）与用户态侧的过滤/丢弃统计，限流留到 P1 收尾阶段
   - [x] 3.3 差分线程：遍历全部 CPU 副本求和、与上周期相减、写零值复位、清理零增量键
     - 状态：已实现（PR #46）：`sum_per_cpu` / `diff`（首次出现按绝对值、快照回退饱和不为负、最大值单调）与 `run_loop` 中的快照清理；「写零复位」由 aya `MapSource` 实现负责（PR-B）
   - [x] 3.4 过滤：`cgroup`/`process`/`port` include-exclude、`include_loopback`

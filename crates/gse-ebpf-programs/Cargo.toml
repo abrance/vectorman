@@ -1,0 +1,28 @@
+[package]
+name = "gse-ebpf-programs"
+version = "0.1.0"
+edition = "2021"
+description = "gse-agent 的 eBPF 内核态程序（aya-bpf），需 nightly + bpf-linker 构建"
+publish = false
+
+[dependencies]
+aya-ebpf = "0.2"
+ebpf-abi = { path = "../ebpf-abi", default-features = false }
+
+[[bin]]
+name = "network"
+path = "src/network.rs"
+
+[[bin]]
+name = "tcp"
+path = "src/tcp.rs"
+
+[[bin]]
+name = "process"
+path = "src/process.rs"
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = true
+panic = "abort"

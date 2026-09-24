@@ -831,6 +831,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ebpf-abi"
+version = "0.1.0"
+
+[[package]]
 name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1148,6 +1152,7 @@ dependencies = [
 name = "gse-agent-ebpf"
 version = "0.1.0"
 dependencies = [
+ "ebpf-abi",
  "libc",
  "serde",
  "serde_json",

@@ -1,0 +1,7 @@
+[package]
+name = "ebpf-abi"
+version = "0.1.0"
+edition = "2021"
+description = "eBPF 内核态与用户态共享的 #[repr(C)] 布局与运行期参数索引"
+
+[dependencies]

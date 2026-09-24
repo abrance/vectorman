@@ -11,3 +11,15 @@ jobs:
     with:
       working-directory: .
       rust-toolchain: stable
+
+  # eBPF 内核态程序不在工作区里（用 bpfel-unknown-none + nightly），单独类型检查。
+  # 只做 check：产 .o 需要 bpf-linker，用 scripts/build-ebpf.sh（构建链见设计 Pitfalls 第一条）。
+  ebpf-programs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src
+      - name: Type-check eBPF programs
+        run: scripts/build-ebpf.sh --check

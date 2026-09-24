@@ -104,12 +104,12 @@ graph TD
 | 信号 | 挂载点 | 采集内容 |
 | --- | --- | --- |
 | `ebpf_network` | `tracepoint/sock/inet_sock_set_state` | 连接状态迁移（ESTABLISHED、CLOSE、失败态），按 `(pid, saddr, sport, daddr, dport)` 建桶 |
-| `ebpf_network` | `kretprobe/tcp_connect`、`kretprobe/inet_csk_accept` | 建立与接受结果，失败码 |
-| `ebpf_network` | `kretprobe/tcp_sendmsg`、`kretprobe/tcp_recvmsg` | 字节数（返回值为负时不计），按连接键累加；不作为独立事件 |
-| `ebpf_network` | `kprobe/tcp_close` | 连接存续时长（`bpf_ktime_get_ns` 差值入 log2 直方图槽） |
+| `ebpf_network` | `kprobe`+`kretprobe/tcp_connect` | 主动连接失败与错误码（`errno` → `refused`/`timeout`/`unreachable`/`reset`/`other`）。**`kretprobe/inet_csk_accept` 已弃用**：被动建立由 ESTABLISHED 迁移覆盖，不重复挂 |
+| `ebpf_network` | `kprobe`+`kretprobe/tcp_sendmsg`、`tcp_recvmsg` | 字节数（返回值为负时不计），按连接键累加；不作为独立事件 |
+| `ebpf_network` | `tracepoint/sock/inet_sock_set_state`（实现取此方案） | 连接存续时长：建立与关闭两端时间差入 log2 直方图槽。**原方案 `kprobe/tcp_close` 已弃用**：`tcp_close` 只给 `sk` 指针，要拼连接键就得多依赖 `struct sock` 偏移；用同一个 tracepoint 的两端更少依赖 |
 | `ebpf_tcp` | `kprobe/tcp_retransmit_skb` | 重传次数（按 `(pid, saddr, sport, daddr, dport)` 累加） |
 | `ebpf_tcp` | `kprobe/tcp_send_active_reset` | RST 次数 |
-| `ebpf_process` | `tracepoint/sched/sched_process_exec`、`sched_process_exit`、`sched_process_fork` | 生命周期事件，`cmdline` 从 `bprm` 读并截断 512 字节 |
+| `ebpf_process` | `tracepoint/sched/sched_process_exec`、`sched_process_exit`、`sched_process_fork` | 生命周期事件。**实现取 16 字节 `comm`（`bpf_get_current_comm()`）**，不读 `bprm.cmdline`：少一处版本相关偏移依赖，完整 `cmdline` 留到 P2 |
 | `ebpf_syscall` | `tracepoint/syscalls/sys_enter_openat` + `sys_exit_openat`（`read`/`write`/`fsync` 同构） | 起止时间差入直方图槽，错误码计数 |
 | `ebpf_dns` | `kprobe/udp_sendmsg`、`kprobe/udp_recvmsg`（过滤 `port == 53`） | `(pid, transaction_id)` 匹配耗时与 rcode |
 | `ebpf_cpu_profile` | 每 tid 的 `perf_event_open` + `bpf_get_stackid(BPF_F_USER_STACK)` | 栈 id 与采样计数 |
@@ -404,6 +404,8 @@ Agent 侧产出（每 60 秒一批），严格按 `observability-data-model` 命
 - 差分后必须显式把值写回 0，否则第二周期会重复计入同一批数据；`PerCpuHashMap::insert` 写零值是必需的，不能只删除键。
 - `tcp_sendmsg` 的返回值语义（入队字节 vs 实际发送）会导致 `bytes_sent` 与内核计数器有偏差，设计以返回值为准并在文档标注口径，不要试图与 `/proc/net/dev` 对齐。
 - `inet_sock_set_state` 的 state 常量与内核版本相关，不要硬编码数值；从 `aya` 的 BTF/常量映射或运行期探测取。
+- **实现期确定的做法**：内核态**完全不硬编码**结构体偏移与状态值 —— 用户态解析 `/sys/kernel/btf/vmlinux`（`struct sock_common`/`sock` 字段偏移）与 tracepoint 的 `format` 文件（字段偏移），连同 TCP 状态常量一起写入 `CFG: Array<u64>`（下标见 `ebpf_abi::CfgIndex`，带 `CFG_VERSION` 版本号，不匹配则不采集）。好处：内核态不需重新编译就能适配不同内核，状态语义留在可单测的用户态。
+- kprobe 的参数在 kretprobe 里**拿不到**（返回时寄存器已变）：字节数/连接失败这类「入口建键 + 返回判值」的组合必须用 `ENTRY: HashMap<tid, ConnKey>` 暂存入口键，返回时取出并清除；kretprobe 未配对时跳过，不要用当前进程重新建键（会记到错误的连接上）。
 - `latency_hist` 的槽上界会低估长尾（例如槽 23 覆盖到 `2^24` 微秒以上），`p95` 近似值必须标注为近似，前端 tooltip 要写清楚。
 - 内核态程序的栈与循环受限（验证器），`latency_hist` 遍历必须用 `bpf_loop` 或展开的固定次数循环，不能用动态长度 `for`。
 - `EbpfEdge` 的 `record_id` 包含 `bucket_start_micros`，桶宽变更会使同一连接在两个桶粒度下产生两套记录；采集项改 `bucket_secs` 属于语义变更，需在链路页提示。

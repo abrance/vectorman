@@ -26,9 +26,12 @@ members = [
     "crates/gse-server-core",
     "crates/gse-agent-core",
     "crates/gse-agent-ebpf",
+    "crates/ebpf-abi",
     "crates/vectorman-version",
     "crates/vectorman-metrics",
 ]
+# 内核态程序用 bpfel 目标 + nightly 构建，不能进工作区（否则根目录 cargo build/test 会尝试按主机目标编译它）。
+exclude = ["crates/gse-ebpf-programs"]
 
 [workspace.package]
 version = "0.1.0"
@@ -49,6 +52,7 @@ gse-proto = { path = "crates/gse-proto" }
 gse-server-core = { path = "crates/gse-server-core" }
 gse-agent-core = { path = "crates/gse-agent-core" }
 gse-agent-ebpf = { path = "crates/gse-agent-ebpf" }
+ebpf-abi = { path = "crates/ebpf-abi" }
 vectorman-version = { path = "crates/vectorman-version" }
 vectorman-metrics = { path = "crates/vectorman-metrics" }
 
