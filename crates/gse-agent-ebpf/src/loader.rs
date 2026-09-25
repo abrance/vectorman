@@ -17,6 +17,7 @@ use aya::Ebpf;
 use crate::aggregate::{ConnKey, ProcessContext};
 use crate::attach::{AttachPlan, AttachPoint, EbpfItemKind};
 use crate::cfg::CfgValues;
+use crate::cgroup::ProcessResolver;
 use crate::config::EbpfConfig;
 use crate::{ConnSnapshot, MapSource, ProcSnapshot};
 use ebpf_abi::{ConnAggWire, ProcAggWire, ProcKey};
@@ -26,6 +27,11 @@ pub const CFG_MAP: &str = "CFG";
 
 /// 令牌桶状态 map 名（内核态程序里同名）。
 pub const RATE_MAP: &str = "RATE";
+
+/// pid → 容器信息 的缓存 TTL（秒）。取 5 分钟：容器重建/pid 复用不会带来长期错误。
+pub const PROCESS_CACHE_TTL_SECS: u64 = 300;
+/// 缓存上限，超过就整体清空（见 `cgroup::ProcessResolver`）。
+pub const MAX_PROCESS_CACHE: usize = 8192;
 
 /// 令牌桶状态在 `PerCpuArray` 里的下标（与 `ebpf-abi`/内核态一致）。
 pub mod rate_slot {
@@ -177,6 +183,7 @@ impl LoadedItem {
                     map,
                     cpus,
                     rate,
+                    resolver: ProcessResolver::new(PROCESS_CACHE_TTL_SECS, MAX_PROCESS_CACHE),
                 })))
             }
             EbpfItemKind::Process => {
@@ -192,6 +199,7 @@ impl LoadedItem {
                     map,
                     cpus,
                     rate,
+                    resolver: ProcessResolver::new(PROCESS_CACHE_TTL_SECS, MAX_PROCESS_CACHE),
                     events,
                 })))
             }
@@ -289,6 +297,8 @@ pub struct ConnSource {
     cpus: usize,
     /// 令牌桶状态（读走限流丢弃计数）。
     rate: Option<PerCpuArray<MapData, u64>>,
+    /// pid → 容器/Pod 反查（需求 11.1：边记录要有 `src_container_id`/`src_pod`）。
+    resolver: ProcessResolver,
 }
 
 /// 进程型采集项的 map 读取状态。
@@ -298,6 +308,7 @@ pub struct ProcessSource {
     map: PerCpuHashMap<MapData, PodProcKey, PodProcAgg>,
     cpus: usize,
     rate: Option<PerCpuArray<MapData, u64>>,
+    resolver: ProcessResolver,
     /// 原始事件环缓冲（`raw_events_enabled=false` 时内核态不写，读到的也是空）。
     events: Option<aya::maps::RingBuf<MapData>>,
 }
@@ -369,6 +380,15 @@ impl AyaMapSource {
         out
     }
 
+    /// 当前缓存了多少个 pid 的反查结果（自监控）。
+    #[must_use]
+    pub fn cached_processes(&self) -> usize {
+        match self {
+            Self::Conn(source) => source.resolver.cached(),
+            Self::Process(source) => source.resolver.cached(),
+        }
+    }
+
     /// 进程型快照（只对 process 采集项有意义）。
     pub fn drain_process(&mut self) -> Result<Option<ProcSnapshot>, String> {
         let Self::Process(source) = self else {
@@ -422,10 +442,23 @@ impl MapSource for AyaMapSource {
         Ok(out)
     }
 
-    fn process_context(&self, _key: &ConnKey) -> Option<ProcessContext> {
-        // 进程上下文由内核态一起采集（`comm` 在原始事件与进程项里），用户态不在采集热路径上
-        // 读 `/proc`；边记录的服务名由 dataserver 反查。
-        None
+    /// 按 `pid` 反查容器/Pod 与进程名。
+    ///
+    /// 内核态只给 `pid`/`cgroup_id`；容器与 Pod 的对应关系在用户态用 `/proc/<pid>/cgroup`
+    /// 反查（每个 pid 只查一次并缓存）。这同时让采集项的 `process_include`/`process_exclude`
+    /// 过滤真正生效 —— 之前拿不到进程名，带进程过滤的配置会把所有记录都丢掉。
+    ///
+    /// 取不到时返回 `None`，调用方按「无上下文」处理（不阻塞采集）。
+    fn process_context_by_pid(&mut self, pid: u32) -> Option<ProcessContext> {
+        let info = match self {
+            Self::Conn(source) => source.resolver.resolve(pid),
+            Self::Process(source) => source.resolver.resolve(pid),
+        }?;
+        Some(ProcessContext {
+            process_name: info.process_name,
+            container_id: info.container_id,
+            pod_name: info.pod_uid,
+        })
     }
 }
 

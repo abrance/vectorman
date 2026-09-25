@@ -162,8 +162,20 @@
   - **遗留**：进程指标 `ebpf_process_*` 仍由 Agent 产出，维度是 `pid`/`cgroup_id`/`process_name`；
     共享模型里写了 `service`/`container_id` 维度，需要 dataserver 侧补一次 cgroup → 服务名归一（归入 5.9）
 
-- [ ] 5.9 进程指标的服务维度归一（实现期新增子项）
-  - [ ] 状态：**未做，但已完成方案分析**。Agent 发的 `ebpf_process_*` 只有
+- [x] 5.9 进程指标的服务维度归一（实现期新增子项）
+  - [x] 状态：**已实现 Agent 侧部分（PR #59）**，并修正了方案：**按 `pid` 反查，不按 `cgroup_id`**。
+    `cgroup_id` 是 cgroup 目录 inode，要映射成路径得遍历 `/sys/fs/cgroup` 并逐目录 `stat`（v1 还要区分控制器层级，
+    本机就是 v1/hybrid），成本高且脆弱；而连接键与进程键里**已经带了 `pid`**，直接读 `/proc/<pid>/cgroup`
+    即可，且同一 pid 一生只查一次 → 缓存。实现：`gse-agent-ebpf/src/cgroup.rs`
+    （k8s v1/v2、containerd/cri-o/docker、systemd 形态的路径解析为纯函数 + `/proc` 读取 + TTL 缓存，7 个用例）。
+  - 落地效果：`MapSource::process_context_by_pid` 接上反查 → **边记录填上 `src_container_id`/`src_pod`、
+    进程指标带上 `container_id`/`pod_uid` 维度**，并且采集项的 `process_include`/`process_exclude`
+    过滤**第一次真正生效**（此前拿不到进程名，带进程过滤的配置会把所有记录都丢掉）。
+  - **仍未做（明确边界）**：① `src_pod` 里放的是 Pod **uid**（`pod<uid>` 只能解到 uid），Pod **名**需要
+    k8s 侧数据，因此 dataserver 的 `lookup_by_pod`（按真实 Pod 名匹配端点表）暂时命中不了，服务名仍靠
+    静态映射与 `(ip, port)` 反查；② `service` 维度由 dataserver 填（需要 `MetricSink` 钩子），本 PR 未做。
+  - 上机验证：本机 sudo 跑检查点，反查缓存 28 个 pid，宿主机进程正确显示 `host`（本机无容器，容器路径由单测覆盖真实形态）。
+  - 原方案分析（保留备查）：Agent 发的 `ebpf_process_*` 只有
     `pid`/`cgroup_id`/`process_name`，共享模型要求 `service`/`container_id`（需求 4.6）。
   - **缺口不在 dataserver，而在 Agent**：需求 11.1 要求 Agent 用 `cgroup_id` 反查并填 `src_pod`/`src_container_id`，
     但当前**边记录与进程记录都没填**（内核态只给 `cgroup_id`）。因此 5.9 的前置是「Agent 侧的 cgroup 反查」，

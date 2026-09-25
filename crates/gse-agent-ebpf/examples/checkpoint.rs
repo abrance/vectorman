@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use gse_agent_ebpf::attach::EbpfItemKind;
 use gse_agent_ebpf::cfg::CfgValues;
+use gse_agent_ebpf::cgroup::{describe, ProcessResolver};
 use gse_agent_ebpf::config::EbpfConfig;
 use gse_agent_ebpf::loader::{object_bytes, LoadedItem};
 use gse_agent_ebpf::preflight::PreflightEnv;
@@ -211,6 +212,9 @@ fn main() -> ExitCode {
             return ExitCode::from(3);
         }
     };
+    // 容器/Pod 反查（需求 11.1）：按 pid 读 `/proc/<pid>/cgroup`，把结果打在每条记录后面，
+    // 这样上机跑一次就能看出反查是否对得上（宿主机进程应显示 host）。
+    let mut resolver = ProcessResolver::new(60, 4096);
     let mut connections = 0u64;
     let mut retrans = 0u64;
     let mut resets = 0u64;
@@ -232,12 +236,16 @@ fn main() -> ExitCode {
                         }
                         process_events += exec + exit + fork;
                         println!(
-                            "进程 pid={} cgroup={} comm={:?} exec={exec} exit={exit} fork={fork}",
+                            "进程 pid={} cgroup={} comm={:?} exec={exec} exit={exit} fork={fork} 上下文={}",
                             key.pid,
                             key.cgroup_id,
                             String::from_utf8_lossy(&key.comm)
                                 .trim_end_matches('\0')
                                 .to_string(),
+                            resolver
+                                .resolve(key.pid)
+                                .map(|info| describe(&info))
+                                .unwrap_or_else(|| "未反查到".to_string()),
                         );
                     }
                 }
@@ -258,7 +266,7 @@ fn main() -> ExitCode {
                     retrans += view.tcp_retrans;
                     resets += view.tcp_resets;
                     println!(
-                        "键 pid={} cgroup={} {}:{} -> {}:{} proto={} 连接={} 失败={} 发={} 收={} 重传={}",
+                        "键 pid={} cgroup={} {}:{} -> {}:{} proto={} 连接={} 失败={} 发={} 收={} 重传={} 上下文={}",
                         key.pid,
                         key.cgroup_id,
                         gse_agent_ebpf::aggregate::ipv4_of(key.saddr),
@@ -271,6 +279,10 @@ fn main() -> ExitCode {
                         view.bytes_sent,
                         view.bytes_recv,
                         view.tcp_retrans,
+                        resolver
+                            .resolve(key.pid)
+                            .map(|info| describe(&info))
+                            .unwrap_or_else(|| "未反查到".to_string()),
                     );
                 }
             }
@@ -282,7 +294,9 @@ fn main() -> ExitCode {
     }
 
     println!(
-        "读快照 {reads} 次：新建连接 {connections}，重传 {retrans}，RST {resets}，进程事件 {process_events}"
+        "读快照 {reads} 次：新建连接 {connections}，重传 {retrans}，RST {resets}，进程事件 {process_events}；\
+         反查缓存 {} 个 pid",
+        resolver.cached()
     );
     // 判定标准按采集项区分：重传/RST 本来就稀少，进程事件在空闲机器上也可能为 0，
     // 因此只有 `ebpf_network` 把「一条连接都没采到」当作失败（它最容易踩过滤与偏移问题）。
