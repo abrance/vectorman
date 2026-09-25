@@ -91,13 +91,23 @@ export type EdgeSearchRequest = {
   to_ts?: number;
   src_service?: string;
   dst_service?: string;
+  /// 省略时服务端把 OTLP 与 eBPF 两路按分钟桶与源/目标服务合并汇总（`source` 返回 `merged`）。
   source?: "otlp" | "ebpf";
+  /// 只有 eBPF 侧有协议；指定后 OTLP 侧的行会被过滤掉。
+  protocol?: "tcp" | "udp";
+  src_ip?: string;
+  dst_ip?: string;
+  dst_port?: number;
   agent_id?: string;
   min_requests?: number;
   limit?: number;
   offset?: number;
 };
 
+/// 边列表的一行。
+///
+/// 两侧共有的字段是 `calls`/`errors`/`duration_*`；eBPF 侧独有的是连接/IP/端口/协议/字节/重传，
+/// OTLP 侧这些为空或 0（span 配对没有这些语义），因此展示时要按 `source` 区分。
 export type EdgeRow = {
   bucket_ts: number;
   src_service: string;
@@ -107,8 +117,19 @@ export type EdgeRow = {
   errors: number;
   duration_sum: number;
   duration_max: number;
+  /// `otlp` | `ebpf` | `merged`（`merged` 表示这一行是两路相加的结果）。
   source: string;
   agent_id: string;
+  src_ip: string;
+  dst_ip: string;
+  dst_port: number;
+  protocol: string;
+  connections: number;
+  failures: number;
+  bytes_sent: number;
+  bytes_recv: number;
+  duration_avg_micros: number;
+  tcp_retrans: number;
 };
 
 export type EdgeSearchPage = {

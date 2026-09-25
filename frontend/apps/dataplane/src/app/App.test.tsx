@@ -8,7 +8,7 @@ import {
   MemoryNotifier,
   MemoryQueryStore,
 } from "@vectorman/primitives";
-import { ApmAdapter, DataplaneAdapter, FetchHttpClient, type CollectItem } from "@vectorman/adapters";
+import { ApmAdapter, DataplaneAdapter, EbpfAdapter, FetchHttpClient, type CollectItem } from "@vectorman/adapters";
 import { App } from "./App";
 import { RuntimeProvider } from "./runtime";
 
@@ -107,12 +107,88 @@ class FakeHttp implements HttpClient {
         } as T,
       };
     }
-    if (url === "/v1/edges/search") {
+    if (url === "/v1/ebpf/capability") {
       return {
         status: 200,
         body: {
-          total: 2,
-          edges: [
+          reported: 2,
+          agents: [
+            {
+              agent_id: "a-1",
+              item_id: "item-ebpf",
+              available: true,
+              kernel_ok: true,
+              btf_ok: true,
+              capability_ok: true,
+              kernel_release: "6.1.0",
+              reason: "",
+            },
+            {
+              agent_id: "a-2",
+              item_id: "item-ebpf-2",
+              available: false,
+              kernel_ok: false,
+              btf_ok: true,
+              capability_ok: false,
+              kernel_release: "5.4.0",
+              reason: "eBPF preflight failed",
+            },
+          ],
+        } as T,
+      };
+    }
+    if (url === "/v1/ebpf/events/search") {
+      return {
+        status: 200,
+        body: {
+          records: [
+            {
+              id: "ebpf-1",
+              timestamp: 1_710_000_000_000_000,
+              level: "info",
+              message: "java exec /usr/bin/java",
+              labels: { event_type: "process_exec", process_name: "java", pid: "42" },
+            },
+          ],
+        } as T,
+      };
+    }
+    if (url === "/v1/edges/search") {
+      const body = req.body as Record<string, unknown> | undefined;
+      const onlyEbpf = body?.source === "ebpf";
+      return {
+        status: 200,
+        body: (onlyEbpf
+          ? {
+              total: 1,
+              edges: [
+                {
+                  bucket_ts: 1_710_000_000_000_000,
+                  src_service: "order-api",
+                  dst_service: "unknown-10.0.0.9",
+                  span_kind: "",
+                  calls: 6,
+                  errors: 1,
+                  duration_sum: 500,
+                  duration_max: 300,
+                  source: "ebpf",
+                  agent_id: "a-1",
+                  src_ip: "10.0.0.5",
+                  dst_ip: "10.0.0.9",
+                  dst_port: 8080,
+                  protocol: "tcp",
+                  connections: 6,
+                  failures: 1,
+                  bytes_sent: 1_048_576,
+                  bytes_recv: 2_048,
+                  duration_avg_micros: 83,
+                  tcp_retrans: 2,
+                },
+              ],
+            }
+          : {
+              total: 2,
+              edges: [
             {
               bucket_ts: 1_710_000_000_000_000,
               src_service: "gateway",
@@ -124,6 +200,16 @@ class FakeHttp implements HttpClient {
               duration_max: 3_000,
               source: "otlp",
               agent_id: "a-1",
+              src_ip: "",
+              dst_ip: "",
+              dst_port: 0,
+              protocol: "",
+              connections: 6,
+              failures: 1,
+              bytes_sent: 0,
+              bytes_recv: 0,
+              duration_avg_micros: 1_000,
+              tcp_retrans: 0,
             },
             {
               bucket_ts: 1_710_000_000_000_000,
@@ -136,9 +222,19 @@ class FakeHttp implements HttpClient {
               duration_max: 250,
               source: "otlp",
               agent_id: "a-1",
+              src_ip: "",
+              dst_ip: "",
+              dst_port: 0,
+              protocol: "",
+              connections: 2,
+              failures: 0,
+              bytes_sent: 0,
+              bytes_recv: 0,
+              duration_avg_micros: 200,
+              tcp_retrans: 0,
             },
           ],
-        } as T,
+            }) as T,
       };
     }
     if (url === "/v1/ts/stats") {
@@ -345,12 +441,13 @@ function renderAt(path: string) {
   const http = new FakeHttp(items);
   const adapter = new DataplaneAdapter(http);
   const apm = new ApmAdapter(http);
+  const ebpf = new EbpfAdapter(http);
   const query = new MemoryQueryStore();
   return {
     http,
     query,
     ...render(
-      <RuntimeProvider value={{ dataplane: adapter, apm, query, notifier: new MemoryNotifier() }}>
+      <RuntimeProvider value={{ dataplane: adapter, apm, ebpf, query, notifier: new MemoryNotifier() }}>
         <MemoryRouter initialEntries={[path]}>
           <App />
         </MemoryRouter>
@@ -437,6 +534,47 @@ describe("trace and log correlation", () => {
     expect(href).toContain("/logs?service=payment");
     expect(href).toContain("from_ts=1710000000000000");
     detail.unmount();
+  });
+});
+
+describe("ebpf page", () => {
+  it("shows capability status, edge rows and unknown-service mapping entry", async () => {
+    const ebpfView = renderAt("/ebpf");
+    await waitFor(() => {
+      expect(screen.getByText("eBPF 能力状态")).toBeTruthy();
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/1 个采集项不可用/)).toBeTruthy();
+    });
+    // 诊断文案里同时含失败项与原因（中间用 `·` 连接，因此按正则匹配整段）。
+    expect(screen.getByText(/内核版本不足（5.4.0，需 ≥ 5.8）/)).toBeTruthy();
+    expect(screen.getByText(/eBPF preflight failed/)).toBeTruthy();
+    await waitFor(() => {
+      expect(screen.getByText("unknown-10.0.0.9")).toBeTruthy();
+    });
+    // 边表里的 eBPF 独有字段：目标地址、字节、重传。
+    expect(screen.getByText("10.0.0.9:8080")).toBeTruthy();
+    expect(screen.getByText("1.0 MiB")).toBeTruthy();
+    // 未识别服务可以一键跳到映射配置（带 CIDR 预填）。
+    fireEvent.click(screen.getByRole("button", { name: "建立映射" }));
+    await waitFor(() => {
+      expect(screen.getByText("服务名映射")).toBeTruthy();
+    });
+    cleanup();
+    ebpfView.unmount();
+  });
+
+  it("shows the raw-event hint and queries the events view", async () => {
+    const eventsView = renderAt("/ebpf");
+    await waitFor(() => {
+      expect(screen.getByText("事件")).toBeTruthy();
+    });
+    fireEvent.click(screen.getByText("事件"));
+    await waitFor(() => {
+      expect(screen.getByText(/原始事件默认关闭/)).toBeTruthy();
+    });
+    cleanup();
+    eventsView.unmount();
   });
 });
 

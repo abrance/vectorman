@@ -14,6 +14,16 @@ function edge(partial: Partial<EdgeRow> & { src_service: string; dst_service: st
     duration_max: partial.duration_max ?? 100,
     source: partial.source ?? "otlp",
     agent_id: partial.agent_id ?? "agent-1",
+    src_ip: partial.src_ip ?? "",
+    dst_ip: partial.dst_ip ?? "",
+    dst_port: partial.dst_port ?? 0,
+    protocol: partial.protocol ?? "",
+    connections: partial.connections ?? 0,
+    failures: partial.failures ?? 0,
+    bytes_sent: partial.bytes_sent ?? 0,
+    bytes_recv: partial.bytes_recv ?? 0,
+    duration_avg_micros: partial.duration_avg_micros ?? 0,
+    tcp_retrans: partial.tcp_retrans ?? 0,
   };
 }
 

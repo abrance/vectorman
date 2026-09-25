@@ -3,7 +3,7 @@ import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 import { ConfigProvider } from "antd";
 import zhCN from "antd/locale/zh_CN";
-import { ApmAdapter, DataplaneAdapter, FetchHttpClient } from "@vectorman/adapters";
+import { ApmAdapter, DataplaneAdapter, EbpfAdapter, FetchHttpClient } from "@vectorman/adapters";
 import {
   JsonErrorMapper,
   MemoryAuthSession,
@@ -20,6 +20,7 @@ const notifier = new MemoryNotifier();
 const http = new FetchHttpClient(session, mapper);
 const dataplane = new DataplaneAdapter(http);
 const apm = new ApmAdapter(http);
+const ebpf = new EbpfAdapter(http);
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
@@ -28,7 +29,7 @@ createRoot(document.getElementById("root")!).render(
       theme={{ token: { motion: false } }}
       autoInsertSpaceInButton={false}
     >
-      <RuntimeProvider value={{ dataplane, apm, query, notifier }}>
+      <RuntimeProvider value={{ dataplane, apm, ebpf, query, notifier }}>
         <BrowserRouter>
           <App />
         </BrowserRouter>
