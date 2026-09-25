@@ -1,0 +1,153 @@
+# Vectorman gse-agent 的 K8s 清单（DaemonSet，每节点一份）。
+#
+# 适用：k3s / kubeadm 等标准集群；节点内核 ≥ 5.8 且带 BTF（eBPF 采集的前提，见 README 第 0 节）。
+# 前置：gse-server 与 dataserver 已就绪、台账已登记各节点 Agent（README 第 2 节）。
+# 用法：见同目录 README.md。apply 前请替换三处 REPLACE_ME（server_addr / token / image）。
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vectorman
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gse-agent
+  namespace: vectorman
+---
+# Pod **名**反查要跨命名空间列 Pod（内核只给 cgroup → uid）；只读权限。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gse-agent-pods-read
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gse-agent-pods-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gse-agent-pods-read
+subjects:
+  - kind: ServiceAccount
+    name: gse-agent
+    namespace: vectorman
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gse-agent-conf
+  namespace: vectorman
+data:
+  gse-agent.toml: |
+    # 与 gse-server 的连接。也可用环境变量 GSE_AGENT_SERVER 覆盖（见 DaemonSet）。
+    server_addr = "REPLACE_ME:7100"
+    # agent_id：由 Downward API 覆盖为节点名（GSE_AGENT_ID），这里留占位。
+    agent_id = "REPLACE_ME"
+    # token：由 Secret 经 GSE_AGENT_TOKEN 覆盖，这里留空。
+    token = ""
+    heartbeat_interval_secs = 30
+    # 集群内不接收 OTLP（应用要发 span 时再打开，并另配 Service/NodePort）。
+    otlp_enabled = false
+---
+# 台账里预登记的 Agent token（与 /api/gse/agents 登记时用的值一致）。
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gse-agent-token
+  namespace: vectorman
+type: Opaque
+stringData:
+  token: "REPLACE_ME"
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gse-agent
+  namespace: vectorman
+  labels:
+    app: gse-agent
+spec:
+  selector:
+    matchLabels:
+      app: gse-agent
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: gse-agent
+    spec:
+      serviceAccountName: gse-agent
+      # 容器内 /proc 即宿主机视图：容器/Pod 反查（/proc/<pid>/cgroup → pod uid）依赖它。
+      hostPID: true
+      # 控制面/有污点的节点同样需要节点级采集。
+      tolerations:
+        - operator: Exists
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: gse-agent
+          image: vectorman-gse-agent:1.2.0
+          # 单机 k3s 无 registry：镜像由 build-image.sh --import 直接导入，故不强制拉取。
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            # 加载内核态 eBPF 程序并读 tracefs。内核 ≥ 5.8 时等价最小写法：
+            #   capabilities: { add: ["BPF", "PERFMON"] }
+            privileged: true
+          env:
+            - name: GSE_AGENT_CONFIG
+              value: /etc/vectorman/gse-agent.toml
+            # 每节点一个稳定身份：Pod 重建后仍是同一个 Agent（agent_id = 节点名）。
+            - name: GSE_AGENT_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: GSE_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gse-agent-token
+                  key: token
+          volumeMounts:
+            - name: conf
+              mountPath: /etc/vectorman
+              readOnly: true
+            # 内核结构体偏移（网络/TCP 采集项用；syscall 项不需要）。
+            - name: btf
+              mountPath: /sys/kernel/btf
+              readOnly: true
+            # tracepoint 字段偏移：代码读 /sys/kernel/tracing/events/**/format。
+            - name: tracing
+              mountPath: /sys/kernel/tracing
+              readOnly: true
+            # scratch 镜像没有 /tmp；作业功能在未指定 job_work_dir 时用系统临时目录。
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: conf
+          configMap:
+            name: gse-agent-conf
+        # type: Directory（不用 DirectoryOrCreate）：路径不存在就明确失败，
+        # 而不是造个空目录让 Agent 悄悄退到兜底布局。
+        - name: btf
+          hostPath:
+            path: /sys/kernel/btf
+            type: Directory
+        - name: tracing
+          hostPath:
+            path: /sys/kernel/tracing
+            type: Directory
+        - name: tmp
+          emptyDir: {}

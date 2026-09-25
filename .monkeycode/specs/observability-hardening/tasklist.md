@@ -7,17 +7,30 @@
 
 ## 1. K8s 部署清单（对应需求 1、9）
 
-- [ ] 1.1 新增 `packaging/deploy/k8s/gse-agent-daemonset.yaml`：Namespace / ServiceAccount /
+- [x] 1.1 新增 `packaging/deploy/k8s/gse-agent-daemonset.yaml`：Namespace / ServiceAccount /
       ClusterRole(pods get,list) / ClusterRoleBinding / ConfigMap / DaemonSet 六个对象，
       按设计的字段取值（`hostPID: true`、BTF 与 tracing 只读 hostPath、特权、Downward API 取 `spec.nodeName`
       作 `agent_id`、`token` 走 Secret、`emptyDir` 作上行队列目录）
-- [ ] 1.2 新增 `packaging/deploy/k8s/README.md`：镜像怎么来（用安装包二进制 + `debian:12-slim` 自建）、
+- [x] 1.2 新增 `packaging/deploy/k8s/README.md`：镜像怎么来（scratch + 静态二进制，实测 10.7 MB）、
       台账里怎么预登记各节点 Agent、如何 `kubectl apply`、如何用 `nodeSelector` 灰度、
       以及「停用采集项/删 DaemonSet」两种回滚方式
-- [ ] 1.3 `kubectl apply --dry-run=client -f` 本地校验通过（清单语法与 API 版本）
-- [ ] 1.4 打包脚本 `packaging/build-package.sh` 把 `deploy/k8s/` 一并打入安装包（保持「随包分发」的一致性）
+- [x] 1.3 已在 cloud3 真集群 `kubectl apply --dry-run=server` 通过（7 个对象全部校验通过；
+      命名空间需先存在，dry-run 不落盘 —— 已建 `vectorman` 命名空间）
+- [x] 1.4 打包脚本 `packaging/build-package.sh` 把 `deploy/k8s/` 一并打入安装包（保持「随包分发」的一致性）
 
-- **检查点 A**：清单能 `--dry-run` 通过；打包产物里含 `deploy/k8s/`；既有 Rust/前端测试保持全绿。
+- **检查点 A**（2026-09-25 完成）：清单在 cloud3 真集群 `--dry-run=server` 通过；
+  `deploy/k8s/` 已随包分发；既有 Rust/前端测试保持全绿。
+
+已完成但属于「实施期发现」的两件事，记录在此避免丢失：
+
+- [x] 1.5 **节点前提在真集群实测**：用只读短命 Pod 在 cloud3 确认内核 6.8 / BTF / tracefs 路径 /
+      hostPID 可见宿主进程 / 特权能力（结论写进 `design.md` 的「目标平台」表与 `deploy/k8s/README.md`）
+- [x] 1.6 **集群自签 CA 的 TLS 信任**（本 feature 的阻塞级发现，随材料一并交付代码修复）：
+      `K8sCredential.ca_pem` + `kubeconfig::tls_config` + 本地 TLS 握手测试（带 CA 成功 / 不带被拒）；
+      见需求 3.5。**没有它，Pod 名反查在 k3s 上必然失败且只静默退化成 uid**
+- [x] 1.7 **镜像交付链路实测**：`build-image.sh --pkg ... --import cloud3` 走
+      `docker save | ssh cloud3 'sudo -n k3s ctr images import -'`，6 秒导入、`k3s ctr images ls` 可查
+      （集群内无 registry，脚本已处理 containerd socket 的 root 权限）
 
 ## 2. 单机回归清单（对应需求 5、9）
 

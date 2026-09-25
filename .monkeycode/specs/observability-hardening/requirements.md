@@ -72,6 +72,11 @@ v1.1.0 已交付 APM 全链路与 eBPF 四类采集项（`ebpf_network` / `ebpf_
    与 `kubeconfig.rs`，命名空间为空时列全部命名空间），索引按 TTL 缓存。
 3. THE 服务名归一 SHALL 能在真集群里命中「按 Pod 名登记的端点表」这一层（此前因只有 uid 而永远落空）。
 4. IF k8s 凭据不可用或 API 不可达，THE Agent SHALL 退回 uid（不报错、不影响其它采集项）并留下日志。
+5. THE k8s 客户端 SHALL 支持**集群自签 CA**：k3s/kubeadm 的 apiserver 用集群自签证书，
+   而客户端的默认根是公有 CA，因此凭证 SHALL 带上 CA（in-cluster 的 `ca.crt`，
+   或 kubeconfig 的 `certificate-authority` / `certificate-authority-data`）并**只对该客户端生效**。
+   _（2026-09-25 实施时发现并修复：缺这一步 Pod 名反查会以 TLS 校验失败告终，
+   `src_pod` 静默退化成 uid —— 见 `todo.md` 与 `kubeconfig.rs::tls_config`。）_
 
 ### Requirement 4: 容量与丢弃的可验收口径（被动观测）
 
