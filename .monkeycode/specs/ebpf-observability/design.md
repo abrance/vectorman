@@ -112,6 +112,9 @@ graph TD
 - **合并视图的键**（实现期修正需求 13.3）：按 `(bucket_ts, src_service, dst_service)` 汇总，`protocol` 作为**行字段**而不是身份。
   理由：OTLP 的边来自 span 配对，**没有协议**；若把协议放进合并键，两路数据永远不会命中同一个键，合并模式会退化成「两路并排」。
   代价是同分钟同一条边混合 tcp/udp 时归并成 `protocol=mixed` 且计数相加（只影响合并视图；单看 eBPF 时协议仍是分组维度）。
+- **前端**：`/ebpf` 页把「能力状态」放在页首（而不是单独页签）：它回答的是「为什么没有 eBPF 数据」，
+  对两个视图都相关；且必须区分「没有 Agent 上报」与「上报了但不可用」，否则会被误读成「没数据」。
+  图表沿用仓库既有的手绘 SVG（不引 echarts），与 APM/拓扑页保持一致。
 - **能力状态查询不能用 instant + 当前时间**：Prom instant 只回看几分钟，而 `agent_ebpf_capability` 是**状态**点（Agent 在采集项启动时上报一次），
   用 instant 会把「几小时前上报过不可用」显示成「没有上报」。实现改用 7 天范围查询并取每条序列最后一个样本。
 - **热更新**：复用采集框架的 `reconcile`（按 `item_id` + 配置指纹）—— 配置变更或 `enabled=false` 会 abort 采集任务，任务 drop 时 `Ebpf` 随之 drop，从而 detach link 并删除 map。

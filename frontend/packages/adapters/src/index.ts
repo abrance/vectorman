@@ -43,6 +43,7 @@ export {
   type TraceSummary,
   type TsStorageStats,
 } from "./dataplane/apm";
+export { EbpfAdapter, type CapabilityEntry, type CapabilityReport, type EbpfEventSearchRequest } from "./dataplane/ebpf";
 export { PromQueryAdapter, type PromEnvelope } from "./dataplane/prom";
 export {
   DataplaneAdapter,

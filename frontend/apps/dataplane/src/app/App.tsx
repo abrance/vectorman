@@ -1,6 +1,7 @@
 import { Layout, Menu } from "antd";
 import { NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { CollectPage } from "../pages/collect-page";
+import { EbpfPage } from "../pages/ebpf-page";
 import { LogsPage } from "../pages/logs-page";
 import { MetricsPage } from "../pages/metrics-page";
 import { ApmPage } from "../pages/apm-page";
@@ -17,6 +18,7 @@ const items = [
   { key: "/traces", label: <NavLink to="/traces">trace</NavLink> },
   { key: "/topology", label: <NavLink to="/topology">服务拓扑</NavLink> },
   { key: "/apm", label: <NavLink to="/apm">APM 指标</NavLink> },
+  { key: "/ebpf", label: <NavLink to="/ebpf">eBPF</NavLink> },
   { key: "/settings", label: <NavLink to="/settings">设置</NavLink> },
 ];
 
@@ -43,6 +45,7 @@ export function App() {
           <Route path="/traces/:traceId" element={<TraceDetailPage />} />
           <Route path="/topology" element={<TopologyPage />} />
           <Route path="/apm" element={<ApmPage />} />
+          <Route path="/ebpf" element={<EbpfPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="/settings/service-aliases" element={<SettingsPage defaultTab="aliases" />} />
           <Route path="*" element={<Navigate to="/" replace />} />
