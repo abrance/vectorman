@@ -1,18 +1,21 @@
-# gse-agent 的容器镜像：scratch + 静态链接（musl）二进制，无运行时依赖。
+# gse-server / dataserver / console 的 K8s 镜像与部署
 #
-# 构建上下文必须是**发布包解压后的根目录**（内含 gse-agent/bin/gse-agent 与 gse-agent/conf/）：
-#   docker build -f packaging/deploy/k8s/Dockerfile -t vectorman-gse-agent:<version> /tmp/vectorman-1.2.0
-# 或直接用 build-image.sh（并把镜像送进 k3s）。
+# 二进制都是静态链接（musl），一个 scratch 镜像装下全部 server 侧组件；
+# 入口由 Pod 的 command 指定，web dist 用 hostPath/emptyDir 挂载（不烘进镜像）。
+#
+# 构建上下文 = 发布包解压后的根目录（内含 <component>/bin/<bin> 与 <component>/web/）：
+#   docker build -f packaging/deploy/k8s/Dockerfile -t vectorman-server:1.2.0 /tmp/vectorman-1.2.0
 FROM scratch
 
-COPY gse-agent/bin/gse-agent /usr/local/bin/gse-agent
-# 配置由 ConfigMap 挂到 /etc/vectorman/gse-agent.toml（见 gse-agent-daemonset.yaml）；
-# 这里只放一份示例，方便进容器对照字段。
-COPY gse-agent/conf/gse-agent.toml.example /usr/local/share/gse-agent.toml.example
+COPY dataserver/bin/dataserver   /usr/local/bin/dataserver
+COPY gse-server/bin/gse-server   /usr/local/bin/gse-server
+COPY console/bin/console         /usr/local/bin/console
+COPY dpc/bin/dpc                 /usr/local/bin/dpc
+COPY vmctl/bin/vmctl             /usr/local/bin/vmctl
+# 配置示例随镜像（实际配置用 ConfigMap 挂载）。
+COPY dataserver/conf/config.toml.example           /usr/local/share/dataserver/config.toml.example
+COPY gse-server/conf/gse-server.toml.example       /usr/local/share/gse-server/gse-server.toml.example
+COPY console/conf/console.toml.example             /usr/local/share/console/console.toml.example
 
-# 需要的外部依赖都由 Pod 提供：
-#   /proc            <- hostPID: true（宿主视图）
-#   /sys/kernel/btf  <- hostPath 只读
-#   /sys/kernel/tracing <- hostPath 只读
-#   /tmp             <- emptyDir
-ENTRYPOINT ["/usr/local/bin/gse-agent"]
+# 入口由 Pod spec 的 command 决定；这里给个能自证的默认值。
+ENTRYPOINT ["/usr/local/bin/gse-server"]
