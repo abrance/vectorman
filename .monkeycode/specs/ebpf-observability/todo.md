@@ -148,30 +148,41 @@
   `attempt to write a readonly database`；更隐蔽的是**旧进程还占着端口**，`curl` 打到的是旧实例，
   于是「数据面一直 offline」看起来像代码问题。排查顺序：先确认没有残留进程、端口空闲，再删库重启。
   （这一条曾让我得出两次错误的测量结论。）
+- **清理循环的间隔**：`ts_clean_interval_secs` 在 `main.rs` 里被 `.max(60)` 夹到 **60 秒**，
+  配置成 5 秒不会更快（`apm_clean_interval_secs` 同理）。验证保留期时要等一个完整周期，别以为没生效。
 - **dataserver 的 tsink**：用同一个数据目录反复 `pkill` dataserver 后，tsink 会进入 **fail-fast**，之后所有写入都返回
 `tsink: Storage is shutting down`（**底层原因被这句话掩盖**），连原本正常的进程指标也写不进，
 很容易误判成「刚改的代码把存储搞坏了」。判断方法：换一个**全新的数据目录**再试；正常即可确认是
 本地残留状态问题。要观察 fail-fast 之前的真因，需要看底层日志而不是接口返回。
 
-### TODO-8（低）`ebpf_edge_duration_micros` 少了 `field=max`
+### TODO-8（低）`ebpf_edge_duration_micros` 少了 `field=max` —— ✅ 已完成
 
-- **现状**：边表里有 `duration_max`，查询接口返回 `duration_max`，但指标只派生 `avg`/`p95`。
-- **怎么补**：在 `ebpf_metrics::aggregate` 增加一个 `field=max` 的点（`MAX(duration_max)` 已可按分钟聚合）。
-- **验收**：Prom 查询 `apm_edge_duration_micros{source="ebpf",field="max"}` 有值。
+- **原状**：边表里有 `duration_max`（SQL 也取回来了），但聚合用的 `EdgeRow` DTO **没接这个字段**，
+  因此指标只派生 `avg`/`p95`。
+- **已完成**：`EdgeRow` 增加 `duration_max` 并接上第 12 列；聚合键扩成 `(耗时和, 耗时最大值, 直方图)`，
+  同分钟多条边取 `max`（不是相加），派生 `apm_edge_duration_micros{field="max",source="ebpf"}`，
+  只在 `duration_max > 0` 时产出（与其它字段的「为零不出点」一致）。
+- **验收**：单测断言 `max >= avg` 且带 `source=ebpf`；`ebpf_edge_*` 聚合的既有用例不受影响。
 
-### TODO-9（低）保留期未在真实数据上跑满一轮
+### TODO-9（低）保留期未在真实数据上跑满一轮 —— ⚠️ 大部分已完成
 
-- **现状**：`delete_edges_before_batched` 的分批、只删指定 `data_id`、`retain/` 到期清空都有单测；
-  但没有观察过「真实数据 + 真实清理循环（每小时）」跑一整轮的效果与耗时。
-- **怎么补**：在测试环境写入若干天的数据（或用 `--ingest-url` 快速灌入），把保留期调到最小，
-  观察 `dataserver_ebpf_edges_deleted_total` 与表行数变化。
-- **验收**：清理后表行数与预期一致；单批耗时不影响同连接的其它查询。
+- **已完成（真跑）**：起 gse-server + dataserver（`gse_admin_url` 指向它，让清理循环拿到 live 采集项），
+  按真实 `data_id`（= GSE 的 `item_id`）灌入边记录，观察清理循环：
+  - **到期删除**：2 行（3 天前 1 行 + 当前 1 行，采集项 `retention_days=1`）→ 清理后 **1 行**，
+    日志 `ebpf_edges_deleted=1`，指标 `dataserver_ebpf_edges_deleted_total=1`，**保留的是新行**；
+  - **分批删除**：灌入 2500 条过期行（1.1 MB 单请求，未触 2 MiB 体限）→ 一个周期内 **2500 条全部删掉**
+    （`BATCH_SIZE=1000`，即 3 批 1000/1000/500），1 条新行保留，指标 `=2500`。
+    => 分批路径在真实 sqlite 上确实逐批推进，不会一次大删除。
+- **仍未覆盖（明确边界）**：`retain/{item_id}`（采集项**被删**后到期清空边记录）仍只有单测覆盖 ——
+  最短保留期被夹到 1 天（`clamp_retention_days`），无法在分钟级做真实验证。
 
-### TODO-10（低）CLI 未对真实服务跑过
+### TODO-10（低）CLI 未对真实服务跑过 —— ✅ 已完成
 
-- **现状**：`dpc edges`/`ebpf-events`/`ebpf-capability` 的请求体拼装有单测，但没对真实 dataserver 执行过。
-- **怎么补**：`dpc --sql-url http://127.0.0.1:18081 edges --source ebpf --protocol tcp`（附录有起服务的命令）。
-- **验收**：输出 JSON 与 curl 结果一致。
+- **已完成（真跑）**：对本地 dataserver（含真采集数据）逐个执行并通过：
+  `dpc health`（两个端口都 ok）、`dpc edges --source ebpf --limit 2`（288 条边，字段完整）、
+  `dpc ebpf-capability`（`available=true, reported=1`）、
+  `dpc ebpf-events --event-type process_exec --limit 2`（真实事件，`labels.event_type`/`process_name` 正确）。
+- **结论**：CLI 与 HTTP 接口一致，无需改动代码（这本身就是验收结论）。
 
 ### TODO-11（低）P2 / P3 未实现
 
