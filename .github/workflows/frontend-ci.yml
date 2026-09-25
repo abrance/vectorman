@@ -1,0 +1,30 @@
+name: Frontend CI
+
+on:
+  pull_request:
+    paths: ['frontend/**']
+  push:
+    branches: [main]
+    paths: ['frontend/**']
+
+# 复用 yoc 的 React 可复用流水线（与 rust-ci / helm-ci 同一约定）。
+#
+# 这个作业是补上的：此前前端**完全不在流水线里**，`/ebpf`（PR #55）、`/topology`、`/apm`
+# 等页面都是「本地跑绿 + 人工确认」合入的，之后任何前端改动都不会被拦住。
+# 首次加入时立刻暴露了 4 个 workspace 早就存在的类型错误（见 git 历史），
+# 说明「没进 CI 的测试」约等于没有测试。
+jobs:
+  react-ci:
+    uses: abrance/yoc/.github/workflows/react-ci.yml@v1.0.0
+    with:
+      working-directory: frontend
+      node-version: "24"
+      package-manager: npm
+      cache-dependency-path: frontend/package-lock.json
+      # 仓库没有 lint 脚本，跳过。
+      lint-command: ""
+      # 覆盖全部 7 个 workspace（根脚本里逐个 tsc）。
+      typecheck-command: npm run typecheck
+      # 根脚本按 workspace 展开，含 @vectorman/dataplane 的 46 个用例。
+      test-command: npm test
+      build-command: npm run build:dataplane

@@ -11,6 +11,9 @@ export type JobRerunFormValues = {
   envText?: string;
   timeout_secs?: number;
   working_dir?: string;
+  /// `file_transfer` 专有：目标路径。表单里已渲染、`buildRerunRequest` 也读它，
+  /// 但类型里漏了 —— 补上后 `tsc --noEmit` 才干净（见 frontend-ci 作业）。
+  dest_path?: string;
 };
 
 export function formatEnv(env?: Record<string, string> | null): string {
