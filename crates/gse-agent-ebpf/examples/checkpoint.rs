@@ -211,21 +211,52 @@ fn main() -> ExitCode {
             return ExitCode::from(3);
         }
     };
-    let mut total = 0u64;
+    let mut connections = 0u64;
+    let mut retrans = 0u64;
+    let mut resets = 0u64;
+    let mut process_events = 0u64;
     let mut reads = 0u64;
     let deadline = std::time::Instant::now() + Duration::from_secs(args.seconds.max(1));
     while std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(args.interval_millis.max(100)));
-        let snapshot = runtime.block_on(async { source.drain() });
-        match snapshot {
+        // 进程项的计数在另一张 map 上（`PROC_AGG`），走 `drain_process`；
+        // 连接型（network/tcp）走 `drain`。用错接口会「看到 0」而误判成没采到。
+        if args.kind == EbpfItemKind::Process {
+            match runtime.block_on(async { source.drain_process() }) {
+                Ok(Some(rows)) => {
+                    reads += 1;
+                    for (key, per_cpu) in rows {
+                        let (exec, exit, fork) = gse_agent_ebpf::sum_process(&per_cpu);
+                        if exec + exit + fork == 0 {
+                            continue;
+                        }
+                        process_events += exec + exit + fork;
+                        println!(
+                            "进程 pid={} cgroup={} comm={:?} exec={exec} exit={exit} fork={fork}",
+                            key.pid,
+                            key.cgroup_id,
+                            String::from_utf8_lossy(&key.comm)
+                                .trim_end_matches('\0')
+                                .to_string(),
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(reason) => {
+                    eprintln!("读取进程快照失败：{reason}");
+                    return ExitCode::from(4);
+                }
+            }
+            continue;
+        }
+        match runtime.block_on(async { source.drain() }) {
             Ok(rows) => {
                 reads += 1;
-                if rows.is_empty() {
-                    continue;
-                }
                 for (key, per_cpu) in rows {
                     let view = gse_agent_ebpf::view_per_cpu(&per_cpu);
-                    total += view.connections;
+                    connections += view.connections;
+                    retrans += view.tcp_retrans;
+                    resets += view.tcp_resets;
                     println!(
                         "键 pid={} cgroup={} {}:{} -> {}:{} proto={} 连接={} 失败={} 发={} 收={} 重传={}",
                         key.pid,
@@ -250,13 +281,20 @@ fn main() -> ExitCode {
         }
     }
 
-    println!("读快照 {reads} 次，累计连接数 {total}");
-    if total == 0 {
-        eprintln!(
-            "警告：全程没有采到连接。检查是否真的产生了流量、是否被回环/端口过滤掉\
-             （自测时加 --include-loopback），以及 tracepoint 字段偏移是否与内核匹配。"
-        );
-        return ExitCode::from(4);
+    println!(
+        "读快照 {reads} 次：新建连接 {connections}，重传 {retrans}，RST {resets}，进程事件 {process_events}"
+    );
+    // 判定标准按采集项区分：重传/RST 本来就稀少，进程事件在空闲机器上也可能为 0，
+    // 因此只有 `ebpf_network` 把「一条连接都没采到」当作失败（它最容易踩过滤与偏移问题）。
+    match args.kind {
+        EbpfItemKind::Network if connections == 0 => {
+            eprintln!(
+                "警告：全程没有采到连接。检查是否真的产生了流量、是否被回环/端口过滤掉\
+                 （自测时加 --include-loopback），以及 tracepoint 字段偏移是否与内核匹配。"
+            );
+            return ExitCode::from(4);
+        }
+        _ => {}
     }
     println!("检查点通过：加载、挂载、差分读取都正常");
     ExitCode::SUCCESS

@@ -200,8 +200,8 @@ pub enum CfgIndex {
     IncludeLoopback,
     /// 是否输出原始事件到 RingBuf（0/1）。
     RawEventsEnabled,
-    /// 令牌桶速率（每秒事件数）；0 表示不限制。
-    RateLimitPerSec,
+    /// 令牌桶每刻度补充的令牌数（用户态由速率换算，内核只做乘法）；0 表示不限制。
+    RateLimitTokensPerTick,
     /// 令牌桶容量（突发上限）。
     RateLimitBurst,
     /// 单位：`u64` 槽位数量占位，便于后续扩展时保持枚举稳定。
@@ -211,28 +211,62 @@ pub enum CfgIndex {
 /// `CFG` map 的长度（下标上限，留余量便于向后兼容追加）。
 pub const CFG_LEN: u32 = 64;
 
+/// 令牌桶的时间刻度：一次补充的最小粒度是 `1 << TOKEN_TICK_SHIFT` 纳秒（约 1.05 毫秒）。
+///
+/// **为什么用移位而不是除法**：BPF 目标没有 64 位除法指令，LLVM 会把「u64 常量除法」优化成
+/// 128 位乘法，从而引用 `__multi3`（compiler_builtins）—— 这个符号在对象里是未定义的，
+/// aya 加载时会在函数重定位阶段直接失败（实测报 `error relocating function`）。
+/// 因此内核态一律用移位与乘法，刻度由用户在宿主机侧换算。
+pub const TOKEN_TICK_SHIFT: u32 = 20;
+
+/// 1 秒对应的补充分段数（`1e9 >> TOKEN_TICK_SHIFT`）。
+pub const TOKEN_TICKS_PER_SEC: u64 = 1_000_000_000 >> TOKEN_TICK_SHIFT;
+
+/// 由「每秒事件数」换算「每个刻度补充多少令牌」（用户态调用，见 `cfg`）。
+///
+/// 除不尽时向上取整，避免速率被系统性低估。
+#[must_use]
+pub const fn tokens_per_tick(rate_per_sec: u64) -> u64 {
+    let ticks = TOKEN_TICKS_PER_SEC;
+    let raw = rate_per_sec / ticks;
+    if rate_per_sec.is_multiple_of(ticks) {
+        raw
+    } else {
+        raw + 1
+    }
+}
+
 /// 令牌桶一步：返回「消费后剩余令牌」与「是否放行」。
 ///
 /// 放在共享 crate 里是为了**能在宿主机单测**：内核态只做「读 map → 调用本函数 → 写回」，
 /// 决策逻辑（含边界：首次、长时间无事件、零速率、溢出）都在这里验证。
 ///
 /// - `last_ns == 0` 视为首次：直接给满桶（避免启动瞬间按「从时间零点到现在」的超大额度放行）；
-/// - 补充速率按 `rate_per_sec` 线性计算，向上取整到整秒之外用整数除法（宁可少补，不多放）；
-/// - `rate_per_sec == 0` 由调用方判为「不限制」，不会进到这里。
+/// - 补充按 `TOKEN_TICK_SHIFT` 的刻度计算，**全程只有移位、乘法与加法**（见常量说明）；
+/// - `tokens_per_tick == 0` 由调用方判为「不限制」，不会进到这里。
 #[must_use]
 pub const fn token_bucket_step(
     tokens: u64,
     last_ns: u64,
     now_ns: u64,
-    rate_per_sec: u64,
+    tokens_per_tick: u64,
     burst: u64,
 ) -> (u64, bool) {
     let burst = if burst == 0 { 1 } else { burst };
-    let available = if last_ns == 0 {
+    let available = if last_ns == 0 || tokens_per_tick == 0 {
         burst
     } else {
         let elapsed_ns = now_ns.saturating_sub(last_ns);
-        let refill = elapsed_ns.saturating_mul(rate_per_sec) / 1_000_000_000;
+        let mut ticks = elapsed_ns >> TOKEN_TICK_SHIFT;
+        // 限幅：桶最多装 `burst` 个令牌，补充超过它没有意义。
+        // 这一步同时把乘法结果压在 `u64` 内（**不能用 `saturating_mul`**：它需要 128 位乘积
+        // 判溢出，会让对象引用未定义的 `__multi3`）。这里的除法是**运行时**除数，
+        // BPF 有原生除法指令；只有「常量除法」才会被 LLVM 优化成 128 位乘法。
+        let max_ticks = burst / tokens_per_tick + 1;
+        if ticks > max_ticks {
+            ticks = max_ticks;
+        }
+        let refill = ticks * tokens_per_tick;
         let filled = tokens.saturating_add(refill);
         // `min` 在 const fn 里还不能用（`Ord` 不是 const trait），手写比较。
         if filled > burst {
@@ -249,6 +283,8 @@ pub const fn token_bucket_step(
 }
 
 /// 由事件速率上限推导令牌桶容量：速率的 1/10，夹取到 1..=10_000。
+///
+/// **只在用户态调用**（内核态不做除法，见 [`TOKEN_TICK_SHIFT`]）。
 ///
 /// 容量太小会把正常突发（例如连接风暴）当超限丢弃；太大则失去「限流」的意义。
 #[must_use]

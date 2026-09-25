@@ -126,7 +126,7 @@ impl LoadedItem {
         }
         let mut bpf = loader
             .load(object)
-            .map_err(|e| format!("加载 eBPF 对象失败（{kind}）：{e}"))?;
+            .map_err(|e| format!("加载 eBPF 对象失败（{kind}）：{}", error_chain(&e)))?;
 
         write_cfg(&mut bpf, cfg_values)?;
 
@@ -197,6 +197,20 @@ impl LoadedItem {
             }
         }
     }
+}
+
+/// 展开错误链。
+///
+/// aya 的顶层错误（如 `error relocating function`）会把真因藏在 `source()` 里，
+/// 只打一条顶层信息时排查会绕远路（实际踩过：真因是 `__multi3` 之类的未定义符号）。
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(&format!(": {cause}"));
+        source = cause.source();
+    }
+    message
 }
 
 /// 取出令牌桶 map（不存在时返回 `None`：旧对象文件也能跑，只是没有限流计数）。

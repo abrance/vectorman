@@ -317,6 +317,23 @@ mod tests {
     }
 
     #[test]
+    fn ipv4_formatting_is_big_endian_order() {
+        // 内核态用 `u32::from_be` 归一：127.0.0.1 的主机序值是 0x7F000001。
+        assert_eq!(ipv4_of(0x7F00_0001), "127.0.0.1");
+        assert_eq!(ipv4_of(0x0A00_0005), "10.0.0.5");
+        assert_eq!(ipv4_of(0xC0A8_0101), "192.168.1.1");
+        assert_eq!(ipv4_of(0), "0.0.0.0");
+        // 端到端：内核读到的是内存里的网络序字节 [192,168,1,1]，在小端上按 u32 读是 0x0101A8C0，
+        // `u32::from_be` 归一到 0xC0A80101，格式化结果必须还是 192.168.1.1。
+        let raw_le = u32::from_le_bytes([192, 168, 1, 1]);
+        assert_eq!(ipv4_of(u32::from_be(raw_le)), "192.168.1.1");
+        assert_eq!(
+            ipv4_of(u32::from_be(u32::from_le_bytes([127, 0, 0, 1]))),
+            "127.0.0.1"
+        );
+    }
+
+    #[test]
     fn view_per_cpu_sums_copies_and_keeps_histogram_shape() {
         let mut cpu0 = ebpf_abi::ConnAggWire {
             connections: 2,
