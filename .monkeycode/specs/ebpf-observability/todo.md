@@ -97,25 +97,36 @@
 - **验收**：人为压低阈值能看到告警指标；不改变内核态丢弃逻辑。
 - **备注**：若确认不做，应把该配置项从 DTO 中移除，避免「配了没用」的误导。
 
-### TODO-6（中）`agent_ebpf_*` 自监控指标点未输出
+### TODO-6（中）`agent_ebpf_*` 自监控指标点未输出 —— ✅ 已完成
 
-- **现状**：`EbpfStats`/`EbpfSnapshot` 有 `flushes`/`edges`/`metrics`/`filtered`/`idle_keys`/
-  `read_errors`/`rate_limited` 等计数，但**只存在于内存**；需求 12.3 要求「统计并输出每项限制的
-  触发次数与被丢弃的数据量」。
-- **怎么补**：采集循环每 N 轮把快照发成 `data_type=metrics`（`agent_ebpf_*`），或在
-  `agent_ebpf_capability` 同一条记录里带 `tags.field` 区分（注意 tsink 里 field 不是序列身份，
-  多值要用 label `field`）。
-- **验收**：Prom 能查到 `agent_ebpf_rate_limited_total`、`agent_ebpf_read_errors_total` 等。
+- **原状**：`EbpfStats`/`EbpfSnapshot` 有 8 个计数（`flushes`/`edges`/`metrics`/`filtered`/`idle_keys`/
+  `read_errors`/`map_overflow_dropped`/`rate_limited`），但**只存在于内存**；需求 12.3 要求
+  「统计并输出每项限制的触发次数与被丢弃的数据量」。内核态限流、map 满、map 读失败这些
+  「出事了但没报错」的情况，只留在内存里等于运维在 Prom 上看不见，采集看起来一直「正常」。
+- **已完成**：`stats_metrics(agent_id, item_id, &snapshot)` 把快照发成 `agent_ebpf_*_total` 八条点，
+  两个采集循环（连接/进程）每轮各发一次（`record_id` 带时间戳，接入侧按 id 去重）。
+  检查点工具也调用**同一个函数**，否则工具会「验证」出假的通过（生产漏发的点，工具照样漏发）。
+- **实测**：本机真跑并在 Prom 查回 `agent_ebpf_flushes_total=3`、`agent_ebpf_metric_points_total=604`、
+  `agent_ebpf_idle_keys_total=0`（干净数据目录；见下面「本地 scratch 环境的一个坑」）。
 
-### TODO-7（中）dataserver 侧 eBPF 自监控只做了两项
+### TODO-7（中）dataserver 侧接入计数不完整 —— ✅ 已完成
 
-- **现状**：已有 `dataserver_ebpf_agg_points_total`、`dataserver_ebpf_agg_errors_total`、
-  `dataserver_ebpf_last_agg_bucket`、`dataserver_ebpf_edges_deleted_total`。
-- **欠**：需求 12.4 还要求「**批次数、边记录数、非法记录数**、限流丢弃数」。
-- **怎么补**：在接入路径按 `data_type` 计数（`dataserver_ebpf_batches_total`、
-  `dataserver_ebpf_records_total{result="accepted|invalid"}`）；这些是通用接入统计，
-  顺带也能服务 `traces`/`logs`。
-- **验收**：Prom 能查到上述计数器，且与查询接口的 `total` 对得上。
+- **原状**：已有 `vectorman_ingest_records_{accepted,failed}_total`（**没有 `data_type` 维度**，
+  因此分不出 eBPF 与 traces），加上 eBPF 聚合侧的 4 项自监控。
+- **已完成**：新增带标签的计数器 `dataserver_ingest_batches_total{data_type,status}` 与
+  `dataserver_ingest_records_total{data_type,result=accepted|invalid}`。`data_type=~"ebpf.*"`
+  即需求 12.4 的口径（批次数、边记录数、非法记录数），顺带也覆盖 traces/logs/metrics。
+  为此给 `vectorman-metrics` 加了 `inc_counter_labeled`（标签名首次固定、个数不符就丢弃而不是 panic，
+  自监控出问题不该带崩数据面；同名不可既做普通又做带标签计数器，注册表按名字唯一）。
+- **实测**：`dataserver_ingest_records_total{data_type="ebpf",result="accepted"} 1241`、
+  `{data_type="metrics",result="accepted"} 612`，与采集侧上报数一致。
+
+### 本地 scratch 环境的一个坑（排查时别误判）
+
+用同一个数据目录反复 `pkill` dataserver 后，tsink 会进入 **fail-fast**，之后所有写入都返回
+`tsink: Storage is shutting down`（**底层原因被这句话掩盖**），连原本正常的进程指标也写不进，
+很容易误判成「刚改的代码把存储搞坏了」。判断方法：换一个**全新的数据目录**再试；正常即可确认是
+本地残留状态问题。要观察 fail-fast 之前的真因，需要看底层日志而不是接口返回。
 
 ### TODO-8（低）`ebpf_edge_duration_micros` 少了 `field=max`
 

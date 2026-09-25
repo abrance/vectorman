@@ -209,6 +209,10 @@ struct Totals {
     retrans: u64,
     resets: u64,
     process_events: u64,
+    /// 差分为空被跳过的键数（与采集循环同一口径）。
+    idle_keys: u64,
+    /// 内核态令牌桶丢弃数（与采集循环同一口径）。
+    rate_limited: u64,
 }
 
 fn main() -> ExitCode {
@@ -356,6 +360,7 @@ fn main() -> ExitCode {
                     let delta = diff(previous.get(&key), &view);
                     previous.insert(key, view);
                     if is_empty(&delta) {
+                        totals.idle_keys += 1;
                         continue;
                     }
                     totals.connections += delta.connections;
@@ -409,6 +414,7 @@ fn main() -> ExitCode {
                 }
                 // 限流丢弃计数（需求 12.3 的可观测项）。
                 let limited = source.take_rate_limit_drops();
+                totals.rate_limited += limited;
                 if limited > 0 {
                     println!("本周期被限流丢弃 {limited} 个事件");
                 }
@@ -483,6 +489,36 @@ fn main() -> ExitCode {
         }
         println!("构造进程指标 {emitted} 条");
     }
+
+    // 自监控指标点：与 `run_loop`/`run_process_loop` 走同一个构造函数（否则工具会「验证」出
+    // 假的通过 —— 生产路径上漏发的点，工具也照样漏发）。
+    // 工具只填它真正统计到的项（其余为 0 而不是编造）：验证目标是「发射路径通」，
+    // 不是「把每个计数器在工具里重新实现一遍」。
+    let stats = gse_agent_ebpf::EbpfSnapshot {
+        flushes: totals.reads,
+        edges: pending_edges.len() as u64,
+        metrics: pending_metrics.len() as u64,
+        filtered: 0,
+        idle_keys: totals.idle_keys,
+        read_errors: 0,
+        map_overflow_dropped: 0,
+        rate_limited: totals.rate_limited,
+    };
+    pending_metrics.extend(gse_agent_ebpf::stats_metrics(
+        &args.agent_id,
+        &args.item_id,
+        &stats,
+    ));
+    println!(
+        "自监控：flush={} 边={} 过滤={} 空差分={} 读取失败={} map满丢弃={} 限流丢弃={}",
+        stats.flushes,
+        stats.edges,
+        stats.filtered,
+        stats.idle_keys,
+        stats.read_errors,
+        stats.map_overflow_dropped,
+        stats.rate_limited
+    );
 
     // 判定标准按采集项区分：重传/RST 本来就稀少、进程事件在空闲机器上也可能为 0，
     // 因此只有 `ebpf_network` 把「一条连接都没采到」当作失败（它最容易踩过滤与偏移问题）。
