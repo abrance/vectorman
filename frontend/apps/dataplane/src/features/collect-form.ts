@@ -24,6 +24,11 @@ export type CollectFormValues = {
   service_allowlist?: string;
   service_denylist?: string;
   attribute_allowlist?: string;
+  /// ebpf_*：采集回环（本机自测用，生产一般关）；原始事件默认关。
+  include_loopback?: boolean;
+  raw_events_enabled?: boolean;
+  /// ebpf_syscall：慢调用阈值（微秒），超过才上报慢调用原始事件。
+  slow_threshold_micros?: number;
 };
 
 export const COLLECT_KINDS: { value: CollectItemKind; label: string }[] = [
@@ -31,11 +36,24 @@ export const COLLECT_KINDS: { value: CollectItemKind; label: string }[] = [
   { value: "log_file", label: "文件日志" },
   { value: "log_k8s_stdout", label: "K8s 标准输出" },
   { value: "apm_otlp", label: "APM（OTLP trace）" },
+  { value: "ebpf_network", label: "eBPF 网络连接" },
+  { value: "ebpf_tcp", label: "eBPF TCP 异常" },
+  { value: "ebpf_process", label: "eBPF 进程生命周期" },
+  { value: "ebpf_syscall", label: "eBPF 文件与 syscall" },
 ];
 
 const DEFAULT_INTERVAL = 15;
 const DEFAULT_BATCH_MAX = 100;
 const DEFAULT_FLUSH = 5;
+/// eBPF 上报间隔缺省 10 秒（与 Agent 侧 `EbpfConfig` 的缺省一致）。
+const DEFAULT_EBPF_FLUSH = 10;
+/// syscall 慢调用阈值缺省 100ms（Agent 侧同样缺省 100_000 微秒）。
+const DEFAULT_SLOW_THRESHOLD_MICROS = 100_000;
+
+/// 是否 eBPF 采集项（决定 `collector` 里带哪些参数）。
+export function isEbpfKind(kind: CollectItemKind | string): boolean {
+  return kind.startsWith("ebpf_");
+}
 
 function positive(value: number | undefined, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
@@ -91,6 +109,20 @@ export function toCollectItemInput(values: CollectFormValues): CollectItemInput 
   let collector: Record<string, unknown>;
   if (values.kind === "metrics_host") {
     collector = { interval_secs: positive(values.interval_secs, DEFAULT_INTERVAL) };
+  } else if (isEbpfKind(values.kind)) {
+    // eBPF：内核态程序由 Agent 按采集项加载；这里只暴露最常用的几个开关，
+    // 其余（map 容量/限流/包含排除名单）用 `collector` JSON 精调（Agent 侧会夹取越界值）。
+    collector = {
+      flush_interval_secs: positive(values.flush_interval_secs, DEFAULT_EBPF_FLUSH),
+      include_loopback: values.include_loopback === true,
+      raw_events_enabled: values.raw_events_enabled === true,
+    };
+    if (values.kind === "ebpf_syscall") {
+      // 慢调用阈值：非负数（0 会被 Agent 夹到下限 1ms）。
+      collector.slow_threshold_micros = nonNegative(
+        values.slow_threshold_micros ?? DEFAULT_SLOW_THRESHOLD_MICROS,
+      );
+    }
   } else if (values.kind === "apm_otlp") {
     collector = {
       service_allowlist: splitList(values.service_allowlist),
@@ -167,5 +199,9 @@ export function toCollectFormValues(item: CollectItem): CollectFormValues {
     service_allowlist: listStr(collector, "service_allowlist"),
     service_denylist: listStr(collector, "service_denylist"),
     attribute_allowlist: listStr(collector, "attribute_allowlist"),
+    include_loopback: collector.include_loopback === true,
+    raw_events_enabled: collector.raw_events_enabled === true,
+    slow_threshold_micros:
+      num(collector, "slow_threshold_micros") ?? DEFAULT_SLOW_THRESHOLD_MICROS,
   };
 }

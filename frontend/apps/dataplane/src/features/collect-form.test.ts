@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { CollectItem } from "@vectorman/adapters";
 import {
+  COLLECT_KINDS,
   splitList,
   toCollectFormValues,
   toCollectItemInput,
@@ -137,5 +138,84 @@ describe("apm_otlp", () => {
       batch_max_records: 50,
       flush_interval_secs: 10,
     });
+  });
+});
+
+describe("ebpf", () => {
+  it("下拉里包含全部 eBPF 类型（界面能开出这些采集项）", () => {
+    const values = COLLECT_KINDS.map((k) => k.value);
+    for (const kind of ["ebpf_network", "ebpf_tcp", "ebpf_process", "ebpf_syscall"]) {
+      expect(values).toContain(kind);
+    }
+  });
+
+  it("按类型构造 collector：只带该类型相关的参数", () => {
+    const network = toCollectItemInput({
+      ...base,
+      kind: "ebpf_network",
+      flush_interval_secs: 0,
+    });
+    expect(network.collector).toEqual({
+      flush_interval_secs: 10,
+      include_loopback: false,
+      raw_events_enabled: false,
+    });
+
+    // syscall 额外带慢调用阈值（未填走缺省 100ms）。
+    const syscall = toCollectItemInput({
+      ...base,
+      kind: "ebpf_syscall",
+      flush_interval_secs: 30,
+      raw_events_enabled: true,
+      include_loopback: true,
+    });
+    expect(syscall.collector).toEqual({
+      flush_interval_secs: 30,
+      include_loopback: true,
+      raw_events_enabled: true,
+      slow_threshold_micros: 100_000,
+    });
+
+    // 其它 eBPF 类型不出现 syscall 专有字段。
+    const tcp = toCollectItemInput({ ...base, kind: "ebpf_tcp" });
+    expect(tcp.collector).not.toHaveProperty("slow_threshold_micros");
+
+    // 阈值可显式指定，且不会被当成负数。
+    const custom = toCollectItemInput({
+      ...base,
+      kind: "ebpf_syscall",
+      slow_threshold_micros: 250_000,
+    });
+    expect(custom.collector.slow_threshold_micros).toBe(250_000);
+    const negative = toCollectItemInput({
+      ...base,
+      kind: "ebpf_syscall",
+      slow_threshold_micros: -5,
+    });
+    expect(negative.collector.slow_threshold_micros).toBe(0);
+  });
+
+  it("编辑回填：eBPF 参数能读回表单", () => {
+    const item: CollectItem = {
+      item_id: "item-1",
+      agent_ids: ["a-1"],
+      name: "ebpf net",
+      kind: "ebpf_network",
+      enabled: true,
+      collector: {
+        flush_interval_secs: 20,
+        include_loopback: true,
+        raw_events_enabled: true,
+      },
+      storage: { retention_days: 3 },
+    };
+    const values = toCollectFormValues(item);
+    expect(values.kind).toBe("ebpf_network");
+    expect(values.flush_interval_secs).toBe(20);
+    expect(values.include_loopback).toBe(true);
+    expect(values.raw_events_enabled).toBe(true);
+    expect(values.slow_threshold_micros).toBe(100_000);
+    // 回填后再提交保持同一形状（round-trip）。
+    expect(toCollectItemInput(values).collector).toEqual(item.collector);
   });
 });

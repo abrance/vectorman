@@ -1,4 +1,4 @@
-import { Button, Drawer, Form, Input, InputNumber, Modal, Select, Space, Switch, Table, Tag } from "antd";
+import { Alert, Button, Drawer, Form, Input, InputNumber, Modal, Select, Space, Switch, Table, Tag } from "antd";
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import type { CollectItem } from "@vectorman/adapters";
@@ -6,6 +6,7 @@ import { formatTimestamp } from "@vectorman/primitives";
 import { useRuntime } from "../app/runtime";
 import {
   COLLECT_KINDS,
+  isEbpfKind,
   toCollectFormValues,
   type CollectFormValues,
 } from "../features/collect-form";
@@ -35,6 +36,9 @@ const DEFAULTS: CollectFormValues = {
   include_regex: "",
   exclude_regex: "",
   extract: [],
+  include_loopback: false,
+  raw_events_enabled: false,
+  slow_threshold_micros: 100_000,
 };
 
 export function CollectPage() {
@@ -345,6 +349,50 @@ export function CollectPage() {
                     </>
                   )}
                 </Form.List>
+              </>
+            )}
+
+            {isEbpfKind(kind) && (
+              <>
+                <Alert
+                  type="info"
+                  showIcon
+                  style={{ marginBottom: 12 }}
+                  message="eBPF 采集需要特权与内核支持"
+                  description="Linux + 内核 ≥ 5.8 + 可读 /sys/kernel/btf/vmlinux，并以 root（或 CAP_BPF+CAP_PERFMON）运行 Agent。不满足时只降级本采集项，Agent 上报 agent_ebpf_capability 说明原因，其它采集项照常；具体原因见「eBPF」页的能力状态卡片。边记录建议保存周期 ≥ 3 天。"
+                />
+                <Form.Item
+                  name="flush_interval_secs"
+                  label="上报间隔（秒）"
+                  tooltip="内核态按这个周期差分并上报（缺省 10 秒）"
+                >
+                  <InputNumber min={1} max={60} style={{ width: "100%" }} />
+                </Form.Item>
+                {kind === "ebpf_syscall" && (
+                  <Form.Item
+                    name="slow_threshold_micros"
+                    label="慢调用阈值（微秒）"
+                    tooltip="超过该耗时的调用会额外上报原始事件（含路径，截断 256 字节）；缺省 100000（100ms）"
+                  >
+                    <InputNumber min={0} step={1000} style={{ width: "100%" }} />
+                  </Form.Item>
+                )}
+                <Form.Item
+                  name="include_loopback"
+                  label="采集回环流量"
+                  valuePropName="checked"
+                  tooltip="生产环境一般关闭；本机自测时打开才能看到 127.0.0.1 的连接"
+                >
+                  <Switch />
+                </Form.Item>
+                <Form.Item
+                  name="raw_events_enabled"
+                  label="上报原始事件"
+                  valuePropName="checked"
+                  tooltip="连接建立/关闭、进程生命周期、慢调用等明细，按抽样比例上行；默认关闭"
+                >
+                  <Switch />
+                </Form.Item>
               </>
             )}
 
