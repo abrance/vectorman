@@ -43,19 +43,40 @@ jobs:
             sudo tee /etc/apt/sources.list.d/llvm-21.list >/dev/null
           sudo apt-get update -q
           sudo apt-get install -y -q llvm-21-dev libclang-21-dev clang-21
-          # apt.llvm.org 把 `llvm-config-21` 放在 /usr/bin，而 llvm-sys 只认
-          # `$LLVM_SYS_211_PREFIX/bin/llvm-config`，所以补一个链接。
-          sudo mkdir -p /usr/lib/llvm-21/bin
-          sudo ln -sf /usr/bin/llvm-config-21 /usr/lib/llvm-21/bin/llvm-config
+          # bpf-linker 的 build.rs 自己找 LLVM：优先 `LLVM_PREFIX`，否则在 **PATH** 上找
+          # 不带版本后缀的 `llvm-config`（apt.llvm.org 提供的是 `llvm-config-21`）。
+          # 这里把版本化目录加进 PATH，链里就不需要造符号链接。
+          echo "/usr/lib/llvm-21/bin" >> "$GITHUB_PATH"
           /usr/lib/llvm-21/bin/llvm-config --version
       - name: Install bpf-linker
         env:
+          # llvm-sys（bpf-linker 的依赖）认这个；bpf-linker 自己的 build.rs 另认 LLVM_PREFIX。
           LLVM_SYS_211_PREFIX: /usr/lib/llvm-21
+          LLVM_PREFIX: /usr/lib/llvm-21
         run: cargo install bpf-linker --no-default-features --features llvm-21
       - name: Install nightly toolchain
         run: rustup toolchain install nightly --profile minimal --component rust-src
       - name: Build eBPF object files
         run: scripts/build-ebpf.sh
+      - name: Inspect object files
+        run: |
+          set -euo pipefail
+          section() { llvm-readelf -S "$1" | grep -o "$2" | head -1; }
+          # 每个对象必须真的有对应类型的程序段与 map 段，否则「编出来了」不等于「能用」。
+          for spec in "network:kretprobe:network.o" "network:tracepoint:network.o" \
+                      "tcp:kretprobe:tcp.o" "process:tracepoint:process.o"; do
+            kind="${spec%%:*}"; rest="${spec#*:}"; want="${rest%%:*}"; file="packaging/ebpf/${rest#*:}"
+            found="$(section "$file" "$want" || true)"
+            if [[ -z "$found" ]]; then
+              echo "缺少 $kind 的 $want 程序段：$file" >&2
+              llvm-readelf -S "$file" >&2
+              exit 1
+            fi
+            echo "$file 含 $want 段"
+          done
+          for file in packaging/ebpf/*.o; do
+            llvm-readelf -S "$file" | grep -q "\.maps" || { echo "$file 缺少 .maps 段" >&2; exit 1; }
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: ebpf-objects
