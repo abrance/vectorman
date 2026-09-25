@@ -55,7 +55,7 @@
   边表真实行（`unknown-<ip>`）、切到事件视图并点查询后拿到原始事件（事件类型渲染成中文标签）。
   不设 `VITE_E2E_URL` 时整体跳过（CI 保持绿），设了就真打真实服务。
 - **实测**：本机起 dataserver + 真采集（边 + 原始事件）后 **2/2 通过**；不带环境变量时
-  `46 passed | 2 skipped`。
+  该 app 的 `49 passed | 2 skipped`（含后续新增的采集项类型用例）。
 - **过程中踩到的三件事**（都写进了用例注释，避免下次重复）：
   1. jsdom 的 `AbortController/AbortSignal` 与 Node `fetch`(undici) **不是同一个类**，直接传会报
      `Expected signal to be an instance of AbortSignal` → 测试里注入一个去掉 `signal` 的 fetch 包装

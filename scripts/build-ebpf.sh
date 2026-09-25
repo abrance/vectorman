@@ -52,8 +52,21 @@ done
 # （需要 128 位乘积判溢出），都会引用 compiler_builtins 的 `__multi3`。这种对象能编出来，
 # 但 aya 加载时会在函数重定位阶段失败（`error relocating function`），排查成本高。
 # 在构建期就挡住，比在目标机上发现便宜得多。
+#
+# 读符号的工具：优先 llvm-readelf（LLVM 工具链自带），退到 GNU readelf（binutils，几乎必有）。
+# **必须有**：两者都缺时明确报错退出，而不是让 `set -e` 静默失败 —— 之前没接 `| tail` 时
+# 才会看到「脚本莫名退出码 1」，接了管道还会被 tail 的退出码掩盖（本地打包就踩过）。
+if command -v llvm-readelf >/dev/null 2>&1; then
+    readelf_bin="llvm-readelf"
+elif command -v readelf >/dev/null 2>&1; then
+    readelf_bin="readelf"
+else
+    echo "错误：需要 llvm-readelf 或 GNU readelf 来检查未定义符号（装 binutils 或 LLVM 工具链）。" >&2
+    exit 1
+fi
+
 for bin in network tcp process syscall; do
-    undefined="$(llvm-readelf -s "$out_dir/$bin.o" 2>/dev/null |
+    undefined="$("$readelf_bin" -s "$out_dir/$bin.o" 2>/dev/null |
         awk '$4=="FUNC" && $7=="UND" {print $8}' | tr '\n' ' ')"
     if [[ -n "$undefined" ]]; then
         echo "错误：$out_dir/$bin.o 引用了未定义的函数符号：$undefined" >&2
