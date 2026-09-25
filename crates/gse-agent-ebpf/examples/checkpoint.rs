@@ -264,7 +264,8 @@ fn main() -> ExitCode {
             return ExitCode::from(3);
         }
     };
-    let loaded = match LoadedItem::load(args.kind, &object, &config, &cfg) {
+    // 检查点工具不带 k8s 凭据，Pod 名反查不启用（退回 uid）。
+    let loaded = match LoadedItem::load(args.kind, &object, &config, &cfg, None) {
         Ok(loaded) => loaded,
         Err(reason) => {
             eprintln!("加载/挂载失败：{reason}");
@@ -360,10 +361,13 @@ fn main() -> ExitCode {
                     totals.connections += delta.connections;
                     totals.retrans += delta.tcp_retrans;
                     totals.resets += delta.tcp_resets;
-                    let context = resolver.resolve(key.pid).map(|info| ProcessContext {
-                        process_name: info.process_name,
-                        container_id: info.container_id,
-                        pod_name: info.pod_uid,
+                    let context = resolver.resolve(key.pid).map(|info| {
+                        let pod_name = info.pod_label();
+                        ProcessContext {
+                            process_name: info.process_name,
+                            container_id: info.container_id,
+                            pod_name,
+                        }
                     });
                     // 与 `run_loop` 完全相同的记录构造路径（服务名留空，由 dataserver 反查）。
                     if let Some(record) = edge_record(
@@ -397,6 +401,7 @@ fn main() -> ExitCode {
                             .map(|c| describe(&gse_agent_ebpf::cgroup::ContainerInfo {
                                 container_id: c.container_id.clone(),
                                 pod_uid: c.pod_name.clone(),
+                                pod_name: String::new(),
                                 process_name: c.process_name.clone(),
                             }))
                             .unwrap_or_else(|| "未反查到".to_string()),

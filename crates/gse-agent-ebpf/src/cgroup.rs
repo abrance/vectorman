@@ -7,10 +7,12 @@
 //! 成本高且脆弱。而连接键与进程键里**已经带了 `pid`**，直接从 `/proc/<pid>/cgroup`
 //! 读路径即可 —— 同一个 pid 一生只查一次并缓存，代价可忽略。
 //!
-//! 代价与边界：
-//! - 进程已退出时 `/proc/<pid>` 不存在 → 拿不到容器信息（边缘事件可能缺），按空处理；
-//! - Pod **名**需要 k8s 侧的数据（`pod<uid>` 只给出 uid），因此这里只解出 `pod_uid`，
-//!   Pod 名由 `/v1/apm/services` 侧的端点表或后续 k8s 采集补齐。
+//! - Pod **名**：`/proc/<pid>/cgroup` 只能给出 Pod **uid**，名称要通过 Kubernetes API 反查
+//!   （`uid → name`）。因此本模块支持注入一个**索引加载器**（由调用方提供，见
+//!   [`ProcessResolver::with_pod_names`]）：只在真正遇到 Pod uid 时按 TTL 拉一次全量索引，
+//!   k8s 不可用时退回 uid（`src_pod` 语义与加索引前一致，不会有回归）。
+
+use std::sync::Arc;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -23,6 +25,8 @@ pub struct ContainerInfo {
     pub container_id: String,
     /// Pod uid（k8s 形态下从 `pod<uid>` 解出，其他形态为空）。
     pub pod_uid: String,
+    /// Pod 名（k8s API 反查得到；未启用或查不到时为空）。
+    pub pod_name: String,
     /// 进程名（读 `/proc/<pid>/comm`，用于 `process_include/exclude` 过滤）。
     pub process_name: String,
 }
@@ -32,6 +36,17 @@ impl ContainerInfo {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.container_id.is_empty() && self.pod_uid.is_empty() && self.process_name.is_empty()
+    }
+
+    /// `src_pod` 用哪个值：优先 Pod **名**（dataserver 的端点表是按名字匹配的），
+    /// 反查不到时退回 uid —— 退回时与「没有 k8s 索引」的行为完全一致，不是回归。
+    #[must_use]
+    pub fn pod_label(&self) -> String {
+        if self.pod_name.is_empty() {
+            self.pod_uid.clone()
+        } else {
+            self.pod_name.clone()
+        }
     }
 }
 
@@ -146,7 +161,18 @@ pub struct ProcessResolver {
     max_entries: usize,
     cache: HashMap<u32, (Instant, ContainerInfo)>,
     proc_root: PathBuf,
+    /// `uid → Pod 名` 的全量索引加载器（由调用方注入；`None` 表示不做名称反查）。
+    pod_names: Option<PodNameLoader>,
+    /// 已加载的索引与加载时刻（按 [`POD_INDEX_TTL`] 过期）。
+    pod_index: HashMap<String, String>,
+    pod_index_at: Option<Instant>,
 }
+
+/// Pod 名索引加载器：一次全量 `uid → name`（失败返回 Err，调用方退回 uid）。
+pub type PodNameLoader = Arc<dyn Fn() -> Result<HashMap<String, String>, String> + Send + Sync>;
+
+/// 索引 TTL。Pod 名几乎不变，拉一次能用很久；太短是白白打 apiserver。
+const POD_INDEX_TTL: Duration = Duration::from_secs(300);
 
 impl ProcessResolver {
     #[must_use]
@@ -156,7 +182,27 @@ impl ProcessResolver {
             max_entries: max_entries.max(1),
             cache: HashMap::new(),
             proc_root: PathBuf::from("/proc"),
+            pod_names: None,
+            pod_index: HashMap::new(),
+            pod_index_at: None,
         }
+    }
+
+    /// 注入 Pod 名索引加载器（`uid → name`）。
+    ///
+    /// **只在必要时调用**：解析过程中遇到 Pod uid 且索引过期时才加载一次，
+    /// 宿主机进程（无 Pod uid）与没有 k8s 的机器都不会触发。
+    #[must_use]
+    pub fn with_pod_names(mut self, loader: PodNameLoader) -> Self {
+        self.pod_names = Some(loader);
+        self
+    }
+
+    /// 同 [`ProcessResolver::with_pod_names`]，但接受 `Option`（调用方直接透传配置）。
+    #[must_use]
+    pub fn with_pod_names_opt(mut self, loader: Option<PodNameLoader>) -> Self {
+        self.pod_names = loader;
+        self
     }
 
     /// 测试用：替换 `/proc` 根目录。
@@ -176,10 +222,8 @@ impl ProcessResolver {
                 return Some(info.clone());
             }
         }
-        let info = self.read_proc(pid)?;
-        if info.is_empty() {
-            return None;
-        }
+        let mut info = self.read_proc(pid)?;
+        self.fill_pod_name(&mut info);
         // 简单容量保护：满了就整体清空（条目数远小于进程数，不做 LRU）。
         if self.cache.len() >= self.max_entries {
             self.cache.clear();
@@ -192,6 +236,43 @@ impl ProcessResolver {
     #[must_use]
     pub fn cached(&self) -> usize {
         self.cache.len()
+    }
+
+    /// 当前已加载的 Pod 名索引条目数（自监控）。
+    #[must_use]
+    pub fn pod_index_len(&self) -> usize {
+        self.pod_index.len()
+    }
+
+    /// 用 k8s 索引补 Pod 名。
+    ///
+    /// 索引按 TTL 失效；加载失败**不报错也不清空旧索引**（旧名字比没有名字有用），
+    /// 只是把加载时刻推后，避免每个 pid 都去打一次 apiserver。
+    fn fill_pod_name(&mut self, info: &mut ContainerInfo) {
+        if info.pod_uid.is_empty() {
+            return;
+        }
+        let Some(loader) = self.pod_names.clone() else {
+            return;
+        };
+        let stale = self
+            .pod_index_at
+            .is_none_or(|at| at.elapsed() >= POD_INDEX_TTL);
+        if stale {
+            match loader() {
+                Ok(index) => {
+                    self.pod_index = index;
+                    self.pod_index_at = Some(Instant::now());
+                }
+                Err(reason) => {
+                    eprintln!("gse-agent: Pod 名索引加载失败，退回 uid：{reason}");
+                    self.pod_index_at = Some(Instant::now());
+                }
+            }
+        }
+        if let Some(name) = self.pod_index.get(&info.pod_uid) {
+            info.pod_name = name.clone();
+        }
     }
 
     fn read_proc(&self, pid: u32) -> Option<ContainerInfo> {
@@ -207,14 +288,19 @@ impl ProcessResolver {
     }
 }
 
-/// 便于日志/自监控的展示。
+/// 便于日志/自监控的展示（Pod 优先显示名字，名字未知才显示 uid 前缀）。
 #[must_use]
 pub fn describe(info: &ContainerInfo) -> String {
-    match (info.container_id.as_str(), info.pod_uid.as_str()) {
+    let pod = if !info.pod_name.is_empty() {
+        info.pod_name.clone()
+    } else {
+        short(&info.pod_uid)
+    };
+    match (info.container_id.as_str(), pod.as_str()) {
         ("", "") => "host".to_string(),
         (id, "") => format!("container:{}", short(id)),
-        ("", uid) => format!("pod:{}", short(uid)),
-        (id, uid) => format!("pod:{} container:{}", short(uid), short(id)),
+        ("", _) => format!("pod:{pod}"),
+        (id, _) => format!("pod:{pod} container:{}", short(id)),
     }
 }
 
@@ -334,9 +420,10 @@ mod tests {
 
     #[test]
     fn describe_and_short_are_readable() {
-        let info = ContainerInfo {
+        let mut info = ContainerInfo {
             container_id: "6a3f2b1c9d8e7f6a".repeat(4),
             pod_uid: "9f8e7d6c-5b4a-3210-9f8e-7d6c5b4a3210".into(),
+            pod_name: String::new(),
             process_name: "java".into(),
         };
         let text = describe(&info);
@@ -344,5 +431,82 @@ mod tests {
         assert!(text.contains("container:6a3f2b1c9d8e"), "{text}");
         assert_eq!(describe(&ContainerInfo::default()), "host");
         assert_eq!(short("6a3f2b1c9d8e7f6a"), "6a3f2b1c9d8e");
+
+        // 有 Pod 名时展示名字；`pod_label()` 也优先用名字。
+        info.pod_name = "order-api-7c9f".into();
+        assert_eq!(describe(&info), "pod:order-api-7c9f container:6a3f2b1c9d8e");
+        assert_eq!(info.pod_label(), "order-api-7c9f");
+        info.pod_name.clear();
+        assert_eq!(info.pod_label(), "9f8e7d6c-5b4a-3210-9f8e-7d6c5b4a3210");
+    }
+
+    /// Pod 名反查：只在遇到 Pod uid 时按 TTL 拉一次索引；失败退回 uid。
+    #[test]
+    fn resolver_fills_pod_name_from_injected_index() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const CGROUP: &str = "0::/kubepods.slice/kubepods-burstable.slice/\
+            kubepods-burstable-pod9f8e7d6c-5b4a-3210-9f8e-7d6c5b4a3210.slice/\
+            cri-containerd-6a3f2b1c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a.scope\n";
+        const UID: &str = "9f8e7d6c-5b4a-3210-9f8e-7d6c5b4a3210";
+
+        let dir = tempfile::tempdir().unwrap();
+        for pid in [4242, 4243] {
+            let pid_dir = dir.path().join(pid.to_string());
+            std::fs::create_dir_all(&pid_dir).unwrap();
+            std::fs::write(pid_dir.join("cgroup"), CGROUP).unwrap();
+            std::fs::write(pid_dir.join("comm"), "java\n").unwrap();
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let loader_calls = calls.clone();
+        let loader_calls2 = calls.clone();
+        let mut resolver = ProcessResolver::new(60, 8)
+            .with_proc_root(dir.path())
+            .with_pod_names(Arc::new(move || {
+                loader_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(HashMap::from([(UID.to_string(), "order-api-7c9f".into())]))
+            }));
+
+        let info = resolver.resolve(4242).expect("解析成功");
+        assert_eq!(info.pod_name, "order-api-7c9f");
+        assert_eq!(info.pod_label(), "order-api-7c9f");
+        assert_eq!(resolver.pod_index_len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // 同一 uid 的第二个 pid：复用已加载的索引，不再打 apiserver。
+        let info = resolver.resolve(4243).expect("解析成功");
+        assert_eq!(info.pod_name, "order-api-7c9f");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "索引只加载一次");
+
+        // 加载失败：不报错，退回 uid（与没有索引时行为一致）。
+        let mut failing = ProcessResolver::new(60, 8)
+            .with_proc_root(dir.path())
+            .with_pod_names(Arc::new(|| Err("apiserver 不可达".to_string())));
+        let info = failing.resolve(4242).expect("解析成功");
+        assert!(info.pod_name.is_empty());
+        assert_eq!(info.pod_label(), UID);
+
+        // 未注入加载器：完全不反查（宿主机与非 k8s 环境零开销）。
+        let mut plain = ProcessResolver::new(60, 8).with_proc_root(dir.path());
+        let info = plain.resolve(4242).expect("解析成功");
+        assert!(info.pod_name.is_empty());
+        assert_eq!(info.pod_label(), UID);
+
+        // 宿主机进程（无 Pod uid）不会触发索引加载。
+        let host_dir = tempfile::tempdir().unwrap();
+        let pid_dir = host_dir.path().join("77");
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        std::fs::write(pid_dir.join("cgroup"), "0::/user.slice/user-1000.slice\n").unwrap();
+        let before = calls.load(Ordering::SeqCst);
+        let mut host = ProcessResolver::new(60, 8)
+            .with_proc_root(host_dir.path())
+            .with_pod_names(Arc::new(move || {
+                loader_calls2.fetch_add(1, Ordering::SeqCst);
+                Ok(HashMap::new())
+            }));
+        let info = host.resolve(77).expect("解析成功");
+        assert!(info.pod_label().is_empty(), "宿主机进程没有 Pod 标签");
+        assert_eq!(calls.load(Ordering::SeqCst), before, "宿主机不拉索引");
     }
 }

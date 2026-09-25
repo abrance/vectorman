@@ -17,7 +17,7 @@ use aya::Ebpf;
 use crate::aggregate::{ConnKey, ProcessContext};
 use crate::attach::{AttachPlan, AttachPoint, EbpfItemKind};
 use crate::cfg::CfgValues;
-use crate::cgroup::ProcessResolver;
+use crate::cgroup::{PodNameLoader, ProcessResolver};
 use crate::config::EbpfConfig;
 use crate::{ConnSnapshot, MapSource, ProcSnapshot};
 use ebpf_abi::{ConnAggWire, ProcAggWire, ProcKey};
@@ -102,17 +102,22 @@ pub struct LoadedItem {
     bpf: Option<Ebpf>,
     /// 已挂载的程序名（排障与断言用）。
     attached: Vec<String>,
+    /// Pod 名索引加载器（透传给反查器）。
+    pod_names: Option<PodNameLoader>,
 }
 
 impl LoadedItem {
     /// 加载对象文件并挂载计划里的全部程序。
     ///
     /// `object` 是 `packaging/ebpf/<kind>.o` 的字节。
+    /// `pod_names` 是 Pod 名索引加载器（`uid → name`，由 Agent 注入 k8s 反查；`None` 表示
+    /// 不做名称反查，`src_pod` 退回 uid）。
     pub fn load(
         kind: EbpfItemKind,
         object: &[u8],
         config: &EbpfConfig,
         cfg_values: &CfgValues,
+        pod_names: Option<PodNameLoader>,
     ) -> Result<Self, String> {
         if object.is_empty() {
             return Err(format!(
@@ -145,6 +150,7 @@ impl LoadedItem {
             kind,
             bpf: Some(bpf),
             attached,
+            pod_names,
         })
     }
 
@@ -166,6 +172,7 @@ impl LoadedItem {
     /// 取出 per-CPU 聚合 map 作为差分源（顺带把 `Ebpf` 的所有权带过去，避免 map 失效）。
     pub fn into_map_source(mut self) -> Result<AyaMapSource, String> {
         let kind = self.kind;
+        let pod_names = self.pod_names.take();
         let map_name = AttachPlan::aggregate_map(kind);
         let mut bpf = self.bpf.take().ok_or_else(|| "采集项已卸载".to_string())?;
         let map = bpf
@@ -183,7 +190,8 @@ impl LoadedItem {
                     map,
                     cpus,
                     rate,
-                    resolver: ProcessResolver::new(PROCESS_CACHE_TTL_SECS, MAX_PROCESS_CACHE),
+                    resolver: ProcessResolver::new(PROCESS_CACHE_TTL_SECS, MAX_PROCESS_CACHE)
+                        .with_pod_names_opt(pod_names.clone()),
                 })))
             }
             EbpfItemKind::Process => {
@@ -199,7 +207,8 @@ impl LoadedItem {
                     map,
                     cpus,
                     rate,
-                    resolver: ProcessResolver::new(PROCESS_CACHE_TTL_SECS, MAX_PROCESS_CACHE),
+                    resolver: ProcessResolver::new(PROCESS_CACHE_TTL_SECS, MAX_PROCESS_CACHE)
+                        .with_pod_names_opt(pod_names.clone()),
                     events,
                 })))
             }
@@ -454,10 +463,12 @@ impl MapSource for AyaMapSource {
             Self::Conn(source) => source.resolver.resolve(pid),
             Self::Process(source) => source.resolver.resolve(pid),
         }?;
+        // 有 Pod 名就用名字（dataserver 的端点表按名字匹配），没有才退回 uid。
+        let pod_name = info.pod_label();
         Some(ProcessContext {
             process_name: info.process_name,
             container_id: info.container_id,
-            pod_name: info.pod_uid,
+            pod_name,
         })
     }
 }
@@ -484,7 +495,7 @@ mod tests {
     fn missing_object_reports_build_hint() {
         let config = EbpfConfig::default();
         let cfg = CfgValues::from_slots(vec![0u64; ebpf_abi::CFG_LEN as usize]).unwrap();
-        let err = match LoadedItem::load(EbpfItemKind::Network, &[], &config, &cfg) {
+        let err = match LoadedItem::load(EbpfItemKind::Network, &[], &config, &cfg, None) {
             Ok(_) => panic!("空对象文件必须失败"),
             Err(err) => err,
         };

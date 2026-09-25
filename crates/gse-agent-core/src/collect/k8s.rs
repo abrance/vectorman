@@ -22,6 +22,8 @@ use super::CollectShared;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PodSummary {
     pub name: String,
+    /// `metadata.uid`（eBPF 侧的 cgroup 只给 uid，需要它反查 Pod 名）。
+    pub uid: String,
     pub containers: Vec<String>,
 }
 
@@ -37,6 +39,11 @@ pub fn parse_pods(v: &Value) -> Vec<PodSummary> {
                 .pointer("/metadata/name")
                 .and_then(|x| x.as_str())?
                 .to_string();
+            let uid = item
+                .pointer("/metadata/uid")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string();
             let containers = item
                 .pointer("/spec/containers")
                 .and_then(|x| x.as_array())
@@ -46,9 +53,39 @@ pub fn parse_pods(v: &Value) -> Vec<PodSummary> {
                         .collect()
                 })
                 .unwrap_or_default();
-            Some(PodSummary { name, containers })
+            Some(PodSummary {
+                name,
+                uid,
+                containers,
+            })
         })
         .collect()
+}
+
+/// `uid → Pod 名` 索引（eBPF 的 cgroup 反查用：`/proc/<pid>/cgroup` 只给 uid）。
+///
+/// 没有 uid 的条目跳过：空键会把所有 Pod 混成一条。
+#[must_use]
+pub fn pod_name_index(pods: &[PodSummary]) -> HashMap<String, String> {
+    pods.iter()
+        .filter(|p| !p.uid.is_empty())
+        .map(|p| (p.uid.clone(), p.name.clone()))
+        .collect()
+}
+
+/// 拉取一次 Pod 名索引（供 eBPF 的 Pod 名反查使用）。
+///
+/// `namespace` 为空时列全部命名空间（eBPF 采集面向整机，不该被单个命名空间限制）。
+/// 凭据解析失败或接口不可达都返回 `Err`，调用方退回 uid 即可（不致命）。
+pub fn list_pod_name_index(cfg: &CollectorConfig) -> Result<HashMap<String, String>, String> {
+    let cred = kubeconfig::resolve(&cfg.kubeconfig)?;
+    let client = K8sClient::new(cred.base_url, cred.token);
+    let pods = if cfg.namespace.trim().is_empty() {
+        client.list_pods("")?
+    } else {
+        client.list_pods(cfg.namespace.trim())?
+    };
+    Ok(pod_name_index(&pods))
 }
 
 /// 按 Pod 名 glob 与容器配置选出要 follow 的 `(pod, container)`。
@@ -114,9 +151,13 @@ impl K8sClient {
         }
     }
 
-    /// `GET /api/v1/namespaces/{ns}/pods`。
+    /// `GET /api/v1/namespaces/{ns}/pods`；`namespace` 为空时列全部命名空间。
     pub fn list_pods(&self, namespace: &str) -> Result<Vec<PodSummary>, String> {
-        let path = format!("/api/v1/namespaces/{namespace}/pods");
+        let path = if namespace.trim().is_empty() {
+            "/api/v1/pods".to_string()
+        } else {
+            format!("/api/v1/namespaces/{namespace}/pods")
+        };
         let resp = self
             .get(&path)
             .call()
@@ -319,8 +360,106 @@ mod tests {
     fn pod(name: &str, containers: &[&str]) -> PodSummary {
         PodSummary {
             name: name.to_string(),
+            uid: String::new(),
             containers: containers.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    /// `uid → name` 索引：eBPF 的 cgroup 只给 uid，Pod 名要靠它反查。
+    #[test]
+    fn parse_pods_reads_uids_and_builds_index() {
+        let v = serde_json::json!({
+            "items": [
+                {"metadata": {"name": "order-api-1", "uid": "uid-1"}, "spec": {"containers": [{"name": "app"}]}},
+                {"metadata": {"name": "web-1", "uid": "uid-2"}, "spec": {"containers": [{"name": "app"}]}},
+                // 没有 uid 的条目要跳过：空键会把所有 Pod 混成一条。
+                {"metadata": {"name": "no-uid"}, "spec": {"containers": [{"name": "app"}]}}
+            ]
+        });
+        let pods = parse_pods(&v);
+        assert_eq!(pods.len(), 3);
+        assert_eq!(pods[0].uid, "uid-1");
+        let index = pod_name_index(&pods);
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.get("uid-1").map(String::as_str), Some("order-api-1"));
+        assert_eq!(index.get("uid-2").map(String::as_str), Some("web-1"));
+        assert!(!index.contains_key(""), "无 uid 的条目不进索引");
+        // 缺 metadata.uid 时字段为空而不是解析失败。
+        assert_eq!(pods[2].uid, "");
+    }
+
+    /// `list_pod_name_index` 全链路：kubeconfig → apiserver → `uid → Pod 名`。
+    ///
+    /// 这条链是 eBPF 的 Pod 名反查的实际入口（本机没有 k8s，用假 apiserver 覆盖）。
+    #[test]
+    fn list_pod_name_index_end_to_end() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let body = r#"{"items":[
+                    {"metadata":{"name":"order-api-1","uid":"uid-1"},"spec":{"containers":[{"name":"app"}]}},
+                    {"metadata":{"name":"web-1","uid":"uid-2"},"spec":{"containers":[{"name":"app"}]}}
+                ]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let path = std::env::temp_dir().join(format!(
+            "vectorman-k8s-{}-{}.yaml",
+            std::process::id(),
+            addr.port()
+        ));
+        std::fs::write(&path, format!("server: \"http://{addr}\"\ntoken: t\n")).unwrap();
+        let cfg = CollectorConfig {
+            kubeconfig: path.to_string_lossy().to_string(),
+            ..CollectorConfig::default()
+        };
+        let index = list_pod_name_index(&cfg);
+        let _ = std::fs::remove_file(&path);
+        let index = index.expect("索引应加载成功");
+        assert_eq!(index.get("uid-1").map(String::as_str), Some("order-api-1"));
+        assert_eq!(index.get("uid-2").map(String::as_str), Some("web-1"));
+    }
+
+    /// 空命名空间走集群级路径（eBPF 采集面向整机，不该被单个命名空间限制）。
+    #[test]
+    fn list_pods_without_namespace_uses_cluster_path() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(String::new()));
+        let seen_in_thread = seen.clone();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+                *seen_in_thread.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body =
+                    r#"{"items":[{"metadata":{"name":"a","uid":"u1"},"spec":{"containers":[]}}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        let client = K8sClient::new(format!("http://{addr}"), "");
+        let pods = client.list_pods("").expect("list pods");
+        assert_eq!(
+            pod_name_index(&pods).get("u1").map(String::as_str),
+            Some("a")
+        );
+        assert!(
+            seen.lock().unwrap().starts_with("GET /api/v1/pods "),
+            "空命名空间应请求 /api/v1/pods：{}",
+            seen.lock().unwrap()
+        );
     }
 
     #[test]
