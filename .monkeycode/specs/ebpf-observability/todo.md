@@ -56,17 +56,19 @@
   打开 `/ebpf` → 断言能力状态卡片、边表出现真实行 → 切到事件视图 → 断言有事件与时间格式。
 - **验收**：截图 + 断言通过；发现的前后端字段不一致问题修掉（本轮已修两个同类问题，见 PR #60）。
 
-### TODO-3（中）进程指标的 `service` 维度未补齐（5.9 剩余部分）
+### TODO-3（中）进程指标的 `service` 维度未补齐（5.9 剩余部分）—— ✅ 已完成
 
-- **现状**：`ebpf_process_*` 带 `pid`/`cgroup_id`/`process_name`/`container_id`/`pod_uid`；
+- **原状**：`ebpf_process_*` 带 `pid`/`cgroup_id`/`process_name`/`container_id`/`pod_uid`；
   共享模型要求 `service`/`container_id`，`service` 仍缺（dataserver 侧未填）。
-- **为什么欠**：填 `service` 需要 dataserver 在接入 `data_type=metrics` 时做一次归一
-  （静态映射 `process_name`/`process_prefix`），当前 metrics 路径没有钩子。
-- **怎么补**：给 `data_type=metrics` 增加与 `TraceSink`/`EdgeSink` 同形的 `MetricSink` 钩子，
-  **只处理 `ebpf_process_*`**（其余原样透传，避免在热路径上引入无谓的 async 开销），
-  复用 `AliasCache` 解析 `process_name → service`。
-- **验收**：Prom 查询 `ebpf_process_exec_total` 的序列带非空 `service`；非 eBPF 指标行为不变
-  （用现有 metrics 用例回归）。
+- **已完成**：给 `data_type=metrics` 增加与 `TraceSink`/`EdgeSink` 同形的 `MetricSink` 钩子
+  （新文件 `crates/dataplane-ingest/src/metric.rs`），`ApmSink` 实现它并用 `AliasCache`
+  按 `process_name`/`process_prefix` 归一服务名。三个出口在模块内打包成私有 `Sinks` 结构传递
+  （否则 `apply_one` 参数超 clippy 阈值）。**sink 不返回错误**：补维度是尽力而为，失败不能丢指标；
+  未命中填 `unknown-<process_name>`（与边记录 `unknown-<ip>` 同约定）。
+- **实测**（本机 dataserver + 真采集）：建映射 `true→coreutils`、`sleep→sleeper` 后上报，
+  Prom 查询 `ebpf_process_exec_total{service="coreutils"}` 命中 58 条序列（`process_name="true"`）、
+  `{service="sleeper"}` 59 条（`process_name="sleep"`）；未映射的进程为 `unknown-<进程名>`
+  （如 `unknown-git-submodule`）。`cpu_usage` 等非进程指标原样落库（单测断言不受影响）。
 
 ### TODO-4（中）Pod 名反查（k8s）未实现
 

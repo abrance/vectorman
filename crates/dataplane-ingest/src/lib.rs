@@ -14,9 +14,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod edge;
+pub mod metric;
 pub mod trace;
 
 pub use edge::{EbpfEdge, EdgeSink};
+pub use metric::MetricSink;
 pub use trace::{SpanEvent, SpanLink, TraceSink, TraceSpan};
 
 /// 采集类型。
@@ -178,10 +180,11 @@ pub async fn apply_with_trace_sink(
     kv: &dyn KvStore,
     trace_sink: Option<&dyn TraceSink>,
 ) -> Result<IngestReply, DataplaneError> {
-    apply_with_sinks(envelope, ts, log, kv, trace_sink, None).await
+    apply_with_sinks(envelope, ts, log, kv, trace_sink, None, None).await
 }
 
-/// 接入一批记录，并把派生数据交给各自的出口（`traces` → `trace_sink`，`ebpf_edges` → `edge_sink`）。
+/// 接入一批记录，并把派生数据交给各自的出口
+/// （`traces` → `trace_sink`，`ebpf_edges` → `edge_sink`，`metrics` 的维度补全 → `metric_sink`）。
 ///
 /// 出口的失败**不影响**接入应答：明细已落库，重试整批只会造成明细重复，
 /// 因此只记录到标准错误并由自监控计数（见 `apm-tracing` 设计「错误处理」）。
@@ -192,6 +195,7 @@ pub async fn apply_with_sinks(
     kv: &dyn KvStore,
     trace_sink: Option<&dyn TraceSink>,
     edge_sink: Option<&dyn EdgeSink>,
+    metric_sink: Option<&dyn MetricSink>,
 ) -> Result<IngestReply, DataplaneError> {
     if envelope.agent_id.trim().is_empty() {
         return Err(DataplaneError::invalid_argument("agent_id is required"));
@@ -206,7 +210,12 @@ pub async fn apply_with_sinks(
     let mut failures = Vec::new();
 
     for raw in &envelope.records {
-        match apply_one(&envelope, raw, ts, log, kv, trace_sink, edge_sink).await {
+        let sinks = Sinks {
+            trace: trace_sink,
+            edge: edge_sink,
+            metric: metric_sink,
+        };
+        match apply_one(&envelope, raw, ts, log, kv, &sinks).await {
             Ok(()) => accepted += 1,
             Err(ApplyRecordError::Invalid(failure)) => failures.push(failure),
             Err(ApplyRecordError::Engine(e)) => return Err(e),
@@ -226,6 +235,15 @@ pub async fn apply_with_sinks(
     })
 }
 
+/// 三个派生出口的打包：只在模块内传递，避免 `apply_one` 的参数表继续膨胀
+/// （出口从 1 个长到 3 个，公参版本见 [`apply_with_sinks`]）。
+#[derive(Clone, Copy, Default)]
+struct Sinks<'a> {
+    trace: Option<&'a dyn TraceSink>,
+    edge: Option<&'a dyn EdgeSink>,
+    metric: Option<&'a dyn MetricSink>,
+}
+
 enum ApplyRecordError {
     Invalid(RecordFailure),
     Engine(DataplaneError),
@@ -237,9 +255,13 @@ async fn apply_one(
     ts: &dyn TimeSeriesStore,
     log: &dyn LogStore,
     kv: &dyn KvStore,
-    trace_sink: Option<&dyn TraceSink>,
-    edge_sink: Option<&dyn EdgeSink>,
+    sinks: &Sinks<'_>,
 ) -> Result<(), ApplyRecordError> {
+    let Sinks {
+        trace: trace_sink,
+        edge: edge_sink,
+        metric: metric_sink,
+    } = *sinks;
     match envelope.data_type {
         DataType::Metrics => {
             let rec: MetricsRecord = parse_record(raw)?;
@@ -249,6 +271,12 @@ async fn apply_one(
             }
             let mut tags = rec.tags;
             merge_envelope_tags(&mut tags, envelope);
+            // 维度补全放在去重之后：重复记录不值得再查一次名称映射。
+            if let Some(sink) = metric_sink {
+                for (key, value) in sink.metric_tags(&rec.measurement, &tags).await {
+                    tags.insert(key, value);
+                }
+            }
             ts.write(TsPoint {
                 measurement: rec.measurement,
                 tags,
@@ -614,6 +642,110 @@ mod tests {
         assert_eq!(found.result[0].value.unwrap().1, 12.5);
     }
 
+    /// 只给 `ebpf_process_*` 补 service 的假 sink（记录调用次数，便于断言「不该调的不调」）。
+    #[derive(Default)]
+    struct RecordingMetricSink {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl metric::MetricSink for RecordingMetricSink {
+        async fn metric_tags(
+            &self,
+            measurement: &str,
+            tags: &BTreeMap<String, String>,
+        ) -> Vec<(String, String)> {
+            self.calls.lock().unwrap().push(measurement.to_string());
+            if !measurement.starts_with("ebpf_process_") {
+                return Vec::new();
+            }
+            let name = tags.get("process_name").cloned().unwrap_or_default();
+            vec![("service".into(), format!("svc-{name}"))]
+        }
+    }
+
+    #[tokio::test]
+    async fn metric_sink_enriches_process_metrics_only() {
+        let e = engines();
+        let sink = RecordingMetricSink::default();
+        let process = json!({
+            "record_id": "p1",
+            "timestamp": 1_710_000_000_000_000i64,
+            "measurement": "ebpf_process_exec_total",
+            "tags": {"process_name": "java", "pid": "42"},
+            "field_name": "value",
+            "field_value": 3.0
+        });
+        let other = json!({
+            "record_id": "m2",
+            "timestamp": 1_710_000_000_000_000i64,
+            "measurement": "cpu_usage",
+            "tags": {"role": "web"},
+            "field_name": "value",
+            "field_value": 1.0
+        });
+        let env = envelope("metrics", vec![process, other]);
+        let reply = apply_with_sinks(
+            env,
+            &e.ts,
+            &e.log,
+            &e.kv,
+            None,
+            None,
+            Some(&sink as &dyn metric::MetricSink),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.status, "ok");
+
+        // sink 看得到合并信封标签之后的最终标签集。
+        let enriched =
+            e.ts.query_instant(
+                r#"ebpf_process_exec_total{service="svc-java",agent_id="agent-1"}"#,
+                Some(1_710_000_000_000_000),
+            )
+            .await
+            .unwrap();
+        assert_eq!(enriched.result.len(), 1, "进程指标应带补全的 service 维度");
+        // 其它指标原样落库：没有 service 标签，也不会因为 sink 返回空而丢点。
+        let untouched =
+            e.ts.query_instant(
+                r#"cpu_usage{agent_id="agent-1"}"#,
+                Some(1_710_000_000_000_000),
+            )
+            .await
+            .unwrap();
+        assert_eq!(untouched.result.len(), 1);
+        assert_eq!(
+            sink.calls.lock().unwrap().len(),
+            2,
+            "每个点问一次，由 sink 自行判断"
+        );
+
+        // 没有 sink 时行为不变（不补维度也不报错）。
+        let plain = serde_json::from_value::<DataEnvelope>(json!({
+            "batch_id": "b2", "data_type": "metrics", "data_id": "item-1",
+            "agent_id": "agent-1", "host_id": "host-1",
+            "sent_at_micros": 1_710_000_000_000_000i64,
+            "records": [{
+                "record_id": "p9", "timestamp": 1_710_000_000_000_000i64,
+                "measurement": "ebpf_process_exec_total",
+                "tags": {"process_name": "go"}, "field_name": "value", "field_value": 1.0
+            }],
+        }))
+        .unwrap();
+        let reply = apply(plain, &e.ts, &e.log, &e.kv).await.unwrap();
+        assert_eq!(reply.status, "ok");
+        let raw =
+            e.ts.query_instant(
+                r#"ebpf_process_exec_total{process_name="go"}"#,
+                Some(1_710_000_000_000_000),
+            )
+            .await
+            .unwrap();
+        assert_eq!(raw.result.len(), 1);
+    }
+
     #[tokio::test]
     async fn logs_roundtrip() {
         let e = engines();
@@ -936,6 +1068,7 @@ mod tests {
             &e.kv,
             None,
             Some(&sink as &dyn edge::EdgeSink),
+            None,
         )
         .await
         .unwrap();
@@ -957,6 +1090,7 @@ mod tests {
             &e.kv,
             None,
             Some(&sink as &dyn edge::EdgeSink),
+            None,
         )
         .await
         .unwrap();
@@ -979,6 +1113,7 @@ mod tests {
             &e.kv,
             None,
             Some(&sink as &dyn edge::EdgeSink),
+            None,
         )
         .await
         .unwrap();

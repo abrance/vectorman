@@ -174,9 +174,15 @@
   - 落地效果：`MapSource::process_context_by_pid` 接上反查 → **边记录填上 `src_container_id`/`src_pod`、
     进程指标带上 `container_id`/`pod_uid` 维度**，并且采集项的 `process_include`/`process_exclude`
     过滤**第一次真正生效**（此前拿不到进程名，带进程过滤的配置会把所有记录都丢掉）。
+  - [x] **服务端部分已完成**：`MetricSink` 钩子（`dataplane-ingest/src/metric.rs`）→ `ApmSink` 实现
+    按 `process_name`/`process_prefix` 查静态映射，填 `service`，未命中填 `unknown-<process_name>`。
+    实测：`ebpf_process_exec_total{service="coreutils"}`（`process_name="true"`，58 条序列）、
+    `{service="sleeper"}`（`process_name="sleep"`，59 条序列），未映射的为 `unknown-<进程名>`。
+    → 至此 5.9 的「`service` 维度」部分闭合，仅剩下面的 Pod **名**一项。
   - **仍未做（明确边界）**：① `src_pod` 里放的是 Pod **uid**（`pod<uid>` 只能解到 uid），Pod **名**需要
-    k8s 侧数据，因此 dataserver 的 `lookup_by_pod`（按真实 Pod 名匹配端点表）暂时命中不了，服务名仍靠
-    静态映射与 `(ip, port)` 反查；② `service` 维度由 dataserver 填（需要 `MetricSink` 钩子），本 PR 未做。
+    k8s 侧数据，因此 dataserver 的 `lookup_by_pod`（按真实 Pod 名匹配端点表）暂时命中不了；
+    ② `host_ip`/`pod_name` 为空，因此进程指标的 `service` 只有 `process_name`/`process_prefix`
+    两类映射适用（`cidr`/`pod_prefix` 对进程指标不适用）。
   - 上机验证：本机 sudo 跑检查点，反查缓存 28 个 pid，宿主机进程正确显示 `host`（本机无容器，容器路径由单测覆盖真实形态）。
   - 原方案分析（保留备查）：Agent 发的 `ebpf_process_*` 只有
     `pid`/`cgroup_id`/`process_name`，共享模型要求 `service`/`container_id`（需求 4.6）。

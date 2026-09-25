@@ -238,8 +238,16 @@ map 类型与容量：
 2. 逐条解析 `EbpfEdge`；缺 `record_id` 或 `timestamp`、`connections == 0`、`failures > connections`、`latency_hist` 长度超 `hist_slots` → 记 `failures`，继续。
 3. 幂等：`KvStore.exists("ingest/{record_id}")` 命中则跳过。
 4. 服务名反查（`EndpointRegistry`）：按固定顺序 ① 静态映射 `apm_service_alias`（`process_name` → `process_prefix` → `pod_prefix` → `cidr`，同类取 `updated_ts` 最新）→ ② `(dst_ip, dst_port)` 精确命中 → ③ `dst_pod` 命中 → ④ `unknown-<ip>`。命中则回填 `src_service`、`dst_service` 并落库。本 feature 的 Agent 不填服务名，服务名完全由 `dataserver` 反查得出；静态映射的 CRUD 由 `apm-tracing` 提供（`/v1/apm/service-aliases`），本 feature 只消费。
-5. 落 sqlite `ebpf_edges`：主键 `(agent_id, bucket_ts, src_ip, src_port, dst_ip, dst_port, protocol)`，冲突时后写覆盖（同桶重发语义一致）。
-6. `KvStore.set("ingest/{record_id}")`；更新 `stream/{agent_id}/ebpf_edges/{data_id}` 的 `last_seen`。
+5. **进程指标的 `service` 维度（实现期补充）**：`ebpf_process_*` 走的是 `data_type=metrics`
+   通用路径，而 `service` 只能由服务端的静态映射得出，因此给该路径加了一个**与 `TraceSink`/`EdgeSink`
+   同形的 `MetricSink` 钩子**（`dataplane-ingest`）：sink 只被问一次 `(measurement, tags)`，
+   返回要补的标签。`ApmSink` 的实现只处理 `ebpf_process_*`（其余测量项直接返回空，不付缓存查询），
+   且**不返回错误** —— 补维度是尽力而为，失败不能把指标本身丢掉。命中静态映射则填服务名，
+   未命中填 `unknown-<process_name>`（与边的 `unknown-<ip>` 同一约定：维度始终存在，
+   值本身表明「没映射上」）。`host_ip`/`pod_name` 传空：进程指标只有 `agent_id`/`host_id`，
+   没有 IP，因此只有 `process_name`/`process_prefix` 两类映射适用。
+6. 落 sqlite `ebpf_edges`：主键 `(agent_id, bucket_ts, src_ip, src_port, dst_ip, dst_port, protocol)`，冲突时后写覆盖（同桶重发语义一致）。
+7. `KvStore.set("ingest/{record_id}")`；更新 `stream/{agent_id}/ebpf_edges/{data_id}` 的 `last_seen`。
 
 `DataType::EbpfProfiles`（P3）：
 

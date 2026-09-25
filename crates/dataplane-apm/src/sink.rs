@@ -4,12 +4,13 @@
 //! （不 await 存储），因此不会拖慢接入路径。落库由 dataserver 的后台任务调用
 //! [`ApmSink::flush_due`] 与 [`ApmSink::purge_expired`]。
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use dataplane_core::DataplaneError;
 use dataplane_ingest::trace::{TraceSink, TraceSpan};
-use dataplane_ingest::{DataEnvelope, EbpfEdge, EdgeSink};
+use dataplane_ingest::{DataEnvelope, EbpfEdge, EdgeSink, MetricSink};
 use dataplane_sql::RelationalStore;
 
 use crate::accumulator::{ApmSinkConfig, TraceSummaryAccumulator};
@@ -20,6 +21,15 @@ use crate::endpoint::EndpointRegistry;
 use crate::red::RedSamples;
 
 pub use crate::accumulator::ApmSinkConfig as Config;
+
+/// 需要补 `service` 维度的测量项前缀（进程生命周期指标）。
+const PROCESS_MEASUREMENT_PREFIX: &str = "ebpf_process_";
+/// 进程名标签（Agent 侧写入）。
+const PROCESS_NAME_TAG: &str = "process_name";
+/// 服务名标签。
+const SERVICE_TAG: &str = "service";
+/// 未能映射到服务时的前缀（与边记录的 `unknown-<ip>` 同一约定）。
+const UNKNOWN_SERVICE_PREFIX: &str = "unknown-";
 
 /// 一次 flush 的结果，供自监控使用。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -301,6 +311,49 @@ impl EdgeSink for ApmSink {
 
     fn written_edges(&self) -> u64 {
         self.ebpf_edges.written()
+    }
+}
+
+/// 进程指标的 `service` 维度：Agent 只给 `process_name`（进程名），归一成服务名要靠
+/// 服务端配置的静态映射，所以在这一层补。
+///
+/// 只处理 `ebpf_process_*`：其余指标（`agent_ebpf_*`、以及既有的通用指标）原样落库，
+/// 避免给每条指标都付一次缓存查询。
+#[async_trait]
+impl MetricSink for ApmSink {
+    async fn metric_tags(
+        &self,
+        measurement: &str,
+        tags: &BTreeMap<String, String>,
+    ) -> Vec<(String, String)> {
+        if !measurement.starts_with(PROCESS_MEASUREMENT_PREFIX) {
+            return Vec::new();
+        }
+        if tags.contains_key(SERVICE_TAG) {
+            return Vec::new();
+        }
+        let Some(process_name) = tags.get(PROCESS_NAME_TAG).filter(|v| !v.is_empty()) else {
+            return Vec::new();
+        };
+        // host_ip/pod_name 留空：进程指标只有 `address`（agent_id/host_id），没有 IP；
+        // 因此只有 process_name/process_prefix 两类映射能命中，cidr/pod_prefix 不适用。
+        match self
+            .aliases
+            .resolve(self.sql.as_ref(), "", "", process_name)
+            .await
+        {
+            Ok(Some(service)) => vec![(SERVICE_TAG.to_string(), service)],
+            // 未命中不丢维度：与边记录的 `unknown-<ip>` 同一约定，值本身表明「没映射上」。
+            Ok(None) => vec![(
+                SERVICE_TAG.to_string(),
+                format!("{UNKNOWN_SERVICE_PREFIX}{process_name}"),
+            )],
+            Err(err) => {
+                // 补维度失败不能影响接入（见 `MetricSink` 的约定），只记录。
+                eprintln!("gse-dataserver: 进程指标服务名反查失败（{measurement}）：{err}");
+                Vec::new()
+            }
+        }
     }
 }
 
