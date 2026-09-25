@@ -76,8 +76,12 @@ jobs:
             fi
             echo "$file 含 $want 段"
           done
+          # map 段名由 aya-bpf/LLVM 决定，不同版本可能是 `maps`/`.maps`；这里是**证据**而不是断言：
+          # 打印出来便于排查（程序段与 BTF 段才是硬要求）。
           for file in packaging/ebpf/*.o; do
-            llvm-readelf -S "$file" | grep -q "\.maps" || { echo "$file 缺少 .maps 段" >&2; exit 1; }
+            llvm-readelf -S "$file" | grep -q "\.BTF" || { echo "$file 缺少 .BTF 段" >&2; exit 1; }
+            echo "== $file 段："
+            llvm-readelf -S "$file" | awk '/^ *\[/ {print "   " $0}'
           done
       - uses: actions/upload-artifact@v4
         with:
