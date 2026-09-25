@@ -45,4 +45,20 @@ for bin in network tcp process; do
     install -m 0644 "$src" "$out_dir/$bin.o"
     printf '  %s (%s 字节)\n' "$out_dir/$bin.o" "$(stat -c%s "$out_dir/$bin.o")"
 done
-echo "==> 完成：$out_dir"
+
+# 守卫：对象里不能有**未定义的函数符号**。
+#
+# 踩过的坑：内核态里对 u64 做常量除法（LLVM 会优化成 128 位乘法）或用 `saturating_mul`
+# （需要 128 位乘积判溢出），都会引用 compiler_builtins 的 `__multi3`。这种对象能编出来，
+# 但 aya 加载时会在函数重定位阶段失败（`error relocating function`），排查成本高。
+# 在构建期就挡住，比在目标机上发现便宜得多。
+for bin in network tcp process; do
+    undefined="$(llvm-readelf -s "$out_dir/$bin.o" 2>/dev/null |
+        awk '$4=="FUNC" && $7=="UND" {print $8}' | tr '\n' ' ')"
+    if [[ -n "$undefined" ]]; then
+        echo "错误：$out_dir/$bin.o 引用了未定义的函数符号：$undefined" >&2
+        echo "      通常是内核态里出现了常量除法（u64 / 常量）或 saturating_mul —— 改用移位/普通乘法。" >&2
+        exit 1
+    fi
+done
+echo "==> 完成：$out_dir（无未定义函数符号）"

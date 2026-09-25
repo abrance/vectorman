@@ -24,5 +24,9 @@ path = "src/process.rs"
 [profile.release]
 opt-level = 3
 debug = false
+# 开 LTO：用来 DCE 掉共享 crate 里未被内核态用到的函数（例如用户态的换算函数里含常量除法，
+# 未 DCE 时会让对象引用未定义的 `__multi3`）。**同时**要求所有 helper 标 `#[inline(always)]`：
+# LTO 会把未内联的 helper 合并进 `.text` 并内部化（丢符号），而 aya 只能链接**有符号**的函数，
+# 于是加载时报 `error relocating function: function 0xNNN not found`。
 lto = true
 panic = "abort"

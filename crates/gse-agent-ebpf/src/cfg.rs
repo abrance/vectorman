@@ -142,7 +142,10 @@ impl CfgValues {
         slots[CfgIndex::RawEventsEnabled as usize] = u64::from(config.raw_events_enabled);
         // 令牌桶（需求 9.5、12.1-12.2）：内核态拿不到 CPU 百分比，限流口径是「每秒事件数 + 突发容量」；
         // `max_cpu_percent` 只作为用户态告警阈值（见设计里的口径说明）。0 表示不限制。
-        slots[CfgIndex::RateLimitPerSec as usize] = config.max_events_per_sec;
+        // 内核态不能做除法（会引用未定义的 `__multi3`，aya 加载时函数重定位会失败），
+        // 所以这里换算成「每刻度令牌数」下发，内核只做移位与乘法。
+        slots[CfgIndex::RateLimitTokensPerTick as usize] =
+            ebpf_abi::tokens_per_tick(config.max_events_per_sec);
         slots[CfgIndex::RateLimitBurst as usize] =
             ebpf_abi::burst_for_rate(config.max_events_per_sec);
 
@@ -222,9 +225,9 @@ mod tests {
         assert_eq!(cfg.get(CfgIndex::IncludeLoopback), 1);
         assert_eq!(cfg.get(CfgIndex::RawEventsEnabled), 1);
         assert_eq!(
-            cfg.get(CfgIndex::RateLimitPerSec),
-            50_000,
-            "缺省每秒 5 万事件"
+            cfg.get(CfgIndex::RateLimitTokensPerTick),
+            ebpf_abi::tokens_per_tick(50_000),
+            "缺省每秒 5 万事件换算成每刻度令牌数"
         );
         assert_eq!(
             cfg.get(CfgIndex::RateLimitBurst),
@@ -243,7 +246,10 @@ mod tests {
         assert_eq!(cfg.get(CfgIndex::TpSaddr), 30);
         assert_eq!(cfg.get(CfgIndex::IncludeLoopback), 0, "默认不采回环");
         assert_eq!(cfg.get(CfgIndex::RawEventsEnabled), 0);
-        assert_eq!(cfg.get(CfgIndex::RateLimitPerSec), 50_000);
+        assert_eq!(
+            cfg.get(CfgIndex::RateLimitTokensPerTick),
+            ebpf_abi::tokens_per_tick(50_000)
+        );
     }
 
     #[test]

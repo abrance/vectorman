@@ -5,6 +5,12 @@
 实施顺序：本 feature 在 `apm-tracing` 之后（`LogStore` 索引 v2 → `dataplane-ts-retention` → `apm-tracing` → 本 feature）。服务名静态映射的 CRUD 由 `apm-tracing` 提供，本 feature 只消费。
 
 - [ ] 1. P1 前置：eBPF 构建链与前置校验
+  - [x] 1.0 `.o` 产物入库
+    - 状态：已入库（PR #58）：本机用 bpf-linker 0.11.1 官方**预编译静态二进制**编出
+      `packaging/ebpf/{network,tcp,process}.o` 并提交；`scripts/build-ebpf.sh` 新增构建期守卫
+      （对象出现未定义函数符号即失败，挡 `__multi3` 这类问题），CI 的 `ebpf-objects` 作业仍可按需重建。
+      **维护提醒**：改了内核态源码就要重跑 `scripts/build-ebpf.sh` 并提交新产物 ——
+      二进制入库的陈旧风险由此而来，CI 的段/map 数量断言只能挡住部分漂移。
   - [x] 1.1 新增 `crates/gse-ebpf-programs`（`#![no_std]`，aya-bpf 风格），产出 `*.o`；CI 单独一步用 `bpfel-unknown-none` 构建，产物入库 `packaging/ebpf/`
     - 产物链（PR #56 补齐）：**不把 `.o` 提交进 git**，改为「构建期内嵌 + 发布期产出」。理由与做法见 `packaging/ebpf/README.md`：
       二进制入库会陈旧（源码改了、产物忘了重编，运行的是旧程序且看不出来）且评审噪音大；而 `build.rs` 已能区分

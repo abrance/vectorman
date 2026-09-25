@@ -59,6 +59,15 @@ static CFG: Array<u64> = Array::with_max_entries(CFG_LEN, 0);
 #[map]
 static RATE: PerCpuArray<u64> = PerCpuArray::with_max_entries(common::rate_slot::LEN, 0);
 
+/// tracepoint 条目缓冲（per-CPU，64 字节）：栈上放不下（见 `common::read_tp_buf` 的说明）。
+#[map]
+static TPBUF: PerCpuArray<[u64; common::TP_SCRATCH_WORDS]> =
+    PerCpuArray::with_max_entries(1, 0);
+
+/// 构造新聚合值的暂存区（per-CPU）：`ConnAggWire` 有 300+ 字节，放栈上会超 512 字节上限。
+#[map]
+static SCRATCH: PerCpuArray<ConnAggWire> = PerCpuArray::with_max_entries(1, 0);
+
 #[inline(always)]
 fn bump<F: FnOnce(&mut ConnAggWire)>(key: &ConnKey, f: F) {
     if let Some(ptr) = CONN_AGG.get_ptr_mut(key) {
@@ -66,9 +75,16 @@ fn bump<F: FnOnce(&mut ConnAggWire)>(key: &ConnKey, f: F) {
         unsafe { f(&mut *ptr) };
         return;
     }
-    let mut value = ConnAggWire::default();
-    f(&mut value);
-    let _ = CONN_AGG.insert(key, &value, 0);
+    // 新键：先清零、再改、再插入。**在 map 值上做**而不是栈上：
+    // `ConnAggWire` 含 32 槽直方图共 300+ 字节，放栈上会触发 BPF 栈超限。
+    let Some(scratch) = SCRATCH.get_ptr_mut(0) else {
+        return;
+    };
+    unsafe {
+        *scratch = ConnAggWire::default();
+        f(&mut *scratch);
+        let _ = CONN_AGG.insert(key, &*scratch, 0);
+    }
 }
 
 /// 连接状态迁移：建连、关闭时长、主动连接超时失败。
@@ -98,22 +114,37 @@ fn try_inet_sock_set_state(ctx: &TracePointContext) -> Result<(), i64> {
     ) else {
         return Ok(());
     };
-    let family: u16 = unsafe { ctx.read_at(offset_family as usize) }.map_err(|e| e as i64)?;
+    // 整条目一次读进 per-CPU 缓冲：**不能**对 ctx 指针做非常量加法（验证器会拒）。
+    if unsafe { common::read_tp_buf(ctx, &TPBUF) }.is_none() {
+        return Ok(());
+    }
+    let Some(family) = common::scratch_u16(&TPBUF, offset_family) else {
+        return Ok(());
+    };
     if family != common::cfg_u16(&CFG, CfgIndex::FamilyInet).unwrap_or(u16::MAX) {
         return Ok(());
     }
-    let old_state: i32 = unsafe { ctx.read_at(offset_old as usize) }.map_err(|e| e as i64)?;
-    let new_state: i32 = unsafe { ctx.read_at(offset_new as usize) }.map_err(|e| e as i64)?;
-    let sport: u16 = unsafe { ctx.read_at(offset_sport as usize) }.map_err(|e| e as i64)?;
-    let dport: u16 = unsafe { ctx.read_at(offset_dport as usize) }.map_err(|e| e as i64)?;
-    let saddr: [u8; 4] = unsafe { ctx.read_at(offset_saddr as usize) }.map_err(|e| e as i64)?;
-    let daddr: [u8; 4] = unsafe { ctx.read_at(offset_daddr as usize) }.map_err(|e| e as i64)?;
+    let (Some(raw_old), Some(raw_new), Some(sport), Some(dport), Some(saddr), Some(daddr)) = (
+        common::scratch_u32(&TPBUF, offset_old),
+        common::scratch_u32(&TPBUF, offset_new),
+        common::scratch_u16(&TPBUF, offset_sport),
+        common::scratch_u16(&TPBUF, offset_dport),
+        common::scratch_u32(&TPBUF, offset_saddr),
+        common::scratch_u32(&TPBUF, offset_daddr),
+    ) else {
+        return Ok(());
+    };
+    let old_state = raw_old as i32;
+    let new_state = raw_new as i32;
+    // tracepoint 里读到的同样是网络序，转主机序后再进键（与 `sock_key` 一致）。
+    let saddr = u32::from_be(saddr);
+    let daddr = u32::from_be(daddr);
 
     let key = ConnKey {
         pid: common::current_tgid(),
         cgroup_id: common::current_cgroup_id(),
-        saddr: u32::from_ne_bytes(saddr),
-        daddr: u32::from_ne_bytes(daddr),
+        saddr,
+        daddr,
         sport,
         dport,
         protocol: 6,
@@ -138,7 +169,8 @@ fn try_inet_sock_set_state(ctx: &TracePointContext) -> Result<(), i64> {
 
     // 关闭：记存续时长（微秒）。
     if let Some(start) = unsafe { CONN_START.get(&key) }.copied() {
-        let micros = now.saturating_sub(start) / 1_000;
+        // 见 `common::ns_to_micros`：用移位替代除法，避免引入 `__multi3` 未定义符号。
+        let micros = common::ns_to_micros(now.saturating_sub(start));
         bump(&key, |value| common::record_duration(value, micros));
     }
     let _ = CONN_START.remove(&key);
@@ -201,10 +233,12 @@ fn tcp_sendmsg_ret(ctx: RetProbeContext) -> u32 {
     let Some(key) = take_entry() else {
         return 0;
     };
-    let ret = ctx.ret::<i64>();
+    // `tcp_sendmsg` 返回 `int`：**必须按 i32 读**。直接读 64 位寄存器会把未定义的高 32 位
+    // 当成字节数（实测出现过 4294967285 这种“负数字节”）。
+    let ret = ctx.ret::<i32>();
     if ret > 0 {
         bump(&key, |value| {
-            value.bytes_sent = value.bytes_sent.saturating_add(ret as u64);
+            value.bytes_sent = value.bytes_sent.saturating_add(ret as u32 as u64);
         });
     }
     0
@@ -215,10 +249,11 @@ fn tcp_recvmsg_ret(ctx: RetProbeContext) -> u32 {
     let Some(key) = take_entry() else {
         return 0;
     };
-    let ret = ctx.ret::<i64>();
+    // 同上：`tcp_recvmsg` 也返回 `int`。
+    let ret = ctx.ret::<i32>();
     if ret > 0 {
         bump(&key, |value| {
-            value.bytes_recv = value.bytes_recv.saturating_add(ret as u64);
+            value.bytes_recv = value.bytes_recv.saturating_add(ret as u32 as u64);
         });
     }
     0
@@ -229,9 +264,9 @@ fn tcp_connect_ret(ctx: RetProbeContext) -> u32 {
     let Some(key) = take_entry() else {
         return 0;
     };
-    let ret = ctx.ret::<i64>();
+    let ret = ctx.ret::<i32>();
     if ret < 0 {
-        let reason = ebpf_abi::reason_from_errno(ret);
+        let reason = ebpf_abi::reason_from_errno(i64::from(ret));
         bump(&key, |value| {
             value.failures = value.failures.saturating_add(1);
             value.failure_reason = reason;

@@ -434,6 +434,30 @@ BPF 程序里读不到「本次执行消耗了多少 CPU」。因此实现的口
 - 拿不到限流状态时**放行**而不是拒绝：宁可多采，也不要因为缺一个 map 变成完全不采集；
 - 丢弃数由用户态周期性读走并复位（`EbpfSnapshot.rate_limited`），对应需求 12.3 的「统计并输出触发次数」。
 
+### 上机验证（检查点）发现的真实问题
+
+在 6.1 内核上以 root 实际加载/挂载/读取后，暴露了 5 个**只在目标机才会出现**的问题，
+全部已修并写成构建期或上机检查项。这些都不是纯逻辑错误，单测与类型检查都发现不了：
+
+1. **对象引用了未定义的 `__multi3`**：内核态里对 `u64` 做**常量除法**（LLVM 优化成 128 位乘法）
+   或用 `saturating_mul`（需要 128 位乘积判溢出）都会引用 compiler_builtins 的 `__multi3`。
+   这种对象编译、链接都成功，但 aya 加载时在函数重定位阶段失败（`error relocating function`）。
+   修法：内核态一律用移位/普通乘法（`ns → µs` 用 `>> 10` 并记录 ~2.4% 偏差；令牌桶改成
+   「每刻度令牌数」由用户态换算）。**构建脚本现在会检查未定义函数符号并直接失败**。
+2. **验证器拒绝 ctx 指针的非常量加法**：因为偏移由用户态下发，「`ctx + 偏移`」是非常量运算，
+   内核报 `math between ctx pointer and register with unbounded min value is not allowed`。
+   修法：tracepoint 条目先整体读进 **per-CPU 缓冲**，再用**掩码后的有界偏移**取值。
+3. **BPF 栈超限**：插入路径要在栈上构造 `ConnAggWire`（300+ 字节，含 32 槽直方图），
+   再加缓冲直接触发 LLVM 的 `Looks like the BPF stack limit is exceeded`。
+   修法：聚合值改在 **per-CPU scratch map** 上构造后插入（同时也是 memset 的来源）。
+4. **IP 字节序**：`skc_daddr` 是 `__be32`，直接当主机序格式化会把 `127.0.0.1` 显示成 `1.0.0.127`。
+   修法：构造连接键时统一 `u32::from_be`，用户态按大端位序格式化（有单测）。
+5. **kretprobe 返回值宽度**：`tcp_sendmsg`/`tcp_recvmsg` 返回 `int`，按 `i64` 读整个寄存器会把
+   未定义的高 32 位当字节数（实测出现 `4294967285` 这种「负数字节」）。修法：按 `i32` 读。
+
+配套还改了工具本身：错误链展开（aya 顶层错误 `error relocating function` 会藏住真因）、
+按采集项区分判定（`ebpf_tcp` 的重传/RST 本就稀少、进程项要走 `drain_process`）。
+
 ## Pitfalls
 
 - eBPF 程序需要用 `bpfel-unknown-none` 目标构建，依赖 nightly 工具链，与现有 musl 静态构建的工具链不同。方案：CI 单独一步产出 `*.o`，产物入库到 `packaging/ebpf/`，用户态通过 `include_bytes!` 嵌入；部署期不编译（对应需求 17.6）。

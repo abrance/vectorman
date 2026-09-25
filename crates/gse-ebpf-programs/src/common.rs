@@ -55,6 +55,76 @@ pub fn cfg_ready(map: &Array<u64>) -> bool {
     cfg(map, CfgIndex::Version) == Some(CFG_VERSION)
 }
 
+/// tracepoint 条目缓冲的字数（`[u64; 8]` = 64 字节）。
+pub const TP_SCRATCH_WORDS: usize = 8;
+
+/// tracepoint 条目的栈缓冲长度。
+///
+/// 只需要覆盖到 `daddr`（5.8–6.x 上偏移 34..38），取 64 字节留余量；
+/// **不能取太大**：BPF 每个程序栈上限 512 字节，缓冲会叠加在已有局部变量之上。
+pub const TP_BUF_LEN: usize = TP_SCRATCH_WORDS * 8;
+
+/// 把 tracepoint 条目整体读进栈缓冲。
+///
+/// **为什么必须这样**：字段偏移由用户态下发（设计里「内核态不硬编码偏移」），
+/// 于是 `ctx + 偏移` 是**非常量**指针运算，验证器直接拒绝：
+/// `math between ctx pointer and register with unbounded min value is not allowed`。
+/// 改为「ctx → 固定长度栈缓冲」一次拷贝（不涉及 ctx 指针运算），再从缓冲里按掩码后的
+/// 有界偏移取值 —— 验证器能证明索引落在缓冲内，于是放行。
+/// 缓冲放在 **per-CPU map** 而不是栈上：BPF 每程序栈上限 512 字节，
+/// 而 tracepoint 处理函数里已经有一个插入路径要用的聚合值（300+ 字节），
+/// 再加缓冲会直接触发 LLVM 的 `BPF stack limit is exceeded`。
+pub unsafe fn read_tp_buf(
+    ctx: &aya_ebpf::programs::TracePointContext,
+    scratch: &aya_ebpf::maps::PerCpuArray<[u64; TP_SCRATCH_WORDS]>,
+) -> Option<()> {
+    let Some(ptr) = scratch.get_ptr_mut(0) else {
+        return None;
+    };
+    let dst = unsafe { core::slice::from_raw_parts_mut(ptr.cast::<u8>(), TP_BUF_LEN) };
+    // `EbpfContext::as_ptr` 需要通过 trait 调用（aya 里它是 trait 方法）。
+    let src = aya_ebpf::EbpfContext::as_ptr(ctx).cast::<u8>();
+    unsafe { aya_ebpf::helpers::bpf_probe_read_kernel_buf(src, dst) }.ok()?;
+    Some(())
+}
+
+/// 从 per-CPU 缓冲里按掩码后的有界偏移读字节。
+#[inline(always)]
+pub fn scratch_u8(
+    scratch: &aya_ebpf::maps::PerCpuArray<[u64; TP_SCRATCH_WORDS]>,
+    index: usize,
+) -> Option<u8> {
+    let ptr = scratch.get_ptr_mut(0)?;
+    let byte = unsafe { ptr.cast::<u8>().add(index & (TP_BUF_LEN - 1)) };
+    Some(unsafe { *byte })
+}
+
+/// 从 per-CPU 缓冲读 u16：偏移按 2 字节对齐掩码，保证 `offset + 1 < TP_BUF_LEN`。
+#[inline(always)]
+pub fn scratch_u16(
+    scratch: &aya_ebpf::maps::PerCpuArray<[u64; TP_SCRATCH_WORDS]>,
+    offset: u64,
+) -> Option<u16> {
+    let index = (offset as usize) & (TP_BUF_LEN - 2);
+    let low = scratch_u8(scratch, index)?;
+    let high = scratch_u8(scratch, index + 1)?;
+    Some(u16::from_ne_bytes([low, high]))
+}
+
+/// 从 per-CPU 缓冲读 u32：偏移按 4 字节对齐掩码，保证 `offset + 3 < TP_BUF_LEN`。
+#[inline(always)]
+pub fn scratch_u32(
+    scratch: &aya_ebpf::maps::PerCpuArray<[u64; TP_SCRATCH_WORDS]>,
+    offset: u64,
+) -> Option<u32> {
+    let index = (offset as usize) & (TP_BUF_LEN - 4);
+    let b0 = scratch_u8(scratch, index)?;
+    let b1 = scratch_u8(scratch, index + 1)?;
+    let b2 = scratch_u8(scratch, index + 2)?;
+    let b3 = scratch_u8(scratch, index + 3)?;
+    Some(u32::from_ne_bytes([b0, b1, b2, b3]))
+}
+
 /// 从内核地址读一个字段（`bpf_probe_read_kernel` 封装）。
 ///
 /// # Safety
@@ -95,6 +165,7 @@ pub fn current_cgroup_id() -> u64 {
 /// # Safety
 ///
 /// `sk` 必须是内核态 `struct sock *`。
+#[inline(always)]
 pub unsafe fn sock_key(sk: *const c_void, cfg_map: &Array<u64>) -> Option<ConnKey> {
     let (Some(offset_daddr), Some(offset_rcv_saddr), Some(offset_dport), Some(offset_num), Some(offset_family), Some(offset_protocol)) = (
         cfg(cfg_map, CfgIndex::SockDaddr),
@@ -110,8 +181,10 @@ pub unsafe fn sock_key(sk: *const c_void, cfg_map: &Array<u64>) -> Option<ConnKe
     if family != cfg_u16(cfg_map, CfgIndex::FamilyInet)? {
         return None;
     }
-    let daddr: u32 = unsafe { read_field(sk, offset_daddr) }?;
-    let saddr: u32 = unsafe { read_field(sk, offset_rcv_saddr) }?;
+    // `skc_daddr`/`skc_rcv_saddr` 是 `__be32`（网络序）。统一转成主机序再进键，
+    // 这样用户态格式化不需要关心字节序（否则 127.0.0.1 会显示成 1.0.0.127 —— 实测踩过）。
+    let daddr: u32 = u32::from_be(unsafe { read_field(sk, offset_daddr) }?);
+    let saddr: u32 = u32::from_be(unsafe { read_field(sk, offset_rcv_saddr) }?);
     let dport_be: u16 = unsafe { read_field(sk, offset_dport) }?;
     let sport: u16 = unsafe { read_field(sk, offset_num) }?;
     let protocol: u8 = unsafe { read_field(sk, offset_protocol) }?;
@@ -164,10 +237,13 @@ pub mod rate_slot {
 /// 内核态不做 CPU 百分比测量（拿不到），限流口径是**每秒事件数 + 突发容量**；
 /// 决策函数在 `ebpf-abi` 里，宿主侧有单测（含首次、补充、时钟回拨、溢出边界）。
 /// 被拒绝的事件在这里累加计数，用户态周期性读走并复位（对应 `agent_ebpf_rate_limited_total`）。
+///
+/// **只做移位与乘法**：BPF 目标没有 64 位除法指令，`u64 / 常量` 会引用未定义的 `__multi3`
+/// （compiler_builtins），对象能编出来但 aya 加载时在函数重定位阶段直接失败。
 #[inline(always)]
 pub fn rate_allow(cfg_map: &Array<u64>, rate: &PerCpuArray<u64>) -> bool {
-    let rate_per_sec = cfg(cfg_map, CfgIndex::RateLimitPerSec).unwrap_or(0);
-    if rate_per_sec == 0 {
+    let tokens_per_tick = cfg(cfg_map, CfgIndex::RateLimitTokensPerTick).unwrap_or(0);
+    if tokens_per_tick == 0 {
         // 0 表示不限制：保持「配置成 0 就不限流」的直觉，避免误配把采集整体掐死。
         return true;
     }
@@ -184,7 +260,7 @@ pub fn rate_allow(cfg_map: &Array<u64>, rate: &PerCpuArray<u64>) -> bool {
     let last_ns = unsafe { *last_ptr };
     let now_ns = unsafe { bpf_ktime_get_ns() };
     let (next_tokens, allowed) =
-        ebpf_abi::token_bucket_step(tokens, last_ns, now_ns, rate_per_sec, burst);
+        ebpf_abi::token_bucket_step(tokens, last_ns, now_ns, tokens_per_tick, burst);
     unsafe {
         *tokens_ptr = next_tokens;
         *last_ptr = now_ns;
@@ -197,6 +273,15 @@ pub fn rate_allow(cfg_map: &Array<u64>, rate: &PerCpuArray<u64>) -> bool {
 
 /// 失败原因默认值（内核态只写枚举，文案在用户态映射）。
 pub const NO_REASON: u32 = REASON_NONE;
+
+/// 纳秒 → 微秒：用 `>> 10`（≈ /1024）而不是 `/1000`。
+///
+/// 偏差约 2.4%，而直方图按 2 的幂分槽、前端 P95 本身就是近似值，因此可接受；
+/// 换来的是内核态不出现常量除法（见 [`rate_allow`] 的说明）。**这是刻意的取舍，不是笔误。**
+#[inline(always)]
+pub const fn ns_to_micros(ns: u64) -> u64 {
+    ns >> 10
+}
 
 /// 历史槽：把微秒时长记入 log2 直方图。
 #[inline(always)]
