@@ -1,27 +1,46 @@
 use serde::{Deserialize, Serialize};
 
 /// 默认配置文件内容，供 `config.toml.example` 使用。
-pub const DEFAULT_CONFIG_TOML: &str = r#"data_path = "./data"
+pub const DEFAULT_CONFIG_TOML: &str = r#"# vectorman dataserver 配置示例（下面每一项的缺省值就是注释里写的值）
+#
+# 用法：复制为 config.toml（安装包布局为 <组件目录>/config.toml）。
+# 环境变量覆盖（DP_ 前缀）：
+#   DP_DATA_PATH / DP_SQL_HTTP_LISTEN / DP_PROM_HTTP_LISTEN / DP_METRICS_HTTP_LISTEN
+#   DP_AUTH_ENABLED / DP_SELF_METRICS_INTERVAL
+#   DATASERVER_HTTP_WEB_DIR（前端 dist 目录）/ DATASERVER_GSE_ADMIN_URL（GSE 管理口）
+
+# 数据目录：必须是目录（单文件仅支持 sqlite）。跨进程并发写同一目录不做文件锁。
+data_path = "./data"
+# 自监控指标写回时序库的周期（秒）；0 关闭。
 self_metrics_interval_secs = 60
 
-# 时序聚合指标的全局保留窗口（天）与是否执行；每个采集项更短的保留期由定时
-# 删除任务（ts_clean_interval_secs）补齐。
+# ---- 时序聚合指标（ts_*）：网络/进程/syscall 指标与通用 metrics 都落在这里 ----
+# 全局保留窗口（天）；每个采集项更短的保留期由下面的定时删除任务补齐。
 ts_retention_days = 30
 ts_retention_enforced = true
+# 基数上限与内存上限（0 = 不限上限，按引擎默认）。
 ts_cardinality_limit = 2000000
 # ts_memory_limit_bytes = 0
 # ts_wal_size_limit_bytes = 0
+# 定时删除周期（秒）。注意：实现里有下限 60 秒，配更小的值不会更快。
 ts_clean_interval_secs = 3600
+
+# ---- APM（trace 明细、span 摘要、服务 RED、拓扑边）----
+# 关闭后 /v1/traces/*、/v1/edges/*、/v1/apm/* 仍可查询，但没有新数据。
 apm_enabled = true
+# 端点表（服务名反查用）保留期（天）。
 apm_endpoint_retention_days = 30
+# APM 聚合节拍（秒）：span 摘要落库、边派生都按这个周期推进。
 apm_agg_interval_secs = 60
+# 采集项未显式给保留期时的缺省值（天）。
 apm_retention_days_default = 3
-# 全局容量上限（字节）；0 = 不限。超限时按最久远优先淘汰 APM 数据。
+# APM 数据全局容量上限（字节）；0 = 不限。超限时按最久远优先淘汰。
 apm_max_bytes = 0
+# APM 清理周期（秒），同样受下限 60 秒约束。
 apm_clean_interval_secs = 3600
-# trace 接入限流（每秒批次数）；0 = 不限。
+# trace 接入限流（每秒批次数）；0 = 不限。超限返回 429，Agent 按既有退避重试。
 apm_ingest_max_batches_per_sec = 0
-# 只写明细的耗时下限（微秒）；0 = 全部写明细。
+# 只写明细的耗时下限（微秒）；0 = 全部写明细。高于该阈值的 span 才落 LogStore 明细。
 apm_min_duration_micros_for_detail = 0
 
 [sql_http]
@@ -35,7 +54,13 @@ listen = "127.0.0.1:9091"
 
 [auth]
 enabled = false
+
+# 前端 dist 目录：配置后同一 SQL HTTP 端口同时托管前端（SPA 子路由回退 index.html）。
+# 目录需含 index.html；未配置或缺失时仅暴露 API。
 # http_web_dir = "web"
+
+# GSE 管理口：配置后经 dataserver 反代 /v1/collect-items 到 GSE 台账，
+# 并且保存周期清理会从 GSE 读「live 采集项」（这是按采集项保留期清理的前提）。
 # gse_admin_url = "http://127.0.0.1:7101"
 "#;
 
@@ -328,6 +353,29 @@ pub fn load_config(path: Option<&str>) -> Result<Config, crate::DataplaneError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `config.toml.example` 与 [`DEFAULT_CONFIG_TOML`] 必须逐字节一致。
+    ///
+    /// 两者曾各自漂移：示例文件停留在只有 `data_path`/端口的老版本，APM 与 TS 的开关一个都没写，
+    /// 新人照抄示例会得到「APM 关闭且不知道它存在」。用测试把「同源」这件事锁住。
+    #[test]
+    fn config_example_matches_default_toml() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("config.toml.example");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!("跳过：{} 不存在", path.display());
+            return;
+        };
+        assert_eq!(
+            text.trim_end(),
+            DEFAULT_CONFIG_TOML.trim_end(),
+            "config.toml.example 与 DEFAULT_CONFIG_TOML 不一致：改一处必须同时改另一处"
+        );
+        // 示例必须能解析（防止写出非法 TOML）。
+        Config::from_toml(&text).expect("示例配置必须能解析");
+    }
 
     #[test]
     fn from_toml_reads_web_dir_and_gse_url() {

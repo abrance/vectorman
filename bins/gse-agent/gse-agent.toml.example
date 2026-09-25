@@ -1,12 +1,45 @@
-# gse-agent 配置示例
+# gse-agent 配置示例（下面每一项的缺省值就是注释里写的值）
 #
-# 默认值：server_addr="127.0.0.1:7100"，agent_id="agent-1"，心跳周期 30s。
-# 配置缺失或 TOML 非法时进程退出码 1，stderr 含 config_invalid 与路径。
-# 环境变量覆盖（GSE_ 前缀）：
+# 用法：复制为 gse-agent.toml（安装包布局为 <组件目录>/conf/gse-agent.toml）。
+# 配置缺失或 TOML 非法时进程以退出码 1 结束，stderr 含 config_invalid 与路径。
+# 环境变量覆盖（GSE_AGENT_ 前缀）：
 #   GSE_AGENT_CONFIG / GSE_AGENT_SERVER / GSE_AGENT_ID / GSE_AGENT_TOKEN / GSE_AGENT_HEARTBEAT
+#   GSE_AGENT_INTERPRETERS / GSE_AGENT_JOB_INTERPRETER / GSE_AGENT_MAX_JOBS / GSE_AGENT_JOB_WORK_DIR
 
+# Server 地址与身份：agent-id + token 必须已在 GSE 台账登记（见 gse-server.toml.example）。
 server_addr = "127.0.0.1:7100"
 agent_id = "agent-1"
 token = ""
 
 heartbeat_interval_secs = 30
+
+# ---- 作业执行（gse-server 下发的一次性脚本/文件传输）----
+# 允许执行的解释器白名单；不在白名单内的作业直接拒绝。
+# allowed_interpreters = ["bash", "sh", "python3"]
+# 未指定解释器时使用哪一个。
+# job_default_interpreter = "bash"
+# 单个 Agent 并发运行的作业上限。
+# max_concurrent_jobs = 1
+# 作业临时脚本目录；为空时用系统临时目录。
+# job_work_dir = "/var/lib/vectorman/gse-agent/tmp"
+
+# ---- OTLP trace 接收器（`apm_otlp` 采集项的前置开关）----
+# 应用侧把 OTLP/HTTP trace 推到本 Agent，再由 Agent 经采集信道转投 dataserver。
+# 默认关闭；开启后需下发一个 `apm_otlp` 采集项才会真正接收。
+# otlp_enabled = false
+# otlp_listen = "0.0.0.0:4318"
+# otlp_max_body_bytes = 8388608
+# otlp_token = ""
+# otlp_allowed_cidrs = []
+
+# ---- eBPF 采集项（ebpf_network / ebpf_tcp / ebpf_process / ebpf_syscall）----
+# 这里没有 eBPF 开关：是否采集由「采集项下发」决定（前端「采集链路」页或
+# POST /api/gse/collect-items），采集项参数放在 collector JSON 里，例如：
+#   flush_interval_secs / bucket_secs / max_events_per_sec / max_cpu_percent
+#   map_max_entries / ring_buffer_bytes / raw_events_enabled / raw_events_sample_ratio
+#   cgroup_include|cgroup_exclude / process_include|process_exclude / port_include|port_exclude
+#   include_loopback / slow_threshold_micros（syscall 慢调用阈值，缺省 100000 微秒）
+#
+# 前置条件（不满足时**只降级 eBPF 本身**，其它采集项照常）：
+#   Linux + 内核 ≥ 5.8 + 可读 /sys/kernel/btf/vmlinux + root（或 CAP_BPF + CAP_PERFMON）
+#   Agent 会上报 `agent_ebpf_capability` 指标说明可用性，前端 eBPF 页据此提示原因。
