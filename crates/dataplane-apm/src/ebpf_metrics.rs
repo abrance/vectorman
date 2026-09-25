@@ -137,6 +137,7 @@ impl EbpfMetricsAggregator {
                 bytes_sent: as_i64(row.get(9)),
                 bytes_recv: as_i64(row.get(10)),
                 duration_sum: as_i64(row.get(11)),
+                duration_max: as_i64(row.get(12)),
                 tcp_retrans: as_i64(row.get(13)),
                 tcp_resets: as_i64(row.get(14)),
                 failures: as_i64(row.get(15)),
@@ -162,6 +163,8 @@ pub struct EdgeRow {
     pub bytes_sent: i64,
     pub bytes_recv: i64,
     pub duration_sum: i64,
+    /// 该边的最大耗时（同分钟多条边取 max，见 `aggregate`）。
+    pub duration_max: i64,
     pub tcp_retrans: i64,
     pub tcp_resets: i64,
     pub failures: i64,
@@ -182,7 +185,8 @@ pub fn aggregate(rows: &[EdgeRow]) -> Vec<TsPoint> {
     let mut failures: BTreeMap<(i64, String, String, String), f64> = BTreeMap::new();
     let mut bytes: BTreeMap<BytesKey, f64> = BTreeMap::new();
     // 耗时：均值直接累加，p95 用直方图槽近似。
-    let mut duration: BTreeMap<(i64, String, String), (i64, Vec<u64>)> = BTreeMap::new();
+    // `(耗时和, 耗时最大值, 耗时直方图)`。
+    let mut duration: BTreeMap<(i64, String, String), (i64, i64, Vec<u64>)> = BTreeMap::new();
 
     for row in rows {
         let bucket = floor_minute(row.bucket_start);
@@ -239,13 +243,15 @@ pub fn aggregate(rows: &[EdgeRow]) -> Vec<TsPoint> {
         }
         let entry = duration
             .entry((bucket, src, dst))
-            .or_insert_with(|| (0, vec![0; row.latency_hist.len()]));
+            .or_insert_with(|| (0, 0, vec![0; row.latency_hist.len()]));
         entry.0 += row.duration_sum;
-        if entry.1.len() < row.latency_hist.len() {
-            entry.1.resize(row.latency_hist.len(), 0);
+        // `max` 取桶内各边的最大值（同分钟多条边的 duration_max 取 max 才是真的最大值）。
+        entry.1 = entry.1.max(row.duration_max);
+        if entry.2.len() < row.latency_hist.len() {
+            entry.2.resize(row.latency_hist.len(), 0);
         }
         for (index, count) in row.latency_hist.iter().enumerate() {
-            entry.1[index] = entry.1[index].saturating_add(*count);
+            entry.2[index] = entry.2[index].saturating_add(*count);
         }
     }
 
@@ -342,7 +348,7 @@ pub fn aggregate(rows: &[EdgeRow]) -> Vec<TsPoint> {
             bucket,
         ));
     }
-    for ((bucket, src, dst), (duration_sum, hist)) in duration {
+    for ((bucket, src, dst), (duration_sum, duration_max, hist)) in duration {
         let connections: f64 = connections_total(rows, &src, &dst, bucket);
         if connections > 0.0 {
             out.push(point(
@@ -356,6 +362,21 @@ pub fn aggregate(rows: &[EdgeRow]) -> Vec<TsPoint> {
                 ],
                 "value",
                 duration_sum as f64 / connections,
+                bucket,
+            ));
+        }
+        if duration_max > 0 {
+            out.push(point(
+                "apm_edge_duration_micros",
+                &[
+                    ("src_service", &src),
+                    ("dst_service", &dst),
+                    ("span_kind", ""),
+                    ("field", "max"),
+                    ("source", "ebpf"),
+                ],
+                "value",
+                duration_max as f64,
                 bucket,
             ));
         }
@@ -591,6 +612,7 @@ mod tests {
             bytes_sent: 100,
             bytes_recv: 200,
             duration_sum: 1_000,
+            duration_max: 1_500,
             tcp_retrans: 1,
             tcp_resets: 0,
             failures,
@@ -664,6 +686,13 @@ mod tests {
             .unwrap();
         // 直方图 [1,2,0]：累计到槽 1 已达 95%，槽 1 的上界是 4 微秒。
         assert_eq!(p95.field_value, 4.0);
+        // `max` 是桶内各边的最大值（边表里有 duration_max，但此前没有对应指标）。
+        let max = points
+            .iter()
+            .find(|p| p.measurement == "apm_edge_duration_micros" && p.tags["field"] == "max")
+            .unwrap();
+        assert!(max.field_value >= avg.field_value, "max 不应小于 avg");
+        assert_eq!(max.tags["source"], "ebpf");
     }
 
     #[test]

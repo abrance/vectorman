@@ -688,6 +688,7 @@ async fn ebpf_metrics_aggregation_uses_watermark_and_is_idempotent() {
         bytes_sent: 10,
         bytes_recv: 20,
         duration_sum: 100,
+        duration_max: 120,
         tcp_retrans: 1,
         tcp_resets: 0,
         failures: 0,
