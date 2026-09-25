@@ -1,5 +1,8 @@
 # 需求实施计划
 
+> 交付后的**遗留项与闭环状态**见同目录 [`todo.md`](./todo.md)：逐跳核对「已实现且实测」与
+> 「已实现但未实测」，并列了 12 项待办（含原因、做法、验收）。本文档记录实施拆分与勾选状态。
+
 本期只交付设计，本清单为待实施拆分，全部未开工。P1/P2/P3 是交付阶段，阶段间可独立上线；P3 未开工不影响 P1/P2。
 
 实施顺序：本 feature 在 `apm-tracing` 之后（`LogStore` 索引 v2 → `dataplane-ts-retention` → `apm-tracing` → 本 feature）。服务名静态映射的 CRUD 由 `apm-tracing` 提供，本 feature 只消费。
@@ -215,6 +218,17 @@
   - [ ] 7.5 `dpc edges`、`dpc ebpf-events` 子命令
     - 对应需求 13.7
   - [ ] 7.6 vitest：两视图参数拼装、`source` 切换表达式、降级标记、跳转 URL
+- [x] 6.1 端到端闭环验证（本机真跑，实现期新增子项）
+  - [x] 状态：已完成。在本机 6.1 内核 + 本地 dataserver 上跑通：
+    内核采集 → 用户态差分出边记录 → `POST /v1/ingest` → 接入校验/服务名反查/落库 → `POST /v1/edges/search`
+    （`source=ebpf` 588 行、缺省合并 38 条逻辑边）→ 指标派生（`ebpf_edge_connections_total` 164 条序列、
+    `apm_edge_requests_total{source=ebpf}` 32 条、`apm_edge_duration_micros` 40 条）→ Prom 查询；
+    进程项另验证了 `ebpf_process_{exec,exit,fork}_total`（192/233/104 条序列）、
+    `agent_ebpf_capability`（`available=1`）与 `POST /v1/ebpf/events/search`（原始事件、时间戳正确）。
+  - 过程中发现并修掉两个「拼起来才暴露」的问题（信封字段不一致、原始事件时间戳恒为 0），详见 design。
+  - **仍未覆盖**：① GSE 下发采集项这一跳（本工具走的是同一套用户态代码，但由手工启动，不经 GSE）；
+    ② 前端 `/ebpf` 页只有单测，未做浏览器实跑；③ Pod **名**反查（需要 k8s 侧数据）。
+
 - [ ] 8. P2 文件与 syscall、DNS
   - [ ] 8.1 内核态：`sys_enter/sys_exit_openat|read|write|fsync` 延迟直方图与错误码计数
     - 对应需求 6.1-6.6

@@ -330,6 +330,11 @@ pub async fn run_process_loop(
 
         // 原始事件：默认关闭；开启时按 `raw_events_sample_ratio` 抽样（需求 4.5、10.3）。
         if cfg.raw_events_enabled {
+            // 单调时钟 → 墙上时钟的偏移每轮算一次即可（同一轮内的事件误差可忽略）。
+            let offset = monotonic_to_unix_offset_micros().unwrap_or_else(|| {
+                eprintln!("gse-agent: /proc/uptime 不可读，原始事件时间戳将退化为读取时刻");
+                now_micros()
+            });
             let events = source.drain_raw_events();
             let mut records = Vec::new();
             for event in events {
@@ -337,7 +342,7 @@ pub async fn run_process_loop(
                 if !sample(sample_cursor, cfg.raw_events_sample_ratio) {
                     continue;
                 }
-                records.push(raw_event_record(&agent_id, &event));
+                records.push(raw_event_record(&agent_id, &event, offset));
             }
             if !records.is_empty() {
                 stats
@@ -370,9 +375,33 @@ pub fn sample(cursor: u64, ratio: f64) -> bool {
     cursor.is_multiple_of(step)
 }
 
-/// 原始事件 → `data_type=ebpf` 记录。
+/// 单调时钟（内核 `bpf_ktime_get_ns`）与墙上时钟的偏移（微秒）。
+///
+/// 内核只有单调时钟，原始事件的时间戳必须换算成 Unix 时间才对前端有意义。
+/// `/proc/uptime` 的第一列就是单调秒数，两者同源，因此 `偏移 = now_unix − uptime`。
+/// 读不到 `/proc/uptime` 时返回 `None`，调用方退回「按读取时刻打时间戳」。
 #[must_use]
-pub fn raw_event_record(agent_id: &str, event: &ebpf_abi::RawEvent) -> serde_json::Value {
+pub fn monotonic_to_unix_offset_micros() -> Option<i64> {
+    let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
+    let seconds: f64 = uptime.split_whitespace().next()?.parse().ok()?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    Some(now_micros().saturating_sub((seconds * 1_000_000.0) as i64))
+}
+
+/// 原始事件 → `data_type=ebpf` 记录。
+///
+/// **字段必须与 dataserver 的 `EbpfRecord` 对齐**（`record_id`/`timestamp`/`event_type`/`pid`/
+/// `process_name`/`message`/`labels`）。踩过的坑：早期版本发的是 `kind`/`comm`/`saddr`…，
+/// 两边各自单测都过，但拼起来整批 `invalid_record: missing field event_type` —— 这类
+/// 「契约不一致」只有真跑一次端到端才会暴露。
+#[must_use]
+pub fn raw_event_record(
+    agent_id: &str,
+    event: &ebpf_abi::RawEvent,
+    monotonic_offset_micros: i64,
+) -> serde_json::Value {
     let kind = match event.kind {
         ebpf_abi::EVENT_KIND_CONNECT => "connect",
         ebpf_abi::EVENT_KIND_ACCEPT => "accept",
@@ -380,33 +409,66 @@ pub fn raw_event_record(agent_id: &str, event: &ebpf_abi::RawEvent) -> serde_jso
         ebpf_abi::EVENT_KIND_PROCESS_EXEC => "process_exec",
         ebpf_abi::EVENT_KIND_PROCESS_EXIT => "process_exit",
         ebpf_abi::EVENT_KIND_PROCESS_FORK => "process_fork",
-        other => {
-            // 未知类型不丢：保留数值，便于新内核加事件类型时排障。
-            return serde_json::json!({
-                "record_id": format!("{agent_id}:{}:{}", event.timestamp_ns, event.kind),
-                "timestamp": (event.timestamp_ns / 1_000) as i64,
-                "kind": format!("unknown_{other}"),
-                "pid": event.pid,
-                "cgroup_id": event.cgroup_id,
-            });
-        }
+        // 未知类型不丢：新内核加事件类型时能直接看到原始编号。
+        other => return unknown_event_record(agent_id, event, other, monotonic_offset_micros),
     };
     let comm = comm_str(&event.comm);
+    let saddr = ipv4_of(event.saddr);
+    let daddr = ipv4_of(event.daddr);
+    let message = if event.kind >= ebpf_abi::EVENT_KIND_PROCESS_EXEC {
+        format!("{kind} {comm}")
+    } else {
+        format!(
+            "{kind} {comm} {saddr}:{} -> {daddr}:{}",
+            event.sport, event.dport
+        )
+    };
     serde_json::json!({
         "record_id": format!(
             "{agent_id}:{}:{kind}:{}:{}",
             event.timestamp_ns, event.pid, event.saddr
         ),
-        "timestamp": (event.timestamp_ns / 1_000) as i64,
-        "kind": kind,
-        "pid": event.pid,
-        "cgroup_id": event.cgroup_id,
-        "comm": comm,
-        "saddr": ipv4_of(event.saddr),
-        "daddr": ipv4_of(event.daddr),
-        "sport": event.sport,
-        "dport": event.dport,
-        "protocol": event.protocol,
+        "timestamp": event_timestamp_micros(event, monotonic_offset_micros),
+        "event_type": kind,
+        "pid": event.pid as i64,
+        "process_name": comm,
+        "message": message,
+        "labels": {
+            "cgroup_id": event.cgroup_id.to_string(),
+            "protocol": event.protocol.to_string(),
+            "saddr": saddr,
+            "daddr": daddr,
+            "sport": event.sport.to_string(),
+            "dport": event.dport.to_string(),
+        },
+    })
+}
+
+/// 事件时间戳（Unix 微秒）：单调时钟 + 偏移；内核没填（0）时退回当前时刻。
+#[must_use]
+pub fn event_timestamp_micros(event: &ebpf_abi::RawEvent, monotonic_offset_micros: i64) -> i64 {
+    if event.timestamp_ns == 0 {
+        return now_micros();
+    }
+    (event.timestamp_ns / 1_000) as i64 + monotonic_offset_micros
+}
+
+/// 未知事件类型：仍然按契约发，`event_type` 保留 `unknown_<n>` 便于排障。
+fn unknown_event_record(
+    agent_id: &str,
+    event: &ebpf_abi::RawEvent,
+    kind: u32,
+    monotonic_offset_micros: i64,
+) -> serde_json::Value {
+    let event_type = format!("unknown_{kind}");
+    serde_json::json!({
+        "record_id": format!("{agent_id}:{}:{event_type}:{}", event.timestamp_ns, event.pid),
+        "timestamp": event_timestamp_micros(event, monotonic_offset_micros),
+        "event_type": event_type,
+        "pid": event.pid as i64,
+        "process_name": comm_str(&event.comm),
+        "message": format!("未知事件类型 {kind}"),
+        "labels": {"cgroup_id": event.cgroup_id.to_string()},
     })
 }
 
@@ -695,18 +757,52 @@ mod tests {
             comm,
             ..Default::default()
         };
-        let record = raw_event_record("agent-1", &event);
-        assert_eq!(record["kind"], "process_exec");
-        assert_eq!(record["comm"], "java");
-        assert_eq!(record["saddr"], "10.0.0.5");
-        assert_eq!(record["dport"], 8_080);
-        assert_eq!(
-            record["timestamp"].as_i64().unwrap(),
-            1_700_000_000_123_456i64
+        let record = raw_event_record("agent-1", &event, -1_700_000_000_000_000);
+        // 字段名必须与 dataserver 的 `EbpfRecord` 一致（`event_type`/`process_name`/`message`）：
+        // 早期版本发的是 `kind`/`comm`，两边各自单测都过，拼起来整批 `missing field event_type`。
+        assert_eq!(record["event_type"], "process_exec");
+        assert_eq!(record["process_name"], "java");
+        assert_eq!(record["pid"], 42);
+        assert!(record["message"]
+            .as_str()
+            .unwrap()
+            .contains("process_exec java"));
+        assert_eq!(record["labels"]["saddr"], "10.0.0.5");
+        assert_eq!(record["labels"]["dport"], "8080");
+
+        // 内核没填时间戳（0）时退回当前时刻，不出现 1970 年。
+        let untimed = ebpf_abi::RawEvent {
+            timestamp_ns: 0,
+            ..event
+        };
+        assert!(
+            raw_event_record("agent-1", &untimed, 0)["timestamp"]
+                .as_i64()
+                .unwrap()
+                > 0
+        );
+        // 时间戳 = 单调时钟 + 偏移（这里用负偏移模拟「boot 时间与 Unix 起点之差」）。
+        assert_eq!(record["timestamp"].as_i64().unwrap(), 123_456);
+
+        // 连接类事件的消息里带五元组，便于日志页直接读。
+        let connect = ebpf_abi::RawEvent {
+            kind: ebpf_abi::EVENT_KIND_CONNECT,
+            ..event
+        };
+        let message = raw_event_record("agent-1", &connect, 0)["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            message.contains("connect java 10.0.0.5:40000 -> 10.0.0.9:8080"),
+            "{message}"
         );
 
         let unknown = ebpf_abi::RawEvent { kind: 99, ..event };
-        assert_eq!(raw_event_record("agent-1", &unknown)["kind"], "unknown_99");
+        assert_eq!(
+            raw_event_record("agent-1", &unknown, 0)["event_type"],
+            "unknown_99"
+        );
     }
 
     #[test]
