@@ -172,6 +172,9 @@ pub struct EdgeRow {
     pub latency_hist: Vec<u64>,
 }
 
+/// 单条边的耗时累计：`(耗时和, 耗时最大值, 耗时直方图)`。
+type DurationAgg = (i64, i64, Vec<u64>);
+
 /// 字节计数的聚合键：`(分钟桶, 源服务, 目标服务, 源 IP, 目标 IP, 目标端口, 方向:协议)`。
 type BytesKey = (i64, String, String, String, String, i64, String);
 
@@ -185,8 +188,7 @@ pub fn aggregate(rows: &[EdgeRow]) -> Vec<TsPoint> {
     let mut failures: BTreeMap<(i64, String, String, String), f64> = BTreeMap::new();
     let mut bytes: BTreeMap<BytesKey, f64> = BTreeMap::new();
     // 耗时：均值直接累加，p95 用直方图槽近似。
-    // `(耗时和, 耗时最大值, 耗时直方图)`。
-    let mut duration: BTreeMap<(i64, String, String), (i64, i64, Vec<u64>)> = BTreeMap::new();
+    let mut duration: BTreeMap<(i64, String, String), DurationAgg> = BTreeMap::new();
 
     for row in rows {
         let bucket = floor_minute(row.bucket_start);
