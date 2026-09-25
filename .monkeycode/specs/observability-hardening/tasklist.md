@@ -49,6 +49,27 @@
 - [ ] 1.11 gse-server 的 web dist 是 **console/dist**、console 的是 **desktop/dist**（已按对应关系铺好，
       前端更新流程「npm build → scp → rollout restart」写进 README；待跑过一次更新流程确认）
 
+## 1c. cops CD 接管（用户已确认口径，2026-09-25 问卷定稿）
+
+> 决策记录：空库起（不搬 cloud2 数据）；cloud2 Agent 改连 cloud3（server_addr 用域名
+> `gse.xiaoyxq.top:30710`，server 监听维持 NodePort，不加 TCPRoute）；DaemonSet 排下一轮；
+> dist 打进镜像（构建上下文改源码树）；metrics 口不建 Service；cops 一次改造到位；
+> cloud2 退役 = cops CD 稳定 2 天后。
+
+- [ ] 1.12 `Dockerfile` 改 multi-stage：构建上下文改为**源码树**（`npm build:console/dataplane` +
+      musl release 产物），dist 打进镜像；`build-image.sh` 增加 `--src` 用法（保留 `--pkg` 兼容）
+- [ ] 1.13 vectorman release workflow 增加「构建多功能镜像 → push `ghcr.io/abrance/vectorman-server:<tag>`」
+      （cops 的 check-registries 守卫只放行 ghcr.io）；镜像 tag 与 cops 单元 `.env` 的
+      `*_IMAGE_TAG` 对齐（只 bump tag 行）
+- [ ] 1.14 `server-stack.yaml` 增加三条域名 × 两条 IngressRoute（web 跳转 + websecure +
+      `tls.certResolver letsencrypt`，沿用 cops whoami/model-logcluster 的已验证写法）；
+      ConfigMap/Deployment 不动；**DNS 先生效再 apply**
+- [ ] 1.15 删 Pod 重建数据仍在、`rollout restart` 无 CrashLoop、cron 全量 apply 幂等
+      （连续两晚 Pod AGE 增长）—— 作为 cops 接管后的验收
+- [ ] 1.16 cloud2 Agent 迁移：台账重新登记（host+agent，token 一致）、
+      `server_addr = "gse.xiaoyxq.top:30710"`、重启 systemd、心跳 online；
+      迁移 PR 描述写死「空库起」决定
+
 ## 2. 单机回归清单（对应需求 5、9）
 
 - [ ] 2.1 把设计里的 V12 三条命令固化成可复制的清单（写进 `ebpf-observability/todo.md` 附录或
