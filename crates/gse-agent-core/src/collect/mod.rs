@@ -105,9 +105,10 @@ impl CollectShared {
     }
 
     /// 组批入队；`data_id = item_id`，空记录不入队。
-    pub async fn push(&self, data_type: &str, item_id: &str, records: Vec<Value>) {
+    /// 入队一批记录；返回**被淘汰的记录数**（容量满时淘汰最旧，见 `Buffer::push`）。
+    pub async fn push(&self, data_type: &str, item_id: &str, records: Vec<Value>) -> u64 {
         if records.is_empty() {
-            return;
+            return 0;
         }
         let host_id = self.host_id().await.unwrap_or_default();
         let env = DataEnvelope {
@@ -124,7 +125,7 @@ impl CollectShared {
             sent_at_micros: now_micros(),
             records,
         };
-        self.buffer.push(env).await;
+        self.buffer.push(env).await
     }
 }
 

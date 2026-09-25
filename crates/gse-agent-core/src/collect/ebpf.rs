@@ -34,25 +34,28 @@ pub const BTF_PATH: &str = "/sys/kernel/btf/vmlinux";
 /// 把 eBPF 采集结果交给既有采集信道（`CollectShared::push` 做组批与重试）。
 struct SharedSink {
     shared: Arc<CollectShared>,
+    /// 上行缓冲淘汰计数（缓冲满时淘汰最旧；必须上报，否则丢数据在 Prom 上看不见）。
+    stats: Arc<EbpfStats>,
 }
 
 impl EbpfSink for SharedSink {
     fn edges(&self, item_id: &str, records: Vec<serde_json::Value>) {
-        push(&self.shared, "ebpf_edges", item_id, records);
+        push(&self.shared, &self.stats, "ebpf_edges", item_id, records);
     }
 
     fn metrics(&self, item_id: &str, records: Vec<serde_json::Value>) {
-        push(&self.shared, "metrics", item_id, records);
+        push(&self.shared, &self.stats, "metrics", item_id, records);
     }
 
     fn raw_events(&self, item_id: &str, records: Vec<serde_json::Value>) {
-        push(&self.shared, "ebpf", item_id, records);
+        push(&self.shared, &self.stats, "ebpf", item_id, records);
     }
 }
 
-/// `push` 是 async，采集循环是同步上下文，这里用阻塞提交（队列是无界的，不会卡采集）。
+/// `push` 是 async，采集循环是同步上下文，这里用 spawn 提交（队列无界，不会卡采集）。
 fn push(
     shared: &Arc<CollectShared>,
+    stats: &Arc<EbpfStats>,
     data_type: &str,
     item_id: &str,
     records: Vec<serde_json::Value>,
@@ -61,11 +64,17 @@ fn push(
         return;
     }
     let shared = shared.clone();
+    let stats = stats.clone();
     let data_type = data_type.to_string();
     let item_id = item_id.to_string();
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(async move {
-            shared.push(&data_type, &item_id, records).await;
+            let dropped = shared.push(&data_type, &item_id, records).await;
+            if dropped > 0 {
+                stats
+                    .buffer_dropped
+                    .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+            }
         });
     } else {
         eprintln!("gse-agent: ebpf push outside runtime; {data_type} records dropped");
@@ -85,10 +94,11 @@ pub async fn run_item(
     // 不新增配置面；凭据解析不到就关闭反查（只影响 `src_pod` 退化成 uid，不影响采集）。
     let pod_names = pod_name_loader(&collector);
     let report = PreflightEnv::detect().check();
+    let stats = Arc::new(EbpfStats::default());
     let sink: Arc<dyn EbpfSink> = Arc::new(SharedSink {
         shared: shared.clone(),
+        stats: stats.clone(),
     });
-    let stats = Arc::new(EbpfStats::default());
 
     if !report.ok() {
         // 前置校验失败：只降级本项，Agent 其它能力不受影响。

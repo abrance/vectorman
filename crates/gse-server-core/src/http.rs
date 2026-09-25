@@ -421,7 +421,15 @@ async fn create_dataplane(
         d.registered_at = ledger_stamp();
     }
     match admin.ledger.upsert_dataplane(&d).await {
-        Ok(()) => created(&d),
+        Ok(()) => {
+            // 立刻探一次：否则要等最多一个探活间隔（默认 30s）才会变 online，
+            // 这段时间 Agent 拿不到上报地址，采集数据积压后被淘汰。
+            crate::dataplane::spawn_probe_after_register(
+                admin.ledger.clone(),
+                d.service_id.clone(),
+            );
+            created(&d)
+        }
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
