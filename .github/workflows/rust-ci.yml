@@ -43,6 +43,11 @@ jobs:
             sudo tee /etc/apt/sources.list.d/llvm-21.list >/dev/null
           sudo apt-get update -q
           sudo apt-get install -y -q llvm-21-dev libclang-21-dev clang-21
+          # apt.llvm.org 把 `llvm-config-21` 放在 /usr/bin，而 llvm-sys 只认
+          # `$LLVM_SYS_211_PREFIX/bin/llvm-config`，所以补一个链接。
+          sudo mkdir -p /usr/lib/llvm-21/bin
+          sudo ln -sf /usr/bin/llvm-config-21 /usr/lib/llvm-21/bin/llvm-config
+          /usr/lib/llvm-21/bin/llvm-config --version
       - name: Install bpf-linker
         env:
           LLVM_SYS_211_PREFIX: /usr/lib/llvm-21
