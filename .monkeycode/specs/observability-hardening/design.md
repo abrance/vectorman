@@ -46,8 +46,11 @@ flowchart LR
 
 要点：
 
-- **gse-server 与 dataserver 本版仍跑在集群外**（安装包 + systemd），DaemonSet 通过 ConfigMap 里的
-  `server_addr` 指向它们；不引入 Ingress/Service 暴露（验证成本最低，部署形态的 k8s 化留给 v1.3 的 charts）。
+- **（2026-09-25 用户决定，口径更新）server 侧整体上集群**：gse-server / dataserver / console 以
+  Deployment（单副本、`strategy: Recreate`）+ NodePort Service 跑在 k3s 里，数据与 web dist 走
+  节点 hostPath（`/opt/vectorman-k8s/*`）；Agent 的 `server_addr` 指向 `{node}:30710`（RPC NodePort）。
+  材料见 `packaging/deploy/k8s/server-stack.yaml` 与 README 第 5b 节（含 cloud3 实测结论）。
+  CLI（`dpc`/`vmctl`）不进集群；helm 化仍排 v1.3。
 - **Agent 看到的是宿主机视图**：`hostPID: true` 让容器内 `/proc` 即宿主机 procfs，
   因此 `crates/gse-agent-ebpf/src/cgroup.rs` 读 `/proc/<pid>/cgroup` 能拿到宿主机的 cgroup 路径
   （含 `pod<uid>` 与容器 ID），无需额外挂载 `/proc`，也不需要改代码。

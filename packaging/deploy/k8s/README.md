@@ -155,6 +155,71 @@ sudo bpftool prog list | grep -c gse || echo "无残留"
 sudo bpftool map list  | grep -c gse || echo "无残留"
 ```
 
+## 5b. server 组件上 k3s（gse-server / dataserver / console）
+
+> **已在 cloud3 实测（2026-09-25）**：三 Deployment 全部 Running；`/health`、台账 API、
+> GSE/数据面前端（含 SPA 回退）、Prom/SQL 口、`ingest → 落库 → edges/search` 全链路通过；
+> dataplane 探活 `online`；**删 Pod 重建后数据仍在**（hostPath 生效）。
+> 部署期踩的两个坑已写进下文设计要点（镜像 tag 要一致；dataserver 的 `http_web_dir`
+> 是**顶层键**，写进 `[sql_http]` 段会静默失效）。
+
+server 侧也可以整体进集群（与 Agent 的 DaemonSet 同一命名空间 `vectorman`）：
+
+```bash
+# 1) 造镜像（server 侧五件二进制共用一个 scratch 镜像，入口由 Pod command 指定）
+packaging/deploy/k8s/build-image.sh --pkg /tmp/vectorman-1.2.0 --version 1.2.0 --import cloud3
+
+# 2) 准备节点目录（数据 + 前端 dist；hostPath 不会自动创建父目录）
+ssh cloud3 'mkdir -p /opt/vectorman-k8s/{gse-server,dataserver,web/dataplane,web/console}'
+# 前端 dist（本机构建后 scp；更新前端 = 重传 + 滚动重启，不用重造镜像）
+npm run build:console && npm run build:dataplane
+#   对应关系与二进制安装一致：gse-server/web = console/dist（GSE 前端）、
+#   console/web = desktop/dist（桌面门户）、dataserver/web = dataplane/dist
+scp -r frontend/apps/console/dist/.  cloud3:/opt/vectorman-k8s/web/gse/
+scp -r frontend/apps/desktop/dist/.  cloud3:/opt/vectorman-k8s/web/console/
+scp -r frontend/apps/dataplane/dist/. cloud3:/opt/vectorman-k8s/web/dataplane/
+
+# 3) 干跑 + 应用
+kubectl apply --dry-run=server -f packaging/deploy/k8s/server-stack.yaml
+kubectl apply -f packaging/deploy/k8s/server-stack.yaml
+kubectl -n vectorman get pods,svc
+```
+
+访问入口（节点 IP + NodePort）：
+
+| 组件 | 用途 | NodePort |
+| --- | --- | --- |
+| gse-server | Agent RPC（Agent 的 `server_addr` 填 `{node}:30710`） | 30710 |
+| gse-server | 台账 API + GSE 前端 | 30711 |
+| dataserver | 数据面前端 + 查询（同源，相对路径） | 30881 |
+| dataserver | Prom 查询口 | 30990 |
+| console | 桌面门户 | 30720 |
+
+关键设计（都有代码事实支撑，不是想当然）：
+
+- **数据落盘**：gse-server 的 `db` 与 dataserver 的 `data_path` 都走
+  `hostPath /opt/vectorman-k8s/<组件>`（单节点 k3s，不引入 PVC/local-path）；
+  两个 Deployment 都用 `strategy: Recreate` —— sqlite/tsink 是文件型存储，滚动更新会双开进程写同一文件。
+- **前端 dist 用 hostPath**（不用 ConfigMap）：dataplane 的单个 js 就有 1.2 MB，
+  超 ConfigMap 的 1 MiB 单文件限制；`scp` + 重启即可更新，不用重造镜像。
+- **同源部署**：前端是相对路径请求（`/v1/...`、`/api/sql/v1/sql`），dataserver 的
+  `http_web_dir` 挂 dist 后同端口托管（SPA 回退 index.html），无需改前端、无需 Ingress。
+- **配置全走 env/ConfigMap**：`GSE_SERVER_CONFIG`、`CONSOLE_CONFIG`、`--config`（dataserver）、
+  `DP_DATA_PATH`；监听改绑 `0.0.0.0`（Pod 网络里没有 localhost 之外的可达性）。
+- **台账联动**：dataserver 的 `gse_admin_url` 指向集群内 Service
+  `http://gse-server-internal.vectorman.svc:7101`（清理器按台账 live 采集项决定保留范围）。
+- **CLI 不进集群**：`dpc` / `vmctl` 是运维命令行，留在能访问 NodePort 的机器上用即可。
+- **镜像 tag 必须与清单一致**：清单 `image: vectorman-server:1.2.0` 而导入的是 `...:1.2.0-dev`
+  会 `ErrImagePull`（k3s 不会去 docker.io 找这个不存在的仓库）。
+- **dataserver 的 `http_web_dir` 是顶层键**：写进 `[sql_http]` 段会被解析成
+  `sql_http.http_web_dir`，顶层仍为 None，静态托管**静默关闭**（日志只有一行 404，无报错）。
+  `gse_admin_url` 同理是顶层键。核对方法：`kubectl get cm dataserver-conf -o jsonpath='{.data.config\.toml}'`。
+- **删 Pod 后立刻重建可能撞 redb 文件锁**（旧容器还没完全退出 →
+  `open redb: Database already open. Cannot acquire lock.` → CrashLoop，等旧容器 Exited 后自动恢复）。
+  换镜像/改配置时用 `kubectl rollout restart`（先停旧再起新），别 `delete pod` 后马上再 apply。
+- **配置变更要重启 Pod**：ConfigMap 挂载内容变了但 env/pod spec 没变时不会自动滚动；
+  `kubectl -n vectorman rollout restart deploy/<name>`。
+
 ## 6. 设计要点（为什么这么写）
 
 | 写法 | 原因 |

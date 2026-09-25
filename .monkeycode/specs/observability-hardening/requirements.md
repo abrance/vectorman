@@ -29,6 +29,10 @@ v1.1.0 已交付 APM 全链路与 eBPF 四类采集项（`ebpf_network` / `ebpf_
 
 ## Requirements
 
+> **2026-09-25 范围更新（用户决定）**：server 侧组件（gse-server / dataserver / console）也以
+> Deployment + NodePort 上 k3s（cloud3），Agent 暂不部署 —— 下文 Requirement 1 中「服务端留在集群外」
+> 的表述随之修正，验收以 `packaging/deploy/k8s/server-stack.yaml` 与 README 第 5b 节为准。
+
 ### Requirement 1: 集群内以 DaemonSet 形态部署 Agent
 
 **User Story:** AS 运维人员, I want 用 k8s 原生方式在每个节点部署 Agent, so that 采集不依赖手工登机安装。
@@ -141,7 +145,8 @@ v1.1.0 已交付 APM 全链路与 eBPF 四类采集项（`ebpf_network` / `ebpf_
 
 1. THE 验证环境 SHALL 为**自建 Kubernetes 集群**（kubeadm 等），节点内核 **≥ 5.8** 且带 BTF。
 2. THE 验证 SHALL 需要：节点可用特权容器、gse-server 与 dataserver 从集群内可达
-   （本版用安装在集群外的安装包实例，不要求 Ingress/Service 暴露）。
+   （_2026-09-25 更新：两者已以 Deployment + NodePort 跑进集群，见 `server-stack.yaml`；
+   对 Agent 只要求 `{node}:30710` 可达，不要求 Ingress/域名_）。
 3. THE 验证影响面 SHALL 限于轻量：只部署 Agent、下发采集项、观察指标与页面，不制造压力与异常。
 4. THE 本 feature SHALL NOT 改变任一已交付采集项的数据模型与指标命名（只做验证、口径与文档对齐）。
 

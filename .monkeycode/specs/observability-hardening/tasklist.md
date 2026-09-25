@@ -32,6 +32,23 @@
       `docker save | ssh cloud3 'sudo -n k3s ctr images import -'`，6 秒导入、`k3s ctr images ls` 可查
       （集群内无 registry，脚本已处理 containerd socket 的 root 权限）
 
+## 1b. server 组件进集群（用户决定，2026-09-25）
+
+> 用户决定：**server 侧（gse-server / dataserver / console）整体上 k3s（cloud3），
+> Agent 暂不部署** —— 原设计「server 留在集群外」的口径作废，随交付更新。
+
+- [x] 1.8 `packaging/deploy/k8s/Dockerfile` 改为**多功能镜像**（五组件二进制共用一个 scratch 镜像，
+      入口由 Pod command 指定；实测 56 MB，三个入口 `--version` 正常）
+- [x] 1.9 新增 `packaging/deploy/k8s/server-stack.yaml`：三 Deployment（`strategy: Recreate`）+
+      4 Service（NodePort 30710/30711/30881/30990 + ClusterIP 7101）+ 3 ConfigMap；
+      数据与 web dist 走 hostPath `/opt/vectorman-k8s/*`
+- [x] 1.10 cloud3 实测通过：三 Pod Running；`/health`、台账 API、两套前端（含 SPA 回退）、
+      Prom/SQL 口、`ingest → 落库 → edges/search` 全链路、dataplane 探活 `online`、
+      **删 Pod 重建数据仍在**；过程中发现并修正「镜像 tag 不一致」与
+      「`http_web_dir` 写错段导致静态托管静默关闭」两个坑（均记录在 `deploy/k8s/README.md`）
+- [ ] 1.11 gse-server 的 web dist 是 **console/dist**、console 的是 **desktop/dist**（已按对应关系铺好，
+      前端更新流程「npm build → scp → rollout restart」写进 README；待跑过一次更新流程确认）
+
 ## 2. 单机回归清单（对应需求 5、9）
 
 - [ ] 2.1 把设计里的 V12 三条命令固化成可复制的清单（写进 `ebpf-observability/todo.md` 附录或
