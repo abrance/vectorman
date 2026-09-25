@@ -32,6 +32,12 @@ v1.1.0 已交付 APM 全链路与 eBPF 四类采集项（`ebpf_network` / `ebpf_
 > **2026-09-25 范围更新（用户决定）**：server 侧组件（gse-server / dataserver / console）也以
 > Deployment + NodePort 上 k3s（cloud3），Agent 暂不部署 —— 下文 Requirement 1 中「服务端留在集群外」
 > 的表述随之修正，验收以 `packaging/deploy/k8s/server-stack.yaml` 与 README 第 5b 节为准。
+>
+> **对外入口口径（用户定稿）**：server 侧只负责「IP:port 监听」；**客户端配置一律写「域名:port」**。
+> 三个子域名 `gse.` / `data.` / `console.`（解析到节点 IP）：前两个经 Traefik（websecure + 两条
+> IngressRoute 惯例），Agent RPC 走 NodePort 30710 直连（`server_addr = "gse.xiaoyxq.top:30710"`，
+> 不加 TCPRoute）。存量数据**空库起**（cloud2 的 49MB 测试数据不迁移）；cops CD 接管与 dist 进镜像
+> 一次改造到位；cloud2 旧 systemd 在 cops CD 稳定 2 天后退役。
 
 ### Requirement 1: 集群内以 DaemonSet 形态部署 Agent
 

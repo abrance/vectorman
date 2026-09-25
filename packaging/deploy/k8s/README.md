@@ -189,11 +189,24 @@ kubectl -n vectorman get pods,svc
 
 | 组件 | 用途 | NodePort |
 | --- | --- | --- |
-| gse-server | Agent RPC（Agent 的 `server_addr` 填 `{node}:30710`） | 30710 |
+| gse-server | Agent RPC（Agent 的 `server_addr` 填 `gse.xiaoyxq.top:30710` —— 域名由 DNS 解析到节点 IP，流量直打 NodePort，不过 Traefik） | 30710 |
 | gse-server | 台账 API + GSE 前端 | 30711 |
 | dataserver | 数据面前端 + 查询（同源，相对路径） | 30881 |
 | dataserver | Prom 查询口 | 30990 |
 | console | 桌面门户 | 30720 |
+
+**DNS 与 Agent 连接口径**（2026-09-25 定稿）：server 侧只负责「IP:port 监听」（NodePort），
+**客户端配置一律写「域名:port」**——`gse-agent` 的 `server_addr = "gse.xiaoyxq.top:30710"`。
+三个子域名都解析到节点 IP（`186.244.201.55`）：
+
+| DNS 记录 | 指向 | 用途 |
+| --- | --- | --- |
+| `gse.xiaoyxq.top` | 186.244.201.55 | Traefik 80/443 → gse-server:7101（GSE 前端/台账 API）+ Agent RPC 30710（直连 NodePort） |
+| `data.xiaoyxq.top` | 186.244.201.55 | Traefik → dataserver:8081 |
+| `console.xiaoyxq.top` | 186.244.201.55 | Traefik → console:7200 |
+
+Agent RPC 不加 TCPRoute：域名只是 IP 的名字，连 `server_addr` 解析后直打 NodePort。
+前置：腾讯云轻量防火墙放行 TCP 30710（80/443 通常已放行）。
 
 关键设计（都有代码事实支撑，不是想当然）：
 
