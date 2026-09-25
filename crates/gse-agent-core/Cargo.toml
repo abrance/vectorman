@@ -14,6 +14,9 @@ serde_json.workspace = true
 toml = "0.8"
 libc = "0.2"
 ureq = { version = "2", features = ["json"] }
+# k8s apiserver 用集群自签 CA：需要按 CA 自建 rustls 配置（feature 与 ureq 的 tls 对齐，不引入新 provider）。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
 regex = "1"
 sha2 = "0.10"
 base64 = "0.22"

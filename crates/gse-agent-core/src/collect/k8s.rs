@@ -79,7 +79,7 @@ pub fn pod_name_index(pods: &[PodSummary]) -> HashMap<String, String> {
 /// 凭据解析失败或接口不可达都返回 `Err`，调用方退回 uid 即可（不致命）。
 pub fn list_pod_name_index(cfg: &CollectorConfig) -> Result<HashMap<String, String>, String> {
     let cred = kubeconfig::resolve(&cfg.kubeconfig)?;
-    let client = K8sClient::new(cred.base_url, cred.token);
+    let client = K8sClient::from_credential(cred)?;
     let pods = if cfg.namespace.trim().is_empty() {
         client.list_pods("")?
     } else {
@@ -130,15 +130,26 @@ pub struct K8sClient {
 
 impl K8sClient {
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
-        let agent = ureq::AgentBuilder::new()
+        Self::build(base_url.into(), token.into(), None).expect("无自定义 CA 时不会失败")
+    }
+
+    /// 由解析出的凭证构造：带集群自签 CA 时，TLS 只信任该 CA。
+    pub fn from_credential(cred: kubeconfig::K8sCredential) -> Result<Self, String> {
+        Self::build(cred.base_url, cred.token, cred.ca_pem.as_deref())
+    }
+
+    fn build(base_url: String, token: String, ca_pem: Option<&str>) -> Result<Self, String> {
+        let mut builder = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(10))
-            .timeout_read(Duration::from_secs(30))
-            .build();
-        Self {
-            agent,
-            base_url: base_url.into().trim_end_matches('/').to_string(),
-            token: token.into(),
+            .timeout_read(Duration::from_secs(30));
+        if let Some(ca) = ca_pem {
+            builder = builder.tls_config(kubeconfig::tls_config(ca)?);
         }
+        Ok(Self {
+            agent: builder.build(),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            token,
+        })
     }
 
     fn get(&self, path: &str) -> ureq::Request {
@@ -192,7 +203,13 @@ pub async fn run(shared: Arc<CollectShared>, item_id: String, cfg: CollectorConf
             return;
         }
     };
-    let client = Arc::new(K8sClient::new(cred.base_url, cred.token));
+    let client = match K8sClient::from_credential(cred) {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            eprintln!("gse-agent: k8s client 构造失败: {e}");
+            return;
+        }
+    };
     let cleaner = Arc::new(Cleaner::new(&cfg.clean));
     let (tx, mut rx) = mpsc::unbounded_channel::<FollowLine>();
     let mut active = Followers::default();
@@ -572,5 +589,73 @@ mod tests {
         let reader = client.open_log("default", "p", "c", &cfg).expect("open");
         let lines: Vec<String> = BufReader::new(reader).lines().map(|l| l.unwrap()).collect();
         assert_eq!(lines, vec!["line1", "line2"]);
+    }
+
+    /// 自签证书的 HTTPS 服务（模拟 k3s 的 apiserver）：能证明 CA 真的接上了。
+    fn tls_mock_server() -> String {
+        use rustls::pki_types::PrivateKeyDer;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let certs: Vec<_> = rustls_pemfile::certs(
+                &mut crate::collect::kubeconfig::test_ca::LEAF_CERT.as_bytes(),
+            )
+            .map(|c| c.expect("cert"))
+            .collect();
+            let key: PrivateKeyDer = rustls_pemfile::private_key(
+                &mut crate::collect::kubeconfig::test_ca::LEAF_KEY.as_bytes(),
+            )
+            .expect("key parse")
+            .expect("key present");
+            let cfg = Arc::new(
+                rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(certs, key)
+                    .expect("server cfg"),
+            );
+            if let Ok((tcp, _)) = listener.accept() {
+                let tls = rustls::ServerConnection::new(cfg).expect("tls conn");
+                let mut stream = rustls::StreamOwned::new(tls, tcp);
+                let mut buf = [0u8; 1024];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let body = r#"{"items":[]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("https://{addr}")
+    }
+
+    /// 带上集群 CA 才握手成功（k3s 等自签集群的前提）。
+    #[test]
+    fn trusts_cluster_ca_for_https() {
+        let base = tls_mock_server();
+        let cred = kubeconfig::K8sCredential {
+            base_url: base,
+            token: "t".to_string(),
+            ca_pem: Some(crate::collect::kubeconfig::test_ca::CERT.to_string()),
+        };
+        let client = K8sClient::from_credential(cred).expect("client");
+        if let Err(e) = client.list_pods("") {
+            panic!("带集群 CA 应能完成 TLS 握手，实际: {e}");
+        }
+    }
+
+    /// 不带 CA（默认公有根）应被自签证书拒掉 —— 证明上面那条不是“什么都信”。
+    #[test]
+    fn rejects_self_signed_cert_without_ca() {
+        let base = tls_mock_server();
+        let cred = kubeconfig::K8sCredential {
+            base_url: base,
+            token: "t".to_string(),
+            ca_pem: None,
+        };
+        let client = K8sClient::from_credential(cred).expect("client");
+        assert!(client.list_pods("").is_err(), "默认根证书不应信任自签证书");
     }
 }
