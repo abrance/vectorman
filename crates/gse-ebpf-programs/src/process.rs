@@ -21,7 +21,7 @@ mod common;
 use aya_ebpf::{
     helpers::bpf_get_current_comm,
     macros::{map, tracepoint},
-    maps::{Array, PerCpuHashMap, RingBuf},
+    maps::{Array, PerCpuArray, PerCpuHashMap, RingBuf},
     programs::TracePointContext,
 };
 use ebpf_abi::{
@@ -39,6 +39,10 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(262144, 0);
 
 #[map]
 static CFG: Array<u64> = Array::with_max_entries(CFG_LEN, 0);
+
+/// 令牌桶状态（per-CPU：令牌数、上次补充时间、被限流丢弃数）。
+#[map]
+static RATE: PerCpuArray<u64> = PerCpuArray::with_max_entries(common::rate_slot::LEN, 0);
 
 #[inline(always)]
 fn bump<F: FnOnce(&mut ProcAggWire)>(key: &ProcKey, f: F) {
@@ -89,7 +93,7 @@ fn emit(kind: u32, key: &ProcKey) {
 
 #[tracepoint(name = "sched_process_exec", category = "sched")]
 fn sched_process_exec(_ctx: TracePointContext) -> u32 {
-    if !common::cfg_ready(&CFG) {
+    if !common::cfg_ready(&CFG) || !common::rate_allow(&CFG, &RATE) {
         return 0;
     }
     let key = key();
@@ -102,7 +106,7 @@ fn sched_process_exec(_ctx: TracePointContext) -> u32 {
 
 #[tracepoint(name = "sched_process_exit", category = "sched")]
 fn sched_process_exit(_ctx: TracePointContext) -> u32 {
-    if !common::cfg_ready(&CFG) {
+    if !common::cfg_ready(&CFG) || !common::rate_allow(&CFG, &RATE) {
         return 0;
     }
     let key = key();
@@ -115,7 +119,7 @@ fn sched_process_exit(_ctx: TracePointContext) -> u32 {
 
 #[tracepoint(name = "sched_process_fork", category = "sched")]
 fn sched_process_fork(_ctx: TracePointContext) -> u32 {
-    if !common::cfg_ready(&CFG) {
+    if !common::cfg_ready(&CFG) || !common::rate_allow(&CFG, &RATE) {
         return 0;
     }
     let key = key();

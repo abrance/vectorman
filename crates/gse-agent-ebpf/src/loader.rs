@@ -10,7 +10,7 @@
 //!
 //! 加载失败由调用方按 [`crate::backoff::Backoff`] 重试。
 
-use aya::maps::{Array, MapData, PerCpuHashMap, PerCpuValues};
+use aya::maps::{Array, MapData, PerCpuArray, PerCpuHashMap, PerCpuValues};
 use aya::programs::{KProbe, TracePoint};
 use aya::Ebpf;
 
@@ -23,6 +23,16 @@ use ebpf_abi::{ConnAggWire, ProcAggWire, ProcKey};
 
 /// `CFG` map 名（内核态程序里同名）。
 pub const CFG_MAP: &str = "CFG";
+
+/// 令牌桶状态 map 名（内核态程序里同名）。
+pub const RATE_MAP: &str = "RATE";
+
+/// 令牌桶状态在 `PerCpuArray` 里的下标（与 `ebpf-abi`/内核态一致）。
+pub mod rate_slot {
+    pub const TOKENS: u32 = 0;
+    pub const LAST_NS: u32 = 1;
+    pub const DROPPED: u32 = 2;
+}
 
 mod objects {
     include!(concat!(env!("OUT_DIR"), "/ebpf_objects.rs"));
@@ -161,12 +171,19 @@ impl LoadedItem {
                 let map: PerCpuHashMap<MapData, PodConnKey, PodConnAgg> =
                     PerCpuHashMap::try_from(map)
                         .map_err(|e| format!("map {map_name} 类型不符：{e}"))?;
-                Ok(AyaMapSource::Conn(Box::new(ConnSource { bpf, map, cpus })))
+                let rate = take_rate_map(&mut bpf);
+                Ok(AyaMapSource::Conn(Box::new(ConnSource {
+                    bpf,
+                    map,
+                    cpus,
+                    rate,
+                })))
             }
             EbpfItemKind::Process => {
                 let map: PerCpuHashMap<MapData, PodProcKey, PodProcAgg> =
                     PerCpuHashMap::try_from(map)
                         .map_err(|e| format!("map {map_name} 类型不符：{e}"))?;
+                let rate = take_rate_map(&mut bpf);
                 let events = bpf
                     .take_map("EVENTS")
                     .and_then(|m| aya::maps::RingBuf::try_from(m).ok());
@@ -174,11 +191,18 @@ impl LoadedItem {
                     bpf,
                     map,
                     cpus,
+                    rate,
                     events,
                 })))
             }
         }
     }
+}
+
+/// 取出令牌桶 map（不存在时返回 `None`：旧对象文件也能跑，只是没有限流计数）。
+fn take_rate_map(bpf: &mut Ebpf) -> Option<PerCpuArray<MapData, u64>> {
+    let map = bpf.take_map(RATE_MAP)?;
+    PerCpuArray::try_from(map).ok()
 }
 
 /// 把 `CFG` 数组写进 map（内核态读它拿偏移与状态常量）。
@@ -249,6 +273,8 @@ pub struct ConnSource {
     bpf: Ebpf,
     map: PerCpuHashMap<MapData, PodConnKey, PodConnAgg>,
     cpus: usize,
+    /// 令牌桶状态（读走限流丢弃计数）。
+    rate: Option<PerCpuArray<MapData, u64>>,
 }
 
 /// 进程型采集项的 map 读取状态。
@@ -257,6 +283,7 @@ pub struct ProcessSource {
     bpf: Ebpf,
     map: PerCpuHashMap<MapData, PodProcKey, PodProcAgg>,
     cpus: usize,
+    rate: Option<PerCpuArray<MapData, u64>>,
     /// 原始事件环缓冲（`raw_events_enabled=false` 时内核态不写，读到的也是空）。
     events: Option<aya::maps::RingBuf<MapData>>,
 }
@@ -278,6 +305,30 @@ impl AyaMapSource {
             Self::Conn(source) => source.cpus,
             Self::Process(source) => source.cpus,
         }
+    }
+
+    /// 读走本采集项被限流丢弃的事件数（跨 CPU 求和后把内核侧计数清零）。
+    ///
+    /// 与 per-CPU 聚合值同理：**必须写回 0**，否则下一周期会重复计入。
+    pub fn take_rate_limit_drops(&mut self) -> u64 {
+        let rate = match self {
+            Self::Conn(source) => source.rate.as_mut(),
+            Self::Process(source) => source.rate.as_mut(),
+        };
+        let Some(rate) = rate else {
+            return 0;
+        };
+        // `PerCpuArray::get` 返回该下标的**全部 CPU 副本**，跨 CPU 求和后整体写回 0。
+        let Ok(values) = rate.get(&rate_slot::DROPPED, 0) else {
+            return 0;
+        };
+        let total: u64 = values.iter().copied().fold(0u64, u64::saturating_add);
+        if total > 0 {
+            if let Ok(zero) = PerCpuValues::try_from(vec![0u64; values.len()]) {
+                let _ = rate.set(rate_slot::DROPPED, zero, 0);
+            }
+        }
+        total
     }
 
     /// 读原始事件（只对 process 采集项有意义；内核态开启抽样时才写）。

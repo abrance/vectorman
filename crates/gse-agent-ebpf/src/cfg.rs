@@ -140,6 +140,11 @@ impl CfgValues {
         }
         slots[CfgIndex::IncludeLoopback as usize] = u64::from(config.include_loopback);
         slots[CfgIndex::RawEventsEnabled as usize] = u64::from(config.raw_events_enabled);
+        // 令牌桶（需求 9.5、12.1-12.2）：内核态拿不到 CPU 百分比，限流口径是「每秒事件数 + 突发容量」；
+        // `max_cpu_percent` 只作为用户态告警阈值（见设计里的口径说明）。0 表示不限制。
+        slots[CfgIndex::RateLimitPerSec as usize] = config.max_events_per_sec;
+        slots[CfgIndex::RateLimitBurst as usize] =
+            ebpf_abi::burst_for_rate(config.max_events_per_sec);
 
         // 关键字段校验：偏移不能为 0（除 `skc_daddr` 天然是 0），否则说明解析错了结构体。
         for (struct_name, member, index) in SOCK_FIELDS {
@@ -216,6 +221,16 @@ mod tests {
         assert_eq!(cfg.get(CfgIndex::TcpClose), 7);
         assert_eq!(cfg.get(CfgIndex::IncludeLoopback), 1);
         assert_eq!(cfg.get(CfgIndex::RawEventsEnabled), 1);
+        assert_eq!(
+            cfg.get(CfgIndex::RateLimitPerSec),
+            50_000,
+            "缺省每秒 5 万事件"
+        );
+        assert_eq!(
+            cfg.get(CfgIndex::RateLimitBurst),
+            5_000,
+            "突发容量是速率的 1/10"
+        );
         assert_eq!(cfg.slots().len(), CFG_LEN as usize);
     }
 
@@ -228,6 +243,7 @@ mod tests {
         assert_eq!(cfg.get(CfgIndex::TpSaddr), 30);
         assert_eq!(cfg.get(CfgIndex::IncludeLoopback), 0, "默认不采回环");
         assert_eq!(cfg.get(CfgIndex::RawEventsEnabled), 0);
+        assert_eq!(cfg.get(CfgIndex::RateLimitPerSec), 50_000);
     }
 
     #[test]
