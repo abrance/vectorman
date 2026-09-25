@@ -109,6 +109,11 @@ graph TD
 - **每个采集项一份 map**：`ebpf_network` 用 `CONN_AGG`、`ebpf_tcp` 用 `TCP_AGG`、`ebpf_process` 用 `PROC_AGG`。若两者共享同一 map，两个采集项会各读一次同一批增量 → 重复计数。同理 `ebpf_tcp` **只出指标不出边记录**：边记录按 `record_id` 覆盖写，两路都发会让同一连接的字段互相覆盖。
 - **`aya::Pod` 与孤儿规则**：`ebpf-abi` 是内核态共享 crate，不能依赖 `aya`；用户态用 `#[repr(transparent)]` 包装类型在本地实现 `aya::Pod`，读写时取出内层值。
 - **原始事件**：进程项经 `EVENTS` RingBuf 读取后按 `raw_events_sample_ratio` 等间隔抽样（不引随机数依赖，长期比例稳定）；未知事件类型按 `unknown_<n>` 上报而不是丢弃。
+- **合并视图的键**（实现期修正需求 13.3）：按 `(bucket_ts, src_service, dst_service)` 汇总，`protocol` 作为**行字段**而不是身份。
+  理由：OTLP 的边来自 span 配对，**没有协议**；若把协议放进合并键，两路数据永远不会命中同一个键，合并模式会退化成「两路并排」。
+  代价是同分钟同一条边混合 tcp/udp 时归并成 `protocol=mixed` 且计数相加（只影响合并视图；单看 eBPF 时协议仍是分组维度）。
+- **能力状态查询不能用 instant + 当前时间**：Prom instant 只回看几分钟，而 `agent_ebpf_capability` 是**状态**点（Agent 在采集项启动时上报一次），
+  用 instant 会把「几小时前上报过不可用」显示成「没有上报」。实现改用 7 天范围查询并取每条序列最后一个样本。
 - **热更新**：复用采集框架的 `reconcile`（按 `item_id` + 配置指纹）—— 配置变更或 `enabled=false` 会 abort 采集任务，任务 drop 时 `Ebpf` 随之 drop，从而 detach link 并删除 map。
 
 ### 内核态程序与挂载点

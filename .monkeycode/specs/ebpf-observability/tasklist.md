@@ -110,10 +110,20 @@
     - 状态：已实现（PR #51）：`dataplane-apm/src/ebpf_edge.rs` 按固定顺序反查（Agent 已填写的服务名不覆盖），
       复用 `AliasCache`（快照 + 显式失效）与 `EndpointRegistry`（命中/负面都缓存 60 秒）；未命中落 `unknown-<ip>` 且**不**写端点表。
       单测覆盖：两面均未识别、静态映射命中（含缓存失效契约）、端点表 `(ip,port)` 命中、负面缓存 TTL 内仍返回未识别、覆盖写幂等
-  - [ ] 5.4 `POST /v1/edges/search`：过滤、分页、`source` 为空时两路合并汇总
+  - [x] 5.4 `POST /v1/edges/search`：过滤、分页、`source` 为空时两路合并汇总
     - 对应需求 13.1-13.3、13.5-13.6
-  - [ ] 5.5 `POST /v1/ebpf/events/search` 与 `GET /v1/ebpf/capability`
+    - 状态：已实现（PR #53）。`source=otlp|ebpf` 时各查各表（SQL 分页）；缺省时两路在内存合并再分页（单路候选上限 10000）。
+      响应行补齐需求 13.2 要求的字段（`src_ip`/`dst_ip`/`dst_port`/`protocol`/`connections`/`failures`/`bytes_*`/`duration_avg_micros`/`tcp_retrans`），
+      OTLP 侧这些字段为空/0（span 配对没有 IP 与字节语义）。非法时间范围返回 400 `invalid_argument`。
+      **与需求 13.3 的偏差（重要）**：需求写按 `(bucket_ts, src_service, dst_service, protocol)` 汇总，但 OTLP 侧的边**没有协议**，
+      把协议放进键里会让两路永远合不到一起、合并模式形同虚设。因此实现按 `(bucket_ts, src_service, dst_service)` 汇总，
+      协议降为**行字段**（取首个非空；同分钟同一条边出现多种协议时记 `mixed` 并把计数相加）。该限制只影响合并视图，
+      单看 eBPF 时协议仍是分组维度
+  - [x] 5.5 `POST /v1/ebpf/events/search` 与 `GET /v1/ebpf/capability`
     - 对应需求 13.4 与 1.5、12.6
+    - 状态：已实现（PR #53）：事件检索复用日志检索，但 `data_type` 由服务端固定为 `ebpf`（客户端改不了，避免串到 APM 日志）；
+      能力状态读 `agent_ebpf_capability` 指标，按 Agent 汇总 `available/kernel_ok/btf_ok/capability_ok/kernel_release/reason`，
+      并给出 `reported` 计数以区分「没上报」与「上报了不可用」
   - [ ] 5.6 保留期清理：`ebpf_edges` 分批删除、`data_type=ebpf` 循环删除、`retain/` 机制；聚合指标接入 `dataplane-ts-retention`（`ts_retention_days` 缺省 30 天）
     - 对应需求 14.1-14.4
   - [ ] 5.7 httptest：幂等重放、非法字段 `partial`、合并查询求和、清理三类数据、时间范围非法 400

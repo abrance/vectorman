@@ -497,6 +497,82 @@ pub async fn write_watermark(sql: &dyn RelationalStore, value: i64) -> Result<()
     Ok(())
 }
 
+/// 一个 Agent 的 eBPF 能力状态（`GET /v1/ebpf/capability`）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CapabilityEntry {
+    pub agent_id: String,
+    pub item_id: String,
+    pub available: bool,
+    pub kernel_ok: bool,
+    pub btf_ok: bool,
+    pub capability_ok: bool,
+    pub kernel_release: String,
+    /// 不可用时的原因（取自指标标签 `reason`）。
+    pub reason: String,
+}
+
+/// 能力状态报告。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct CapabilityReport {
+    pub agents: Vec<CapabilityEntry>,
+    /// 有多少 Agent 报过能力状态（用来区分「没上报」与「上报了不可用」）。
+    pub reported: usize,
+}
+
+/// 能力状态的回看窗口：Agent 只在采集项启动/状态变化时上报一次，所以要能查到很久之前的点。
+pub const CAPABILITY_LOOKBACK_MICROS: i64 = 7 * 24 * 3600 * 1_000_000;
+
+/// 回看窗口内的查询步长（秒）。
+pub const CAPABILITY_STEP_SECS: i64 = 3_600;
+
+/// 读 `agent_ebpf_capability` 指标的最新值。
+///
+/// 指标由 Agent 在每个采集项启动时上报一次（`field_value=1/0`，标签带
+/// `agent_id`/`item_id`/`kernel_ok`/`btf_ok`/`capability_ok`/`kernel_release`/`reason`）。
+///
+/// **不能用 instant 查询 + 当前时间**：Prom 的 instant 查询只回看几分钟，而能力点是**状态**，
+/// 可能几小时前才上报过一次；那样会把「早就上报过不可用」显示成「没有上报」。这里改用
+/// 7 天范围查询并取每条序列的最后一个样本。
+pub async fn capability_report(
+    ts: &dyn TimeSeriesStore,
+) -> Result<CapabilityReport, DataplaneError> {
+    let now = crate::now_micros();
+    let result = ts
+        .query_range(
+            "agent_ebpf_capability",
+            now - CAPABILITY_LOOKBACK_MICROS,
+            now,
+            CAPABILITY_STEP_SECS,
+        )
+        .await?;
+    let mut agents: Vec<CapabilityEntry> = Vec::new();
+    for series in result.result {
+        // 取最后一个样本：同标签的后续上报覆盖旧值。
+        let value = series
+            .values
+            .as_ref()
+            .and_then(|values| values.last().map(|(_, v)| *v))
+            .or(series.value.map(|(_, v)| v))
+            .unwrap_or_default();
+        let tag = |key: &str| series.metric.get(key).cloned().unwrap_or_default();
+        agents.push(CapabilityEntry {
+            agent_id: tag("agent_id"),
+            item_id: tag("item_id"),
+            available: value >= 1.0,
+            kernel_ok: tag("kernel_ok") == "true",
+            btf_ok: tag("btf_ok") == "true",
+            capability_ok: tag("capability_ok") == "true",
+            kernel_release: tag("kernel_release"),
+            reason: tag("reason"),
+        });
+    }
+    agents.sort_by(|a, b| a.agent_id.cmp(&b.agent_id).then(a.item_id.cmp(&b.item_id)));
+    Ok(CapabilityReport {
+        reported: agents.len(),
+        agents,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
