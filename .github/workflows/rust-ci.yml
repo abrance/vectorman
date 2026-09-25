@@ -112,8 +112,9 @@ jobs:
             fi
             echo "$file map 数=$count"
           }
-          # network: CONN_AGG/CONN_START/ENTRY/CFG/RATE；tcp: TCP_AGG/ENTRY/CFG/RATE；
-          # process: PROC_AGG/EVENTS/CFG/RATE
-          expect_maps network.o 5
+          # network: CONN_AGG/CONN_START/ENTRY/CFG/RATE/TPBUF/SCRATCH（后两个是上机验证发现的
+          #          「栈放不下」问题引入的 per-CPU 缓冲/暂存区）；
+          # tcp: TCP_AGG/ENTRY/CFG/RATE；process: PROC_AGG/EVENTS/CFG/RATE
+          expect_maps network.o 7
           expect_maps tcp.o 4
           expect_maps process.o 4
