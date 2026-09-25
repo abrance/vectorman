@@ -46,15 +46,26 @@
   60 秒里丢了 **2279 条边记录、只入库 149 条**。检查点工具直连 dataserver 上报，永远看不到这一幕，
   这正是「必须走真实下发链路」的原因。
 
-### TODO-2（高）前端 `/ebpf` 页只做了单测，没有浏览器实跑
+### TODO-2（高）前端 `/ebpf` 页没有浏览器实跑 —— ⚠️ 大部分已完成（缺真实浏览器）
 
-- **现状**：`App.test.tsx` 覆盖了能力状态卡片、边表字段、未识别服务跳转、事件视图提示；
-  `tsc --noEmit`、`build:dataplane` 通过。
-- **为什么欠**：单测用 fake HTTP，验证不了真实接口形状与渲染细节（例如长字段换行、
-  `field=avg|p95` 曲线的真实数据、能力状态的失败文案在真实数据下的展示）。
-- **怎么补**：用 Playwright 对本地 dataserver（可用本文档附录的命令起）跑一遍：
-  打开 `/ebpf` → 断言能力状态卡片、边表出现真实行 → 切到事件视图 → 断言有事件与时间格式。
-- **验收**：截图 + 断言通过；发现的前后端字段不一致问题修掉（本轮已修两个同类问题，见 PR #60）。
+- **原状**：`App.test.tsx` 覆盖了能力状态卡片、边表字段、未识别服务跳转、事件视图提示；
+  但**响应形状是手写的**（`FakeHttp`），后端字段改名时它们照过 —— 本仓库已因此踩过两次坑。
+- **已完成**：新增 `apps/dataplane/src/pages/ebpf-live.test.tsx`，对**真实 dataserver** 跑
+  「真实 HTTP → 适配器 → React → DOM」，覆盖：能力状态卡片（真实 Agent/采集项/可用/内核版本）、
+  边表真实行（`unknown-<ip>`）、切到事件视图并点查询后拿到原始事件（事件类型渲染成中文标签）。
+  不设 `VITE_E2E_URL` 时整体跳过（CI 保持绿），设了就真打真实服务。
+- **实测**：本机起 dataserver + 真采集（边 + 原始事件）后 **2/2 通过**；不带环境变量时
+  `46 passed | 2 skipped`。
+- **过程中踩到的三件事**（都写进了用例注释，避免下次重复）：
+  1. jsdom 的 `AbortController/AbortSignal` 与 Node `fetch`(undici) **不是同一个类**，直接传会报
+     `Expected signal to be an instance of AbortSignal` → 测试里注入一个去掉 `signal` 的 fetch 包装
+     （生产路径不受影响）；
+  2. **antd 会在两个汉字之间插空格**，按钮文案实际是「查 询」，按 `"查询"` 查不到 →
+     用 `/查\s*询/` 正则；
+  3. 能力卡片在加载中渲染的是「加载中」占位，因此**必须等正条件**（出现「可用」）而不是
+     等「没有告警」—— 后者在首帧就成立，会在数据到达前提前通过。
+- **仍未做（明确边界）**：**真实浏览器**（Playwright）未接 —— 现有验证覆盖不到 CSS/布局与真实事件循环。
+  若后续要接：Playwright 会对本地 dataserver 跑同一组断言，并补截图；代价是新增浏览器依赖（约 100MB+）。
 
 ### TODO-3（中）进程指标的 `service` 维度未补齐（5.9 剩余部分）—— ✅ 已完成
 
@@ -261,7 +272,13 @@ setsid nohup ./target/debug/dataserver --config /tmp/ebpf-loop/config.toml > /tm
 sudo -E cargo run -p gse-agent-ebpf --example checkpoint -- \
     --kind ebpf_network --seconds 10 --ingest-url http://127.0.0.1:18081
 
-# 4. 查回来
+# 4. 前端页面对真实接口的验证（jsdom 渲染 + 真实 HTTP，不含真实浏览器）
+cd frontend && VITE_E2E_URL=http://127.0.0.1:18081 npm test -w @vectorman/dataplane
+
+# 5. CLI 对真实服务
+./target/debug/dpc --sql-url http://127.0.0.1:18081 --prom-url http://127.0.0.1:19090 edges --source ebpf --limit 3
+
+# 6. 查回来
 curl -s -X POST http://127.0.0.1:18081/v1/edges/search \
     -H 'content-type: application/json' -d '{"source":"ebpf","limit":3}'
 curl -s http://127.0.0.1:18081/v1/ebpf/capability
