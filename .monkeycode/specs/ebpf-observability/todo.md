@@ -201,12 +201,60 @@
   `dpc ebpf-events --event-type process_exec --limit 2`（真实事件，`labels.event_type`/`process_name` 正确）。
 - **结论**：CLI 与 HTTP 接口一致，无需改动代码（这本身就是验收结论）。
 
-### TODO-11（低）P2 / P3 未实现
+### TODO-11（低）P2 / P3 未实现（附可执行拆分）
 
-- **P2**：文件与 syscall 延迟（`sys_enter/sys_exit_openat|read|write|fsync`）、DNS 延迟
-  （`udp_sendmsg/recvmsg` 过滤 53）。设计已写挂载点与指标名，内核态与用户态都未实现。
-- **P3**：CPU profile（perf 采样 + 折叠栈 + 符号化），单独阶段。
-- **验收**：按 `tasklist.md` 第 8/9 节的验收标准。
+#### P2 第一半：`ebpf_syscall`（建议先做，风险低）
+
+按需求 6 与设计（挂载点、`SYSCALL_HIST`）拆成一次 PR 可以交付的范围：
+
+1. **ABI**（`crates/ebpf-abi`）：`SyscallKey { pid, cgroup_id, op, comm }`、
+   `SyscallAggWire { calls, errors, duration_sum_us, duration_max_us, hist[32] }`、
+   `SyscallErrKey { op, comm, errno }`、新增 `CfgIndex`（4 个 op 各自的 enter-args / exit-ret /
+   openat-filename 偏移，外加 `SlowThresholdMicros`、`HistSlots`）、`EVENT_KIND_SLOW_IO`。
+2. **内核程序**（`crates/gse-ebpf-programs/src/syscall.rs`）：4 个 op × enter/exit = 8 个
+   `tracepoint/syscalls/...`；`PENDING: HashMap<tid, {op, ts, cgroup_id, comm, filename_ptr}>`
+   配 enter→exit；exit 读 `ret`，负数按 `errno = -ret` 计入 `SYSCALL_ERR`；耗时入直方图槽；
+   超过 `slow_threshold_micros` 且 `raw_events_enabled` 时把路径（`bpf_probe_read_user_str`，
+   **截断 256 字节**）随慢事件推 `EVENTS` ringbuf。
+   - 复用 `common::read_tp_buf`/`scratch_u32`（**不能对 ctx 做非常量偏移运算**，验证器会拒）；
+   - 复用 `cfg_ready`/`rate_allow`。
+3. **运行期参数**（`cfg.rs`）：按 op 读 `sys_enter_*/sys_exit_*` 的 `format` 取 `args`/`ret`/
+   `filename` 偏移（**缺字段即拒绝采集**，与现有口径一致）；`config.rs` 增加
+   `slow_threshold_micros`（缺省 100_000，夹取）。`attach.rs` 增加 `EbpfItemKind::Syscall` 的挂载计划。
+4. **用户态**：`loader.rs` 接 map 类型（`SYSCALL_AGG`/`SYSCALL_ERR`/`PENDING`/`EVENTS`）；
+   `lib.rs` 加 syscall 差分循环，产出 `ebpf_syscall_duration_micros{op,process_name,service}`
+   （`field=avg|p95`，p95 用槽上界近似，与边指标同一套）与
+   `ebpf_syscall_failures_total{op,errno}`；慢调用原始事件走 `data_type=ebpf`。
+5. **dataserver**：`MetricSink` 目前只给 `ebpf_process_*` 补 `service`，扩到 `ebpf_syscall_*`
+   （需求 6.2 的维度里有 `service`）—— 一行判断 + 用例。
+6. **产物与验证**：`scripts/build-ebpf.sh` 加 `syscall.o`、CI 作业加 map/段断言、提交 `.o`；
+   上机用检查点跑 `--kind ebpf_syscall`，断言真实 `openat/read/write/fsync` 计数与错误码；
+
+#### P2 第二半：`ebpf_dns`（**有设计风险，建议先评审再动手**）
+
+需求 7.1 要求「UDP 与 TCP 的请求/响应匹配耗时」+ 7.4「`query_name` 从 question 段解析」。
+麻烦在于**在 `udp_sendmsg`/`udp_recvmsg` 上取报文**：`msghdr.msg_iter` 是 `iov_iter`
+（联合体 + 位域，布局随内核版本变化），这正是本项目刻意回避的那类依赖 ——
+设计原则是「内核态不硬编码结构体偏移」，而 BTF 解析也只能解决其中一部分。三个可选方案：
+
+- **(a) tracepoint + 用户缓冲**：挂 `sys_enter/sys_exit_sendto|recvfrom`（以及 `send|recv`），
+  用 `bpf_probe_read_user` 读**用户态**报文缓冲（读用户内存合法，不需要结构体内部布局），
+  目的地址端口从 `struct sockaddr_in`（POSIX 固定布局）取。覆盖「应用直接 sendto/recvfrom」的形态；
+  已 connect 的 socket 走 `send`/`recv` 时拿不到端口，需要额外处理。
+- **(b) 内核只记元组、用户态解析**：内核推 `(pid, tid, ts, 报文字节片段)` 到 ringbuf，
+  用户态按 `(pid, transaction_id)` 匹配并解析 question 段。满足「不做缓存」，但把报文复制到
+  用户态的开销与 ringbuf 压力要评估。
+- **(c) 只在用户态做**：不满足需求 7.1（拿不到请求与响应的匹配），不建议。
+
+倾向 **(a)** 并在设计与需求里写明「覆盖形态」的边界（哪些调用路径能采到、哪些采不到），
+避免做成「看起来有数据、实际漏一半」。
+
+#### P3：CPU profile
+
+独立阶段（`perf_event_open` + `bpf_get_stackid` + 折叠栈 + 符号化 + `ebpf_profile_index` 落库），
+按 `tasklist.md` 第 9 节实施；本机验证需要内核 `perf_event_paranoid` 与符号可用性配合。
+
+- **验收**：P2 按需求 6/7 的验收标准；P3 按 tasklist 第 9 节。
 
 ## 三、工程缺口与维护约定
 
