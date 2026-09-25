@@ -163,6 +163,7 @@ async fn main() -> ExitCode {
         loop {
             ticker.tick().await;
             match run_cleanup(
+                cleanup_state.sql.as_ref(),
                 cleanup_state.log.as_ref(),
                 cleanup_state.ts.as_ref(),
                 cleanup_state.kv.as_ref(),
@@ -181,9 +182,16 @@ async fn main() -> ExitCode {
                             report.ts.tombstones_applied as f64,
                         );
                     }
+                    if report.ebpf_edges_deleted > 0 {
+                        cleanup_metrics.inc_counter(
+                            "dataserver_ebpf_edges_deleted_total",
+                            report.ebpf_edges_deleted as f64,
+                        );
+                    }
                     println!(
-                        "retention cleanup: log_deleted={} ts_items={} ts_matched_series={} ts_tombstones={}",
+                        "retention cleanup: log_deleted={} ebpf_edges_deleted={} ts_items={} ts_matched_series={} ts_tombstones={}",
                         report.log_deleted,
+                        report.ebpf_edges_deleted,
                         report.ts.items,
                         report.ts.matched_series,
                         report.ts.tombstones_applied
