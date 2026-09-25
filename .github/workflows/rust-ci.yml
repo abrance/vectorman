@@ -95,9 +95,12 @@ jobs:
 
           # map 数量必须与源码里的 `#[map]` 声明数一致：legacy `bpf_map_def` 每条 28 字节。
           # 这条断言能抓住「新增了 map 但构建脚本/程序名不一致」这类静默漂移。
+          # 注意：段索引的位数会让列位置漂移（`[ 9]` 与 `[15]` 差一列），
+          # 所以先把 `[ Nr]` 前缀剥掉再取列，不要直接 awk '{print $6}'。
           maps_count() {
             local size
-            size=$(llvm-readelf -S "$1" | grep -E "^ *\[ *[0-9]+\] maps " | awk '{print $6}')
+            size=$(llvm-readelf -S "$1" | grep -E "^ *\[ *[0-9]+\] maps " |
+                     sed -E 's/^ *\[ *[0-9]+\] +//' | awk '{print $5}')
             echo $((16#$size / 28))
           }
           expect_maps() {
