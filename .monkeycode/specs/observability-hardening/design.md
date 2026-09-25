@@ -33,6 +33,17 @@ flowchart LR
     DS -->|"k8s API（in-cluster SA）：uid → Pod 名"| API["kube-apiserver"]
 ```
 
+**目标平台（2026-09-25 用户确认为 cloud3 的 k3s 单节点）**。已在该集群用只读短命 Pod 实测前提：
+
+| 项 | 实测 | 对清单的影响 |
+| --- | --- | --- |
+| 内核 | `6.8.0-48-generic`（Ubuntu 24.04，k3s v1.37，containerd） | 满足 ≥ 5.8；BPF 内存走 memcg 记账（不受 `ulimit -l` 的 8 MiB 限制） |
+| BTF | `/sys/kernel/btf/vmlinux` 存在（6.0 MB） | hostPath 挂 `/sys/kernel/btf` 可行 |
+| tracefs | `/sys/kernel/tracing/events/sock/inet_sock_set_state/format` 可读 | hostPath 挂 `/sys/kernel/tracing` 可行（代码读的就是这个路径） |
+| hostPID | 容器内可见 271 个宿主进程 | 容器/Pod 反查前提成立 |
+| 特权 | `CapEff` 全量 | `privileged: true` 生效 |
+| registry | **集群内没有 registry** | 镜像走 `docker save \| ssh <node> k3s ctr images import -`（k3s 官方方式） |
+
 要点：
 
 - **gse-server 与 dataserver 本版仍跑在集群外**（安装包 + systemd），DaemonSet 通过 ConfigMap 里的
@@ -45,9 +56,18 @@ flowchart LR
 
 ## Components and Interfaces
 
-### 新增：`packaging/deploy/k8s/gse-agent-daemonset.yaml`
+### 新增：`packaging/deploy/k8s/`
 
-一份自包含的最小清单（`kubectl apply -f` 即可），包含 5 个对象：
+一份自包含的最小清单 + 造镜像脚本 + 操作文档（`kubectl apply -f` 即可）：
+
+```
+Dockerfile                   # FROM scratch + 静态 musl 二进制
+build-image.sh               # 造镜像；--import <ssh-host> 直接送进 k3s
+gse-agent-daemonset.yaml     # 下面这 6 个对象
+README.md                    # 节点前提核验、造镜像、台账登记、apply/灰度、验证、回滚、已知限制
+```
+
+清单里共 7 个对象（Namespace / ServiceAccount / ClusterRole / ClusterRoleBinding / ConfigMap / Secret / DaemonSet）：
 
 ```yaml
 apiVersion: v1
@@ -110,7 +130,7 @@ spec:
             - { name: conf, mountPath: /etc/vectorman, readOnly: true }
             - { name: btf, mountPath: /sys/kernel/btf, readOnly: true }
             - { name: tracing, mountPath: /sys/kernel/tracing, readOnly: true }
-            - { name: queue, mountPath: /var/lib/vectorman }
+            - { name: tmp, mountPath: /tmp }
           resources:
             requests: { cpu: 50m, memory: 128Mi }
             limits: { memory: 512Mi }
@@ -118,7 +138,7 @@ spec:
         - { name: conf, configMap: { name: gse-agent-conf } }
         - { name: btf, hostPath: { path: /sys/kernel/btf, type: Directory } }
         - { name: tracing, hostPath: { path: /sys/kernel/tracing, type: DirectoryOrCreate } }
-        - { name: queue, emptyDir: {} }
+        - { name: tmp, emptyDir: {} }   # scratch 镜像没有 /tmp（作业功能会用到系统临时目录）
 ```
 
 接口与依赖：
@@ -132,16 +152,43 @@ spec:
 | gse-server（集群外） | 注册/心跳/采集项下发 | Agent 退避重连；期间不上报 |
 | dataserver（集群外） | `/v1/ingest` 上报 | 上行缓冲积压，超上限时**淘汰最旧并计数**（`agent_ebpf_buffer_dropped_total`） |
 
-### 镜像
+### 镜像与交付
 
-本版**不引入镜像构建流水线**：验证时用 `docker build` 把安装包里的 `gse-agent/bin/gse-agent` +
-`conf/` 打进一个基础镜像（`debian:12-slim` + 二进制），推到验证环境可达的 registry。
+本版**不引入镜像构建流水线**，也不假设有 registry。材料是：
+
+- `packaging/deploy/k8s/Dockerfile`：`FROM scratch` + 静态链接（musl）的 `gse-agent` 二进制
+  （不需要基础镜像、不需要 libc；实测镜像 10.7 MB，容器里 `--version` 正常）；
+- `packaging/deploy/k8s/build-image.sh --pkg <发布包目录> [--version <tag>] [--import <ssh-host>]`：
+  本机 `docker build`，`--import` 时 `docker save | ssh <host> 'k3s ctr images import -'`
+  （containerd socket 只有 root 能连：脚本先试直连，失败则退回 `sudo -n k3s ctr`）；
+- 集群里有 registry 时改走 `docker push`，把清单里的 `image:` 换成仓库地址即可。
+
+**已实测的交付链路**（2026-09-25，cloud3）：`docker build` → `docker save | ssh cloud3 'sudo -n k3s ctr images import -'`
+→ 6 秒导入完成、`k3s ctr images ls` 能查到 `vectorman-gse-agent:<tag>`（10.2 MiB，linux/amd64）。
+
 镜像流水线（多架构、签名）与 charts 一起排到 v1.3。
 
 ### 删除：`.github/workflows/helm-ci.yml`
 
 其触发条件是 `charts/**`，而仓库当前**没有** `charts/` 目录（v1.0.8 起即如此），属悬空配置。
 v1.3 恢复 charts 时一并恢复该工作流。
+
+### 集群凭据与 TLS 信任（实施期发现的阻塞）
+
+k3s/kubeadm 的 apiserver 用**集群自签 CA**，而 Agent 的 HTTP 客户端（ureq + rustls）默认只信
+webpki 的公有根 —— 因此 Pod 名反查在自签集群上会以 `invalid peer certificate: UnknownIssuer` 失败，
+`src_pod` 静默退化成 uid（功能看着"在跑"，其实没生效）。
+
+修法（作用域最小化，**不用** `SSL_CERT_FILE` 这类全局环境变量）：
+
+1. `K8sCredential` 增加 `ca_pem`：in-cluster 读 `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt`，
+   kubeconfig 读 `certificate-authority`（相对路径按 kubeconfig 所在目录解析）或
+   `certificate-authority-data`（base64 内联 PEM，k3s 写出的形态）；
+2. `kubeconfig::tls_config(ca_pem)` 用该 CA 构建 rustls 配置（**只信任该 CA**），
+   只装到 apiserver 客户端上；上行到 gse-server/dataserver 的流量不受影响；
+3. 凭据解析函数改为可测形态（`resolve_in(sa_dir, kubeconfig)`），并用一对
+   **CA + 叶证书**（自签的 CA 证书不能当服务端证书，webpki 会报 `CaUsedAsEndEntity`）
+   起本地 TLS 服务做握手测试：带 CA 成功、不带 CA 被拒。
 
 ## Data Models
 

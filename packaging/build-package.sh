@@ -134,6 +134,7 @@ cp -a "$DESKTOP_DIST/." "$ROOT/console/web/"
 mkdir -p "$ROOT/deploy"
 cp packaging/deploy/install.sh packaging/deploy/ctl.sh "$ROOT/deploy/"
 cp -a packaging/deploy/units "$ROOT/deploy/units"
+cp -a packaging/deploy/k8s "$ROOT/deploy/k8s"
 cp README.md "$ROOT/README.md"
 
 if [[ ! -f "$ROOT/gse-server/web/index.html" ]]; then
