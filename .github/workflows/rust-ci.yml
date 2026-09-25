@@ -35,25 +35,27 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install LLVM 21
+      - name: Install LLVM
         run: |
+          # LLVM 主版本必须 **≥ rustc 的 LLVM**：bpf-linker 读 rustc 产出的位码，
+          # 版本低会报 `Unknown attribute kind (N) (Producer: LLVMxx Reader: LLVM 21.x)`。
+          # nightly 1.100 用的是 LLVM 23，所以这里装 23（bpf-linker 0.11 默认 feature 也是 llvm-23）。
           curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key |
             sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" |
-            sudo tee /etc/apt/sources.list.d/llvm-21.list >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" |
+            sudo tee /etc/apt/sources.list.d/llvm-23.list >/dev/null
           sudo apt-get update -q
-          sudo apt-get install -y -q llvm-21-dev libclang-21-dev clang-21
+          sudo apt-get install -y -q llvm-23-dev libclang-23-dev clang-23
           # bpf-linker 的 build.rs 自己找 LLVM：优先 `LLVM_PREFIX`，否则在 **PATH** 上找
-          # 不带版本后缀的 `llvm-config`（apt.llvm.org 提供的是 `llvm-config-21`）。
-          # 这里把版本化目录加进 PATH，链里就不需要造符号链接。
-          echo "/usr/lib/llvm-21/bin" >> "$GITHUB_PATH"
-          /usr/lib/llvm-21/bin/llvm-config --version
+          # 不带版本后缀的 `llvm-config`（apt.llvm.org 提供的是 `llvm-config-23`）。
+          echo "/usr/lib/llvm-23/bin" >> "$GITHUB_PATH"
+          /usr/lib/llvm-23/bin/llvm-config --version
       - name: Install bpf-linker
         env:
           # llvm-sys（bpf-linker 的依赖）认这个；bpf-linker 自己的 build.rs 另认 LLVM_PREFIX。
-          LLVM_SYS_211_PREFIX: /usr/lib/llvm-21
-          LLVM_PREFIX: /usr/lib/llvm-21
-        run: cargo install bpf-linker --no-default-features --features llvm-21
+          LLVM_SYS_231_PREFIX: /usr/lib/llvm-23
+          LLVM_PREFIX: /usr/lib/llvm-23
+        run: cargo install bpf-linker
       - name: Install nightly toolchain
         run: rustup toolchain install nightly --profile minimal --component rust-src
       - name: Build eBPF object files
