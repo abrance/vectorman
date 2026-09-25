@@ -5,7 +5,7 @@ Updated: 2026-09-23
 
 ## Description
 
-在 `gse-agent` 内新增 eBPF 采集能力：内核态程序在 kprobe/tracepoint 上做 per-CPU 计数聚合，用户态按周期差分出增量，形成 `EbpfEdge`（10 秒桶连接边）、`metrics`（网络/进程/TCP/IO/DNS 指标）与可选 `ebpf`（原始事件）；CPU profile（P3）走周期性栈采样并把折叠栈压缩后独立上行。数据沿用既有采集信道直连 `dataserver`，由 `dataserver` 做服务名反查、落库与查询，前端在 `@vectorman/dataplane` 增加 eBPF 页并与 APM 拓扑页共享边指标。
+在 `gse-agent` 内新增 eBPF 采集能力：内核态程序在 kprobe/tracepoint 上做 per-CPU 计数聚合，用户态按周期读取增量（内核侧计数在读完复位），形成 `EbpfEdge`（10 秒桶连接边）、`metrics`（网络/进程/TCP/IO/DNS 指标）与可选 `ebpf`（原始事件）；CPU profile（P3）走周期性栈采样并把折叠栈压缩后独立上行。数据沿用既有采集信道直连 `dataserver`，由 `dataserver` 做服务名反查、落库与查询，前端在 `@vectorman/dataplane` 增加 eBPF 页并与 APM 拓扑页共享边指标。
 
 设计前提（本期只交付设计，不写代码）：
 
@@ -282,10 +282,13 @@ dpc ebpf-events --event-type exec --process-name java --limit 50
 | 路径 | 页 | 数据来源 | 交互 |
 | --- | --- | --- | --- |
 | `/ebpf` | eBPF | 视图「边」→ `POST /v1/edges/search`；视图「事件」→ `POST /v1/ebpf/events/search` | 按 `agent_id`、`source`、服务、端口、时间范围过滤；手动刷新；边行提供「查看该边 trace」跳转 |
-| `/ebpf/profile` | 火焰图 | P3：`GET /v1/ebpf/profiles` + 折叠栈文本 | 阶段三交付；本期为占位路由，展示「未启用」空态 |
+| `/ebpf/profile` | 火焰图 | P3（**未实现**）：`GET /v1/ebpf/profiles` + 折叠栈文本 | 阶段三交付；实现前该路由**不存在**（P3 的详细设计在其动手前单独产出） |
 | `/topology` | 拓扑（既有页扩展） | `sum by (src_service, dst_service) (apm_edge_requests_total)` | `source` 切换（全部 / otlp / ebpf） |
 
-实现约束：图表统一用 `echarts`（与 `apm-tracing` 同一选择）：火焰图（P3）用 `custom`/`bar` 系列，拓扑页用 `graph` series + `layout: 'none'`（坐标前端自算，不用力导向）。后端口径不变，只返回 Prom 形数据点与折叠栈文本；`/ebpf` 页顶部展示前置校验状态与降级标记，来源 `GET /v1/ebpf/capability`。
+实现约束：**图表复用仓库既有的手绘 SVG 组件，不引入图表库**（2026-09-25 修正：原文写的是统一用 `echarts`，
+实现期改为手绘 SVG —— 与 `/topology`,`/apm` 等既有页面保持一致，避免为一个页面引入新依赖；P3 的火焰图沿同一口径，
+具体形态在其设计里定）。后端口径不变，只返回 Prom 形数据点与折叠栈文本；`/ebpf` 页顶部展示前置校验状态与降级标记，
+来源 `GET /v1/ebpf/capability`。
 
 ## Data Models
 
