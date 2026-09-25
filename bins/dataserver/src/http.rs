@@ -310,10 +310,12 @@ async fn ingest(
 ) -> Response {
     let envelope = match body {
         Ok(b) => b.0,
-        Err(_) => {
+        // 带上拒绝原因：`invalid JSON body` 会把「请求体超过上限」与「JSON 语法错」混成一句，
+        // 排查时看不出来（实测踩过：几千条边一次上报被 2 MiB 体限拒，日志里只有这一句）。
+        Err(rejection) => {
             return json_err(
                 StatusCode::BAD_REQUEST,
-                DataplaneError::invalid_argument("invalid JSON body"),
+                DataplaneError::invalid_argument(format!("invalid JSON body: {rejection}")),
             );
         }
     };
@@ -391,10 +393,12 @@ async fn logs_search(
 ) -> Response {
     let query = match body {
         Ok(b) => b.0,
-        Err(_) => {
+        // 带上拒绝原因：`invalid JSON body` 会把「请求体超限」和「JSON 语法错」混在一起，
+        // 排查时看不出来（实测踩过：几千条边一次上报被 2 MiB 体限拒了，却只看到这句）。
+        Err(rejection) => {
             return json_err(
                 StatusCode::BAD_REQUEST,
-                DataplaneError::invalid_argument("invalid JSON body"),
+                DataplaneError::invalid_argument(format!("invalid JSON body: {rejection}")),
             );
         }
     };

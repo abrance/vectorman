@@ -450,6 +450,21 @@ BPF 程序里读不到「本次执行消耗了多少 CPU」。因此实现的口
 边界：`pod<uid>` 只能解出 **Pod uid**，Pod 名需要 k8s 侧数据（Agent 已有 k8s 采集，后续接），
 因此 dataserver 的「按 Pod 名命中端点表」这一层暂时仍命中不了，服务名靠静态映射与 `(ip, port)` 反查。
 
+### 端到端闭环验证（本机真跑）
+
+在 6.1 内核 + 本地 dataserver 上跑通了「内核 → 用户态差分 → 接入校验 → 服务名反查 → sqlite/时序库 →
+查询接口 → Prom 指标」全链路，并因此又发现两个**只有拼起来才暴露**的问题：
+
+1. **原始事件的信封字段与 dataserver 的 `EbpfRecord` 不一致**：Agent 发的是 `kind`/`comm`/`saddr`…，
+   dataserver 要的是 `event_type`/`process_name`/`message`。两边各自单测都过，拼起来整批
+   `invalid_record: missing field event_type`。已按 dataserver 的契约对齐 Agent 侧。
+2. **原始事件的时间戳是 0**（前端显示 1970 年）：内核 `emit()` 忘了填时间戳，而且内核只有**单调时钟**。
+   修法：内核填 `bpf_ktime_get_ns()`，用户态用 `/proc/uptime` 算偏移换算成 Unix 微秒
+   （读不到时退化为读取时刻）。
+
+另外把 `invalid JSON body` 改成带上拒绝原因 —— 原来把「请求体超限」和「JSON 语法错」混成一句话，
+实测因为几千条边一次上报超过 2 MiB 体限被拒，日志里只有那句无信息量的错误。
+
 ### 上机验证（检查点）发现的真实问题
 
 在 6.1 内核上以 root 实际加载/挂载/读取后，暴露了 5 个**只在目标机才会出现**的问题，

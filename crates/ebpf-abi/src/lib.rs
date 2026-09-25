@@ -103,6 +103,7 @@ pub struct RawEvent {
     pub code: u32,
     pub pid: u32,
     pub _pad: u32,
+    /// **单调时钟**（`bpf_ktime_get_ns`，boot 起）；用户态用 `/proc/uptime` 换算成 Unix 微秒。
     pub timestamp_ns: u64,
     pub cgroup_id: u64,
     pub saddr: u32,

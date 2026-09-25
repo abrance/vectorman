@@ -19,7 +19,7 @@
 mod common;
 
 use aya_ebpf::{
-    helpers::bpf_get_current_comm,
+    helpers::{bpf_get_current_comm, bpf_ktime_get_ns},
     macros::{map, tracepoint},
     maps::{Array, PerCpuArray, PerCpuHashMap, RingBuf},
     programs::TracePointContext,
@@ -86,6 +86,9 @@ fn emit(kind: u32, key: &ProcKey) {
         pid: key.pid,
         cgroup_id: key.cgroup_id,
         comm: key.comm,
+        // **单调时钟**（boot 起）。内核拿不到墙上时钟，用户态用 `/proc/uptime` 的偏移换算成
+        // Unix 微秒 —— 早期版本忘了填这个字段，原始事件的时间戳是 0（1970 年），前端不可用。
+        timestamp_ns: unsafe { bpf_ktime_get_ns() },
         ..RawEvent::default()
     });
     entry.submit(0);
