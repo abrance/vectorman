@@ -60,8 +60,9 @@
       内核侧已写零复位」，并注明修正原因（避免再次被照抄成差分实现）
 - [x] 4.2 （随设计 PR 一并完成）`ebpf-observability/design.md` 的图表选型由 `echarts` 改为**手绘 SVG**；
       删除或改正「`/ebpf/profile` 本期占位路由」这类与实现不符的描述
-- [ ] 4.3 DNS 冲突收口：在 `ebpf-observability/todo.md` 明确二选一（扩到 `send`/`recv` ↔ 或降级覆盖形态），
-      并把结论文档化（未收口前不得开始 DNS 实现）
+- [x] 4.3 （2026-09-25 收口）DNS 冲突已定：**先降级**为「仅 `sendto`/`recvfrom` 形态」；
+      需求 7.1 与 `todo.md` 已同步（含真实影响：glibc 2.34+ 的 connect+send/recv 采不到，
+      实现前先用数据核对形态比例，必要时再扩挂载点）
 - [ ] 4.4 复查 `ebpf-observability/todo.md` 的「已定选型」表与 `tasklist.md` 的勾选状态一致
       （P2 前半已完成、P2 后半与 P3 未开工）
 

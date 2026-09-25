@@ -109,9 +109,10 @@ v1.1.0 已交付 APM 全链路与 eBPF 四类采集项（`ebpf_network` / `ebpf_
    差分后内核侧已复位」（与实现一致），并注明该口径的修正原因。
 2. THE `ebpf-observability/design.md` 的图表选型 SHALL 修正为**手绘 SVG**（与实现一致），
    且 SHALL 删除或改正「`/ebpf/profile` 本期占位路由」这一与实现不符的描述。
-3. THE DNS 挂载点与覆盖面的**冲突** SHALL 在设计评审时收口，二选一：
-   ① 挂载点扩到 `send`/`recv`（需从 socket 反查目标端口）；② 覆盖面明确降级为「仅 `sendto`/`recvfrom` 形态」。
-   未收口前 SHALL NOT 开始 DNS 实现。
+3. THE DNS 挂载点与覆盖面的**冲突** SHALL 在设计评审时收口。**已收口（2026-09-25）**：
+   选择②，覆盖面降级为「仅 `sendto`/`recvfrom` 形态」，TCP 53 与已 `connect()` 的 `send`/`recv` 形态不在范围；
+   需求 7.1 与 `todo.md` 已同步（含真实影响与「实现前用数据核对形态比例」的前置）。
+   未完成该数据核对前 SHALL NOT 开始 DNS 实现。
 4. THE DNS 与 CPU profile 的已定选型（内核态解析域名、per-tid 采样、只做 ELF 符号等）
    SHALL 记录在 `ebpf-observability/todo.md`，供其实施时直接引用。
 
