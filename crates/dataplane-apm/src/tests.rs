@@ -2047,3 +2047,94 @@ async fn service_list_includes_endpoint_instances() {
     assert_eq!(instance.collector, "otlp");
     assert_eq!(instance.first_seen_ts, NOW);
 }
+
+/// TODO-3：`ebpf_process_*` 的 `service` 维度由 dataserver 侧的静态映射补。
+#[tokio::test]
+async fn metric_sink_fills_service_for_process_metrics() {
+    use crate::alias::{AliasMatchKind, AliasUpsert};
+    use dataplane_ingest::MetricSink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sql = store(dir.path());
+    bootstrap(sql.as_ref()).await.unwrap();
+    let sink = ApmSink::new(
+        sql.clone(),
+        ApmSinkConfig {
+            endpoint_cache_ttl_secs: 0,
+            ..ApmSinkConfig::default()
+        },
+        Arc::new(RedSamples::new(1_000)),
+    );
+
+    let tags = |name: &str| {
+        BTreeMap::from([
+            ("process_name".to_string(), name.to_string()),
+            ("agent_id".to_string(), "agent-1".to_string()),
+        ])
+    };
+
+    // 命中静态映射（process_name → service）。
+    sink.upsert_alias(
+        &AliasUpsert {
+            match_kind: AliasMatchKind::ProcessName.as_str().to_string(),
+            match_value: "java".into(),
+            service: "order-service".into(),
+            ..AliasUpsert::default()
+        },
+        NOW,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sink.metric_tags("ebpf_process_exec_total", &tags("java"))
+            .await,
+        vec![("service".to_string(), "order-service".to_string())]
+    );
+
+    // 前缀映射同样能命中（进程名带版本/参数时用得上）。
+    sink.upsert_alias(
+        &AliasUpsert {
+            match_kind: AliasMatchKind::ProcessPrefix.as_str().to_string(),
+            match_value: "nginx".into(),
+            service: "edge-gateway".into(),
+            ..AliasUpsert::default()
+        },
+        NOW + 1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sink.metric_tags("ebpf_process_exit_total", &tags("nginx-worker"))
+            .await,
+        vec![("service".to_string(), "edge-gateway".to_string())]
+    );
+
+    // 未命中不丢维度：`unknown-<进程名>`（与边记录的 `unknown-<ip>` 同一约定）。
+    assert_eq!(
+        sink.metric_tags("ebpf_process_fork_total", &tags("kworker/0:1"))
+            .await,
+        vec![("service".to_string(), "unknown-kworker/0:1".to_string())]
+    );
+
+    // 非进程指标原样透传；已有 service 不覆盖；没有 process_name 不猜。
+    assert!(sink
+        .metric_tags("cpu_usage", &tags("java"))
+        .await
+        .is_empty());
+    assert!(sink
+        .metric_tags("agent_ebpf_capability", &tags("java"))
+        .await
+        .is_empty());
+    let with_service = BTreeMap::from([
+        ("process_name".to_string(), "java".to_string()),
+        ("service".to_string(), "already".to_string()),
+    ]);
+    assert!(sink
+        .metric_tags("ebpf_process_exec_total", &with_service)
+        .await
+        .is_empty());
+    assert!(sink
+        .metric_tags("ebpf_process_exec_total", &BTreeMap::new())
+        .await
+        .is_empty());
+}

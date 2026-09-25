@@ -346,9 +346,10 @@ async fn ingest(
 
     let reply = match state.apm.as_ref() {
         Some(sink) => {
-            // 同一个 sink 同时充当 trace 与 eBPF 边的出口（共用端点表与静态映射缓存）。
             let trace_sink = sink.as_ref() as &dyn dataplane_ingest::trace::TraceSink;
             let edge_sink = sink.as_ref() as &dyn dataplane_ingest::EdgeSink;
+            // 同一个 sink 同时充当 trace / eBPF 边 / 指标维度补全的出口。
+            let metric_sink = sink.as_ref() as &dyn dataplane_ingest::MetricSink;
             apply_with_sinks(
                 envelope,
                 state.ts.as_ref(),
@@ -356,6 +357,7 @@ async fn ingest(
                 state.kv.as_ref(),
                 Some(trace_sink),
                 Some(edge_sink),
+                Some(metric_sink),
             )
             .await
         }
