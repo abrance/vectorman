@@ -49,6 +49,19 @@ if [[ -n "$BIN_DIR" ]]; then
     exit 1
   fi
 else
+  # eBPF 内核态对象文件：**发布期构建**而不是入库到 git（二进制入库会陈旧、评审噪音大，
+  # 而 `gse-agent-ebpf/build.rs` 已经能「有就内嵌、没有就给出明确报错」）。
+  #
+  # bpf-linker 需要 LLVM：0.11 起要 LLVM 21+（Ubuntu 24.04 自带的 18 不够，需 apt.llvm.org）。
+  # 没装 bpf-linker 时不报错，只是发布包里没有内嵌对象文件、采集项运行时会明确提示先构建。
+  if command -v bpf-linker >/dev/null 2>&1; then
+    step "ebpf-objects"
+    "$REPO_ROOT/scripts/build-ebpf.sh" || fail ebpf-objects
+  else
+    step "ebpf-objects skipped (bpf-linker not found)"
+    echo "提示：安装 bpf-linker（需 LLVM 21+）后重跑，发布包才会内嵌 packaging/ebpf/*.o" >&2
+  fi
+
   step "cargo-build"
   MUSL_TARGET="x86_64-unknown-linux-musl"
   if ! command -v musl-gcc >/dev/null 2>&1; then

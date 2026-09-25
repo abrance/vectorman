@@ -4,6 +4,8 @@ on:
   pull_request:
   push:
     branches: [main]
+  # 手动触发：用于产出 eBPF 内核态对象文件（见下面的 ebpf-objects 作业）。
+  workflow_dispatch:
 
 jobs:
   rust-ci:
@@ -23,3 +25,34 @@ jobs:
           rustup toolchain install nightly --profile minimal --component rust-src
       - name: Type-check eBPF programs
         run: scripts/build-ebpf.sh --check
+
+  # 产出 `*.o` 需要 bpf-linker + LLVM 21+（bpf-linker 0.11 的默认 feature 是 LLVM 23）。
+  # 只在手动触发时跑：PR 流水线不依赖它（构建链依赖不在默认 runner 上，且不需要每次都编）。
+  # 产物作为 artifact 上传，供检查或按发布流程内嵌（`gse-agent-ebpf/build.rs` 会内嵌
+  # `packaging/ebpf/*.o`；发布脚本 `packaging/build-package.sh` 在本机有 bpf-linker 时自动带上）。
+  ebpf-objects:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LLVM 21
+        run: |
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key |
+            sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" |
+            sudo tee /etc/apt/sources.list.d/llvm-21.list >/dev/null
+          sudo apt-get update -q
+          sudo apt-get install -y -q llvm-21-dev libclang-21-dev clang-21
+      - name: Install bpf-linker
+        env:
+          LLVM_SYS_211_PREFIX: /usr/lib/llvm-21
+        run: cargo install bpf-linker --no-default-features --features llvm-21
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+      - name: Build eBPF object files
+        run: scripts/build-ebpf.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ebpf-objects
+          path: packaging/ebpf/*.o
+          if-no-files-found: error
