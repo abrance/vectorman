@@ -503,6 +503,7 @@ fn main() -> ExitCode {
         read_errors: 0,
         map_overflow_dropped: 0,
         rate_limited: totals.rate_limited,
+        buffer_dropped: 0,
     };
     pending_metrics.extend(gse_agent_ebpf::stats_metrics(
         &args.agent_id,

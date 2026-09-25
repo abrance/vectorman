@@ -5,3 +5,7 @@ frontend/**/dist
 frontend/**/.vite
 /vectorman-*-linux-x86_64
 /vectorman-*-linux-x86_64.tar.gz
+
+# gse-server 台账（本地跑 e2e 时生成）
+gse-server.db
+gse-server.db.job-files/

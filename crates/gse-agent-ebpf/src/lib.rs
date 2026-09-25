@@ -114,6 +114,8 @@ pub struct EbpfStats {
     pub map_overflow_dropped: AtomicU64,
     /// 被内核态令牌桶限流丢弃的事件数（需求 12.3 要求可观测）。
     pub rate_limited: AtomicU64,
+    /// 被**上行缓冲**淘汰的记录数（容量满时淘汰最旧；只在日志里出现等于看不见）。
+    pub buffer_dropped: AtomicU64,
 }
 
 /// 统计快照。
@@ -127,6 +129,7 @@ pub struct EbpfSnapshot {
     pub read_errors: u64,
     pub map_overflow_dropped: u64,
     pub rate_limited: u64,
+    pub buffer_dropped: u64,
 }
 
 impl EbpfStats {
@@ -141,6 +144,7 @@ impl EbpfStats {
             read_errors: self.read_errors.load(Ordering::Relaxed),
             map_overflow_dropped: self.map_overflow_dropped.load(Ordering::Relaxed),
             rate_limited: self.rate_limited.load(Ordering::Relaxed),
+            buffer_dropped: self.buffer_dropped.load(Ordering::Relaxed),
         }
     }
 }
@@ -610,7 +614,7 @@ pub fn stats_metrics(
     snapshot: &EbpfSnapshot,
 ) -> Vec<serde_json::Value> {
     let ts = now_micros();
-    let rows: [(&str, u64); 8] = [
+    let rows: [(&str, u64); 9] = [
         ("agent_ebpf_flushes_total", snapshot.flushes),
         ("agent_ebpf_edges_total", snapshot.edges),
         ("agent_ebpf_metric_points_total", snapshot.metrics),
@@ -622,6 +626,7 @@ pub fn stats_metrics(
             snapshot.map_overflow_dropped,
         ),
         ("agent_ebpf_rate_limited_total", snapshot.rate_limited),
+        ("agent_ebpf_buffer_dropped_total", snapshot.buffer_dropped),
     ];
     rows.iter()
         .map(|(measurement, value)| {
@@ -861,9 +866,10 @@ mod tests {
             read_errors: 1,
             map_overflow_dropped: 5,
             rate_limited: 6,
+            buffer_dropped: 11,
         };
         let points = stats_metrics("agent-1", "item-1", &snapshot);
-        assert_eq!(points.len(), 8, "每个计数字段一条点");
+        assert_eq!(points.len(), 9, "每个计数字段一条点");
         let value_of = |name: &str| -> f64 {
             points
                 .iter()
@@ -876,12 +882,13 @@ mod tests {
         assert_eq!(value_of("agent_ebpf_map_overflow_dropped_total"), 5.0);
         assert_eq!(value_of("agent_ebpf_read_errors_total"), 1.0);
         assert_eq!(value_of("agent_ebpf_edges_total"), 9.0);
+        assert_eq!(value_of("agent_ebpf_buffer_dropped_total"), 11.0);
         // 记录 ID 唯一（接入侧按 record_id 去重，重复 ID 会让后续点被吃掉）。
         let ids: std::collections::HashSet<&str> = points
             .iter()
             .filter_map(|p| p["record_id"].as_str())
             .collect();
-        assert_eq!(ids.len(), 8);
+        assert_eq!(ids.len(), 9);
         assert_eq!(points[0]["tags"]["agent_id"], "agent-1");
         assert_eq!(points[0]["tags"]["item_id"], "item-1");
         assert_eq!(points[0]["field_name"], "value");

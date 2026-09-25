@@ -34,21 +34,29 @@ impl Buffer {
     }
 
     /// 入队；为容纳新批将弹出最旧批次，直到总和不超过上限。
-    pub async fn push(&self, env: DataEnvelope) {
+    /// 入队一条批次。
+    ///
+    /// 返回**被淘汰的记录数**：容量满时按「淘汰最旧」处理，调用方应当把它计入自监控 ——
+    /// 这条路径上的丢数据此前只在日志里出现，Prom 上完全看不见（实测一次 60 秒的
+    /// eBPF 采集丢了 2279 条边记录、只入库 149 条，而所有指标看起来都「正常」）。
+    pub async fn push(&self, env: DataEnvelope) -> u64 {
+        let mut dropped_total = 0u64;
         let mut guard = self.inner.lock().await;
         while !guard.queue.is_empty() && guard.total_records + env.record_count() > self.max_records
         {
             if let Some(dropped) = guard.queue.pop_front() {
+                let records = dropped.record_count() as u64;
                 guard.total_records -= dropped.record_count();
+                dropped_total += records;
                 eprintln!(
                     "gse-agent: drop oldest batch data_type={} records={}",
-                    dropped.data_type,
-                    dropped.record_count()
+                    dropped.data_type, records
                 );
             }
         }
         guard.total_records += env.record_count();
         guard.queue.push_back(env);
+        dropped_total
     }
 
     /// 弹出队头；空返回 None。
@@ -124,6 +132,23 @@ mod tests {
         buf.push(env("metrics", 2)).await; // 3 + 2 = 5 恰好
         assert_eq!(buf.total_records().await, 5);
         assert_eq!(buf.len().await, 2);
+    }
+
+    /// 淘汰必须**返回条数**：只在日志里出现等于看不见（调用方据此计入自监控）。
+    #[tokio::test]
+    async fn overflow_reports_dropped_records() {
+        let buf = Buffer::new(5);
+        assert_eq!(buf.push(env("ebpf_edges", 3)).await, 0, "未超容量不淘汰");
+        // 3 + 4 > 5：淘汰最旧那批（3 条）。
+        assert_eq!(buf.push(env("ebpf_edges", 4)).await, 3);
+        assert_eq!(buf.total_records().await, 4);
+        // 一次入队淘汰两批：5 -> 淘汰 2 + 3，剩 6。
+        let buf = Buffer::new(6);
+        buf.push(env("a", 2)).await;
+        buf.push(env("b", 3)).await;
+        assert_eq!(buf.push(env("c", 6)).await, 5);
+        assert_eq!(buf.total_records().await, 6);
+        assert_eq!(buf.len().await, 1, "只剩最新那批");
     }
 
     #[tokio::test]

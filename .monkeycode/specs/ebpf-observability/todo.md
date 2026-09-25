@@ -32,19 +32,19 @@
 
 ## 二、遗留项
 
-### TODO-1（高）GSE 下发采集项这一跳未端到端验证
+### TODO-1（高）GSE 下发采集项这一跳未端到端验证 —— ✅ 已完成（并且抓到一个严重 bug）
 
-- **现状**：`collect/ebpf.rs` 的入口是 `spawn_collector` 按 `item.kind` 分发；本机验证用的是
-  `--example checkpoint`，它复用**同一套用户态代码**（preflight、加载挂载、差分、边记录、上报，
-  连记录构造函数都相同），但由手工启动，没有经过 GSE 下发。
-- **为什么欠**：跑通需要同时起 `gse-server`（台账 + 采集项下发）+ `gse-agent`（注册、心跳、拉采集项）
-  + `dataserver`（注册为数据面并被 GSE 选路），属于环境装配成本，而不是缺代码。
-- **怎么补**：在测试环境按 `packaging/` 的部署方式起三件套，用 `POST /api/gse/collect-items`
-  下发 `ebpf_network` 采集项（参考 `dataserver/tests/e2e.rs` 的台账装配思路），
-  然后在目标机制造流量并查 `/v1/edges/search`。
-- **验收**：采集项下发后 Agent 日志出现 `已挂载程序：[...]`；`/v1/streams` 有该 `item_id`；
-  `agent_ebpf_capability` 值为 1；停用采集项后内核态探针消失（`bpftool prog list` 无残留）。
-- **依赖**：目标机需 root 或 `CAP_BPF`+`CAP_PERFMON`，且内核 ≥ 5.8 + BTF。
+- **原状**：`collect/ebpf.rs` 的入口是 `spawn_collector` 按 `item.kind` 分发；本机验证用的是
+  `--example checkpoint`，它复用**同一套用户态代码**，但由手工启动，没有经过 GSE 下发。
+- **已完成**：本机起三件套（`gse-server` + `dataserver`（注册为数据面并被选路）+ `gse-agent`），
+  经 `POST /v1/collect-items`（dataserver 反代到 GSE 台账）下发 `ebpf_network` 采集项，
+  Agent **自己**注册、取采集项、`sudo` 加载内核态程序、采集、上报。
+- **实测**：`/v1/streams` 出现 `agent-e2e` 的 `ebpf_edges` / `metrics` 流；
+  `/v1/edges/search` 907 条边（`unknown-10.11.40.171 -> unknown-112.45.121.121`，`tcp`）；
+  Prom 里 `agent_ebpf_flushes_total=5`、`agent_ebpf_edges_total=2274`、`agent_ebpf_buffer_dropped_total=0`。
+- **这一跳立刻抓到的问题（已修，见下）**：上行数据被 Agent 的传输缓冲**大量静默丢弃** ——
+  60 秒里丢了 **2279 条边记录、只入库 149 条**。检查点工具直连 dataserver 上报，永远看不到这一幕，
+  这正是「必须走真实下发链路」的原因。
 
 ### TODO-2（高）前端 `/ebpf` 页只做了单测，没有浏览器实跑
 
@@ -121,9 +121,34 @@
 - **实测**：`dataserver_ingest_records_total{data_type="ebpf",result="accepted"} 1241`、
   `{data_type="metrics",result="accepted"} 612`，与采集侧上报数一致。
 
+### 真实下发链路上抓到并修掉的两个问题（TODO-1 的副产品，已修）
+
+1. **新注册的数据面有最长 30 秒的「盲窗」**：GSE 的探活循环是「先探再睡 30 秒」，
+   而数据面通常在服务启动后才注册，于是要等下一轮才变 `online`；这段时间 Agent 拿不到上报地址
+   （`gse-agent: dataplane_addr unavailable: no online dataplane`），采集数据只能积压。
+   **修法**：注册成功即触发一次探活，并做短重试（5 次 × 2 秒，`spawn_probe_after_register`）——
+   数据面往往正在启动，只探一次失败就会标成 `offline` 又要等 30 秒。实测注册后 **1 秒**变 `online`。
+2. **上行缓冲丢数据不可见**：`Buffer` 容量（默认 1000 条记录）满时按「淘汰最旧」处理，
+   只打一行日志。eBPF 一次 flush 就是几百条边记录，配合上面的盲窗 → 大量丢失，
+   而 Prom 上所有指标都「正常」。**修法**：`Buffer::push` 返回被淘汰的记录数 →
+   `EbpfStats.buffer_dropped` → 新增 `agent_ebpf_buffer_dropped_total`，把丢失纳入可观测。
+
+修完的实测对比（同一台机器、同一个采集项、60 秒）：
+
+| | 修复前 | 修复后 |
+| --- | --- | --- |
+| 数据面变 online | 最多 30 秒 | **1 秒** |
+| `no online dataplane` | 14 次 | 0 |
+| 丢弃记录 | **2279**（入库仅 149） | **0** |
+| 缓冲区淘汰指标 | 不存在（Prom 看不见） | `agent_ebpf_buffer_dropped_total = 0` |
+
 ### 本地 scratch 环境的一个坑（排查时别误判）
 
-用同一个数据目录反复 `pkill` dataserver 后，tsink 会进入 **fail-fast**，之后所有写入都返回
+- **gse-server 的台账 sqlite**：在进程还活着时删掉 `gse-server.db`，之后所有写入都会失败并报
+  `attempt to write a readonly database`；更隐蔽的是**旧进程还占着端口**，`curl` 打到的是旧实例，
+  于是「数据面一直 offline」看起来像代码问题。排查顺序：先确认没有残留进程、端口空闲，再删库重启。
+  （这一条曾让我得出两次错误的测量结论。）
+- **dataserver 的 tsink**：用同一个数据目录反复 `pkill` dataserver 后，tsink 会进入 **fail-fast**，之后所有写入都返回
 `tsink: Storage is shutting down`（**底层原因被这句话掩盖**），连原本正常的进程指标也写不进，
 很容易误判成「刚改的代码把存储搞坏了」。判断方法：换一个**全新的数据目录**再试；正常即可确认是
 本地残留状态问题。要观察 fail-fast 之前的真因，需要看底层日志而不是接口返回。
