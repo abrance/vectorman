@@ -15,6 +15,7 @@ pub mod attach;
 pub mod backoff;
 pub mod btf;
 pub mod cfg;
+pub mod cgroup;
 pub mod config;
 pub mod loader;
 pub mod preflight;
@@ -59,9 +60,17 @@ pub trait MapSource: Send {
     /// 读取本周期快照；实现方负责在读取后把内核侧计数复位。
     fn drain(&mut self) -> Result<ConnSnapshot, String>;
 
-    /// 进程/容器上下文（由 `cgroup_id` 反查；取不到时返回 `None`）。
-    fn process_context(&self, _key: &ConnKey) -> Option<ProcessContext> {
+    /// 按 `pid` 反查进程/容器上下文（取不到时返回 `None`）。
+    ///
+    /// 需要 `&mut self`：反查结果要写缓存（每个 pid 只读一次 `/proc`）。
+    /// 连接键与进程键都带 `pid`，所以这一条同时服务两种采集项。
+    fn process_context_by_pid(&mut self, _pid: u32) -> Option<ProcessContext> {
         None
+    }
+
+    /// 连接键的进程/容器上下文（默认转调 [`MapSource::process_context_by_pid`]）。
+    fn process_context(&mut self, key: &ConnKey) -> Option<ProcessContext> {
+        self.process_context_by_pid(key.pid)
     }
 
     /// 当前生效的内核态程序数量（自监控用）。
@@ -298,6 +307,8 @@ pub async fn run_process_loop(
         let bucket_ts = bucket_start(now_micros(), cfg.bucket_secs);
 
         for (key, per_cpu) in snapshot {
+            // 容器/Pod 由 pid 反查（需求 4.6 的 `container_id` 维度）。
+            let context = source.process_context_by_pid(key.pid);
             let (exec, exit, fork) = sum_process(&per_cpu);
             let current = (exec, exit, fork);
             let delta = match seen.get(&(key.pid, key.cgroup_id, key.comm)) {
@@ -313,7 +324,7 @@ pub async fn run_process_loop(
                 stats.idle_keys.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            minute.observe(&key, delta, bucket_ts);
+            minute.observe(&key, delta, bucket_ts, context.as_ref());
         }
         seen.retain(|_, v| *v != (0, 0, 0));
 
@@ -409,19 +420,40 @@ pub fn comm_str(comm: &[u8; ebpf_abi::TASK_COMM_LEN]) -> String {
 /// 每分钟汇总的进程计数（只输出已关闭的分钟桶）。
 #[derive(Default)]
 pub struct ProcessMinuteAccumulator {
-    buckets: std::collections::BTreeMap<(i64, ProcSeenKey), ProcCounts>,
+    buckets: std::collections::BTreeMap<(i64, ProcSeenKey), (ProcCounts, ProcessLabels)>,
+}
+
+/// 进程指标的额外维度（容器/Pod，由 pid 反查得到）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcessLabels {
+    pub container_id: String,
+    pub pod_uid: String,
 }
 
 impl ProcessMinuteAccumulator {
-    /// 记录一个周期桶。
-    pub fn observe(&mut self, key: &ebpf_abi::ProcKey, delta: (u64, u64, u64), bucket_ts: i64) {
+    /// 记录一个周期桶；`context` 是 pid 反查到的容器/Pod（可能为空）。
+    pub fn observe(
+        &mut self,
+        key: &ebpf_abi::ProcKey,
+        delta: ProcCounts,
+        bucket_ts: i64,
+        context: Option<&ProcessContext>,
+    ) {
+        let labels = ProcessLabels {
+            container_id: context.map(|c| c.container_id.clone()).unwrap_or_default(),
+            pod_uid: context.map(|c| c.pod_name.clone()).unwrap_or_default(),
+        };
         let entry = self
             .buckets
             .entry((bucket_ts, (key.pid, key.cgroup_id, key.comm)))
-            .or_insert((0, 0, 0));
-        entry.0 = entry.0.saturating_add(delta.0);
-        entry.1 = entry.1.saturating_add(delta.1);
-        entry.2 = entry.2.saturating_add(delta.2);
+            .or_insert((ProcCounts::default(), labels.clone()));
+        // 先到的周期可能拿不到上下文（进程刚退出），后续周期补上时以非空值覆盖。
+        if entry.1.container_id.is_empty() && !labels.container_id.is_empty() {
+            entry.1 = labels;
+        }
+        entry.0 .0 = entry.0 .0.saturating_add(delta.0);
+        entry.0 .1 = entry.0 .1.saturating_add(delta.1);
+        entry.0 .2 = entry.0 .2.saturating_add(delta.2);
     }
 
     /// 取出已关闭分钟桶（`now` 之前的整分钟），产出 `ebpf_process_*` 指标。
@@ -435,7 +467,7 @@ impl ProcessMinuteAccumulator {
             .collect();
         let mut out = Vec::new();
         for key in closed {
-            let Some((exec, exit, fork)) = self.buckets.remove(&key) else {
+            let Some(((exec, exit, fork), labels)) = self.buckets.remove(&key) else {
                 continue;
             };
             let (ts, (pid, cgroup_id, comm)) = key;
@@ -457,6 +489,9 @@ impl ProcessMinuteAccumulator {
                         "pid": pid.to_string(),
                         "cgroup_id": cgroup_id.to_string(),
                         "process_name": comm,
+                        // 容器 ID 由 pid 反查得到；Pod 只到 uid（名字需要 k8s 侧数据）。
+                        "container_id": labels.container_id,
+                        "pod_uid": labels.pod_uid,
                     },
                     "field_name": "value",
                     "field_value": value as f64,
@@ -525,7 +560,7 @@ mod tests {
             Ok(guard.remove(0))
         }
 
-        fn process_context(&self, _key: &ConnKey) -> Option<ProcessContext> {
+        fn process_context_by_pid(&mut self, _pid: u32) -> Option<ProcessContext> {
             self.contexts.first().cloned().flatten()
         }
     }
@@ -688,8 +723,13 @@ mod tests {
             }
         };
         let mut acc = ProcessMinuteAccumulator::default();
-        acc.observe(&key(1, b"java"), (2, 0, 1), base);
-        acc.observe(&key(1, b"java"), (1, 3, 0), base + 10_000_000);
+        let context = ProcessContext {
+            process_name: "java".into(),
+            container_id: "c1".into(),
+            pod_name: "9f8e7d6c-5b4a-3210-9f8e-7d6c5b4a3210".into(),
+        };
+        acc.observe(&key(1, b"java"), (2, 0, 1), base, Some(&context));
+        acc.observe(&key(1, b"java"), (1, 3, 0), base + 10_000_000, None);
 
         assert!(acc.drain_closed(base + 30_000_000, "a1").is_empty());
         let metrics = acc.drain_closed(base + 60_000_000, "a1");
@@ -710,6 +750,11 @@ mod tests {
             .unwrap();
         assert_eq!(exec["tags"]["process_name"], "java");
         assert_eq!(exec["tags"]["pid"], "1");
+        assert_eq!(exec["tags"]["container_id"], "c1");
+        assert_eq!(
+            exec["tags"]["pod_uid"],
+            "9f8e7d6c-5b4a-3210-9f8e-7d6c5b4a3210"
+        );
         let ts = exec["timestamp"].as_i64().unwrap();
         assert!(
             ts == base || ts == base + 10_000_000,
