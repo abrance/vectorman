@@ -6,6 +6,7 @@
     "apps/*"
   ],
   "scripts": {
+    "typecheck": "tsc --noEmit -p apps/console && tsc --noEmit -p apps/dataplane && tsc --noEmit -p apps/desktop && tsc --noEmit -p apps/job && tsc --noEmit -p apps/node && tsc --noEmit -p packages/adapters && tsc --noEmit -p packages/primitives",
     "test": "npm run test -w @vectorman/primitives && npm run test -w @vectorman/adapters && npm run test -w @vectorman/node && npm run test -w @vectorman/job && npm run test -w @vectorman/console && npm run test -w @vectorman/desktop && npm run test -w @vectorman/dataplane",
     "dev:console": "npm run dev -w @vectorman/console",
     "build:console": "npm run build -w @vectorman/console",

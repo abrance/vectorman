@@ -136,14 +136,19 @@
 
 ## 三、工程缺口与维护约定
 
-### TODO-12（高）前端测试不在 CI 里
+### TODO-12（高）前端测试不在 CI 里 —— ✅ 已完成
 
-- **现状**：`.github/workflows` 只有 `rust-ci`（含 `ebpf-programs`、手动 `ebpf-objects`）、
+- **原状**：`.github/workflows` 只有 `rust-ci`（含 `ebpf-programs`、手动 `ebpf-objects`）、
   `release`、`helm-ci`；前端 `npm test`、`tsc --noEmit`、`build:dataplane` **只在本地跑过**。
 - **影响**：本轮 `/ebpf` 页（PR #55）是「本地跑绿 + 人工确认」合入的，之后任何前端改动都不会被流水线拦住。
-- **怎么补**：加一个 `frontend` 作业（node 20 + `npm ci` + `npm test -w @vectorman/dataplane` +
-  `npm test -w @vectorman/adapters` + `tsc --noEmit` + `npm run build:dataplane`）。
-- **验收**：故意改坏一个前端断言，CI 变红。
+- **已完成**：新增 `.github/workflows/frontend-ci.yml`（复用 yoc 的 `react-ci@v1.0.0`，与前两个工作流同约定），
+  在 `frontend/**` 变更时跑**安装 → 全量类型检查 → 全部 workspace 测试 → `build:dataplane`**；
+  根 `package.json` 增加 `typecheck`（7 个 workspace 逐个 `tsc --noEmit`）。
+- **副产品（正是这条待办存在的价值）**：第一次全量类型检查就暴露 **4 个 workspace 早就存在的类型错误**
+  （`npm test` 一直是绿的，因为没有类型检查）：`job-rerun-drawer` 的 `dest_path` 不在表单类型里
+  （表单与 `buildRerunRequest` 都在用）、`job-submit-drawer` 传了可能为 `undefined` 的 `agent_id`、
+  以及 `fetch-client.test.ts` 两处 mock 未声明参数（`mock.calls[0][1]` 因此类型不成立）。已一并修掉。
+  「没进 CI 的测试约等于没有测试」，这条待办自己证明了这一点。
 
 ### 维护约定：改了内核态源码必须重建 `.o` 并一起提交
 

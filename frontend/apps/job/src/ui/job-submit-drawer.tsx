@@ -131,7 +131,7 @@ export function JobSubmitDrawer({
       return;
     }
     if (selected && onSubmitTemplate) {
-      onSubmitTemplate(selected.template_id, { agent_id: v.agent_id, vars: v.vars ?? {} });
+      onSubmitTemplate(selected.template_id, { agent_id: v.agent_id ?? "", vars: v.vars ?? {} });
       return;
     }
     onSubmit(buildJobSubmit(v));
