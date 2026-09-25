@@ -418,6 +418,55 @@ async fn logs_search(
     }
 }
 
+/// eBPF 原始事件检索：复用日志检索，但 `data_type` 固定为 `ebpf`（客户端不能改成别的类型）。
+async fn ebpf_events_search(
+    State(state): State<AppState>,
+    body: Result<Json<LogSearchQuery>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let mut query = match body {
+        Ok(b) => b.0,
+        Err(_) => {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                DataplaneError::invalid_argument("invalid JSON body"),
+            );
+        }
+    };
+    query.data_type = Some(data_type_ebpf().to_string());
+    match search(state.log.as_ref(), query).await {
+        Ok(records) => Json(json!({
+            "records": records
+                .into_iter()
+                .map(|r| json!({
+                    "id": r.id,
+                    "timestamp": r.timestamp,
+                    "level": r.level,
+                    "message": r.message,
+                    "labels": r.labels,
+                }))
+                .collect::<Vec<Value>>(),
+        }))
+        .into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+/// `data_type=ebpf` 的字面量（与 `DataType::Ebpf` 的序列化值一致）。
+fn data_type_ebpf() -> &'static str {
+    "ebpf"
+}
+
+/// eBPF 能力状态：读 `agent_ebpf_capability` 指标的最新值，按 Agent 汇总。
+///
+/// 为什么单独给一个接口：拓扑/链路页需要区分「eBPF 不可用」与「eBPF 可用但没有数据」，
+/// 前者要提示运维去加权限，后者只是没流量。
+async fn ebpf_capability(State(state): State<AppState>) -> Response {
+    match dataplane_apm::ebpf_metrics::capability_report(state.ts.as_ref()).await {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
 fn parse_stream_key(key: &str) -> Option<(String, String, String)> {
     let rest = key.strip_prefix("stream/")?;
     let mut parts = rest.splitn(3, '/');
@@ -767,6 +816,8 @@ fn api_routes(state: AppState) -> Router {
         .route("/v1/sql", post(sql_exec))
         .route("/v1/ingest", post(ingest))
         .route("/v1/logs/search", post(logs_search))
+        .route("/v1/ebpf/events/search", post(ebpf_events_search))
+        .route("/v1/ebpf/capability", get(ebpf_capability))
         .route("/v1/streams", get(streams))
         .route("/v1/traces/search", post(traces_search))
         .route("/v1/traces/{trace_id}", get(trace_detail))
@@ -1640,7 +1691,130 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK, "{body}");
         let edges: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(edges["total"], 0, "ebpf 数据源尚未接入");
+        assert_eq!(edges["total"], 0, "这个用例没有 eBPF 边数据");
+
+        // 塞一条 eBPF 边（与上面 OTLP 那条**同一个桶**与同一对服务）：单路能查到，合并模式两路相加。
+        let bucket = now - 60_000_000;
+        env.state
+            .sql
+            .execute(
+                &format!(
+                    "INSERT OR REPLACE INTO {} (record_id, bucket_start, bucket_micros, protocol,
+                        src_ip, src_port, dst_ip, dst_port, src_service, dst_service,
+                        connections, bytes_sent, bytes_recv, duration_sum, duration_max,
+                        tcp_retrans, tcp_resets, failures, failure_reason, latency_hist,
+                        agent_id, data_id)
+                     VALUES ('e1',?1,10000000,'tcp','10.0.0.5',40000,'10.0.0.9',8080,
+                        'gateway','order-api',5,1000,2000,5000,1500,2,1,1,'refused','[1,1]','agent-1','item-ebpf')",
+                    dataplane_apm::tables::EBPF_EDGES
+                ),
+                &[dataplane_core::SqlValue::Integer(bucket)],
+            )
+            .await
+            .unwrap();
+
+        let (st, body) = send(
+            &app,
+            req("POST", "/v1/edges/search", Some(r#"{"source":"ebpf"}"#)),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let edges: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(edges["total"], 1, "{body}");
+        let row = &edges["edges"][0];
+        assert_eq!(row["src_service"], "gateway");
+        assert_eq!(row["dst_service"], "order-api");
+        assert_eq!(row["connections"], 5);
+        assert_eq!(row["failures"], 1);
+        assert_eq!(row["bytes_sent"], 1000);
+        assert_eq!(row["bytes_recv"], 2000);
+        assert_eq!(row["tcp_retrans"], 2);
+        assert_eq!(row["dst_port"], 8080);
+        assert_eq!(row["protocol"], "tcp");
+        assert_eq!(row["duration_avg_micros"], 1000, "5000 / 5");
+        assert_eq!(row["source"], "ebpf");
+
+        // 合并模式：同一桶同一对服务两路相加，`source=merged`。
+        let (st, body) = send(&app, req("POST", "/v1/edges/search", Some("{}"))).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let edges: Value = serde_json::from_str(&body).unwrap();
+        let merged = edges["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["src_service"] == "gateway" && row["dst_service"] == "order-api")
+            .expect("合并后的边");
+        assert_eq!(merged["source"], "merged");
+        assert_eq!(merged["calls"], 8, "3 (otlp) + 5 (ebpf)");
+        assert_eq!(merged["errors"], 2);
+        assert_eq!(merged["bytes_sent"], 1000, "只有 eBPF 侧有字节");
+
+        // 非法时间范围 → 400。
+        let (st, body) = send(
+            &app,
+            req(
+                "POST",
+                "/v1/edges/search",
+                Some(r#"{"from_ts":100,"to_ts":10}"#),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("invalid_argument"), "{body}");
+
+        // eBPF 原始事件检索：`data_type` 被强制为 ebpf，不会串到 APM 日志。
+        env.state
+            .log
+            .append(dataplane_log::LogRecord {
+                id: "ebpf-1".into(),
+                timestamp: now - 5_000_000,
+                level: "info".into(),
+                message: "java exec /usr/bin/java".into(),
+                labels: std::collections::BTreeMap::from([
+                    ("data_type".to_string(), "ebpf".to_string()),
+                    ("event_type".to_string(), "process_exec".to_string()),
+                    ("pid".to_string(), "42".to_string()),
+                    ("process_name".to_string(), "java".to_string()),
+                    ("data_id".to_string(), "item-ebpf".to_string()),
+                ]),
+                payload: None,
+            })
+            .await
+            .unwrap();
+        let (st, body) = send(
+            &app,
+            req(
+                "POST",
+                "/v1/ebpf/events/search",
+                Some(r#"{"event_type":"process_exec"}"#),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let events: Value = serde_json::from_str(&body).unwrap();
+        let records = events["records"].as_array().unwrap();
+        assert_eq!(records.len(), 1, "{body}");
+        assert_eq!(records[0]["labels"]["process_name"], "java");
+        assert_eq!(records[0]["labels"]["event_type"], "process_exec");
+
+        // 事件检索也要遵守时间范围校验。
+        let (st, body) = send(
+            &app,
+            req(
+                "POST",
+                "/v1/ebpf/events/search",
+                Some(r#"{"from_ts":100,"to_ts":10}"#),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+
+        // 能力状态：没上报时是空报告（前端据此区分「不可用」与「没数据」）。
+        let (st, body) = send(&app, req("GET", "/v1/ebpf/capability", None)).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let cap: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(cap["reported"], 0);
+        assert!(cap["agents"].as_array().unwrap().is_empty());
 
         // 服务清单（含端点实例明细，便于排查未识别服务）。
         let (st, body) = send(&app, req("GET", "/v1/apm/services", None)).await;

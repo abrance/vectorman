@@ -121,10 +121,16 @@ enum Command {
         /// 目标服务
         #[arg(long)]
         dst: Option<String>,
-        /// 数据来源：otlp / ebpf
+        /// 数据来源：otlp / ebpf；省略时两路按分钟桶与源/目标服务合并汇总
         #[arg(long)]
         source: Option<String>,
-        /// 最小调用次数
+        /// 协议：tcp / udp（只有 eBPF 侧有协议）
+        #[arg(long)]
+        protocol: Option<String>,
+        /// 目标端口
+        #[arg(long)]
+        dst_port: Option<i64>,
+        /// 最小调用次数（eBPF 侧即连接数）
         #[arg(long)]
         min_requests: Option<i64>,
         /// 起始时间（Unix 微秒）
@@ -137,6 +143,29 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// 检索 eBPF 原始事件，`POST /v1/ebpf/events/search`
+    EbpfEvents {
+        /// 事件类型：process_exec / process_exit / process_fork / connect / accept / close
+        #[arg(long)]
+        event_type: Option<String>,
+        /// 进程名
+        #[arg(long)]
+        process_name: Option<String>,
+        /// 关键词（消息全文）
+        #[arg(long)]
+        query: Option<String>,
+        /// 起始时间（Unix 微秒）
+        #[arg(long)]
+        from_ts: Option<i64>,
+        /// 结束时间（Unix 微秒）
+        #[arg(long)]
+        to_ts: Option<i64>,
+        /// 最大返回条数
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// 查看 eBPF 能力状态，`GET /v1/ebpf/capability`
+    EbpfCapability,
 }
 
 #[derive(Subcommand)]
@@ -238,10 +267,32 @@ fn run(cli: &Cli) -> Result<(), DpcError> {
             ),
         ),
         Command::Trace { trace_id } => cmd_get(&cli.sql_url, &format!("/v1/traces/{trace_id}")),
+        Command::EbpfEvents {
+            event_type,
+            process_name,
+            query,
+            from_ts,
+            to_ts,
+            limit,
+        } => cmd_post(
+            &cli.sql_url,
+            "/v1/ebpf/events/search",
+            ebpf_events_body(
+                event_type.as_deref(),
+                process_name.as_deref(),
+                query.as_deref(),
+                *from_ts,
+                *to_ts,
+                *limit,
+            ),
+        ),
+        Command::EbpfCapability => cmd_get(&cli.sql_url, "/v1/ebpf/capability"),
         Command::Edges {
             src,
             dst,
             source,
+            protocol,
+            dst_port,
             min_requests,
             from_ts,
             to_ts,
@@ -253,6 +304,8 @@ fn run(cli: &Cli) -> Result<(), DpcError> {
                 src.as_deref(),
                 dst.as_deref(),
                 source.as_deref(),
+                protocol.as_deref(),
+                *dst_port,
                 *min_requests,
                 *from_ts,
                 *to_ts,
@@ -364,6 +417,8 @@ fn edges_body(
     src: Option<&str>,
     dst: Option<&str>,
     source: Option<&str>,
+    protocol: Option<&str>,
+    dst_port: Option<i64>,
     min_requests: Option<i64>,
     from_ts: Option<i64>,
     to_ts: Option<i64>,
@@ -374,13 +429,50 @@ fn edges_body(
         ("src_service", src),
         ("dst_service", dst),
         ("source", source),
+        ("protocol", protocol),
     ] {
         if let Some(value) = value {
             body.insert(key.into(), value.into());
         }
     }
+    if let Some(v) = dst_port {
+        body.insert("dst_port".into(), v.into());
+    }
     if let Some(v) = min_requests {
         body.insert("min_requests".into(), v.into());
+    }
+    if let Some(v) = from_ts {
+        body.insert("from_ts".into(), v.into());
+    }
+    if let Some(v) = to_ts {
+        body.insert("to_ts".into(), v.into());
+    }
+    if let Some(v) = limit {
+        body.insert("limit".into(), v.into());
+    }
+    serde_json::Value::Object(body)
+}
+
+/// eBPF 事件过滤条件拼成 `/v1/ebpf/events/search` 请求体。
+///
+/// `data_type` 由服务端固定为 `ebpf`，这里不传（客户端不能改）。
+fn ebpf_events_body(
+    event_type: Option<&str>,
+    process_name: Option<&str>,
+    query: Option<&str>,
+    from_ts: Option<i64>,
+    to_ts: Option<i64>,
+    limit: Option<usize>,
+) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    if let Some(v) = event_type {
+        body.insert("event_type".into(), v.into());
+    }
+    if let Some(v) = process_name {
+        body.insert("labels".into(), serde_json::json!({"process_name": v}));
+    }
+    if let Some(v) = query {
+        body.insert("message_query".into(), v.into());
     }
     if let Some(v) = from_ts {
         body.insert("from_ts".into(), v.into());
@@ -614,7 +706,7 @@ fn ureq_err_str(e: ureq::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{edges_body, logs_body, traces_body, ts_delete_body};
+    use super::{ebpf_events_body, edges_body, logs_body, traces_body, ts_delete_body};
     use serde_json::json;
 
     #[test]
@@ -677,14 +769,16 @@ mod tests {
     #[test]
     fn edges_body_keeps_only_provided_filters() {
         assert_eq!(
-            edges_body(None, None, None, None, None, None, None),
+            edges_body(None, None, None, None, None, None, None, None, None),
             json!({})
         );
         assert_eq!(
             edges_body(
                 Some("gateway"),
                 Some("order-api"),
-                Some("otlp"),
+                Some("ebpf"),
+                Some("tcp"),
+                Some(8080),
                 Some(10),
                 None,
                 None,
@@ -693,10 +787,55 @@ mod tests {
             json!({
                 "src_service": "gateway",
                 "dst_service": "order-api",
-                "source": "otlp",
+                "source": "ebpf",
+                "protocol": "tcp",
+                "dst_port": 8080,
                 "min_requests": 10,
                 "limit": 50
             })
+        );
+        // 省略 `source` 时不下发该字段：由服务端做两路合并。
+        let merged = edges_body(
+            Some("gateway"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(merged, json!({"src_service": "gateway"}));
+        assert!(merged.get("source").is_none());
+    }
+
+    #[test]
+    fn ebpf_events_body_fixes_data_type_on_server() {
+        assert_eq!(
+            ebpf_events_body(None, None, None, None, None, None),
+            json!({})
+        );
+        let body = ebpf_events_body(
+            Some("process_exec"),
+            Some("java"),
+            Some("exec"),
+            None,
+            None,
+            Some(20),
+        );
+        assert_eq!(
+            body,
+            json!({
+                "event_type": "process_exec",
+                "labels": {"process_name": "java"},
+                "message_query": "exec",
+                "limit": 20
+            })
+        );
+        assert!(
+            body.get("data_type").is_none(),
+            "data_type 由服务端固定为 ebpf，客户端不传"
         );
     }
 

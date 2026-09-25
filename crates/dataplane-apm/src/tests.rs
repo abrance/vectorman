@@ -749,6 +749,196 @@ async fn ebpf_metrics_aggregation_uses_watermark_and_is_idempotent() {
     );
 }
 
+/// 边查询：`source` 单路、缺省合并汇总、过滤器与非法时间范围。
+#[tokio::test]
+async fn edge_search_merges_sources_and_filters() {
+    use crate::query::{search_edges, EdgeSearchQuery, SOURCE_MERGED};
+
+    let dir = tempfile::tempdir().unwrap();
+    let sql = store(dir.path());
+    crate::bootstrap(sql.as_ref()).await.unwrap();
+
+    let bucket = 1_710_000_000_000_000i64;
+    // OTLP 侧一条（无协议）。
+    sql.execute(
+        &format!(
+            "INSERT INTO {} (bucket_start, src_service, dst_service, span_kind, calls, errors,
+                duration_sum, duration_max, agent_id, data_id) VALUES (?1,'order-api','pay-api','client',4,1,400,200,'a1','i1')",
+            crate::tables::EDGE_SUMMARY
+        ),
+        &[SqlValue::Integer(bucket)],
+    )
+    .await
+    .unwrap();
+    // eBPF 侧同一条逻辑边（带协议），以及一条不同目标。
+    for (rid, dst, proto, conn, fail) in [
+        ("e1", "pay-api", "tcp", 6, 2),
+        ("e2", "search-api", "tcp", 1, 0),
+    ] {
+        sql.execute(
+            &format!(
+                "INSERT INTO {} (record_id, bucket_start, bucket_micros, protocol, src_ip, src_port,
+                    dst_ip, dst_port, src_service, dst_service, connections, bytes_sent, bytes_recv,
+                    duration_sum, duration_max, tcp_retrans, tcp_resets, failures, failure_reason,
+                    latency_hist, agent_id, data_id)
+                 VALUES (?1,?2,10000000,?3,'10.0.0.5',40000,'10.0.0.9',8080,'order-api',?4,?5,100,200,600,300,1,0,?6,'refused','[1]','a2','i2')",
+                crate::tables::EBPF_EDGES
+            ),
+            &[
+                SqlValue::Text(rid.to_string()),
+                SqlValue::Integer(bucket),
+                SqlValue::Text(proto.to_string()),
+                SqlValue::Text(dst.to_string()),
+                SqlValue::Integer(conn),
+                SqlValue::Integer(fail),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    let query = |source: Option<&str>, protocol: Option<&str>| EdgeSearchQuery {
+        from_ts: Some(bucket - 60_000_000),
+        to_ts: Some(bucket + 60_000_000),
+        src_service: None,
+        dst_service: None,
+        src_ip: None,
+        dst_ip: None,
+        dst_port: None,
+        protocol: protocol.map(str::to_string),
+        source: source.map(str::to_string),
+        agent_id: None,
+        min_requests: None,
+        limit: Some(10),
+        offset: None,
+    };
+
+    // 单路。
+    let otlp = search_edges(sql.as_ref(), &query(Some("otlp"), None))
+        .await
+        .unwrap();
+    assert_eq!(otlp.total, 1);
+    assert_eq!(otlp.edges[0].calls, 4);
+    assert_eq!(otlp.edges[0].source, "otlp");
+    let ebpf = search_edges(sql.as_ref(), &query(Some("ebpf"), None))
+        .await
+        .unwrap();
+    assert_eq!(ebpf.total, 2);
+    assert!(ebpf.edges.iter().all(|row| row.source == "ebpf"));
+    let pay = ebpf
+        .edges
+        .iter()
+        .find(|row| row.dst_service == "pay-api")
+        .unwrap();
+    assert_eq!(pay.connections, 6);
+    assert_eq!(pay.failures, 2);
+    assert_eq!(pay.bytes_sent, 100);
+    assert_eq!(pay.dst_port, 8080);
+    assert_eq!(
+        pay.protocol, "tcp",
+        "协议是行的字段（OTLP 侧为空，取 eBPF 侧的值）"
+    );
+    assert_eq!(pay.tcp_retrans, 1);
+    assert_eq!(pay.duration_avg_micros, 100, "600 / 6");
+    assert!(pay.span_kind.is_empty(), "eBPF 不产生 span");
+
+    // 合并：同一条逻辑边相加，且标为 merged。
+    let merged = search_edges(sql.as_ref(), &query(None, None))
+        .await
+        .unwrap();
+    assert_eq!(merged.total, 2, "order-api→pay-api 合并成一行，另一条独立");
+    let pay = merged
+        .edges
+        .iter()
+        .find(|row| row.dst_service == "pay-api")
+        .unwrap();
+    assert_eq!(pay.source, SOURCE_MERGED);
+    assert_eq!(pay.calls, 10, "4 (otlp) + 6 (ebpf)");
+    assert_eq!(pay.errors, 3);
+    assert_eq!(pay.duration_sum, 1_000);
+    assert_eq!(pay.bytes_sent, 100, "OTLP 侧没有字节，只有 eBPF 侧贡献");
+    assert_eq!(
+        pay.protocol, "tcp",
+        "协议是行的字段（OTLP 侧为空，取 eBPF 侧的值）"
+    );
+
+    // 协议过滤只影响 eBPF 侧。
+    let by_proto = search_edges(sql.as_ref(), &query(None, Some("tcp")))
+        .await
+        .unwrap();
+    assert_eq!(by_proto.total, 2, "OTLP 侧无协议，被过滤掉后只剩 eBPF 两条");
+
+    // 非法时间范围 → invalid_argument。
+    let mut bad = query(None, None);
+    bad.from_ts = Some(bucket + 60_000_000);
+    bad.to_ts = Some(bucket);
+    let err = search_edges(sql.as_ref(), &bad).await.unwrap_err();
+    assert_eq!(err.code, dataplane_core::ErrorCode::InvalidArgument);
+}
+
+/// 能力状态读取：区分「不可用」与「没上报」，标签缺失不 panic。
+#[tokio::test]
+async fn capability_report_reads_latest_state() {
+    use crate::ebpf_metrics::capability_report;
+
+    let dir = tempfile::tempdir().unwrap();
+    let ts = ts_store(dir.path());
+
+    // 没上报时是空报告（前端据此显示「无 Agent 上报」而不是「不可用」）。
+    let empty = capability_report(ts.as_ref()).await.unwrap();
+    assert_eq!(empty.reported, 0);
+    assert!(empty.agents.is_empty());
+
+    // 用「现在」附近的时间戳：能力是状态，查询按回看窗口取最新样本（测试里不能写死历史时间）。
+    let now = crate::now_micros();
+    let mut tags = std::collections::BTreeMap::new();
+    for (k, v) in [
+        ("agent_id", "agent-1"),
+        ("item_id", "item-ebpf"),
+        ("kernel_ok", "false"),
+        ("btf_ok", "true"),
+        ("capability_ok", "true"),
+        ("kernel_release", "5.4.0"),
+        ("reason", "eBPF preflight failed: kernel >= 5.8"),
+    ] {
+        tags.insert(k.to_string(), v.to_string());
+    }
+    ts.write(dataplane_ts::TsPoint {
+        measurement: "agent_ebpf_capability".into(),
+        tags: tags.clone(),
+        field_name: "available".into(),
+        field_value: 0.0,
+        timestamp: now - 3_600_000_000,
+    })
+    .await
+    .unwrap();
+
+    let report = capability_report(ts.as_ref()).await.unwrap();
+    assert_eq!(report.reported, 1);
+    let entry = &report.agents[0];
+    assert_eq!(entry.agent_id, "agent-1");
+    assert!(!entry.available);
+    assert!(!entry.kernel_ok);
+    assert!(entry.btf_ok);
+    assert!(entry.capability_ok);
+    assert_eq!(entry.kernel_release, "5.4.0");
+    assert!(entry.reason.contains("kernel >= 5.8"));
+
+    // 后来变得可用：同标签写 1 覆盖旧值。
+    ts.write(dataplane_ts::TsPoint {
+        measurement: "agent_ebpf_capability".into(),
+        tags,
+        field_name: "available".into(),
+        field_value: 1.0,
+        timestamp: now - 60_000_000,
+    })
+    .await
+    .unwrap();
+    let report = capability_report(ts.as_ref()).await.unwrap();
+    assert_eq!(report.reported, 1, "同标签是覆盖，不会变成两条");
+    assert!(report.agents[0].available);
+}
+
 #[tokio::test]
 async fn missing_endpoint_resource_is_ignored() {
     let dir = tempfile::tempdir().unwrap();
