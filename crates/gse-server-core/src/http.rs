@@ -537,6 +537,7 @@ fn build_collect_item(item_id: &str, input: &CollectItemInput) -> Result<Collect
             | "ebpf_network"
             | "ebpf_tcp"
             | "ebpf_process"
+            | "ebpf_syscall"
     ) {
         return Err(GseError::new(
             "invalid_argument",
@@ -613,7 +614,7 @@ fn build_collect_item(item_id: &str, input: &CollectItemInput) -> Result<Collect
                 }
             }
         }
-        "ebpf_network" | "ebpf_tcp" | "ebpf_process" => {
+        "ebpf_network" | "ebpf_tcp" | "ebpf_process" | "ebpf_syscall" => {
             // eBPF 采集项：Agent 侧会夹取（`EbpfConfig::from_value`），这里是第一道闸；
             // 只校验「明显非法」的值，避免把 Agent 的夹取逻辑抄两遍产生口径分叉。
             for key in [
@@ -1831,6 +1832,22 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         assert!(body.contains("ebpf_network"), "{body}");
+
+        // **每一种 eBPF 类型都要能建**：此前白名单漏了 `ebpf_syscall`，
+        // 结果这个采集项只能靠改代码之外的办法建（前端/API 全部被拒 `unsupported kind`）。
+        // 逐类型建一遍，新增类型忘了加白名单时这里会红。
+        for kind in ["ebpf_network", "ebpf_tcp", "ebpf_process", "ebpf_syscall"] {
+            let payload = format!(
+                r#"{{"name":"k","kind":"{kind}","agent_ids":["a-1"],"collector":{{"flush_interval_secs":10}}}}"#
+            );
+            let (status, body) = send(
+                &mut app,
+                req("POST", "/api/gse/collect-items", Some(payload.as_str())),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{kind}: {body}");
+            assert!(body.contains(kind), "{kind}: {body}");
+        }
 
         // apm_otlp：名单与攒批上限都要校验。
         let (status, body) = send(
