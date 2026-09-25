@@ -125,6 +125,21 @@ pub fn scratch_u32(
     Some(u32::from_ne_bytes([b0, b1, b2, b3]))
 }
 
+/// 从 per-CPU 缓冲读 u64：偏移按 8 字节对齐掩码，保证 `offset + 7 < TP_BUF_LEN`。
+///
+/// `sys_exit_*` 的 `ret` 是 `long`（64 位）：**必须按 64 位读**。只读低 32 位时，
+/// 大返回值（例如 `read` 一次读出 >2GiB）会看起来像负数、被误判成失败。
+#[inline(always)]
+pub fn scratch_u64(
+    scratch: &aya_ebpf::maps::PerCpuArray<[u64; TP_SCRATCH_WORDS]>,
+    offset: u64,
+) -> Option<u64> {
+    let index = (offset as usize) & (TP_BUF_LEN - 8);
+    let low = scratch_u32(scratch, index as u64)?;
+    let high = scratch_u32(scratch, (index + 4) as u64)?;
+    Some(u64::from(low) | (u64::from(high) << 32))
+}
+
 /// 从内核地址读一个字段（`bpf_probe_read_kernel` 封装）。
 ///
 /// # Safety

@@ -38,6 +38,16 @@ pub const TCP_LISTEN: u64 = 10;
 pub const TCP_CLOSING: u64 = 11;
 pub const TCP_NEW_SYN_RECV: u64 = 12;
 
+/// syscall tracepoint 字段偏移的兜底值（`format` 不可读时用）。
+///
+/// 这两个偏移在结构上由 tracepoint 头决定：common 头 8 字节 + `__syscall_nr`(4) + 4 字节对齐，
+/// 因此参数区从 16 开始（`ret` 就是第一个参数槽）；`sys_enter_openat` 的 `filename` 是第二个
+/// 参数槽（`dfd` 之后），即 24。实测 6.1 内核与文档一致。
+#[must_use]
+pub const fn syscall_defaults() -> (u64, u64) {
+    (16, 24)
+}
+
 /// 内核态用到的 `struct sock` 字段（BTF 类型名, 成员名, CFG 下标）。
 const SOCK_FIELDS: [(&str, &str, CfgIndex); 6] = [
     ("sock_common", "skc_daddr", CfgIndex::SockDaddr),
@@ -87,6 +97,69 @@ impl CfgValues {
     #[must_use]
     pub fn get(&self, index: CfgIndex) -> u64 {
         self.slots.get(index as usize).copied().unwrap_or_default()
+    }
+
+    /// `ebpf_syscall` 的 CFG：只需要 syscall tracepoint 的字段偏移，**不需要 BTF**
+    /// （内核程序只读 tracepoint 缓冲与助手，不读内核结构体）。
+    ///
+    /// `exit_formats` 是四个 `sys_exit_*` 的 `format` 文本，`openat_enter_format` 是
+    /// `sys_enter_openat` 的。任一项为 `None`（文件不可读）时用 [`syscall_defaults`] 兜底。
+    ///
+    /// **四个 exit 的 `ret` 偏移必须一致**：不一致说明格式化输出结构发生了变化，
+    /// 这时候按其中一个下发会让另外三个读到错位的数据 —— 宁可整项拒绝。
+    pub fn build_syscall(
+        exit_formats: [Option<&str>; 4],
+        openat_enter_format: Option<&str>,
+        config: &EbpfConfig,
+    ) -> Result<Self, String> {
+        let mut slots = vec![0u64; CFG_LEN as usize];
+        slots[CfgIndex::Version as usize] = CFG_VERSION;
+
+        let (default_ret, default_filename) = syscall_defaults();
+        let mut ret: Option<u64> = None;
+        for (index, text) in exit_formats.iter().enumerate() {
+            let offset = match text {
+                Some(text) => {
+                    let fields = tracepoint_format::parse(text);
+                    u64::from(
+                        fields
+                            .get("ret")
+                            .ok_or_else(|| {
+                                format!("sys_exit_*（第 {index} 个）的 format 缺少字段 ret")
+                            })?
+                            .offset,
+                    )
+                }
+                None => default_ret,
+            };
+            match ret {
+                Some(existing) if existing != offset => {
+                    return Err(format!(
+                        "sys_exit_* 的 ret 偏移不一致（{existing} vs {offset}，第 {index} 个），拒绝下发"
+                    ));
+                }
+                _ => ret = Some(offset),
+            }
+        }
+        slots[CfgIndex::SysExitRet as usize] = ret.unwrap_or(default_ret);
+        // `filename` 只用于慢调用事件里的路径：拿不到就置 0，内核按「没有路径」处理，
+        // **不因此拒绝整个采集项**（延迟本身仍然有价值）。
+        slots[CfgIndex::SysOpenatFilename as usize] = match openat_enter_format {
+            Some(text) => tracepoint_format::parse(text)
+                .get("filename")
+                .map(|field| field.offset as u64)
+                .unwrap_or(0),
+            None => default_filename,
+        };
+        slots[CfgIndex::SlowThresholdMicros as usize] = config.slow_threshold_micros;
+        slots[CfgIndex::RawEventsEnabled as usize] = u64::from(config.raw_events_enabled);
+        // 令牌桶与 CPU 阈值口径与其它采集项一致（限流在内核态，CPU 只做用户态告警）。
+        slots[CfgIndex::RateLimitTokensPerTick as usize] =
+            ebpf_abi::tokens_per_tick(config.max_events_per_sec);
+        slots[CfgIndex::RateLimitBurst as usize] =
+            ebpf_abi::burst_for_rate(config.max_events_per_sec);
+        slots[CfgIndex::IncludeLoopback as usize] = u64::from(config.include_loopback);
+        Ok(Self { slots })
     }
 
     /// 从 BTF 与 tracepoint `format` 组装。
@@ -250,6 +323,58 @@ mod tests {
             cfg.get(CfgIndex::RateLimitTokensPerTick),
             ebpf_abi::tokens_per_tick(50_000)
         );
+    }
+
+    #[test]
+    fn syscall_cfg_uses_formats_and_rejects_mismatch() {
+        let ret_fmt = "field:long ret;\toffset:16;\tsize:8;\tsigned:1;";
+        let enter_fmt = "field:const char * filename;\toffset:24;\tsize:8;\tsigned:0;";
+        let cfg = CfgValues::build_syscall(
+            [Some(ret_fmt); 4],
+            Some(enter_fmt),
+            &EbpfConfig {
+                slow_threshold_micros: 250_000,
+                raw_events_enabled: true,
+                ..EbpfConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(cfg.get(CfgIndex::SysExitRet), 16);
+        assert_eq!(cfg.get(CfgIndex::SysOpenatFilename), 24);
+        assert_eq!(cfg.get(CfgIndex::SlowThresholdMicros), 250_000);
+        assert_eq!(cfg.get(CfgIndex::RawEventsEnabled), 1);
+
+        // 四个 exit 的偏移不一致 → 整项拒绝（按其中一个下发会让其它读到错位数据）。
+        let odd = "field:long ret;\toffset:24;\tsize:8;\tsigned:1;";
+        let err = CfgValues::build_syscall(
+            [Some(ret_fmt), Some(odd), Some(ret_fmt), Some(ret_fmt)],
+            Some(enter_fmt),
+            &EbpfConfig::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("不一致"), "{err}");
+
+        // format 不可读 → 兜底值（16/24），不报错。
+        let fallback = CfgValues::build_syscall([None; 4], None, &EbpfConfig::default()).unwrap();
+        assert_eq!(fallback.get(CfgIndex::SysExitRet), 16);
+        assert_eq!(fallback.get(CfgIndex::SysOpenatFilename), 24);
+
+        // 缺少 ret 字段 → 拒绝。
+        let no_ret = "field:int __syscall_nr;\toffset:8;\tsize:4;\tsigned:1;";
+        assert!(CfgValues::build_syscall(
+            [Some(ret_fmt), Some(no_ret), Some(ret_fmt), Some(ret_fmt)],
+            Some(enter_fmt),
+            &EbpfConfig::default()
+        )
+        .is_err());
+
+        // 缺少 filename → 归零但不拒绝（延迟仍然采）。
+        let no_name = "field:int __syscall_nr;\toffset:8;\tsize:4;\tsigned:1;";
+        let cfg =
+            CfgValues::build_syscall([Some(ret_fmt); 4], Some(no_name), &EbpfConfig::default())
+                .unwrap();
+        assert_eq!(cfg.get(CfgIndex::SysOpenatFilename), 0);
+        assert_eq!(cfg.get(CfgIndex::SysExitRet), 16);
     }
 
     #[test]

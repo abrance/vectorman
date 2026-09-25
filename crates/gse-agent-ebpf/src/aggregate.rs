@@ -116,35 +116,12 @@ pub fn sum_per_cpu(values: &[ConnAgg]) -> ConnAgg {
     out
 }
 
-/// 增量 = 本周期快照 − 上周期快照；`prev` 为空表示首次出现（按绝对值计）。
-#[must_use]
-pub fn diff(prev: Option<&ConnAgg>, cur: &ConnAgg) -> ConnAgg {
-    let Some(prev) = prev else {
-        return cur.clone();
-    };
-    let slots = cur.latency_hist.len();
-    let mut latency_hist = Vec::with_capacity(slots);
-    for index in 0..slots {
-        let prev_value = prev.latency_hist.get(index).copied().unwrap_or(0);
-        latency_hist.push(cur.latency_hist[index].saturating_sub(prev_value));
-    }
-    ConnAgg {
-        connections: cur.connections.saturating_sub(prev.connections),
-        failures: cur.failures.saturating_sub(prev.failures),
-        failure_reason: if cur.failures > prev.failures {
-            cur.failure_reason
-        } else {
-            REASON_NONE
-        },
-        bytes_sent: cur.bytes_sent.saturating_sub(prev.bytes_sent),
-        bytes_recv: cur.bytes_recv.saturating_sub(prev.bytes_recv),
-        duration_sum_us: cur.duration_sum_us.saturating_sub(prev.duration_sum_us),
-        duration_max_us: cur.duration_max_us.max(prev.duration_max_us),
-        tcp_retrans: cur.tcp_retrans.saturating_sub(prev.tcp_retrans),
-        tcp_resets: cur.tcp_resets.saturating_sub(prev.tcp_resets),
-        latency_hist,
-    }
-}
+// 这里**没有**「与上周期相减」的函数，这是有意的：
+//
+// `MapSource::drain` 在读完内核 map 后会把计数**写零复位**，所以每次读到的就是本周期增量。
+// 再与上周期相减会把上上周期的量扣掉第二遍 —— 实测把一个进程每轮 80 次的 `openat` 报成 1 次
+// （见 `todo.md` 的记录）。复位失败时 `drain` 返回 `Err`，调用方跳过本周期、数据留到下一轮读，
+// 因此不需要靠差分来防重复。
 
 /// 增量是否为空（全零）。空的键不产生记录与指标。
 #[must_use]
@@ -375,40 +352,6 @@ mod tests {
         assert_eq!(total.connections, 5);
         assert_eq!(total.bytes_sent, 150);
         assert_eq!(total.latency_hist, vec![1, 2, 3], "槽数取最长并按位相加");
-    }
-
-    #[test]
-    fn diff_is_absolute_for_first_seen_and_saturating_after() {
-        let current = agg(5, 500);
-        assert_eq!(diff(None, &current), current, "首次出现按绝对值计");
-
-        let prev = agg(3, 200);
-        let delta = diff(Some(&prev), &current);
-        assert_eq!(delta.connections, 2);
-        assert_eq!(delta.bytes_sent, 300);
-        assert_eq!(delta.duration_max_us, current.duration_max_us, "最大值单调");
-
-        // 快照回退（计数被内核侧复位）时不出现负数。
-        let smaller = agg(1, 10);
-        let delta = diff(Some(&current), &smaller);
-        assert_eq!(delta.connections, 0);
-        assert_eq!(delta.bytes_sent, 0);
-        assert!(is_empty(&delta));
-    }
-
-    #[test]
-    fn failure_reason_follows_new_failures_only() {
-        let mut prev = agg(1, 10);
-        prev.failures = 0;
-        let mut cur = agg(1, 10);
-        cur.failures = 3;
-        cur.failure_reason = REASON_REFUSED;
-        assert_eq!(diff(Some(&prev), &cur).failure_reason, REASON_REFUSED);
-
-        // 失败数没有增加 → 不重复报告原因。
-        let mut same = cur.clone();
-        same.connections += 1;
-        assert_eq!(diff(Some(&cur), &same).failure_reason, REASON_NONE);
     }
 
     #[test]

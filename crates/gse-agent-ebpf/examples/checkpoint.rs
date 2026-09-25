@@ -39,8 +39,7 @@ use gse_agent_ebpf::loader::{object_bytes, LoadedItem};
 use gse_agent_ebpf::preflight::PreflightEnv;
 use gse_agent_ebpf::{btf::Btf, MapSource};
 use gse_agent_ebpf::{
-    bucket_start, diff, edge_record, is_empty, raw_event_record, sum_process, ConnAgg,
-    ProcessContext,
+    bucket_start, edge_record, is_empty, raw_event_record, sum_process, ProcessContext,
 };
 
 /// 单批上报的记录数：接入端有请求体上限（默认 2 MiB），几千条边一次发会被拒。
@@ -123,8 +122,50 @@ fn now_micros() -> i64 {
         .unwrap_or(0)
 }
 
+/// syscall tracepoint 的 `format`（与 `gse-agent-core::collect::ebpf::SYSCALL_FORMATS` 同序）。
+const SYSCALL_FORMATS: [&str; 8] = [
+    "syscalls/sys_exit_openat",
+    "syscalls/sys_exit_read",
+    "syscalls/sys_exit_write",
+    "syscalls/sys_exit_fsync",
+    "syscalls/sys_enter_openat",
+    "syscalls/sys_enter_read",
+    "syscalls/sys_enter_write",
+    "syscalls/sys_enter_fsync",
+];
+
+/// 读一个 tracepoint 的 `format`（tracing → debugfs）。
+fn read_format(event: &str) -> Option<String> {
+    for root in [
+        "/sys/kernel/tracing/events",
+        "/sys/kernel/debug/tracing/events",
+    ] {
+        if let Ok(text) = std::fs::read_to_string(format!("{root}/{event}/format")) {
+            return Some(text);
+        }
+    }
+    None
+}
+
 /// 运行期参数：BTF + tracepoint `format`，与 `gse-agent` 走同一套解析。
-fn cfg_values(config: &EbpfConfig) -> Result<CfgValues, String> {
+fn cfg_values(kind: EbpfItemKind, config: &EbpfConfig) -> Result<CfgValues, String> {
+    // syscall 项不需要 BTF（内核程序只读 tracepoint 缓冲与助手）。
+    if kind == EbpfItemKind::Syscall {
+        let texts: Vec<Option<String>> = SYSCALL_FORMATS.iter().map(|e| read_format(e)).collect();
+        if texts.iter().all(Option::is_none) {
+            eprintln!("提示：syscall tracepoint format 全部读不到，使用兜底布局（16/24）");
+        }
+        return CfgValues::build_syscall(
+            [
+                texts[0].as_deref(),
+                texts[1].as_deref(),
+                texts[2].as_deref(),
+                texts[3].as_deref(),
+            ],
+            texts[4].as_deref(),
+            config,
+        );
+    }
     let btf = Btf::parse(
         &std::fs::read("/sys/kernel/btf/vmlinux")
             .map_err(|e| format!("读取 /sys/kernel/btf/vmlinux 失败：{e}"))?,
@@ -213,6 +254,10 @@ struct Totals {
     idle_keys: u64,
     /// 内核态令牌桶丢弃数（与采集循环同一口径）。
     rate_limited: u64,
+    /// syscall 调用次数（`ebpf_syscall` 用）。
+    syscall_calls: u64,
+    /// syscall 返回负值的次数。
+    syscall_errors: u64,
 }
 
 fn main() -> ExitCode {
@@ -244,7 +289,7 @@ fn main() -> ExitCode {
         raw_events_enabled: args.raw_events,
         ..EbpfConfig::default()
     };
-    let cfg = match cfg_values(&config) {
+    let cfg = match cfg_values(args.kind, &config) {
         Ok(cfg) => cfg,
         Err(reason) => {
             eprintln!("运行期参数解析失败：{reason}");
@@ -302,8 +347,9 @@ fn main() -> ExitCode {
     let mut totals = Totals::default();
     let mut pending_edges: Vec<serde_json::Value> = Vec::new();
     let mut pending_metrics: Vec<serde_json::Value> = Vec::new();
-    // 差分基准：**只上报本周期真实增量**（与 `run_loop` 相同语义）。
-    let mut previous: BTreeMap<ebpf_abi::ConnKey, ConnAgg> = BTreeMap::new();
+    // 原始事件（含 syscall 的慢调用事件）在采集循环里攒，循环后统一上报。
+    let mut raw_records: Vec<serde_json::Value> = Vec::new();
+
     let mut process_totals: BTreeMap<ProcSeenKey, (u64, u64, u64)> = BTreeMap::new();
 
     let deadline = std::time::Instant::now() + Duration::from_secs(args.seconds.max(1));
@@ -351,14 +397,107 @@ fn main() -> ExitCode {
             continue;
         }
 
+        // syscall 项：走 `SYSCALL_AGG` + `SYSCALL_ERR` + `SLOW_IO`。
+        if args.kind == EbpfItemKind::Syscall {
+            let rows = match runtime.block_on(async { source.drain_syscall() }) {
+                Ok(Some(rows)) => rows,
+                Ok(None) => Vec::new(),
+                Err(reason) => {
+                    eprintln!("读取 syscall 快照失败：{reason}");
+                    return ExitCode::from(4);
+                }
+            };
+            totals.reads += 1;
+            for (key, per_cpu) in rows {
+                // 每次 drain 即增量（内核侧写零复位），不再相减。
+                let delta = gse_agent_ebpf::sum_syscall(&per_cpu);
+                if gse_agent_ebpf::syscall_is_empty(&delta) {
+                    totals.idle_keys += 1;
+                    continue;
+                }
+                totals.syscall_calls += delta.calls;
+                totals.syscall_errors += delta.errors;
+                let op = ebpf_abi::syscall_op_name(key.op);
+                let comm = gse_agent_ebpf::syscall::comm_str(&key.comm);
+                let avg = if delta.calls > 0 {
+                    delta.duration_sum_us as f64 / delta.calls as f64
+                } else {
+                    0.0
+                };
+                println!(
+                    "syscall op={op} pid={} comm={comm:?} calls={} errors={} avg={avg:.1}us max={}us p95={:?}us",
+                    key.pid,
+                    delta.calls,
+                    delta.errors,
+                    delta.duration_max_us,
+                    gse_agent_ebpf::histogram_p95(&delta.hist),
+                );
+                pending_metrics.extend(gse_agent_ebpf::duration_metrics(
+                    &args.agent_id,
+                    &args.item_id,
+                    &key,
+                    &delta,
+                    now_micros(),
+                ));
+            }
+            match runtime.block_on(async { source.drain_syscall_errors() }) {
+                Ok(errors) => {
+                    for (key, per_cpu) in errors {
+                        // 每次 drain 即增量。
+                        let delta: u64 = per_cpu.iter().copied().fold(0u64, u64::saturating_add);
+                        if delta > 0 {
+                            println!(
+                                "syscall 错误 op={} errno={} 次数={delta}",
+                                ebpf_abi::syscall_op_name(key.op),
+                                key.errno
+                            );
+                        }
+                        if let Some(point) = gse_agent_ebpf::failure_metrics(
+                            &args.agent_id,
+                            &args.item_id,
+                            &key,
+                            delta,
+                            now_micros(),
+                        ) {
+                            pending_metrics.push(point);
+                        }
+                    }
+                }
+                Err(reason) => eprintln!("读取 syscall 错误码快照失败：{reason}"),
+            }
+
+            for event in source.drain_slow_io() {
+                let path = gse_agent_ebpf::slow_io_path(&event);
+                println!(
+                    "慢调用 op={} pid={} comm={:?} {}us errno={} path={path}",
+                    ebpf_abi::syscall_op_name(event.op),
+                    event.pid,
+                    String::from_utf8_lossy(&event.comm).trim_end_matches('\0'),
+                    event.duration_us,
+                    event.errno
+                );
+                if args.raw_events {
+                    let offset = gse_agent_ebpf::monotonic_to_unix_offset_micros()
+                        .unwrap_or_else(now_micros);
+                    raw_records.push(gse_agent_ebpf::slow_io_record(
+                        &args.agent_id,
+                        &event,
+                        offset,
+                    ));
+                }
+            }
+            let limited = source.take_rate_limit_drops();
+            totals.rate_limited += limited;
+            continue;
+        }
+
         match runtime.block_on(async { source.drain() }) {
             Ok(rows) => {
                 totals.reads += 1;
                 let bucket = bucket_start(now_micros(), BUCKET_SECS);
                 for (key, per_cpu) in rows {
-                    let view = gse_agent_ebpf::view_per_cpu(&per_cpu);
-                    let delta = diff(previous.get(&key), &view);
-                    previous.insert(key, view);
+                    // 每次 drain 读到的就是本周期增量（内核侧已写零复位），不再相减。
+                    let delta = gse_agent_ebpf::view_per_cpu(&per_cpu);
                     if is_empty(&delta) {
                         totals.idle_keys += 1;
                         continue;
@@ -437,7 +576,6 @@ fn main() -> ExitCode {
     );
 
     // 原始事件（`data_type=ebpf`）：只在开启时内核态才写，这里一次读走。
-    let mut raw_records: Vec<serde_json::Value> = Vec::new();
     if args.raw_events {
         // 单调时钟 → 墙上时钟（与采集循环同一套换算）。
         let offset = gse_agent_ebpf::monotonic_to_unix_offset_micros().unwrap_or_else(now_micros);
@@ -543,6 +681,10 @@ fn main() -> ExitCode {
 
     // 判定标准按采集项区分：重传/RST 本来就稀少、进程事件在空闲机器上也可能为 0，
     // 因此只有 `ebpf_network` 把「一条连接都没采到」当作失败（它最容易踩过滤与偏移问题）。
+    if args.kind == EbpfItemKind::Syscall && totals.syscall_calls == 0 {
+        eprintln!("警告：全程没有采到 syscall 调用。检查 tracepoint 是否可挂（syscalls 类别需要内核支持）、\n以及期间是否真的发生了文件读写（自测可用 `cat /etc/hostname` 触发 openat/read）。");
+        return ExitCode::from(4);
+    }
     if args.kind == EbpfItemKind::Network && totals.connections == 0 {
         eprintln!(
             "警告：全程没有采到连接。检查是否真的产生了流量、是否被回环/端口过滤掉\

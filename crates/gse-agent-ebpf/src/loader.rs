@@ -19,8 +19,10 @@ use crate::attach::{AttachPlan, AttachPoint, EbpfItemKind};
 use crate::cfg::CfgValues;
 use crate::cgroup::{PodNameLoader, ProcessResolver};
 use crate::config::EbpfConfig;
-use crate::{ConnSnapshot, MapSource, ProcSnapshot};
-use ebpf_abi::{ConnAggWire, ProcAggWire, ProcKey};
+use crate::{ConnSnapshot, MapSource, ProcSnapshot, SyscallErrSnapshot, SyscallSnapshot};
+use ebpf_abi::{
+    ConnAggWire, ProcAggWire, ProcKey, SlowIoEvent, SyscallAggWire, SyscallErrKey, SyscallKey,
+};
 
 /// `CFG` map 名（内核态程序里同名）。
 pub const CFG_MAP: &str = "CFG";
@@ -54,13 +56,17 @@ pub fn object_bytes(kind: EbpfItemKind) -> &'static [u8] {
         EbpfItemKind::Network => objects::NETWORK,
         EbpfItemKind::Tcp => objects::TCP,
         EbpfItemKind::Process => objects::PROCESS,
+        EbpfItemKind::Syscall => objects::SYSCALL,
     }
 }
 
 /// 三个目标文件是否都已内嵌（`.o` 入库后为 `true`）。
 #[must_use]
 pub fn objects_embedded() -> bool {
-    !objects::NETWORK.is_empty() && !objects::TCP.is_empty() && !objects::PROCESS.is_empty()
+    !objects::NETWORK.is_empty()
+        && !objects::TCP.is_empty()
+        && !objects::PROCESS.is_empty()
+        && !objects::SYSCALL.is_empty()
 }
 
 /// `aya::Pod` 需要类型在本 crate 里实现（孤儿规则）：用 `#[repr(transparent)]` 包一层，
@@ -92,6 +98,27 @@ struct PodProcAgg(ProcAggWire);
 
 // SAFETY: 同上。
 unsafe impl aya::Pod for PodProcAgg {}
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct PodSyscallKey(SyscallKey);
+
+// SAFETY: 同上。
+unsafe impl aya::Pod for PodSyscallKey {}
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default)]
+struct PodSyscallAgg(SyscallAggWire);
+
+// SAFETY: 同上。
+unsafe impl aya::Pod for PodSyscallAgg {}
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct PodSyscallErrKey(SyscallErrKey);
+
+// SAFETY: 同上。
+unsafe impl aya::Pod for PodSyscallErrKey {}
 
 /// 加载并挂载好的一个采集项。
 pub struct LoadedItem {
@@ -134,6 +161,9 @@ impl LoadedItem {
         );
         if kind == EbpfItemKind::Process {
             loader.map_max_entries("EVENTS", config.ring_buffer_bytes as u32);
+        }
+        if kind == EbpfItemKind::Syscall {
+            loader.map_max_entries("SLOW_IO", config.ring_buffer_bytes as u32);
         }
         let mut bpf = loader
             .load(object)
@@ -192,6 +222,26 @@ impl LoadedItem {
                     rate,
                     resolver: ProcessResolver::new(PROCESS_CACHE_TTL_SECS, MAX_PROCESS_CACHE)
                         .with_pod_names_opt(pod_names.clone()),
+                })))
+            }
+            EbpfItemKind::Syscall => {
+                let map: PerCpuHashMap<MapData, PodSyscallKey, PodSyscallAgg> =
+                    PerCpuHashMap::try_from(map)
+                        .map_err(|e| format!("map {map_name} 类型不符：{e}"))?;
+                let err = bpf.take_map("SYSCALL_ERR").and_then(|m| {
+                    PerCpuHashMap::<MapData, PodSyscallErrKey, u64>::try_from(m).ok()
+                });
+                let slow = bpf
+                    .take_map("SLOW_IO")
+                    .and_then(|m| aya::maps::RingBuf::try_from(m).ok());
+                let rate = take_rate_map(&mut bpf);
+                Ok(AyaMapSource::Syscall(Box::new(SyscallSource {
+                    bpf,
+                    map,
+                    err,
+                    slow,
+                    cpus,
+                    rate,
                 })))
             }
             EbpfItemKind::Process => {
@@ -295,6 +345,8 @@ pub enum AyaMapSource {
     Conn(Box<ConnSource>),
     /// 进程型采集项。
     Process(Box<ProcessSource>),
+    /// syscall 延迟采集项。
+    Syscall(Box<SyscallSource>),
 }
 
 /// 连接型采集项的 map 读取状态（字段私有：`aya::Pod` 包装类型不外露）。
@@ -308,6 +360,19 @@ pub struct ConnSource {
     rate: Option<PerCpuArray<MapData, u64>>,
     /// pid → 容器/Pod 反查（需求 11.1：边记录要有 `src_container_id`/`src_pod`）。
     resolver: ProcessResolver,
+}
+
+/// syscall 采集项的 map 读取状态（聚合 + 错误码 + 慢调用事件）。
+pub struct SyscallSource {
+    #[allow(dead_code)]
+    bpf: Ebpf,
+    map: PerCpuHashMap<MapData, PodSyscallKey, PodSyscallAgg>,
+    /// 错误码计数（`(op, errno)` → 次数）。
+    err: Option<PerCpuHashMap<MapData, PodSyscallErrKey, u64>>,
+    /// 慢调用事件环缓冲（内核态只在上限内写）。
+    slow: Option<aya::maps::RingBuf<MapData>>,
+    cpus: usize,
+    rate: Option<PerCpuArray<MapData, u64>>,
 }
 
 /// 进程型采集项的 map 读取状态。
@@ -329,6 +394,7 @@ impl AyaMapSource {
         match self {
             Self::Conn(_) => EbpfItemKind::Network,
             Self::Process(_) => EbpfItemKind::Process,
+            Self::Syscall(_) => EbpfItemKind::Syscall,
         }
     }
 
@@ -338,6 +404,7 @@ impl AyaMapSource {
         match self {
             Self::Conn(source) => source.cpus,
             Self::Process(source) => source.cpus,
+            Self::Syscall(source) => source.cpus,
         }
     }
 
@@ -348,6 +415,7 @@ impl AyaMapSource {
         let rate = match self {
             Self::Conn(source) => source.rate.as_mut(),
             Self::Process(source) => source.rate.as_mut(),
+            Self::Syscall(source) => source.rate.as_mut(),
         };
         let Some(rate) = rate else {
             return 0;
@@ -395,7 +463,83 @@ impl AyaMapSource {
         match self {
             Self::Conn(source) => source.resolver.cached(),
             Self::Process(source) => source.resolver.cached(),
+            // syscall 采集项不做容器反查（指标维度里没有容器/Pod）。
+            Self::Syscall(_) => 0,
         }
+    }
+
+    /// syscall 聚合快照（只对 syscall 采集项有意义）。
+    pub fn drain_syscall(&mut self) -> Result<Option<SyscallSnapshot>, String> {
+        let Self::Syscall(source) = self else {
+            return Ok(None);
+        };
+        let map = &mut source.map;
+        let cpus = source.cpus;
+        let mut out = Vec::new();
+        let mut keys = Vec::new();
+        for entry in map.iter() {
+            let (key, values) = entry.map_err(|e| format!("遍历 per-CPU map 失败：{e}"))?;
+            out.push((
+                key.0,
+                values.iter().map(|v| v.0).collect::<Vec<SyscallAggWire>>(),
+            ));
+            keys.push(key);
+        }
+        for key in keys {
+            // 写零复位（与连接/进程聚合同一口径）。
+            let zero = PerCpuValues::try_from(vec![PodSyscallAgg::default(); cpus])
+                .map_err(|e| format!("构造零值失败：{e}"))?;
+            map.insert(key, zero, 0)
+                .map_err(|e| format!("写零复位失败：{e}"))?;
+        }
+        Ok(Some(out))
+    }
+
+    /// syscall 错误码快照（`(op, errno)` → 次数）。
+    pub fn drain_syscall_errors(&mut self) -> Result<SyscallErrSnapshot, String> {
+        let Self::Syscall(source) = self else {
+            return Ok(Vec::new());
+        };
+        let Some(map) = source.err.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let cpus = source.cpus;
+        let mut out = Vec::new();
+        let mut keys = Vec::new();
+        for entry in map.iter() {
+            let (key, values) = entry.map_err(|e| format!("遍历错误码 map 失败：{e}"))?;
+            out.push((key.0, values.iter().copied().collect::<Vec<u64>>()));
+            keys.push(key);
+        }
+        for key in keys {
+            let zero = PerCpuValues::try_from(vec![0u64; cpus])
+                .map_err(|e| format!("构造零值失败：{e}"))?;
+            map.insert(key, zero, 0)
+                .map_err(|e| format!("写零复位失败：{e}"))?;
+        }
+        Ok(out)
+    }
+
+    /// 读慢调用事件（只对 syscall 采集项有意义）。
+    ///
+    /// 与原始事件同理：环缓冲是「尽力而为」，读空返回空、不阻塞。
+    pub fn drain_slow_io(&mut self) -> Vec<SlowIoEvent> {
+        let Self::Syscall(source) = self else {
+            return Vec::new();
+        };
+        let Some(ring) = source.slow.as_mut() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        while let Some(item) = ring.next() {
+            let bytes = item.as_ref();
+            if bytes.len() < std::mem::size_of::<SlowIoEvent>() {
+                continue;
+            }
+            let event = unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<SlowIoEvent>()) };
+            out.push(event);
+        }
+        out
     }
 
     /// 进程型快照（只对 process 采集项有意义）。
@@ -462,6 +606,8 @@ impl MapSource for AyaMapSource {
         let info = match self {
             Self::Conn(source) => source.resolver.resolve(pid),
             Self::Process(source) => source.resolver.resolve(pid),
+            // syscall 指标不带容器/Pod 维度：内核态已经给了 `comm`。
+            Self::Syscall(_) => return None,
         }?;
         // 有 Pod 名就用名字（dataserver 的端点表按名字匹配），没有才退回 uid。
         let pod_name = info.pod_label();

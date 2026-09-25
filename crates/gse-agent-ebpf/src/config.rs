@@ -18,6 +18,12 @@ pub const DEFAULT_MAP_MAX_ENTRIES: u64 = 16_384;
 pub const DEFAULT_MAX_CPU_PERCENT: u32 = 5;
 /// 缺省每秒事件上限。
 pub const DEFAULT_MAX_EVENTS_PER_SEC: u64 = 50_000;
+/// 慢调用阈值缺省 100ms（需求 6.5）。
+pub const DEFAULT_SLOW_THRESHOLD_MICROS: u64 = 100_000;
+/// 下限 1ms：再小会导致慢事件海量（每个调用都算慢）。
+pub const MIN_SLOW_THRESHOLD_MICROS: u64 = 1_000;
+/// 上限 60s：再大等于关掉慢事件，不如显式关闭 `raw_events_enabled`。
+pub const MAX_SLOW_THRESHOLD_MICROS: u64 = 60_000_000;
 /// 缺省环缓冲容量（字节）。
 pub const DEFAULT_RING_BUFFER_BYTES: usize = 256 * 1024;
 /// 缺省直方图槽上限（与内核态编译期数组一致）。
@@ -38,6 +44,8 @@ pub struct EbpfConfig {
     pub include_loopback: bool,
     pub raw_events_enabled: bool,
     pub raw_events_sample_ratio: f64,
+    /// 慢调用阈值（微秒，`ebpf_syscall`）：超过才产生慢调用原始事件（需求 6.5）。
+    pub slow_threshold_micros: u64,
     pub max_cpu_percent: u32,
     pub max_events_per_sec: u64,
     pub map_max_entries: u64,
@@ -59,6 +67,7 @@ impl Default for EbpfConfig {
             include_loopback: false,
             raw_events_enabled: false,
             raw_events_sample_ratio: 0.01,
+            slow_threshold_micros: DEFAULT_SLOW_THRESHOLD_MICROS,
             max_cpu_percent: DEFAULT_MAX_CPU_PERCENT,
             max_events_per_sec: DEFAULT_MAX_EVENTS_PER_SEC,
             map_max_entries: DEFAULT_MAP_MAX_ENTRIES,
@@ -135,6 +144,12 @@ impl EbpfConfig {
                 .and_then(Value::as_bool)
                 .unwrap_or(default.raw_events_enabled),
             raw_events_sample_ratio: ratio,
+            slow_threshold_micros: value
+                .get("slow_threshold_micros")
+                .and_then(Value::as_u64)
+                .map_or(default.slow_threshold_micros, |v| {
+                    v.clamp(MIN_SLOW_THRESHOLD_MICROS, MAX_SLOW_THRESHOLD_MICROS)
+                }),
             max_cpu_percent: value
                 .get("max_cpu_percent")
                 .and_then(Value::as_u64)
@@ -239,6 +254,17 @@ mod tests {
         assert!(!default.include_loopback);
         assert!(!default.raw_events_enabled);
         assert_eq!(default.max_cpu_percent, 5);
+        assert_eq!(default.slow_threshold_micros, 100_000, "慢调用缺省 100ms");
+
+        // 慢调用阈值的夹取（需求 6.5）。
+        let slow = |v: u64| {
+            EbpfConfig::from_value(&serde_json::json!({"slow_threshold_micros": v}))
+                .slow_threshold_micros
+        };
+        assert_eq!(slow(0), MIN_SLOW_THRESHOLD_MICROS, "0 夹到 1ms");
+        assert_eq!(slow(5), MIN_SLOW_THRESHOLD_MICROS);
+        assert_eq!(slow(50_000), 50_000);
+        assert_eq!(slow(u64::MAX), MAX_SLOW_THRESHOLD_MICROS, "上限 60s");
 
         let cfg = EbpfConfig::from_value(&serde_json::json!({
             "bucket_secs": 999,

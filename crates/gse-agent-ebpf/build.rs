@@ -20,6 +20,7 @@ fn main() {
         ("NETWORK", "network.o"),
         ("TCP", "tcp.o"),
         ("PROCESS", "process.o"),
+        ("SYSCALL", "syscall.o"),
     ] {
         let path = dir.join(file);
         println!("cargo:rerun-if-changed={}", path.display());

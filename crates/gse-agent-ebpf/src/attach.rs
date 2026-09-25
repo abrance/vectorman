@@ -14,6 +14,8 @@ pub enum EbpfItemKind {
     Tcp,
     /// 进程生命周期。
     Process,
+    /// 文件与 syscall 延迟（P2）。
+    Syscall,
 }
 
 impl EbpfItemKind {
@@ -24,6 +26,7 @@ impl EbpfItemKind {
             Self::Network => "ebpf_network",
             Self::Tcp => "ebpf_tcp",
             Self::Process => "ebpf_process",
+            Self::Syscall => "ebpf_syscall",
         }
     }
 
@@ -34,6 +37,7 @@ impl EbpfItemKind {
             "ebpf_network" => Some(Self::Network),
             "ebpf_tcp" => Some(Self::Tcp),
             "ebpf_process" => Some(Self::Process),
+            "ebpf_syscall" => Some(Self::Syscall),
             _ => None,
         }
     }
@@ -45,6 +49,7 @@ impl EbpfItemKind {
             Self::Network => "network",
             Self::Tcp => "tcp",
             Self::Process => "process",
+            Self::Syscall => "syscall",
         }
     }
 
@@ -57,10 +62,10 @@ impl EbpfItemKind {
         matches!(self, Self::Network)
     }
 
-    /// 本采集项的全部类型（P1）。
+    /// 本采集项的全部类型（P1 + P2 的 syscall）。
     #[must_use]
-    pub fn all() -> [Self; 3] {
-        [Self::Network, Self::Tcp, Self::Process]
+    pub fn all() -> [Self; 4] {
+        [Self::Network, Self::Tcp, Self::Process, Self::Syscall]
     }
 }
 
@@ -156,6 +161,48 @@ impl AttachPlan {
                     function: "tcp_send_active_reset".into(),
                 },
             ],
+            EbpfItemKind::Syscall => vec![
+                AttachPoint::TracePoint {
+                    program: "sys_enter_openat".into(),
+                    category: "syscalls".into(),
+                    name: "sys_enter_openat".into(),
+                },
+                AttachPoint::TracePoint {
+                    program: "sys_exit_openat".into(),
+                    category: "syscalls".into(),
+                    name: "sys_exit_openat".into(),
+                },
+                AttachPoint::TracePoint {
+                    program: "sys_enter_read".into(),
+                    category: "syscalls".into(),
+                    name: "sys_enter_read".into(),
+                },
+                AttachPoint::TracePoint {
+                    program: "sys_exit_read".into(),
+                    category: "syscalls".into(),
+                    name: "sys_exit_read".into(),
+                },
+                AttachPoint::TracePoint {
+                    program: "sys_enter_write".into(),
+                    category: "syscalls".into(),
+                    name: "sys_enter_write".into(),
+                },
+                AttachPoint::TracePoint {
+                    program: "sys_exit_write".into(),
+                    category: "syscalls".into(),
+                    name: "sys_exit_write".into(),
+                },
+                AttachPoint::TracePoint {
+                    program: "sys_enter_fsync".into(),
+                    category: "syscalls".into(),
+                    name: "sys_enter_fsync".into(),
+                },
+                AttachPoint::TracePoint {
+                    program: "sys_exit_fsync".into(),
+                    category: "syscalls".into(),
+                    name: "sys_exit_fsync".into(),
+                },
+            ],
             EbpfItemKind::Process => vec![
                 AttachPoint::TracePoint {
                     program: "sched_process_exec".into(),
@@ -184,6 +231,7 @@ impl AttachPlan {
             EbpfItemKind::Network => "CONN_AGG",
             EbpfItemKind::Tcp => "TCP_AGG",
             EbpfItemKind::Process => "PROC_AGG",
+            EbpfItemKind::Syscall => "SYSCALL_AGG",
         }
     }
 }
@@ -199,7 +247,11 @@ mod tests {
             assert_eq!(EbpfItemKind::parse(kind.as_str()), Some(kind));
         }
         assert_eq!(EbpfItemKind::parse("cpu"), None);
-        assert_eq!(EbpfItemKind::parse("ebpf_dns"), None, "P2 类型尚未实现");
+        assert_eq!(EbpfItemKind::parse("ebpf_dns"), None, "DNS 尚未实现");
+        assert_eq!(
+            EbpfItemKind::parse("ebpf_syscall"),
+            Some(EbpfItemKind::Syscall)
+        );
         assert_eq!(EbpfItemKind::Network.to_string(), "ebpf_network");
     }
 
@@ -242,11 +294,12 @@ mod tests {
             "tcp 只出指标，避免覆盖边记录"
         );
         assert!(!EbpfItemKind::Process.emits_edges());
+        assert!(!EbpfItemKind::Syscall.emits_edges());
         let maps: HashSet<&str> = EbpfItemKind::all()
             .iter()
             .map(|k| AttachPlan::aggregate_map(*k))
             .collect();
-        assert_eq!(maps.len(), 3, "三个采集项必须用各自的 map");
+        assert_eq!(maps.len(), 4, "每个采集项必须用各自的 map");
         assert_eq!(EbpfItemKind::Network.object_name(), "network");
     }
 }

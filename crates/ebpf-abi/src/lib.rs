@@ -118,6 +118,121 @@ pub struct RawEvent {
     pub _pad3: u32,
 }
 
+/// syscall 操作（`op` 维度）：顺序即内核态写入的编号，用户态映射为字符串。
+pub const SYSCALL_OP_OPENAT: u32 = 1;
+pub const SYSCALL_OP_READ: u32 = 2;
+pub const SYSCALL_OP_WRITE: u32 = 3;
+pub const SYSCALL_OP_FSYNC: u32 = 4;
+/// 支持的 op 数量（用户态按这个数量预置直方图与维度）。
+pub const SYSCALL_OP_COUNT: usize = 4;
+
+/// op 枚举值 → 字符串（用户态指标维度用）。
+#[must_use]
+pub const fn syscall_op_name(op: u32) -> &'static str {
+    match op {
+        SYSCALL_OP_OPENAT => "openat",
+        SYSCALL_OP_READ => "read",
+        SYSCALL_OP_WRITE => "write",
+        SYSCALL_OP_FSYNC => "fsync",
+        _ => "unknown",
+    }
+}
+
+/// syscall 聚合键：`(pid, cgroup_id, op, comm)`。
+///
+/// 进程名进键（而不是只按 pid）：需求 6.2 的维度要 `process_name`，而 pid 会复用；
+/// 带上 16 字节 `comm` 后同一进程的多次调用自然合并。
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[repr(C)]
+pub struct SyscallKey {
+    pub pid: u32,
+    pub _pad: u32,
+    pub cgroup_id: u64,
+    pub op: u32,
+    pub _pad2: u32,
+    pub comm: [u8; TASK_COMM_LEN],
+}
+
+/// syscall 聚合值（内核态 per-CPU map 的值类型）。
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct SyscallAggWire {
+    pub calls: u64,
+    /// 返回值为负的调用次数。
+    pub errors: u64,
+    pub duration_sum_us: u64,
+    pub duration_max_us: u64,
+    pub _pad: u64,
+    /// 调用耗时直方图槽（与连接延迟同一套 `hist_slot` 映射）。
+    pub hist: [u64; HIST_SLOTS],
+}
+
+impl Default for SyscallAggWire {
+    fn default() -> Self {
+        Self {
+            calls: 0,
+            errors: 0,
+            duration_sum_us: 0,
+            duration_max_us: 0,
+            _pad: 0,
+            hist: [0; HIST_SLOTS],
+        }
+    }
+}
+
+/// syscall 错误键：`(op, errno)`。
+///
+/// 需求 6.3 的指标维度就是 `op`/`errno`，所以键里不放进程名 —— 放了会让「同一 (op, errno)
+/// 因进程不同拆成多条」，用户态还得再合并一次，纯粹是白做功。
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[repr(C)]
+pub struct SyscallErrKey {
+    /// 正数 errno（内核态写 `-ret`）。
+    pub errno: u32,
+    pub op: u32,
+}
+
+/// 慢调用事件（`data_type=ebpf` 的 `slow_io`）：只在超过阈值时产生，携带路径。
+///
+/// 单独一个 RingBuf（`SLOW_IO`）而不是复用 `RawEvent`：路径最长 256 字节，塞进
+/// `RawEvent` 会让**每次**进程/连接事件的拷贝都变大（那些事件比慢调用频繁得多）。
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct SlowIoEvent {
+    pub op: u32,
+    /// 实际写入的路径字节数（0 表示没有路径）。
+    pub path_len: u32,
+    pub pid: u32,
+    /// errno（正数），成功为 0。
+    pub errno: u32,
+    /// **单调时钟**（`bpf_ktime_get_ns`），用户态换算成 Unix 微秒。
+    pub timestamp_ns: u64,
+    pub cgroup_id: u64,
+    pub duration_us: u64,
+    pub comm: [u8; TASK_COMM_LEN],
+    /// 路径缓冲（UTF-8，未用部分为 0）。
+    pub path: [u8; SLOW_IO_PATH_LEN],
+}
+
+impl Default for SlowIoEvent {
+    fn default() -> Self {
+        Self {
+            op: 0,
+            path_len: 0,
+            pid: 0,
+            errno: 0,
+            timestamp_ns: 0,
+            cgroup_id: 0,
+            duration_us: 0,
+            comm: [0; TASK_COMM_LEN],
+            path: [0; SLOW_IO_PATH_LEN],
+        }
+    }
+}
+
+/// 慢调用事件保留的路径长度上限（需求 6.4：截断到 256 字节）。
+pub const SLOW_IO_PATH_LEN: usize = 256;
+
 /// 原始事件类型。
 pub const EVENT_KIND_CONNECT: u32 = 1;
 pub const EVENT_KIND_ACCEPT: u32 = 2;
@@ -205,6 +320,13 @@ pub enum CfgIndex {
     RateLimitTokensPerTick,
     /// 令牌桶容量（突发上限）。
     RateLimitBurst,
+    // --- `ebpf_syscall` 采集项（偏移都来自 `syscalls/*/format`，不硬编码）---
+    /// `sys_enter_openat` 的 `filename` 字段偏移（用户指针，慢调用时读路径用）。
+    SysOpenatFilename,
+    /// `sys_exit_*` 的 `ret` 字段偏移（四个 exit tracepoint 必须一致，否则拒绝采集）。
+    SysExitRet,
+    /// 慢调用阈值（微秒）：超过才进 `SLOW_IO`。
+    SlowThresholdMicros,
     /// 单位：`u64` 槽位数量占位，便于后续扩展时保持枚举稳定。
     Reserved,
 }
@@ -365,6 +487,23 @@ mod tests {
         assert_eq!(size_of::<ConnAggWire>(), 72 + HIST_SLOTS * 8);
         assert_eq!(size_of::<ProcAggWire>(), 24);
         assert_eq!(offset_of!(ProcKey, comm), 16);
+
+        // syscall 采集项：键与值同样是对外布局，改动即为兼容性破坏。
+        assert_eq!(offset_of!(SyscallKey, cgroup_id), 8);
+        assert_eq!(offset_of!(SyscallKey, op), 16);
+        assert_eq!(offset_of!(SyscallKey, comm), 24);
+        assert_eq!(size_of::<SyscallKey>(), 40);
+        assert_eq!(offset_of!(SyscallAggWire, calls), 0);
+        assert_eq!(offset_of!(SyscallAggWire, errors), 8);
+        assert_eq!(offset_of!(SyscallAggWire, duration_sum_us), 16);
+        assert_eq!(offset_of!(SyscallAggWire, duration_max_us), 24);
+        assert_eq!(offset_of!(SyscallAggWire, hist), 40);
+        assert_eq!(size_of::<SyscallAggWire>(), 40 + HIST_SLOTS * 8);
+        assert_eq!(offset_of!(SyscallErrKey, op), 4);
+        assert_eq!(size_of::<SyscallErrKey>(), 8);
+        assert_eq!(offset_of!(SlowIoEvent, comm), 40);
+        assert_eq!(offset_of!(SlowIoEvent, path), 56);
+        assert_eq!(size_of::<SlowIoEvent>(), 56 + SLOW_IO_PATH_LEN);
         assert_eq!(offset_of!(RawEvent, comm), 48);
         assert_eq!(offset_of!(RawEvent, timestamp_ns), 16);
         assert_eq!(align_of::<ConnAggWire>(), 8);
@@ -374,6 +513,18 @@ mod tests {
     fn cfg_index_is_contiguous_and_fits() {
         assert_eq!(CfgIndex::Version as u32, 0);
         assert!((CfgIndex::Reserved as u32) < CFG_LEN);
+    }
+
+    #[test]
+    fn syscall_op_names_and_count_agree() {
+        assert_eq!(syscall_op_name(SYSCALL_OP_OPENAT), "openat");
+        assert_eq!(syscall_op_name(SYSCALL_OP_READ), "read");
+        assert_eq!(syscall_op_name(SYSCALL_OP_WRITE), "write");
+        assert_eq!(syscall_op_name(SYSCALL_OP_FSYNC), "fsync");
+        assert_eq!(syscall_op_name(99), "unknown");
+        // 四个 op 的编号连续且与数量一致（用户态按数量建数组）。
+        assert_eq!(SYSCALL_OP_OPENAT as usize, 1);
+        assert_eq!(SYSCALL_OP_FSYNC as usize, SYSCALL_OP_COUNT);
     }
 
     #[test]
