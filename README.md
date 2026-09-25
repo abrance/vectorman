@@ -89,6 +89,19 @@ gse-server `7100`（RPC）、`7101`（台账 HTTP）、`7102`（自监控）。
 - 内核态程序不硬编码内核结构体偏移：偏移来自 BTF 与 tracepoint `format`，**任一项取不到即该项不采集**（不按猜测值跑）；
 - 不满足时**只降级 eBPF 本身**：Agent 上报 `agent_ebpf_capability`（含原因），其它采集项照常工作，前端 `/ebpf` 页会显示原因。
 
+### 会不会把主机搞崩 / 出事怎么退
+
+- **只在 `ebpf_*` 采集项被下发时才加载内核态程序**；不下发就没有任何 BPF 程序在跑（默认零侵入）。
+- 通过 verifier 校验的程序不会因为内存访问破坏内核：verifier 会证明内存访问与循环有界，
+  程序只写自己的 map 与 ringbuf，对内核内存只读且走容错读取（失败返回错误码）。加载被拒时行为是
+  **该项不可用**，不是崩溃。
+- 真正需要盯的是**开销**：程序挂在热路径上（`sys_enter_read/write`、`tcp_sendmsg` 等）。
+  已有缓解：per-CPU 累加、入口令牌桶限流（`max_events_per_sec`）、map 容量上限、
+  `max_cpu_percent` 连续超限 5 分钟标记降级、ringbuf 尽力而为。
+- **灰度与回滚**：先单节点 → 看丢弃计数（`agent_ebpf_*`）与 `dmesg` 无 `verifier`/`kprobe`/`soft lockup`
+  → 再铺开；回滚只需**停用采集项或停止 Agent**（不需要改内核、不需要重启节点）。
+  完整清单（含命令）见 `.monkeycode/specs/observability-hardening/design.md` 的「内核态风险与上线安全」一节。
+
 ## 已知限制
 
 - **DNS 延迟**（`ebpf_dns`）与 **CPU profile / 火焰图**（`ebpf_cpu_profile`）尚未实现；
