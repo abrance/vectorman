@@ -140,7 +140,11 @@
 
 #### Acceptance Criteria
 
-1. WHEN `ebpf_dns` 采集项启用，THE Agent SHALL 采集发往 53 端口的 UDP 与 TCP 请求及其响应的匹配耗时。
+1. WHEN `ebpf_dns` 采集项启用，THE Agent SHALL 采集**发往 53 端口的 DNS 请求与响应**的匹配耗时，
+   覆盖形态为 `sendto`/`recvfrom` 系统调用（挂载点：`sys_enter/sys_exit_sendto|recvfrom`）。
+   _（2026-09-25 收口：原表述为「UDP 与 TCP」，但挂载点采用最小集，两者不可兼得 ——
+   TCP 53 与已 `connect()` 后走 `send`/`recv` 的形态（glibc 2.34+ 的默认行为）**不在本范围**。
+   影响与升级路径见 `todo.md` 的「已收口」一节：实现前先用数据核对形态比例，必要时把挂载点扩到 `send`/`recv`。）_
 2. THE 指标 SHALL 为 `ebpf_dns_duration_micros`（`field_name` 为 `avg` 与 `p95`），维度含 `query_name`、`rcode`、`service`。
 3. THE 请求与响应 SHALL 按 `(pid, transaction_id)` 匹配；超时未匹配的请求计入 `ebpf_dns_timeouts_total`。
 4. THE `query_name` SHALL 从 DNS 报文的 question 段解析，不做缓存；解析失败时用 `unknown` 并计数。

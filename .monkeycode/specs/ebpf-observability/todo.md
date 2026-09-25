@@ -374,33 +374,24 @@ PR 描述里写明重建过。
 | --- | --- | --- |
 | DNS 挂载点 | **最小集：只挂 `sys_enter/sys_exit_sendto|recvfrom`** | 见下方 ⚠️ 冲突 |
 | DNS 域名解析位置 | **内核态解析 question 段** | 内核代码量更大，需在宿主机单测里覆盖压缩指针/跳转/越界（把解析逻辑抽成 `ebpf-abi` 的纯函数以便单测） |
-| DNS 覆盖面 | **UDP 53 + TCP 53**；DoH(443)/DoT(853) 明确不采（加密，只能看连接耗时） | 需求 7.1 原文口径 |
+| DNS 覆盖面 | **只覆盖 `sendto`/`recvfrom` 形态**（先降级）；TCP 53 与 `connect` 后的 `send`/`recv` 形态**不在本范围**；DoH(443)/DoT(853) 不采（加密） | 2026-09-25 收口（见下），需求 7.1 已同步改写 |
 | CPU profile 采样 | **per-tid `perf_event_open`**（受 `max_profiled_processes` 限制） | 与需求 8.6 一致 |
 | CPU profile 符号化 | **只做 ELF + build-id**；Go/Java 语言级符号后置 | 需求 8.3 原文口径 |
 | 旧数据（口径修正前） | **保留 + 文档标注**，不改代码 | 需要时可用 `/v1/ts/delete` 自行清理 |
 | 部署形态 | tarball + systemd 保持；**charts 排 v1.3**；本版删掉悬空的 `helm-ci` workflow | 用户确认有 k8s 环境 |
 
-> ⚠️ **待解决的冲突（DNS）**：挂载点选「只做 `sendto/recvfrom`」与覆盖面选「UDP 53 + TCP 53」在现实中会打架 ——
-> glibc 的解析器通常先 `connect()` 再 `send`/`recv`（UDP 也会 connect），**TCP DNS 更是必然走 `send`/`recv`**，
-> 因此「只挂 sendto/recvfrom」很可能**大部分真实 DNS 流量都采不到**（属于「看起来有数据、实际漏一半」）。
-> 两个可选收口：① 挂载点扩到 `send`/`recv`（需要从 `sock` 反查目标端口，复用已有 BTF 偏移能力）；
-> ② 保持最小集，并在需求里把覆盖面明确降级为「仅 `sendto`/`recvfrom` 形态，其余不采」。
-> 设计 DNS 时需先定这一条。
-
-### V2-1 `ebpf_dns`：DNS 延迟（P2 收尾，最高优先）
-
-- **现状**：需求 7 与设计已有骨架（`DNS_PENDING`、`ebpf_dns_duration_micros`、
-  `ebpf_dns_timeouts_total`），内核态与用户态都未实现 —— 是本 feature 最后一块**已写进需求但没做**的能力。
-- **为什么难**：需要在 `udp_sendmsg/recvmsg`（或 syscall tracepoint）上取**报文内容**才能解析
-  question 段的域名；`msghdr.msg_iter` 是 `iov_iter`（联合体 + 位域、布局随版本变），
-  与「内核态不硬编码结构体偏移」的原则冲突。
-- **候选方案**（详见 `docs` 与下节设计）：
-  1. **syscall tracepoint**（`sys_enter/sys_exit_sendto|recvfrom|send|recv`）+ `bpf_probe_read_user` 读**用户缓冲**：
-     不依赖内核结构体内部布局；已 `connect()` 的 socket 走 `send/recv` 时目标端口需从 socket 反查。
-  2. `kprobe/udp_sendmsg|udp_recvmsg` + 读 `iov_iter`：覆盖最全（含内核态调用方），但布局风险最高。
-  3. 最小集：只做 `sendto/recvfrom`（覆盖常见解析器形态，已 connect 的场景漏采）。
-- **待定决策**：挂载点方案、`query_name` 解析位置（内核 vs 用户态）、是否覆盖 TCP 53、超时口径。
-- **验收**：需求 7.1–7.5；上机能看到真实域名解析耗时（`dig`/`getent hosts` 触发）。
+> ✅ **已收口（2026-09-25）：先降级**（用户决定）。挂载点保持最小集 `sys_enter/sys_exit_sendto|recvfrom`，
+> 覆盖面随之降级为「**仅 `sendto`/`recvfrom` 形态**」；TCP 53 与已 `connect()` 后走 `send`/`recv` 的形态
+> **明确不在本版范围**。需求 7.1 已按此改写（含范围说明与后续升级路径）。
+>
+> **这个口径的真实影响（别误读）**：glibc 从 2.34 起默认用**已连接的 UDP socket**（`connect` + `send`/`recv`），
+> 因此**基于 glibc 的应用可能完全采不到**；而 Go 程序（含 k8s 里的 CoreDNS、kubelet 等）常用
+> `sendto`/`recvfrom`，这些能采到。也就是说：覆盖率与「谁来发 DNS」强相关，不是「UDP 全覆盖」。
+>
+> **实现前建议先用数据核一次**（很便宜）：在目标机上用 tracepoint 统计 53 端口的
+> `sendto`/`recvfrom` 与 `send`/`recv` 调用比例（`bpftrace` 一条命令或临时挂载本采集项只计数不上报），
+> 若 `send`/`recv` 占多数，则回头把挂载点扩到 `send`/`recv`（需从 `sock` 反查目标端口，复用已有 BTF 偏移能力），
+> 而不是拿着一个「大多采不到」的实现上线。
 
 ### V2-2 `ebpf_cpu_profile`：CPU profile 与火焰图（P3）
 
