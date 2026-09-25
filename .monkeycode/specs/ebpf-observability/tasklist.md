@@ -157,9 +157,23 @@
     共享模型里写了 `service`/`container_id` 维度，需要 dataserver 侧补一次 cgroup → 服务名归一（归入 5.9）
 
 - [ ] 5.9 进程指标的服务维度归一（实现期新增子项）
-  - [ ] 状态：未做。Agent 发的 `ebpf_process_*` 带 `process_name`/`pid`/`cgroup_id`，但共享模型要求
-    `service`/`container_id` 维度；dataserver 需要用静态映射（`process_name`）与 cgroup/Pod 反查补齐，
-    或者把进程计数也随边记录一起入库后再派生。需要与 `/ebpf` 页的展示需求一起定，避免先做错维度
+  - [ ] 状态：**未做，但已完成方案分析**。Agent 发的 `ebpf_process_*` 只有
+    `pid`/`cgroup_id`/`process_name`，共享模型要求 `service`/`container_id`（需求 4.6）。
+  - **缺口不在 dataserver，而在 Agent**：需求 11.1 要求 Agent 用 `cgroup_id` 反查并填 `src_pod`/`src_container_id`，
+    但当前**边记录与进程记录都没填**（内核态只给 `cgroup_id`）。因此 5.9 的前置是「Agent 侧的 cgroup 反查」，
+    不是「dataserver 再加一列」。
+  - 方案（按依赖顺序）：
+    1. **容器 ID**：`cgroup_id` 是 cgroup v2 目录的 inode；启动时与周期性（如 5 分钟）扫描 `/proc/*/cgroup`
+       得到 `0::/…/pod<uid>/<container-id>` 路径，`stat` 对应目录拿 inode，建立 `inode → container_id` 缓存；
+       路径解析是纯函数（k8s 与 docker 两种形态），可单测。为什么不在采集热路径读 `/proc`：会拖慢上报且抖动大。
+    2. **Pod 名**：k8s 形态下从 `pod<uid>` 无法直接得到 Pod 名，需要 kubelet/API 侧的 pod 列表 —— Agent 已有
+       k8s 采集能力（`collect/k8s.rs`），复用它拉一次 pod 列表（uid → name/namespace）并缓存；非 k8s 环境直接跳过。
+    3. **service**：两条来源，按优先级 —— 反查到的 Pod 名经 `apm_service_endpoint` 的 Pod 命中（dataserver 侧，
+       已有实现），其次静态映射 `process_name`/`process_prefix`。**Agent 侧不做服务名归一**（它没有全局表）。
+    4. 落法：`ebpf_process_*` 指标带 `container_id`（Agent 填）与 `service`（dataserver 填）。
+       若要 dataserver 填 `service`，需要给 `data_type=metrics` 增加一个与 `TraceSink`/`EdgeSink` 同形的
+       `MetricSink` 钩子（只处理 `ebpf_process_*`，其余原样透传，避免热路径上无谓的 async 开销）。
+  - 不建议的做法：为了「有 service 维度」让 Agent 去查全局映射表（违背需求 11.3），或把进程计数塞进边记录（语义不同）
 
 - [ ] 6. 检查点 - P1 在特权 runner 上跑通受控流量用例后再进入 P2
   - 确保所有测试通过,如有疑问请询问用户
