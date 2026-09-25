@@ -70,14 +70,22 @@
   `{service="sleeper"}` 59 条（`process_name="sleep"`）；未映射的进程为 `unknown-<进程名>`
   （如 `unknown-git-submodule`）。`cpu_usage` 等非进程指标原样落库（单测断言不受影响）。
 
-### TODO-4（中）Pod 名反查（k8s）未实现
+### TODO-4（中）Pod 名反查（k8s）—— ✅ 已完成（未在真实集群验证）
 
-- **现状**：`src_pod` 里放的是 **Pod uid**（`pod<uid>` 只能解出 uid）。
-- **为什么欠**：uid → Pod 名需要 k8s 侧数据（kubelet/API）。Agent 已有 k8s 采集能力，但未接这一路。
-- **怎么补**：复用 `collect/k8s.rs` 的 kubeconfig 客户端，拉一次 Pod 列表（uid → name/namespace）
-  并缓存（TTL 与容器缓存一致）；非 k8s 环境直接跳过。
-- **验收**：k8s 环境里边记录的 `src_pod` 为真实 Pod 名；dataserver 的「按 Pod 名命中端点表」
-  能命中（当前该层因 uid 不匹配而落空）。
+- **原状**：`src_pod` 里放的是 **Pod uid**（`pod<uid>` 只能解出 uid），而 dataserver 的端点表按
+  Pod **名**登记，因此「按 Pod 名命中端点表」这一层永远命中不了。
+- **已完成**：`cgroup::ProcessResolver` 支持注入 `PodNameLoader`（一次全量 `uid → name`），
+  Agent 侧复用采集项里既有的 `namespace`/`kubeconfig`（与 `log_k8s_stdout` 同一份配置，**不新增配置面**），
+  用 `k8s::list_pod_name_index` 拉索引。要点：只遇到 Pod uid 且索引过期时才拉（宿主机进程不触发）、
+  同一 uid 复用同一份索引、失败不带崩采集也不清空旧索引、凭据探不到就整体关闭反查、
+  名字拿不到时 `src_pod` 退回 uid（**与未启用时行为一致，不是回归**）。`ContainerInfo::pod_label()`
+  是这一退回语义的唯一出口（loader 与检查点工具共用）。
+- **验证**：新增 5 个用例 —— 反查器注入索引（命中 / 复用索引只拉一次 / 失败退回 uid / 宿主机不触发）、
+  `list_pod_name_index` 全链路（假 apiserver + 临时 kubeconfig）、`pod_name_loader` 有/无凭据两种状态。
+  本机真跑回归通过（`src_pod` 与改动前一致，宿主机进程仍是 `host`）。
+- **残留风险**：**没有真实 k8s 集群验证**。上述用例覆盖了「凭据 → HTTP → 索引 → 补名」的逻辑，
+  但真实环境里的 RBAC（是否有列 Pod 权限）、网络策略、大集群下的索引大小都未验证。
+  验收标准（k8s 环境里 `src_pod` 是真实 Pod 名、dataserver 按 Pod 名命中端点表）仍需真实集群确认。
 
 ### TODO-5（中）`max_cpu_percent` 没有实际作用点
 
