@@ -1,5 +1,8 @@
 # 需求实施计划
 
+> 交付后的**遗留项与闭环状态**见同目录 [`todo.md`](./todo.md)：逐跳核对「已实现且实测」与
+> 「已实现但未实测」，并列了 12 项待办（含原因、做法、验收）。本文档记录实施拆分与勾选状态。
+
 本期只交付设计，本清单为待实施拆分，全部未开工。P1/P2/P3 是交付阶段，阶段间可独立上线；P3 未开工不影响 P1/P2。
 
 实施顺序：本 feature 在 `apm-tracing` 之后（`LogStore` 索引 v2 → `dataplane-ts-retention` → `apm-tracing` → 本 feature）。服务名静态映射的 CRUD 由 `apm-tracing` 提供，本 feature 只消费。
