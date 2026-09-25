@@ -17,6 +17,7 @@ pub mod btf;
 pub mod cfg;
 pub mod cgroup;
 pub mod config;
+pub mod cpu;
 pub mod loader;
 pub mod preflight;
 pub mod tracepoint_format;
@@ -116,10 +117,14 @@ pub struct EbpfStats {
     pub rate_limited: AtomicU64,
     /// 被**上行缓冲**淘汰的记录数（容量满时淘汰最旧；只在日志里出现等于看不见）。
     pub buffer_dropped: AtomicU64,
+    /// CPU 占比（百分比 × 100，存整数避免原子浮点）；由 [`EbpfStats::set_cpu`] 写入。
+    cpu_percent: AtomicU64,
+    /// `max_cpu_percent` 连续超限标记。
+    degraded: std::sync::atomic::AtomicBool,
 }
 
 /// 统计快照。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub struct EbpfSnapshot {
     pub flushes: u64,
     pub edges: u64,
@@ -130,9 +135,18 @@ pub struct EbpfSnapshot {
     pub map_overflow_dropped: u64,
     pub rate_limited: u64,
     pub buffer_dropped: u64,
+    pub cpu_percent: f64,
+    pub degraded: bool,
 }
 
 impl EbpfStats {
+    /// 写入一次 CPU 采样（`percent` 为百分比，内部按 ×100 存整数）。
+    pub fn set_cpu(&self, percent: f64, degraded: bool) {
+        let scaled = (percent.clamp(0.0, 1000.0) * 100.0) as u64;
+        self.cpu_percent.store(scaled, Ordering::Relaxed);
+        self.degraded.store(degraded, Ordering::Relaxed);
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> EbpfSnapshot {
         EbpfSnapshot {
@@ -145,6 +159,9 @@ impl EbpfStats {
             map_overflow_dropped: self.map_overflow_dropped.load(Ordering::Relaxed),
             rate_limited: self.rate_limited.load(Ordering::Relaxed),
             buffer_dropped: self.buffer_dropped.load(Ordering::Relaxed),
+            // CPU 与降级标记由采集循环写入（`set_cpu`），默认 0/未降级。
+            cpu_percent: self.cpu_percent.load(Ordering::Relaxed) as f64 / 100.0,
+            degraded: self.degraded.load(Ordering::Relaxed),
         }
     }
 }
@@ -198,6 +215,8 @@ pub async fn run_loop(
         &item_id,
         vec![capability_metric(&agent_id, &report, &item_id)],
     );
+    // `max_cpu_percent` 的实际作用点：每轮采一次进程 CPU，连续超限 5 分钟标记「降级运行」。
+    let mut cpu = crate::cpu::CpuTracker::new(cfg.max_cpu_percent);
 
     loop {
         tokio::time::sleep(interval).await;
@@ -214,6 +233,7 @@ pub async fn run_loop(
         if limited > 0 {
             stats.rate_limited.fetch_add(limited, Ordering::Relaxed);
         }
+        report_cpu(&mut cpu, &stats, &item_id, cfg.max_cpu_percent);
         // 自监控：限流丢弃/map 满/读取失败这些「没报错但出事了」的情况要能在 Prom 上看见。
         sink.metrics(
             &item_id,
@@ -602,6 +622,31 @@ pub fn capability_metric(
     })
 }
 
+/// 采样一次 CPU 并写入统计；跨越阈值时告警一次。
+///
+/// 设计口径：`max_cpu_percent` 只是**告警阈值**，不参与内核态丢弃决策、也不自动停采集
+/// （真正限流的是内核态每秒事件数令牌桶）。因此这里只写统计 + 打一行日志。
+fn report_cpu(
+    tracker: &mut crate::cpu::CpuTracker,
+    stats: &EbpfStats,
+    item_id: &str,
+    max_percent: u32,
+) {
+    let was_degraded = tracker.degraded();
+    let percent = tracker.observe(std::time::Instant::now(), crate::cpu::read_self_cpu_ticks());
+    stats.set_cpu(percent, tracker.degraded());
+    match (was_degraded, tracker.degraded()) {
+        (false, true) => eprintln!(
+            "gse-agent: ebpf item {item_id} 降级运行：Agent CPU {percent:.1}% 连续超过 max_cpu_percent={max_percent} 达 {}s（不自动停采集）",
+            crate::cpu::DEGRADE_WINDOW.as_secs()
+        ),
+        (true, false) => eprintln!(
+            "gse-agent: ebpf item {item_id} 退出降级运行：CPU {percent:.1}% 已降到下限以内"
+        ),
+        _ => {}
+    }
+}
+
 /// 约束统计快照 → `agent_ebpf_*` 指标点（需求 12.3：统计算并输出每项限制的触发次数与被丢弃的数据量）。
 ///
 /// 为什么要有：内核态限流、map 满丢弃、map 读取失败这些「出事了但没报错」的情况，
@@ -628,18 +673,40 @@ pub fn stats_metrics(
         ("agent_ebpf_rate_limited_total", snapshot.rate_limited),
         ("agent_ebpf_buffer_dropped_total", snapshot.buffer_dropped),
     ];
+    // 两个非计数器口径：CPU 占比是小数百分比、降级是 0/1 标记。
+    let gauges: [(&str, f64); 2] = [
+        ("agent_ebpf_cpu_percent", snapshot.cpu_percent),
+        (
+            "agent_ebpf_degraded",
+            if snapshot.degraded { 1.0 } else { 0.0 },
+        ),
+    ];
     rows.iter()
-        .map(|(measurement, value)| {
-            serde_json::json!({
-                "record_id": format!("{agent_id}:{item_id}:{measurement}:{ts}"),
-                "timestamp": ts,
-                "measurement": measurement,
-                "tags": {"agent_id": agent_id, "item_id": item_id},
-                "field_name": "value",
-                "field_value": *value as f64,
-            })
-        })
+        .map(|(measurement, value)| stat_point(agent_id, item_id, measurement, *value as f64, ts))
+        .chain(
+            gauges
+                .iter()
+                .map(|(measurement, value)| stat_point(agent_id, item_id, measurement, *value, ts)),
+        )
         .collect()
+}
+
+/// 单条自监控点（计数器与 gauge 共用，保证 `record_id` 规则一致）。
+fn stat_point(
+    agent_id: &str,
+    item_id: &str,
+    measurement: &str,
+    value: f64,
+    ts: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "record_id": format!("{agent_id}:{item_id}:{measurement}:{ts}"),
+        "timestamp": ts,
+        "measurement": measurement,
+        "tags": {"agent_id": agent_id, "item_id": item_id},
+        "field_name": "value",
+        "field_value": value,
+    })
 }
 
 /// 当前 Unix 微秒。
@@ -867,9 +934,11 @@ mod tests {
             map_overflow_dropped: 5,
             rate_limited: 6,
             buffer_dropped: 11,
+            cpu_percent: 2.5,
+            degraded: true,
         };
         let points = stats_metrics("agent-1", "item-1", &snapshot);
-        assert_eq!(points.len(), 9, "每个计数字段一条点");
+        assert_eq!(points.len(), 11, "9 个计数 + CPU 占比 + 降级标记");
         let value_of = |name: &str| -> f64 {
             points
                 .iter()
@@ -883,12 +952,14 @@ mod tests {
         assert_eq!(value_of("agent_ebpf_read_errors_total"), 1.0);
         assert_eq!(value_of("agent_ebpf_edges_total"), 9.0);
         assert_eq!(value_of("agent_ebpf_buffer_dropped_total"), 11.0);
+        assert_eq!(value_of("agent_ebpf_cpu_percent"), 2.5, "小数百分比不截断");
+        assert_eq!(value_of("agent_ebpf_degraded"), 1.0);
         // 记录 ID 唯一（接入侧按 record_id 去重，重复 ID 会让后续点被吃掉）。
         let ids: std::collections::HashSet<&str> = points
             .iter()
             .filter_map(|p| p["record_id"].as_str())
             .collect();
-        assert_eq!(ids.len(), 9);
+        assert_eq!(ids.len(), 11);
         assert_eq!(points[0]["tags"]["agent_id"], "agent-1");
         assert_eq!(points[0]["tags"]["item_id"], "item-1");
         assert_eq!(points[0]["field_name"], "value");

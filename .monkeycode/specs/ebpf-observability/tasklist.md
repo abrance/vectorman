@@ -52,8 +52,12 @@
     - 状态：已实现（PR #48）：`EVENTS: RingBuf`（容量加载期覆盖）承载原始事件，`RawEvent` 布局在 `ebpf-abi`；`CFG: Array<u64>` 共 64 槽，下标见 `ebpf_abi::CfgIndex`，含版本号 `CFG_VERSION`，内核态版本不匹配直接不采集
   - [x] 2.6 `max_cpu_percent` 内核态令牌桶限流
     - 对应需求 9.5、12.1-12.2
+    - 状态：**已实现，但口径改了**（PR #57 内核态 + 后续用户态告警）：内核态拿不到 CPU 时间，
+      改为「每秒事件数 + 突发容量」的令牌桶（`ebpf_abi::token_bucket_step`、`RATE: PerCpuArray<u64>`）；
+      `max_cpu_percent` 落到**用户态告警阈值**（`cpu.rs`：读 `/proc/self/stat` 算进程 CPU 占比，
+      连续超限 5 分钟标记「降级运行」→ `agent_ebpf_cpu_percent` / `agent_ebpf_degraded`，不自动停采集）。
+      此前该配置项**能配但没人读**，属于「配了以为有保护」的误导状态，现已接上。
 - [ ] 3. P1 用户态加载、差分与聚合（差分/聚合/过滤已完成见 PR #46；运行期参数解析/退避/挂载计划已完成见 PR #49；aya 加载与挂载管理待做）
-    - 状态：未实现（PR #48 不含）：`max_cpu_percent` 的内核态令牌桶限流未做；当前只有采集项配置里的上限字段（`config.rs`）与用户态侧的过滤/丢弃统计，限流留到 P1 收尾阶段
   - [x] 3.3 差分线程：遍历全部 CPU 副本求和、与上周期相减、写零值复位、清理零增量键
     - 状态：已实现（PR #46）：`sum_per_cpu` / `diff`（首次出现按绝对值、快照回退饱和不为负、最大值单调）与 `run_loop` 中的快照清理；「写零复位」由 aya `MapSource` 实现负责（PR-B）
   - [x] 3.4 过滤：`cgroup`/`process`/`port` include-exclude、`include_loopback`
