@@ -21,6 +21,7 @@ pub mod aggregator;
 pub mod alias;
 pub mod ebpf_edge;
 pub mod ebpf_metrics;
+pub mod ebpf_retention;
 pub mod edge;
 pub mod query;
 pub mod red;

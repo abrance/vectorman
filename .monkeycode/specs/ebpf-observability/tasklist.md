@@ -124,8 +124,16 @@
     - 状态：已实现（PR #53）：事件检索复用日志检索，但 `data_type` 由服务端固定为 `ebpf`（客户端改不了，避免串到 APM 日志）；
       能力状态读 `agent_ebpf_capability` 指标，按 Agent 汇总 `available/kernel_ok/btf_ok/capability_ok/kernel_release/reason`，
       并给出 `reported` 计数以区分「没上报」与「上报了不可用」
-  - [ ] 5.6 保留期清理：`ebpf_edges` 分批删除、`data_type=ebpf` 循环删除、`retain/` 机制；聚合指标接入 `dataplane-ts-retention`（`ts_retention_days` 缺省 30 天）
+  - [x] 5.6 保留期清理：`ebpf_edges` 分批删除、`data_type=ebpf` 循环删除、`retain/` 机制；聚合指标接入 `dataplane-ts-retention`（`ts_retention_days` 缺省 30 天）
     - 对应需求 14.1-14.4
+    - 状态：已实现（PR #54）。`dataplane-apm/src/ebpf_retention.rs`：`ebpf_edges` 按 `data_id` + `bucket_start` 分批删
+      （用 `rowid IN (SELECT ... LIMIT n)` 而不是 `DELETE ... LIMIT n` —— 后者要 sqlite 编译期打开
+      `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`，不是所有构建都带），循环到删空；行数用同连接的 `SELECT changes()` 取。
+    - 保留期来源：`LiveItem` 增加 `kind`，**eBPF 采集项缺省 3 天**（需求 14.1），其余沿用日志侧的 1 天；
+      `storage.retention_days` 优先于顶层字段。
+    - `data_type=ebpf` 明细沿用既有日志删除路径（`data_id` + 时间上界），采集项被删除后由 `retain/{item_id}` 到期触发边记录清空。
+    - 聚合指标不在这里删：走全局时序保留（`ts_retention_days` 缺省 30 天），由 `dataplane-ts-retention` 的清理任务负责（需求 14.4）。
+    - 清理循环新增自监控 `dataserver_ebpf_edges_deleted_total`，日志行加上 `ebpf_edges_deleted`
   - [ ] 5.7 httptest：幂等重放、非法字段 `partial`、合并查询求和、清理三类数据、时间范围非法 400
     - 状态：部分实现（PR #51）：dataserver e2e 覆盖「1 条合法 + 2 条非法 → `partial` 且只落 1 行、重放幂等、未识别服务归一为 `unknown-<ip>`」。
       **未覆盖**：合并查询求和、清理三类数据、时间范围非法 400（随查询与保留期一起做）

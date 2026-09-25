@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use dataplane_core::{DataplaneError, ErrorCode};
 use dataplane_kv::KvStore;
 use dataplane_log::{LogFilter, LogStore};
+use dataplane_sql::RelationalStore;
 use dataplane_ts::{TimeSeriesStore, TsMatcher, TsMatcherOp, TsSeriesSelection};
 use serde::Deserialize;
 use serde_json::Value;
@@ -25,6 +26,16 @@ const RETAIN_PREFIX: &[u8] = b"retain/";
 pub struct LiveItem {
     pub item_id: String,
     pub retention_days: u32,
+    /// 采集项类型：eBPF 系列的保留期缺省是 3 天（其余保持 1 天）。
+    pub kind: String,
+}
+
+impl LiveItem {
+    /// 是否 eBPF 采集项（`ebpf_network` / `ebpf_tcp` / `ebpf_process` / …）。
+    #[must_use]
+    pub fn is_ebpf(&self) -> bool {
+        self.kind.starts_with("ebpf")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,9 +161,21 @@ pub fn parse_collect_items(body: &str) -> Vec<LiveItem> {
             if item_id.is_empty() {
                 return None;
             }
+            let kind = item
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            // eBPF 侧的边聚合体积远小于日志明细、排障窗口更长，缺省 3 天（其余缺省 1 天）。
+            let retention_days = if kind.starts_with("ebpf") {
+                dataplane_apm::ebpf_retention::retention_days(item)
+            } else {
+                retention_days_from_item(item)
+            };
             Some(LiveItem {
                 item_id,
-                retention_days: retention_days_from_item(item),
+                retention_days,
+                kind,
             })
         })
         .collect()
@@ -194,12 +217,21 @@ pub struct TsCleanReport {
     pub tombstones_applied: u64,
 }
 
+/// `apply_retention` 的结果（时序部分由 `run_cleanup` 合并）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetentionReport {
+    pub log_deleted: u64,
+    pub ebpf_edges_deleted: u64,
+}
+
 /// 一次清理周期的汇总。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[must_use]
 pub struct CleanupReport {
     pub log_deleted: u64,
     pub ts: TsCleanReport,
+    /// 删除的 `ebpf_edges` 行数。
+    pub ebpf_edges_deleted: u64,
 }
 
 /// 连续零命中多少轮后提示一次。
@@ -324,18 +356,27 @@ fn item_selection(item_id: &str, to_ts: i64) -> TsSeriesSelection {
 
 /// 按 live 列表与 `retain/` 前缀删除到期日志，返回删除条数。
 pub async fn apply_retention(
+    sql: &dyn RelationalStore,
     log: &dyn LogStore,
     kv: &dyn KvStore,
     live: &[LiveItem],
     now_micros: i64,
-) -> Result<u64, DataplaneError> {
+) -> Result<RetentionReport, DataplaneError> {
     let mut deleted = 0u64;
+    let mut ebpf_edges_deleted = 0u64;
     for item in live {
         let days = clamp_retention_days(item.retention_days) as i64;
         let cutoff = now_micros.saturating_sub(days * MICROS_PER_DAY);
         deleted += log
             .delete_matching(data_id_filter(&item.item_id, Some(cutoff)))
             .await?;
+        // eBPF 边聚合走 sqlite：分批删（见 `ebpf_retention`），只处理 eBPF 采集项。
+        if item.is_ebpf() {
+            let report =
+                dataplane_apm::ebpf_retention::delete_edges_before(sql, &item.item_id, cutoff)
+                    .await?;
+            ebpf_edges_deleted += report.deleted;
+        }
     }
 
     let rows = kv.scan_prefix(RETAIN_PREFIX).await?;
@@ -354,13 +395,23 @@ pub async fn apply_retention(
             continue;
         }
         deleted += log.delete_matching(data_id_filter(item_id, None)).await?;
+        // 采集项已从 GSE 删除：边记录一次性清空（与日志同一个 `retain/` 到期口径）。
+        let report =
+            dataplane_apm::ebpf_retention::delete_edges_before(sql, item_id, now_micros).await?;
+        ebpf_edges_deleted += report.deleted;
         kv.delete(&key).await?;
     }
-    Ok(deleted)
+    Ok(RetentionReport {
+        log_deleted: deleted,
+        ebpf_edges_deleted,
+    })
 }
 
 /// 拉 live 列表（若已配 GSE）并执行清理。
+// 参数是「一路存储一个」的独立依赖，包成结构体只会多一层壳（调用点只有 main 与测试）。
+#[allow(clippy::too_many_arguments)]
 pub async fn run_cleanup(
+    sql: &dyn RelationalStore,
     log: &dyn LogStore,
     ts: &dyn TimeSeriesStore,
     kv: &dyn KvStore,
@@ -385,11 +436,167 @@ pub async fn run_cleanup(
     };
     // 时序先于日志：`apply_retention` 会删除 `retain/` 键。
     let ts_report = apply_ts_retention(ts, kv, &live, global_ts_days, now_micros, tracker).await?;
-    let log_deleted = apply_retention(log, kv, &live, now_micros).await?;
+    let retention = apply_retention(sql, log, kv, &live, now_micros).await?;
     Ok(CleanupReport {
-        log_deleted,
+        log_deleted: retention.log_deleted,
         ts: ts_report,
+        ebpf_edges_deleted: retention.ebpf_edges_deleted,
     })
+}
+
+#[cfg(test)]
+mod ebpf_retention_tests {
+    use super::*;
+    use dataplane_apm::ebpf_retention;
+    use dataplane_core::SqlValue;
+    use dataplane_sql::{RelationalStore, SqliteRelationalStore};
+
+    fn store(dir: &std::path::Path) -> std::sync::Arc<dyn RelationalStore> {
+        std::sync::Arc::new(SqliteRelationalStore::new(dir.join("sql.db")).unwrap())
+    }
+
+    async fn insert_edge(sql: &dyn RelationalStore, record_id: &str, bucket: i64, item_id: &str) {
+        sql.execute(
+                &format!(
+                    "INSERT OR REPLACE INTO {} (record_id, bucket_start, bucket_micros, protocol,
+                        src_ip, src_port, dst_ip, dst_port, src_service, dst_service,
+                        connections, bytes_sent, bytes_recv, duration_sum, duration_max,
+                        tcp_retrans, tcp_resets, failures, failure_reason, latency_hist,
+                        agent_id, data_id)
+                     VALUES (?1,?2,10000000,'tcp','10.0.0.5',1,'10.0.0.9',2,'a','b',1,0,0,0,0,0,0,0,'','[]','agent-1',?3)",
+                    dataplane_apm::tables::EBPF_EDGES
+                ),
+                &[
+                    SqlValue::Text(record_id.to_string()),
+                    SqlValue::Integer(bucket),
+                    SqlValue::Text(item_id.to_string()),
+                ],
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn count(sql: &dyn RelationalStore) -> i64 {
+        let result = sql
+            .execute(
+                &format!("SELECT COUNT(*) FROM {}", dataplane_apm::tables::EBPF_EDGES),
+                &[],
+            )
+            .await
+            .unwrap();
+        match result.rows.first().and_then(|row| row.first()) {
+            Some(SqlValue::Integer(i)) => *i,
+            _ => 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn deletes_in_batches_until_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql = store(dir.path());
+        dataplane_apm::bootstrap(sql.as_ref()).await.unwrap();
+
+        // 7 条过期 + 3 条仍然有效；批大小 2 → 至少 4 批。
+        for index in 0..7 {
+            insert_edge(sql.as_ref(), &format!("old-{index}"), 1_000, "item-ebpf").await;
+        }
+        for index in 0..3 {
+            insert_edge(
+                sql.as_ref(),
+                &format!("new-{index}"),
+                9_000_000,
+                "item-ebpf",
+            )
+            .await;
+        }
+        let report =
+            ebpf_retention::delete_edges_before_batched(sql.as_ref(), "item-ebpf", 5_000, 2)
+                .await
+                .unwrap();
+        assert_eq!(report.deleted, 7);
+        assert!(report.batches >= 4, "分批删除: {report:?}");
+        assert_eq!(count(sql.as_ref()).await, 3, "有效数据不动");
+
+        // 再跑一次：没有可删的行（说明循环能正常收敛）。
+        let again =
+            ebpf_retention::delete_edges_before_batched(sql.as_ref(), "item-ebpf", 5_000, 2)
+                .await
+                .unwrap();
+        assert_eq!(again.deleted, 0);
+    }
+
+    #[tokio::test]
+    async fn only_touches_the_given_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql = store(dir.path());
+        dataplane_apm::bootstrap(sql.as_ref()).await.unwrap();
+        insert_edge(sql.as_ref(), "a", 1_000, "item-a").await;
+        insert_edge(sql.as_ref(), "b", 1_000, "item-b").await;
+        let report = ebpf_retention::delete_edges_before(sql.as_ref(), "item-a", 5_000)
+            .await
+            .unwrap();
+        assert_eq!(report.deleted, 1);
+        assert_eq!(count(sql.as_ref()).await, 1, "别的采集项不受影响");
+    }
+
+    #[tokio::test]
+    async fn apply_retention_handles_live_and_expired_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let sql = store(dir.path());
+        let kv = dataplane_kv::RedbKvStore::new(dir.path().join("kv")).unwrap();
+        let log = dataplane_log::TantivyLogStore::new(dir.path().join("logs")).unwrap();
+        dataplane_apm::bootstrap(sql.as_ref()).await.unwrap();
+
+        let now = 10 * MICROS_PER_DAY;
+        // live 的 eBPF 采集项：保留 3 天 → 5 天前的边被删，1 天前的不动。
+        insert_edge(sql.as_ref(), "old", now - 5 * MICROS_PER_DAY, "item-ebpf").await;
+        insert_edge(sql.as_ref(), "fresh", now - MICROS_PER_DAY, "item-ebpf").await;
+        let live = vec![LiveItem {
+            item_id: "item-ebpf".to_string(),
+            retention_days: 3,
+            kind: "ebpf_network".to_string(),
+        }];
+        let report = apply_retention(sql.as_ref(), &log, &kv, &live, now)
+            .await
+            .unwrap();
+        assert_eq!(report.ebpf_edges_deleted, 1);
+        assert_eq!(count(sql.as_ref()).await, 1);
+
+        // 已删除的采集项：`retain/` 到期 → 边记录清空。
+        // 用一个严格早于 `now` 的桶：删除条件是 `bucket_start < cutoff`。
+        insert_edge(sql.as_ref(), "leftover", now - 1, "item-gone").await;
+        kv.set(retain_key("item-gone").as_bytes(), br#"{"until_micros":1}"#)
+            .await
+            .unwrap();
+        let report = apply_retention(sql.as_ref(), &log, &kv, &[], now)
+            .await
+            .unwrap();
+        assert_eq!(report.ebpf_edges_deleted, 1);
+        assert_eq!(count(sql.as_ref()).await, 1, "只剩 live 项那一条");
+        assert!(
+            kv.get(retain_key("item-gone").as_bytes()).await.is_err(),
+            "到期后删除 retain 键（再次读取应为 not_found）"
+        );
+    }
+
+    #[test]
+    fn parse_collect_items_marks_ebpf_kind_and_default_days() {
+        let body = r#"{"items":[
+            {"item_id":"e1","kind":"ebpf_network"},
+            {"item_id":"e2","kind":"ebpf_tcp","storage":{"retention_days":7}},
+            {"item_id":"l1","kind":"log_file"}
+        ]}"#;
+        let items = parse_collect_items(body);
+        assert_eq!(items.len(), 3);
+        assert!(items[0].is_ebpf());
+        assert_eq!(
+            items[0].retention_days, 3,
+            "eBPF 采集项缺省 3 天（需求 14.1）"
+        );
+        assert_eq!(items[1].retention_days, 7, "显式配置优先");
+        assert!(!items[2].is_ebpf());
+        assert_eq!(items[2].retention_days, 1, "日志类仍缺省 1 天");
+    }
 }
 
 #[cfg(test)]
@@ -461,10 +668,12 @@ mod tests {
             LiveItem {
                 item_id: "item-short".to_string(),
                 retention_days: 1,
+                kind: "log_file".to_string(),
             },
             LiveItem {
                 item_id: "item-long".to_string(),
                 retention_days: 30,
+                kind: "log_file".to_string(),
             },
         ];
         let report = apply_ts_retention(&ts, &kv, &live, 30, now, &mut TsCleanTracker::default())

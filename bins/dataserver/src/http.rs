@@ -1186,7 +1186,8 @@ mod tests {
             .set(b"retain/item-del", br#"{"until_micros":1}"#)
             .await
             .unwrap();
-        apply_retention(
+        let _ = apply_retention(
+            env.state.sql.as_ref(),
             env.state.log.as_ref(),
             env.state.kv.as_ref(),
             &[],
@@ -1225,12 +1226,14 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK, "{body}");
 
-        apply_retention(
+        let _ = apply_retention(
+            env.state.sql.as_ref(),
             env.state.log.as_ref(),
             env.state.kv.as_ref(),
             &[LiveItem {
                 item_id: "item-live".into(),
                 retention_days: 1,
+                kind: "log_file".into(),
             }],
             TS + 2 * MICROS_PER_DAY,
         )
