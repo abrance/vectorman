@@ -21,6 +21,10 @@ path = "src/tcp.rs"
 name = "process"
 path = "src/process.rs"
 
+[[bin]]
+name = "syscall"
+path = "src/syscall.rs"
+
 [profile.release]
 opt-level = 3
 debug = false

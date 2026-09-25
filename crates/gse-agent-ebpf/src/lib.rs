@@ -20,6 +20,7 @@ pub mod config;
 pub mod cpu;
 pub mod loader;
 pub mod preflight;
+pub mod syscall;
 pub mod tracepoint_format;
 
 use aggregate::ipv4_of;
@@ -28,8 +29,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use aggregate::{
-    bucket_start, conn_view, diff, edge_record, is_empty, reason_str, sum_per_cpu, view_per_cpu,
-    ConnAgg, ConnKey, ConnView, EbpfEdgeRecord, ProcessContext,
+    bucket_start, conn_view, edge_record, is_empty, reason_str, sum_per_cpu, view_per_cpu, ConnAgg,
+    ConnKey, ConnView, EbpfEdgeRecord, ProcessContext,
 };
 pub use attach::{AttachPlan, AttachPoint, EbpfItemKind};
 pub use backoff::Backoff;
@@ -40,12 +41,22 @@ pub use loader::{
     ProcessSource,
 };
 pub use preflight::{PreflightEnv, PreflightReport};
+pub use syscall::{
+    duration_metrics, failure_metrics, histogram_p95, slow_io_path, slow_io_record, sum_syscall,
+    summarize as summarize_syscall, syscall_is_empty, SyscallAgg,
+};
 
 /// 一个周期内的 per-CPU 连接快照（原始内核态布局，求和见 [`aggregate::view_per_cpu`]）。
 pub type ConnSnapshot = Vec<(ConnKey, Vec<ebpf_abi::ConnAggWire>)>;
 
 /// 一个周期内的 per-CPU 进程快照。
 pub type ProcSnapshot = Vec<(ebpf_abi::ProcKey, Vec<ebpf_abi::ProcAggWire>)>;
+
+/// 一个周期内的 per-CPU syscall 聚合快照。
+pub type SyscallSnapshot = syscall::SyscallSnapshot;
+
+/// 一个周期内的 per-CPU syscall 错误码快照。
+pub type SyscallErrSnapshot = syscall::SyscallErrSnapshot;
 
 /// 进程计数三元组（exec/exit/fork）。
 pub type ProcCounts = (u64, u64, u64);
@@ -205,9 +216,6 @@ pub async fn run_loop(
     report: PreflightReport,
     stats: Arc<EbpfStats>,
 ) {
-    // 上一周期快照：键 → 绝对值（差分基准）。
-    let mut previous: std::collections::BTreeMap<ConnKey, ConnAgg> =
-        std::collections::BTreeMap::new();
     let interval = Duration::from_secs(cfg.flush_interval_secs.max(1));
 
     // 首次上报能力状态，便于链路页显示不可用/可用。
@@ -243,9 +251,11 @@ pub async fn run_loop(
 
         let mut edges = Vec::new();
         for (key, per_cpu) in snapshot {
-            let current = view_per_cpu(&per_cpu);
-            let delta = diff(previous.get(&key), &current);
-            previous.insert(key, current);
+            // **每次 drain 读到的就是本周期增量**：`MapSource::drain` 在读完后把内核侧计数写零复位，
+            // 因此这里**不能再与上周期相减**（会把上一次的增量再减一遍，实测把 80 次调用报成 1 次）。
+            // 复位失败时 `drain` 返回 `Err`、本周期不产出，数据仍在内核 map 里等下一周期读走 ——
+            // 既不会重复计数也不会丢。
+            let delta = view_per_cpu(&per_cpu);
             if is_empty(&delta) {
                 stats.idle_keys.fetch_add(1, Ordering::Relaxed);
                 continue;
@@ -283,14 +293,6 @@ pub async fn run_loop(
             }
         }
 
-        // 清理本周期未再出现的键，避免快照无限增长（内核侧已复位）。
-        let seen: std::collections::BTreeSet<ConnKey> = previous
-            .iter()
-            .filter(|(_, agg)| !is_empty(agg))
-            .map(|(key, _)| *key)
-            .collect();
-        previous.retain(|key, _| seen.contains(key));
-
         stats.edges.fetch_add(edges.len() as u64, Ordering::Relaxed);
         if !edges.is_empty() {
             sink.edges(&item_id, edges);
@@ -311,8 +313,6 @@ pub async fn run_process_loop(
     agent_id: String,
     stats: Arc<EbpfStats>,
 ) {
-    let mut seen: std::collections::BTreeMap<ProcSeenKey, ProcCounts> =
-        std::collections::BTreeMap::new();
     let mut minute = ProcessMinuteAccumulator::default();
     let interval = Duration::from_secs(cfg.flush_interval_secs.max(1));
     let mut sample_cursor = 0u64;
@@ -338,24 +338,14 @@ pub async fn run_process_loop(
         for (key, per_cpu) in snapshot {
             // 容器/Pod 由 pid 反查（需求 4.6 的 `container_id` 维度）。
             let context = source.process_context_by_pid(key.pid);
-            let (exec, exit, fork) = sum_process(&per_cpu);
-            let current = (exec, exit, fork);
-            let delta = match seen.get(&(key.pid, key.cgroup_id, key.comm)) {
-                Some(prev) => (
-                    exec.saturating_sub(prev.0),
-                    exit.saturating_sub(prev.1),
-                    fork.saturating_sub(prev.2),
-                ),
-                None => current,
-            };
-            seen.insert((key.pid, key.cgroup_id, key.comm), current);
+            // 每次 drain 读到的就是本周期增量（`drain_process` 读完写零复位），**不再相减**。
+            let delta = sum_process(&per_cpu);
             if delta == (0, 0, 0) {
                 stats.idle_keys.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             minute.observe(&key, delta, bucket_ts, context.as_ref());
         }
-        seen.retain(|_, v| *v != (0, 0, 0));
 
         // 原始事件：默认关闭；开启时按 `raw_events_sample_ratio` 抽样（需求 4.5、10.3）。
         if cfg.raw_events_enabled {
@@ -391,7 +381,109 @@ pub async fn run_process_loop(
     }
 }
 
-/// 抽样判定：按 1/ratio 的整数间隔抽样，保证长期比例接近配置值且不引入随机数依赖。
+/// `ebpf_syscall` 采集循环（需求 6）：差分聚合 → 耗时指标；错误码 → 失败计数；慢调用 → 原始事件。
+///
+/// 与边记录不同，这里**没有服务名反查**：指标维度里的 `service` 留空，由 `dataserver`
+/// 用静态映射补齐（Agent 不知道全局服务表）。
+pub async fn run_syscall_loop(
+    mut source: AyaMapSource,
+    sink: Arc<dyn EbpfSink>,
+    cfg: EbpfConfig,
+    item_id: String,
+    agent_id: String,
+    stats: Arc<EbpfStats>,
+) {
+    let interval = Duration::from_secs(cfg.flush_interval_secs.max(1));
+    // `max_cpu_percent` 的实际作用点（与其他采集循环一致）。
+    let mut cpu = crate::cpu::CpuTracker::new(cfg.max_cpu_percent);
+    let mut slow_cursor = 0u64;
+
+    loop {
+        tokio::time::sleep(interval).await;
+        let snapshot = match source.drain_syscall() {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return,
+            Err(reason) => {
+                stats.read_errors.fetch_add(1, Ordering::Relaxed);
+                eprintln!("gse-agent: ebpf item {item_id} drain syscall failed: {reason}");
+                continue;
+            }
+        };
+        stats.flushes.fetch_add(1, Ordering::Relaxed);
+        let limited = source.take_rate_limit_drops();
+        if limited > 0 {
+            stats.rate_limited.fetch_add(limited, Ordering::Relaxed);
+        }
+        report_cpu(&mut cpu, &stats, &item_id, cfg.max_cpu_percent);
+        sink.metrics(
+            &item_id,
+            stats_metrics(&agent_id, &item_id, &stats.snapshot()),
+        );
+
+        let timestamp = now_micros();
+        let mut points = Vec::new();
+        for (key, values) in &snapshot {
+            // 每次 drain 读到的就是本周期增量（`drain_syscall` 读完把内核侧计数写零复位），
+            // 因此**不能再与上周期相减** —— 那会把上一次的增量再减一遍（实测把 80 次调用报成 1 次）。
+            let delta = syscall::sum_syscall(values);
+            if syscall::syscall_is_empty(&delta) {
+                stats.idle_keys.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            points.extend(syscall::duration_metrics(
+                &agent_id, &item_id, key, &delta, timestamp,
+            ));
+        }
+
+        // 错误码：同样每次 drain 即增量。
+        match source.drain_syscall_errors() {
+            Ok(errors) => {
+                for (key, per_cpu) in errors {
+                    let count: u64 = per_cpu.iter().copied().fold(0u64, u64::saturating_add);
+                    if let Some(point) =
+                        syscall::failure_metrics(&agent_id, &item_id, &key, count, timestamp)
+                    {
+                        points.push(point);
+                    }
+                }
+            }
+            Err(reason) => {
+                stats.read_errors.fetch_add(1, Ordering::Relaxed);
+                eprintln!("gse-agent: ebpf item {item_id} drain syscall errors failed: {reason}");
+            }
+        }
+
+        stats
+            .metrics
+            .fetch_add(points.len() as u64, Ordering::Relaxed);
+        if !points.is_empty() {
+            sink.metrics(&item_id, points);
+        }
+
+        // 慢调用事件：内核只在上限内写，用户态按抽样比例上行（与原始事件同一口径）。
+        if cfg.raw_events_enabled {
+            let events = source.drain_slow_io();
+            if !events.is_empty() {
+                let offset = monotonic_to_unix_offset_micros().unwrap_or_else(now_micros);
+                let mut records = Vec::new();
+                for event in events {
+                    slow_cursor = slow_cursor.wrapping_add(1);
+                    if !sample(slow_cursor, cfg.raw_events_sample_ratio) {
+                        continue;
+                    }
+                    records.push(syscall::slow_io_record(&agent_id, &event, offset));
+                }
+                if !records.is_empty() {
+                    stats
+                        .metrics
+                        .fetch_add(records.len() as u64, Ordering::Relaxed);
+                    sink.raw_events(&item_id, records);
+                }
+            }
+        }
+    }
+}
+
 #[must_use]
 pub fn sample(cursor: u64, ratio: f64) -> bool {
     if ratio >= 1.0 {
@@ -830,8 +922,13 @@ mod tests {
 
         let edges = sink.edges.lock().unwrap().clone();
         assert_eq!(edges.len(), 2, "两轮各出一条边: {edges:?}");
-        assert_eq!(edges[0]["connections"], 2.0, "首轮按绝对值计");
-        assert_eq!(edges[1]["connections"], 3.0, "次轮为增量");
+        // **每次 drain 读到的就是本周期增量**（`drain` 读完把内核侧计数写零复位），
+        // 因此第二轮报的是它自己的 5，而不是 `5 - 2 = 3`。
+        //
+        // 这个断言曾经写的是 3（「次轮为增量」）—— 它把 bug 当成规格：内核已经复位过一次，
+        // 用户态再相减等于扣两遍。实测把 80 次 syscall 报成 1 次（见 todo.md 的记录）。
+        assert_eq!(edges[0]["connections"], 2.0);
+        assert_eq!(edges[1]["connections"], 5.0);
         assert_eq!(edges[1]["src_process"], "java");
         assert_eq!(edges[1]["source"], "ebpf");
         assert!(edges[1]["src_service"].as_str().unwrap().is_empty());

@@ -201,9 +201,38 @@
   `dpc ebpf-events --event-type process_exec --limit 2`（真实事件，`labels.event_type`/`process_name` 正确）。
 - **结论**：CLI 与 HTTP 接口一致，无需改动代码（这本身就是验收结论）。
 
-### TODO-11（低）P2 / P3 未实现（附可执行拆分）
+### TODO-11（低）P2 / P3 —— `ebpf_syscall` ✅ 已完成，DNS/P3 未做
 
-#### P2 第一半：`ebpf_syscall`（建议先做，风险低）
+#### P2 第一半：`ebpf_syscall` —— ✅ 已完成（本 PR）
+
+**顺带修掉一个严重的既有正确性 bug**（见下面单独一节）：用户态「与上周期相减」与内核侧
+「写零复位」重复扣减，导致边/进程/syscall 的聚合**系统性少计**。
+
+已交付（需求 6 全项）：
+
+- 内核 `syscall.rs`：4 个 op × enter/exit 共 8 个 tracepoint + `SYSCALL_AGG`/`SYSCALL_ERR`/
+  `PENDING`/`SLOW_IO`/`SCRATCH`/`TPBUF`（共 8 个 map，CI 断言）；
+- 运行期参数 `build_syscall`：`ret`/`filename` 偏移来自 `syscalls/*/format`；**四个 exit 的
+  `ret` 必须一致**否则整项拒绝；缺 `filename` 只丢路径、不拒绝（延迟仍然采）；
+  syscall 项**不需要 BTF**（内核程序不读内核结构体）；
+- 用户态：`ebpf_syscall_duration_micros{op,process_name,field=avg|p95}` 与
+  `ebpf_syscall_failures_total{op,errno}`；`service` 由 `dataserver` 的 `MetricSink` 补
+  （实测 `service="reader-svc"`）；
+- 慢调用：`slow_threshold_micros`（缺省 100ms）→ `SLOW_IO` → `data_type=ebpf` 的
+  `event_type=slow_io`，路径截断 256 字节（实测采到 `/proc/self/fd/17`）。
+
+实测（本机 sudo 真跑）：
+
+```
+openat calls=80/81/80/81  read calls=158/160/160/162   ← 唯一的 4 轮稳定 key（专用进程）
+慢调用 read 1711435us / 977195us（tail、clash-verge 的真实慢读）
+错误码 openat errno=17、read errno=11
+Prom: ebpf_syscall_duration_micros{service="reader-svc",field="avg"} 2 条序列
+      ebpf_syscall_duration_micros{op="openat",field="p95"} 77 条序列
+      ebpf_syscall_failures_total 6 条序列
+```
+
+#### P2 第二半（原第一半拆分文字，保留备查）
 
 按需求 6 与设计（挂载点、`SYSCALL_HIST`）拆成一次 PR 可以交付的范围：
 
@@ -230,7 +259,35 @@
 6. **产物与验证**：`scripts/build-ebpf.sh` 加 `syscall.o`、CI 作业加 map/段断言、提交 `.o`；
    上机用检查点跑 `--kind ebpf_syscall`，断言真实 `openat/read/write/fsync` 计数与错误码；
 
-#### P2 第二半：`ebpf_dns`（**有设计风险，建议先评审再动手**）
+### 修正：用户态不该再与上周期相减（本轮发现并修掉的严重 bug）
+
+**现象**：用一个专用进程（`zzreader`，每 4 秒周期稳定做 ~80 次 `openat` + ~160 次 `read`）验证
+syscall 采集时，第一轮报 `openat calls=80`，**第二轮只有 1**。
+
+**根因**：两处机制重复扣减 ——
+
+1. `loader` 的 `drain*` 读完内核 map 后会把计数**写零复位**（原注释："不写零会让下一周期重复计入"）；
+2. 用户态循环**又**与上一周期快照相减（`diff`/`diff_syscall`/`seen` 差分）。
+
+于是第二轮的值 = `本轮增量 − 上轮增量`，本轮 80、上轮 80 → 0（残差 1 是抖动）。设计文档里写的是
+「按键求和得到本周期**绝对值**，与上周期相减得到增量」，即设计假设内核计数**单调不减**；
+而实现（`MapSource::drain` 写零复位）与这个假设矛盾，两者叠加就是少计。
+
+**影响面**：`ebpf_network` 的边记录（连接数/字节/耗时/重传/直方图）、`ebpf_process` 的
+exec/exit/fork、以及新加的 syscall。**长期存在的 key 被严重少计**（长连接每轮的字节数、耗时会被减成 0）——
+这也解释了此前验证时看到的 `bytes_sent=0`、`duration_sum=0`：当时以为是「没有数据」，其实是少计。
+
+**修法**：**每次 drain 的结果就是本周期增量**，删掉三处差分（`aggregate::diff`、`syscall::diff_syscall`、
+`run_process_loop` 的 `seen`）。复位失败时 `drain` 返回 `Err` → 本周期跳过、数据留在内核 map 里
+下一轮读走，**既不重复也不丢**，所以不需要靠差分防重复。原来那个断言「次轮为增量 = 5-2 = 3」
+的用例本身在编码 bug，已改成 5 并写明原因。
+
+**修复后实测**：`openat` 80/81/80/81、`read` 158/160/160/162（与真实调用数一致）。
+
+**注**：早先 `todo.md` 里记录过的闭环数字（588 行边、164 条序列等）都是**修复前**采集的，
+比真实值偏低；管线本身是通的，量级口径以此处为准。
+
+#### `ebpf_dns`（**有设计风险，建议先评审再动手**）
 
 需求 7.1 要求「UDP 与 TCP 的请求/响应匹配耗时」+ 7.4「`query_name` 从 question 段解析」。
 麻烦在于**在 `udp_sendmsg`/`udp_recvmsg` 上取报文**：`msghdr.msg_iter` 是 `iov_iter`

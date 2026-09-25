@@ -39,7 +39,7 @@ cd "$crate_dir"
 CARGO_TARGET_DIR="$target_dir" cargo +nightly build --release --target bpfel-unknown-none -Z build-std=core --bins
 
 mkdir -p "$out_dir"
-for bin in network tcp process; do
+for bin in network tcp process syscall; do
     src="$target_dir/bpfel-unknown-none/release/$bin"
     [[ -f "$src" ]] || { echo "错误：缺少构建产物 $src" >&2; exit 1; }
     install -m 0644 "$src" "$out_dir/$bin.o"
@@ -52,7 +52,7 @@ done
 # （需要 128 位乘积判溢出），都会引用 compiler_builtins 的 `__multi3`。这种对象能编出来，
 # 但 aya 加载时会在函数重定位阶段失败（`error relocating function`），排查成本高。
 # 在构建期就挡住，比在目标机上发现便宜得多。
-for bin in network tcp process; do
+for bin in network tcp process syscall; do
     undefined="$(llvm-readelf -s "$out_dir/$bin.o" 2>/dev/null |
         awk '$4=="FUNC" && $7=="UND" {print $8}' | tr '\n' ' ')"
     if [[ -n "$undefined" ]]; then

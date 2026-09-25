@@ -2117,7 +2117,19 @@ async fn metric_sink_fills_service_for_process_metrics() {
         vec![("service".to_string(), "unknown-kworker/0:1".to_string())]
     );
 
-    // 非进程指标原样透传；已有 service 不覆盖；没有 process_name 不猜。
+    // syscall 延迟指标同样要补 service（需求 6.2 的维度里有它）。
+    assert_eq!(
+        sink.metric_tags("ebpf_syscall_duration_micros", &tags("java"))
+            .await,
+        vec![("service".to_string(), "order-service".to_string())]
+    );
+    assert_eq!(
+        sink.metric_tags("ebpf_syscall_failures_total", &tags("java"))
+            .await,
+        vec![("service".to_string(), "order-service".to_string())]
+    );
+
+    // 非进程/非 syscall 指标原样透传；已有 service 不覆盖；没有 process_name 不猜。
     assert!(sink
         .metric_tags("cpu_usage", &tags("java"))
         .await
@@ -2130,6 +2142,16 @@ async fn metric_sink_fills_service_for_process_metrics() {
         ("process_name".to_string(), "java".to_string()),
         ("service".to_string(), "already".to_string()),
     ]);
+    // 空 `service` 等同于「没填」：仍然补全。
+    let empty_service = BTreeMap::from([
+        ("process_name".to_string(), "java".to_string()),
+        ("service".to_string(), String::new()),
+    ]);
+    assert_eq!(
+        sink.metric_tags("ebpf_syscall_duration_micros", &empty_service)
+            .await,
+        vec![("service".to_string(), "order-service".to_string())]
+    );
     assert!(sink
         .metric_tags("ebpf_process_exec_total", &with_service)
         .await

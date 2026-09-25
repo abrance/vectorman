@@ -22,8 +22,11 @@ use crate::red::RedSamples;
 
 pub use crate::accumulator::ApmSinkConfig as Config;
 
-/// 需要补 `service` 维度的测量项前缀（进程生命周期指标）。
-const PROCESS_MEASUREMENT_PREFIX: &str = "ebpf_process_";
+/// 需要补 `service` 维度的测量项前缀。
+///
+/// - `ebpf_process_*`：进程生命周期指标（需求 4.6）；
+/// - `ebpf_syscall_*`：文件与 syscall 延迟指标（需求 6.2/6.3 的维度里也有 `service`）。
+const SERVICE_MEASUREMENT_PREFIXES: [&str; 2] = ["ebpf_process_", "ebpf_syscall_"];
 /// 进程名标签（Agent 侧写入）。
 const PROCESS_NAME_TAG: &str = "process_name";
 /// 服务名标签。
@@ -326,10 +329,15 @@ impl MetricSink for ApmSink {
         measurement: &str,
         tags: &BTreeMap<String, String>,
     ) -> Vec<(String, String)> {
-        if !measurement.starts_with(PROCESS_MEASUREMENT_PREFIX) {
+        if !SERVICE_MEASUREMENT_PREFIXES
+            .iter()
+            .any(|prefix| measurement.starts_with(prefix))
+        {
             return Vec::new();
         }
-        if tags.contains_key(SERVICE_TAG) {
+        // 已有**非空** `service` 才跳过：空值等于「没填」，不该挡住补全
+        // （Agent 侧曾发 `service: ""`，结果服务端判定「已有」而整条不补 —— 实测踩过）。
+        if tags.get(SERVICE_TAG).is_some_and(|v| !v.is_empty()) {
             return Vec::new();
         }
         let Some(process_name) = tags.get(PROCESS_NAME_TAG).filter(|v| !v.is_empty()) else {

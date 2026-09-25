@@ -248,18 +248,35 @@
   - **仍未覆盖**：① GSE 下发采集项这一跳（本工具走的是同一套用户态代码，但由手工启动，不经 GSE）；
     ② 前端 `/ebpf` 页只有单测，未做浏览器实跑；③ Pod **名**反查（需要 k8s 侧数据）。
 
-- [ ] 8. P2 文件与 syscall、DNS
-  - [ ] 8.1 内核态：`sys_enter/sys_exit_openat|read|write|fsync` 延迟直方图与错误码计数
+- [ ] 8. P2 文件与 syscall、DNS（**syscall 已完成**，DNS 待做）
+  - [x] 8.1 内核态：`sys_enter/sys_exit_openat|read|write|fsync` 延迟直方图与错误码计数
     - 对应需求 6.1-6.6
+    - 状态：**已完成**。`crates/gse-ebpf-programs/src/syscall.rs`：8 个 tracepoint（4 op × enter/exit）、
+      `SYSCALL_AGG`/`SYSCALL_ERR`/`PENDING`/`SLOW_IO`/`SCRATCH`/`TPBUF` 共 8 个 map；
+      `ret` 按 **64 位** 读（只读低 32 位会把大返回值当负数）；错误码按正数入键；
+      慢调用就地填 ringbuf 条目（避免 300+ 字节结构体上栈）。
   - [ ] 8.2 内核态：`udp_sendmsg`/`udp_recvmsg` 端口 53 过滤与 `DNS_PENDING` 匹配
     - 对应需求 7.1-7.5
-  - [ ] 8.3 用户态：`ebpf_syscall_duration_micros`、`ebpf_syscall_failures_total`、`ebpf_dns_duration_micros`、`ebpf_dns_timeouts_total`
+    - 状态：**未开工，且需要先评审**（`msghdr.msg_iter` 是 `iov_iter`，布局随版本变，
+      与「内核态不硬编码结构体偏移」冲突；三个候选方案见 `todo.md`）
+  - [x] 8.3 用户态：`ebpf_syscall_duration_micros`、`ebpf_syscall_failures_total`
     - 对应需求 6.2-6.3、7.2-7.3
-  - [ ] 8.4 慢调用阈值与原始慢事件上行（`slow_threshold_micros`）
+    - 状态：**syscall 部分已完成**（`gse-agent-ebpf/src/syscall.rs` + `run_syscall_loop`）：
+      维度 `op`/`process_name`/`field=avg|p95` 与 `op`/`errno`；`service` 不发（由 dataserver 的
+      `MetricSink` 用静态映射补，实测 `service="reader-svc"` 生效）。DNS 两个指标待做。
+  - [x] 8.4 慢调用阈值与原始慢事件上行（`slow_threshold_micros`）
     - 对应需求 6.5
-  - [ ] 8.5 采集项类型 `ebpf_syscall`、`ebpf_dns` 与 GSE 校验
+    - 状态：**已完成**：`EbpfConfig::slow_threshold_micros`（缺省 100_000，夹取 1ms..60s）经
+      `CfgIndex::SlowThresholdMicros` 下发；超阈值且 `raw_events_enabled` 时推 `SLOW_IO`，
+      用户态按抽样比例上行 `data_type=ebpf` 的 `event_type=slow_io`，路径截断 256 字节。
+  - [x] 8.5 采集项类型 `ebpf_syscall` 与 GSE 校验
     - 对应需求 2.1-2.5
-  - [ ] 8.6 单测：直方图到 avg/p95、errno 分组、DNS 事务匹配与超时、路径截断
+    - 状态：**已完成**：`EbpfItemKind::Syscall`（`as_str`/`parse`/`object_name`/挂载计划/聚合 map），
+      GSE 侧校验走既有 eBPF 分支。`ebpf_dns` 待做。
+  - [x] 8.6 单测：直方图到 avg/p95、errno 分组、路径截断（DNS 部分待做）
+    - 状态：**syscall 部分已完成**：per-CPU 求和（max 取 max 不相加）、p95 槽上界（含溢出槽）、
+      avg/p95 指标点的维度与空值跳过、errno 计数、慢调用记录的契约字段与时间戳换算、
+      路径截断/NUL 处理/非法 UTF-8 不 panic、`build_syscall` 的偏移一致性与兜底。
 - [ ] 9. P3 CPU profile 与火焰图
   - [ ] 9.1 内核态：每 tid `perf_event_open`、`bpf_get_stackid(BPF_F_USER_STACK)`、`STACKS` map
     - 对应需求 8.1-8.2

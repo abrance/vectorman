@@ -92,6 +92,12 @@ jobs:
             kprobe/tcp_send_active_reset maps
           check process.o tracepoint/sched/sched_process_exec \
             tracepoint/sched/sched_process_exit tracepoint/sched/sched_process_fork maps
+          # syscall（P2）：4 个 op × enter/exit —— 段名就是 tracepoint 类别/名字。
+          check syscall.o tracepoint/syscalls/sys_enter_openat \
+            tracepoint/syscalls/sys_exit_openat \
+            tracepoint/syscalls/sys_enter_read tracepoint/syscalls/sys_exit_read \
+            tracepoint/syscalls/sys_enter_write tracepoint/syscalls/sys_exit_write \
+            tracepoint/syscalls/sys_enter_fsync tracepoint/syscalls/sys_exit_fsync maps
 
           # map 数量必须与源码里的 `#[map]` 声明数一致：legacy `bpf_map_def` 每条 28 字节。
           # 这条断言能抓住「新增了 map 但构建脚本/程序名不一致」这类静默漂移。
@@ -114,7 +120,9 @@ jobs:
           }
           # network: CONN_AGG/CONN_START/ENTRY/CFG/RATE/TPBUF/SCRATCH（后两个是上机验证发现的
           #          「栈放不下」问题引入的 per-CPU 缓冲/暂存区）；
-          # tcp: TCP_AGG/ENTRY/CFG/RATE；process: PROC_AGG/EVENTS/CFG/RATE
+          # tcp: TCP_AGG/ENTRY/CFG/RATE；process: PROC_AGG/EVENTS/CFG/RATE；
+          # syscall: SYSCALL_AGG/SYSCALL_ERR/PENDING/SLOW_IO/CFG/RATE/SCRATCH/TPBUF
           expect_maps network.o 7
           expect_maps tcp.o 4
           expect_maps process.o 4
+          expect_maps syscall.o 8

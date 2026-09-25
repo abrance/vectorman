@@ -18,10 +18,22 @@ use gse_agent_ebpf::{
     config::EbpfConfig,
     loader::{object_bytes, LoadedItem},
     preflight::{PreflightEnv, PreflightReport},
-    run_loop, run_process_loop, EbpfSink, EbpfStats,
+    run_loop, run_process_loop, run_syscall_loop, EbpfSink, EbpfStats,
 };
 
 use crate::collect::{k8s, kubeconfig, CollectShared};
+
+/// syscall 采集项需要的 tracepoint `format`（顺序：openat/read/write/fsync 的 exit）。
+pub const SYSCALL_FORMATS: [&str; 8] = [
+    "syscalls/sys_exit_openat",
+    "syscalls/sys_exit_read",
+    "syscalls/sys_exit_write",
+    "syscalls/sys_exit_fsync",
+    "syscalls/sys_enter_openat",
+    "syscalls/sys_enter_read",
+    "syscalls/sys_enter_write",
+    "syscalls/sys_enter_fsync",
+];
 
 /// tracepoint `format` 文件路径（`inet_sock_set_state`）。
 pub const FORMAT_PATH: &str = "/sys/kernel/tracing/events/sock/inet_sock_set_state/format";
@@ -160,13 +172,27 @@ pub async fn run_item(
     }
 }
 
+/// 读一个 tracepoint 的 `format`（tracing → debugfs 兜底；都不可读返回 `None`）。
+fn read_format(event: &str) -> Option<String> {
+    for root in [
+        "/sys/kernel/tracing/events",
+        "/sys/kernel/debug/tracing/events",
+    ] {
+        let path = format!("{root}/{event}/format");
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            return Some(text);
+        }
+    }
+    None
+}
+
 /// 加载并挂载，返回可读取 map 的采集项。
 fn load(
     kind: EbpfItemKind,
     config: &EbpfConfig,
     pod_names: Option<PodNameLoader>,
 ) -> Result<LoadedItem, String> {
-    let cfg_values = resolve_cfg(config)?;
+    let cfg_values = resolve_cfg(kind, config)?;
     let object = object_bytes(kind);
     LoadedItem::load(kind, object, config, &cfg_values, pod_names)
 }
@@ -187,7 +213,31 @@ fn pod_name_loader(collector: &serde_json::Value) -> Option<PodNameLoader> {
 /// 运行期参数：BTF 偏移 + tracepoint `format` 字段偏移 + TCP 状态常量。
 ///
 /// 任何一项取不到都返回 `Err`（内核态不按猜测值跑）。
-fn resolve_cfg(config: &EbpfConfig) -> Result<CfgValues, String> {
+fn resolve_cfg(kind: EbpfItemKind, config: &EbpfConfig) -> Result<CfgValues, String> {
+    // `ebpf_syscall` 不需要 BTF（内核程序只读 tracepoint 缓冲与助手），单独一条路径。
+    if kind == EbpfItemKind::Syscall {
+        let texts: Vec<Option<String>> = SYSCALL_FORMATS.iter().map(|e| read_format(e)).collect();
+        if texts.iter().all(Option::is_none) {
+            eprintln!(
+                "gse-agent: 读取 syscall tracepoint format 全部失败，改用兜底布局（16/24，已按 tracepoint 头结构推导）"
+            );
+        }
+        return CfgValues::build_syscall(
+            [
+                texts[0].as_deref(),
+                texts[1].as_deref(),
+                texts[2].as_deref(),
+                texts[3].as_deref(),
+            ],
+            texts[4].as_deref(),
+            config,
+        );
+    }
+    resolve_network_cfg(config)
+}
+
+/// 连接/进程类的运行期参数（需要 BTF）。
+fn resolve_network_cfg(config: &EbpfConfig) -> Result<CfgValues, String> {
     let btf =
         Btf::parse(&std::fs::read(BTF_PATH).map_err(|e| format!("读取 {BTF_PATH} 失败：{e}"))?)?;
     let format_text = match std::fs::read_to_string(FORMAT_PATH) {
@@ -230,6 +280,10 @@ async fn run_loaded(
         EbpfItemKind::Process => {
             let _ = report;
             run_process_loop(source, sink, config, item_id, agent_id, stats).await;
+        }
+        EbpfItemKind::Syscall => {
+            let _ = report;
+            run_syscall_loop(source, sink, config, item_id, agent_id, stats).await;
         }
         // network/tcp 走连接差分循环；`ebpf_tcp` 只出指标（边记录由 `emits_edges` 决定）。
         _ => {
