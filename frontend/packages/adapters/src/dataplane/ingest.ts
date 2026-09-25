@@ -3,7 +3,18 @@ import type { Agent } from "../gse/admin";
 import type { PromEnvelope } from "./prom";
 
 /// 采集项类型。
-export type CollectItemKind = "metrics_host" | "log_file" | "log_k8s_stdout" | "apm_otlp";
+///
+/// `ebpf_*` 系列由内核态程序采集，前置条件是 Linux + 内核 ≥5.8 + BTF + root
+/// （不满足时 Agent 只降级该项并上报 `agent_ebpf_capability` 说明原因）。
+export type CollectItemKind =
+  | "metrics_host"
+  | "log_file"
+  | "log_k8s_stdout"
+  | "apm_otlp"
+  | "ebpf_network"
+  | "ebpf_tcp"
+  | "ebpf_process"
+  | "ebpf_syscall";
 
 /// 清洗提取规则。
 export type ExtractRule = {

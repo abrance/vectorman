@@ -259,6 +259,17 @@ Prom: ebpf_syscall_duration_micros{service="reader-svc",field="avg"} 2 条序列
 6. **产物与验证**：`scripts/build-ebpf.sh` 加 `syscall.o`、CI 作业加 map/段断言、提交 `.o`；
    上机用检查点跑 `--kind ebpf_syscall`，断言真实 `openat/read/write/fsync` 计数与错误码；
 
+### 补：前端此前无法创建 eBPF 采集项（已修）
+
+发现于封版前逐项核对接口与前端选项时：**GSE 白名单漏了 `ebpf_syscall`**（建该类型返回
+`unsupported kind`），且**前端「采集链路」页的类型下拉只有 `metrics_host/log_file/log_k8s_stdout/apm_otlp`**
+—— 界面根本开不出任何 eBPF 采集项，`/ebpf` 页的数据只能靠 API/CLI 灌。
+
+已修：白名单补 `ebpf_syscall`（并加「四种 eBPF 类型逐个建」的用例）；前端补 4 个类型
+（下拉 + 按类型面板：上报间隔、慢调用阈值（syscall）、采集回环、原始事件开关 + 前置条件提示），
+`toCollectItemInput` 按类型裁剪 `collector`。真实 API 验证：四个类型经 dataserver 反代到 GSE
+均返回 201，`collector` 形状按类型裁剪正确。
+
 ### 修正：用户态不该再与上周期相减（本轮发现并修掉的严重 bug）
 
 **现象**：用一个专用进程（`zzreader`，每 4 秒周期稳定做 ~80 次 `openat` + ~160 次 `read`）验证
