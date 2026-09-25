@@ -18,7 +18,7 @@ mod common;
 use aya_ebpf::{
     cty::c_void,
     macros::{kprobe, kretprobe, map},
-    maps::{Array, HashMap, PerCpuHashMap},
+    maps::{Array, HashMap, PerCpuArray, PerCpuHashMap},
     programs::{ProbeContext, RetProbeContext},
 };
 use ebpf_abi::{ConnAggWire, ConnKey, CFG_LEN};
@@ -31,6 +31,10 @@ static ENTRY: HashMap<u64, ConnKey> = HashMap::with_max_entries(16384, 0);
 
 #[map]
 static CFG: Array<u64> = Array::with_max_entries(CFG_LEN, 0);
+
+/// 令牌桶状态（per-CPU：令牌数、上次补充时间、被限流丢弃数）。
+#[map]
+static RATE: PerCpuArray<u64> = PerCpuArray::with_max_entries(common::rate_slot::LEN, 0);
 
 #[inline(always)]
 fn bump<F: FnOnce(&mut ConnAggWire)>(key: &ConnKey, f: F) {
@@ -56,7 +60,7 @@ fn take_entry() -> Option<ConnKey> {
 
 #[inline(always)]
 fn stash_entry(ctx: &ProbeContext) {
-    if !common::cfg_ready(&CFG) {
+    if !common::cfg_ready(&CFG) || !common::rate_allow(&CFG, &RATE) {
         return;
     }
     let Some(sk) = ctx.arg::<*const c_void>(0) else {
@@ -91,7 +95,7 @@ fn tcp_retransmit_skb_ret(ctx: RetProbeContext) -> u32 {
 /// `tcp_send_active_reset` 返回 void：入口直接建键计数，不需要 kretprobe 配对。
 #[kprobe(function = "tcp_send_active_reset")]
 fn tcp_send_active_reset_entry(ctx: ProbeContext) -> u32 {
-    if !common::cfg_ready(&CFG) {
+    if !common::cfg_ready(&CFG) || !common::rate_allow(&CFG, &RATE) {
         return 0;
     }
     let Some(sk) = ctx.arg::<*const c_void>(0) else {

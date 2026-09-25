@@ -14,8 +14,11 @@
 
 use aya_ebpf::{
     cty::{c_int, c_void},
-    helpers::{bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_probe_read_kernel},
-    maps::Array,
+    helpers::{
+        bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_ktime_get_ns,
+        bpf_probe_read_kernel,
+    },
+    maps::{Array, PerCpuArray},
 };
 use ebpf_abi::{CfgIndex, ConnAggWire, ConnKey, CFG_VERSION, REASON_NONE};
 
@@ -142,6 +145,54 @@ pub fn is_state(cfg_map: &Array<u64>, index: CfgIndex, state: c_int) -> bool {
 #[inline(always)]
 pub fn current_owner() -> (u32, u64) {
     (current_tgid(), current_cgroup_id())
+}
+
+/// 令牌桶状态在 `PerCpuArray` 里的下标。
+pub mod rate_slot {
+    /// 剩余令牌。
+    pub const TOKENS: u32 = 0;
+    /// 上次补充时间（纳秒），0 表示首次。
+    pub const LAST_NS: u32 = 1;
+    /// 累计被限流丢弃的事件数（用户态读走并复位）。
+    pub const DROPPED: u32 = 2;
+    /// 数组长度。
+    pub const LEN: u32 = 3;
+}
+
+/// 令牌桶放行判定（需求 9.5、12.1-12.2）。
+///
+/// 内核态不做 CPU 百分比测量（拿不到），限流口径是**每秒事件数 + 突发容量**；
+/// 决策函数在 `ebpf-abi` 里，宿主侧有单测（含首次、补充、时钟回拨、溢出边界）。
+/// 被拒绝的事件在这里累加计数，用户态周期性读走并复位（对应 `agent_ebpf_rate_limited_total`）。
+#[inline(always)]
+pub fn rate_allow(cfg_map: &Array<u64>, rate: &PerCpuArray<u64>) -> bool {
+    let rate_per_sec = cfg(cfg_map, CfgIndex::RateLimitPerSec).unwrap_or(0);
+    if rate_per_sec == 0 {
+        // 0 表示不限制：保持「配置成 0 就不限流」的直觉，避免误配把采集整体掐死。
+        return true;
+    }
+    let burst = cfg(cfg_map, CfgIndex::RateLimitBurst).unwrap_or(1);
+    let (Some(tokens_ptr), Some(last_ptr), Some(dropped_ptr)) = (
+        rate.get_ptr_mut(rate_slot::TOKENS),
+        rate.get_ptr_mut(rate_slot::LAST_NS),
+        rate.get_ptr_mut(rate_slot::DROPPED),
+    ) else {
+        // 拿不到限流状态时**放行**：宁可采多，也不要因为缺 map 变成不采集。
+        return true;
+    };
+    let tokens = unsafe { *tokens_ptr };
+    let last_ns = unsafe { *last_ptr };
+    let now_ns = unsafe { bpf_ktime_get_ns() };
+    let (next_tokens, allowed) =
+        ebpf_abi::token_bucket_step(tokens, last_ns, now_ns, rate_per_sec, burst);
+    unsafe {
+        *tokens_ptr = next_tokens;
+        *last_ptr = now_ns;
+        if !allowed {
+            *dropped_ptr = (*dropped_ptr).saturating_add(1);
+        }
+    }
+    allowed
 }
 
 /// 失败原因默认值（内核态只写枚举，文案在用户态映射）。

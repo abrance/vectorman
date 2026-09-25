@@ -421,6 +421,19 @@ Agent 侧产出（每 60 秒一批），严格按 `observability-data-model` 命
 - P2、P3 各自独立用例；P3 额外断言折叠栈可被 `flamegraph` 类工具消费（格式校验），且 `symbolized` 标记与符号可用性一致。
 - CI 说明：特权测试不在默认流水线内，通过单独脚本与专用 runner 触发；CI 只保证编译与用户态单测。
 
+### 资源限制的口径（实现期修正）
+
+需求 12.1 写的是 `max_cpu_percent` 限制「CPU 占用」，但**内核态没有可用的 CPU 时间测量手段**：
+BPF 程序里读不到「本次执行消耗了多少 CPU」。因此实现的口径是：
+
+- 内核态：**每秒事件数上限**（`max_events_per_sec`）+ **突发容量**（速率的 1/10，夹取 `1..=10_000`）的令牌桶，
+  每个 CPU 一份（`RATE: PerCpuArray<u64>`：令牌数 / 上次补充时间 / 被限流丢弃数）；
+- 用户态：`max_cpu_percent` 作为**告警阈值**（Agent 自身 CPU 占用超限时告警），不参与内核态丢弃决策；
+- 决策函数 `ebpf_abi::token_bucket_step` 放在共享 crate，**在宿主机单测**（首次给满桶、按纳秒线性补充、
+  时钟回拨 saturating、溢出边界）；内核态只做读改写；
+- 拿不到限流状态时**放行**而不是拒绝：宁可多采，也不要因为缺一个 map 变成完全不采集；
+- 丢弃数由用户态周期性读走并复位（`EbpfSnapshot.rate_limited`），对应需求 12.3 的「统计并输出触发次数」。
+
 ## Pitfalls
 
 - eBPF 程序需要用 `bpfel-unknown-none` 目标构建，依赖 nightly 工具链，与现有 musl 静态构建的工具链不同。方案：CI 单独一步产出 `*.o`，产物入库到 `packaging/ebpf/`，用户态通过 `include_bytes!` 嵌入；部署期不编译（对应需求 17.6）。

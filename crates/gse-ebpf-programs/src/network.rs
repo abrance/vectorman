@@ -29,7 +29,7 @@ use aya_ebpf::{
     cty::c_void,
     helpers::bpf_ktime_get_ns,
     macros::{kprobe, kretprobe, map, tracepoint},
-    maps::{Array, HashMap, PerCpuHashMap},
+    maps::{Array, HashMap, PerCpuArray, PerCpuHashMap},
     programs::{ProbeContext, RetProbeContext, TracePointContext},
 };
 use ebpf_abi::{
@@ -54,6 +54,10 @@ static ENTRY: HashMap<u64, ConnKey> = HashMap::with_max_entries(16384, 0);
 /// 运行期参数（结构体偏移、tracepoint 字段偏移、状态常量），由用户态下发。
 #[map]
 static CFG: Array<u64> = Array::with_max_entries(CFG_LEN, 0);
+
+/// 令牌桶状态（per-CPU：令牌数、上次补充时间、被限流丢弃数）。
+#[map]
+static RATE: PerCpuArray<u64> = PerCpuArray::with_max_entries(common::rate_slot::LEN, 0);
 
 #[inline(always)]
 fn bump<F: FnOnce(&mut ConnAggWire)>(key: &ConnKey, f: F) {
@@ -80,7 +84,7 @@ fn inet_sock_set_state(ctx: TracePointContext) -> u32 {
 }
 
 fn try_inet_sock_set_state(ctx: &TracePointContext) -> Result<(), i64> {
-    if !common::cfg_ready(&CFG) {
+    if !common::cfg_ready(&CFG) || !common::rate_allow(&CFG, &RATE) {
         return Ok(());
     }
     let (Some(offset_old), Some(offset_new), Some(offset_sport), Some(offset_dport), Some(offset_family), Some(offset_saddr), Some(offset_daddr)) = (
@@ -163,7 +167,7 @@ fn take_entry() -> Option<ConnKey> {
 /// kprobe 入口：把连接键按 tid 暂存，供 kretprobe 使用。
 #[inline(always)]
 fn stash_entry(ctx: &ProbeContext) {
-    if !common::cfg_ready(&CFG) {
+    if !common::cfg_ready(&CFG) || !common::rate_allow(&CFG, &RATE) {
         return;
     }
     let Some(sk) = ctx.arg::<*const c_void>(0) else {

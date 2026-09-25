@@ -112,7 +112,8 @@ jobs:
             fi
             echo "$file map 数=$count"
           }
-          # network: CONN_AGG/CONN_START/ENTRY/CFG；tcp: TCP_AGG/ENTRY/CFG；process: PROC_AGG/EVENTS/CFG
-          expect_maps network.o 4
-          expect_maps tcp.o 3
-          expect_maps process.o 3
+          # network: CONN_AGG/CONN_START/ENTRY/CFG/RATE；tcp: TCP_AGG/ENTRY/CFG/RATE；
+          # process: PROC_AGG/EVENTS/CFG/RATE
+          expect_maps network.o 5
+          expect_maps tcp.o 4
+          expect_maps process.o 4

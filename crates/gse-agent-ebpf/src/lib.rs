@@ -68,6 +68,13 @@ pub trait MapSource: Send {
     fn attached_programs(&self) -> u64 {
         0
     }
+
+    /// 读走内核态因**限流**丢弃的事件数（跨 CPU 求和并复位）。
+    ///
+    /// 与聚合值同样的口径：读走就复位，否则下一周期会重复计入。
+    fn take_rate_limit_drops(&mut self) -> u64 {
+        0
+    }
 }
 
 /// 上行出口：把边记录与指标交给既有采集通道（`CollectShared::push`）。
@@ -96,6 +103,8 @@ pub struct EbpfStats {
     pub read_errors: AtomicU64,
     /// map 满丢弃计数（内核态 `OVERFLOW_SLOT` 汇总）。
     pub map_overflow_dropped: AtomicU64,
+    /// 被内核态令牌桶限流丢弃的事件数（需求 12.3 要求可观测）。
+    pub rate_limited: AtomicU64,
 }
 
 /// 统计快照。
@@ -108,6 +117,7 @@ pub struct EbpfSnapshot {
     pub idle_keys: u64,
     pub read_errors: u64,
     pub map_overflow_dropped: u64,
+    pub rate_limited: u64,
 }
 
 impl EbpfStats {
@@ -121,6 +131,7 @@ impl EbpfStats {
             idle_keys: self.idle_keys.load(Ordering::Relaxed),
             read_errors: self.read_errors.load(Ordering::Relaxed),
             map_overflow_dropped: self.map_overflow_dropped.load(Ordering::Relaxed),
+            rate_limited: self.rate_limited.load(Ordering::Relaxed),
         }
     }
 }
@@ -186,6 +197,10 @@ pub async fn run_loop(
             }
         };
         stats.flushes.fetch_add(1, Ordering::Relaxed);
+        let limited = source.take_rate_limit_drops();
+        if limited > 0 {
+            stats.rate_limited.fetch_add(limited, Ordering::Relaxed);
+        }
         let bucket_ts = bucket_start(now_micros(), cfg.bucket_secs);
 
         let mut edges = Vec::new();
@@ -276,6 +291,10 @@ pub async fn run_process_loop(
             }
         };
         stats.flushes.fetch_add(1, Ordering::Relaxed);
+        let limited = source.take_rate_limit_drops();
+        if limited > 0 {
+            stats.rate_limited.fetch_add(limited, Ordering::Relaxed);
+        }
         let bucket_ts = bucket_start(now_micros(), cfg.bucket_secs);
 
         for (key, per_cpu) in snapshot {

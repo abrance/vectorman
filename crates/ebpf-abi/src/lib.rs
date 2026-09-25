@@ -200,12 +200,68 @@ pub enum CfgIndex {
     IncludeLoopback,
     /// 是否输出原始事件到 RingBuf（0/1）。
     RawEventsEnabled,
+    /// 令牌桶速率（每秒事件数）；0 表示不限制。
+    RateLimitPerSec,
+    /// 令牌桶容量（突发上限）。
+    RateLimitBurst,
     /// 单位：`u64` 槽位数量占位，便于后续扩展时保持枚举稳定。
     Reserved,
 }
 
 /// `CFG` map 的长度（下标上限，留余量便于向后兼容追加）。
 pub const CFG_LEN: u32 = 64;
+
+/// 令牌桶一步：返回「消费后剩余令牌」与「是否放行」。
+///
+/// 放在共享 crate 里是为了**能在宿主机单测**：内核态只做「读 map → 调用本函数 → 写回」，
+/// 决策逻辑（含边界：首次、长时间无事件、零速率、溢出）都在这里验证。
+///
+/// - `last_ns == 0` 视为首次：直接给满桶（避免启动瞬间按「从时间零点到现在」的超大额度放行）；
+/// - 补充速率按 `rate_per_sec` 线性计算，向上取整到整秒之外用整数除法（宁可少补，不多放）；
+/// - `rate_per_sec == 0` 由调用方判为「不限制」，不会进到这里。
+#[must_use]
+pub const fn token_bucket_step(
+    tokens: u64,
+    last_ns: u64,
+    now_ns: u64,
+    rate_per_sec: u64,
+    burst: u64,
+) -> (u64, bool) {
+    let burst = if burst == 0 { 1 } else { burst };
+    let available = if last_ns == 0 {
+        burst
+    } else {
+        let elapsed_ns = now_ns.saturating_sub(last_ns);
+        let refill = elapsed_ns.saturating_mul(rate_per_sec) / 1_000_000_000;
+        let filled = tokens.saturating_add(refill);
+        // `min` 在 const fn 里还不能用（`Ord` 不是 const trait），手写比较。
+        if filled > burst {
+            burst
+        } else {
+            filled
+        }
+    };
+    if available == 0 {
+        (0, false)
+    } else {
+        (available - 1, true)
+    }
+}
+
+/// 由事件速率上限推导令牌桶容量：速率的 1/10，夹取到 1..=10_000。
+///
+/// 容量太小会把正常突发（例如连接风暴）当超限丢弃；太大则失去「限流」的意义。
+#[must_use]
+pub const fn burst_for_rate(rate_per_sec: u64) -> u64 {
+    let burst = rate_per_sec / 10;
+    if burst == 0 {
+        1
+    } else if burst > 10_000 {
+        10_000
+    } else {
+        burst
+    }
+}
 
 /// 当前配置格式版本；用户态与内核态不一致时不采集。
 pub const CFG_VERSION: u64 = 1;
@@ -296,6 +352,64 @@ mod tests {
             REASON_REFUSED,
             "正数 errno 同样接受"
         );
+    }
+
+    #[test]
+    fn token_bucket_allows_burst_then_blocks() {
+        let rate = 1_000u64; // 每秒 1000 个
+        let burst = burst_for_rate(rate);
+        assert_eq!(burst, 100);
+        // 首次调用直接给满桶。
+        let (tokens, allowed) = token_bucket_step(0, 0, 1_000_000_000, rate, burst);
+        assert!(allowed);
+        assert_eq!(tokens, burst - 1);
+        // 同一时刻连续取：取完 burst 个之后开始拒绝。
+        let mut tokens_left = tokens;
+        let mut allowed_count = 1u64;
+        for _ in 0..burst {
+            let (next, ok) =
+                token_bucket_step(tokens_left, 1_000_000_000, 1_000_000_000, rate, burst);
+            tokens_left = next;
+            if ok {
+                allowed_count += 1;
+            }
+        }
+        assert_eq!(allowed_count, burst, "同一时刻最多放行一桶");
+        assert_eq!(tokens_left, 0);
+        let (_, blocked) = token_bucket_step(0, 1_000_000_000, 1_000_000_000, rate, burst);
+        assert!(!blocked, "没令牌必须拒绝");
+    }
+
+    #[test]
+    fn token_bucket_refills_with_time() {
+        let rate = 1_000u64;
+        let burst = burst_for_rate(rate);
+        // 空桶等 100ms：补 100 个（1000 * 0.1）。
+        let (tokens, allowed) = token_bucket_step(0, 1_000_000_000, 1_100_000_000, rate, burst);
+        assert!(allowed);
+        assert_eq!(tokens, 99);
+        // 等 1 秒：补满但不超容量。
+        let (tokens, _) = token_bucket_step(0, 1_000_000_000, 2_000_000_000, rate, burst);
+        assert_eq!(tokens, burst - 1);
+        // 等很久（时钟回拨用 saturating：`now < last` 时不补也不崩）。
+        let (tokens, allowed) = token_bucket_step(5, 2_000_000_000, 1_000_000_000, rate, burst);
+        assert!(allowed);
+        assert_eq!(tokens, 4);
+        // 溢出边界：超大 elapsed 不 panic。
+        let (_, allowed) = token_bucket_step(0, 1, u64::MAX, u64::MAX, 10);
+        assert!(allowed);
+    }
+
+    #[test]
+    fn burst_for_rate_edges() {
+        assert_eq!(burst_for_rate(0), 1);
+        assert_eq!(
+            burst_for_rate(5),
+            1,
+            "不足 10 也给 1，不能是 0（0 会被当作满桶）"
+        );
+        assert_eq!(burst_for_rate(50_000), 5_000);
+        assert_eq!(burst_for_rate(10_000_000), 10_000, "上限 1 万");
     }
 
     #[test]
