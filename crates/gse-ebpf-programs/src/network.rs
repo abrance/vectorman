@@ -68,7 +68,10 @@ fn bump<F: FnOnce(&mut ConnAggWire)>(key: &ConnKey, f: F) {
 }
 
 /// 连接状态迁移：建连、关闭时长、主动连接超时失败。
-#[tracepoint]
+///
+/// 显式写 `name`/`category`：段名会变成 `tracepoint/sock/inet_sock_set_state`，
+/// 与挂载计划一一对应（不带参数时段名只有 `tracepoint`，核对时容易看漏）。
+#[tracepoint(name = "inet_sock_set_state", category = "sock")]
 fn inet_sock_set_state(ctx: TracePointContext) -> u32 {
     match try_inet_sock_set_state(&ctx) {
         Ok(()) => 0,

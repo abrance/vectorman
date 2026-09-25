@@ -4,6 +4,8 @@ on:
   pull_request:
   push:
     branches: [main]
+  # 手动触发：用于产出 eBPF 内核态对象文件（见下面的 ebpf-objects 作业）。
+  workflow_dispatch:
 
 jobs:
   rust-ci:
@@ -23,3 +25,94 @@ jobs:
           rustup toolchain install nightly --profile minimal --component rust-src
       - name: Type-check eBPF programs
         run: scripts/build-ebpf.sh --check
+
+  # 产出 `*.o` 需要 bpf-linker + LLVM 21+（bpf-linker 0.11 的默认 feature 是 LLVM 23）。
+  # 只在手动触发时跑：PR 流水线不依赖它（构建链依赖不在默认 runner 上，且不需要每次都编）。
+  # 产物作为 artifact 上传，供检查或按发布流程内嵌（`gse-agent-ebpf/build.rs` 会内嵌
+  # `packaging/ebpf/*.o`；发布脚本 `packaging/build-package.sh` 在本机有 bpf-linker 时自动带上）。
+  ebpf-objects:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LLVM
+        run: |
+          # LLVM 主版本必须 **≥ rustc 的 LLVM**：bpf-linker 读 rustc 产出的位码，
+          # 版本低会报 `Unknown attribute kind (N) (Producer: LLVMxx Reader: LLVM 21.x)`。
+          # nightly 1.100 用的是 LLVM 23，所以这里装 23（bpf-linker 0.11 默认 feature 也是 llvm-23）。
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key |
+            sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" |
+            sudo tee /etc/apt/sources.list.d/llvm-23.list >/dev/null
+          sudo apt-get update -q
+          sudo apt-get install -y -q llvm-23-dev libclang-23-dev clang-23
+          # bpf-linker 的 build.rs 自己找 LLVM：优先 `LLVM_PREFIX`，否则在 **PATH** 上找
+          # 不带版本后缀的 `llvm-config`（apt.llvm.org 提供的是 `llvm-config-23`）。
+          echo "/usr/lib/llvm-23/bin" >> "$GITHUB_PATH"
+          /usr/lib/llvm-23/bin/llvm-config --version
+      - name: Install bpf-linker
+        env:
+          # llvm-sys（bpf-linker 的依赖）认这个；bpf-linker 自己的 build.rs 另认 LLVM_PREFIX。
+          LLVM_SYS_231_PREFIX: /usr/lib/llvm-23
+          LLVM_PREFIX: /usr/lib/llvm-23
+        run: cargo install bpf-linker
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+      - name: Build eBPF object files
+        run: scripts/build-ebpf.sh
+      - name: Upload object files
+        uses: actions/upload-artifact@v4
+        with:
+          name: ebpf-objects
+          path: packaging/ebpf/*.o
+          if-no-files-found: error
+      - name: Inspect object files
+        run: |
+          set -euo pipefail
+          # 段名是**实测**结果（aya-bpf 0.2 + LLVM 23）：程序段就是 `kprobe/<fn>`、`kretprobe/<fn>`、
+          # `tracepoint/<cat>/<name>`，map 段叫 `maps`（没有点），且**没有** `.BTF` 段 ——
+          # 这一版 aya-bpf 传的是 legacy `bpf_map_def` 数组。任何段名变化都会在这里暴露。
+          has_section() { llvm-readelf -S "$1" | grep -qE "^ *\[ *[0-9]+\] $2 " ; }
+          check() {
+            local file="packaging/ebpf/$1"; shift
+            for section in "$@"; do
+              if ! has_section "$file" "$section"; then
+                echo "缺少段 $section：$file" >&2
+                llvm-readelf -S "$file" >&2
+                exit 1
+              fi
+            done
+            echo "$file 段检查通过（$# 个）"
+          }
+          check network.o kprobe/tcp_sendmsg kretprobe/tcp_sendmsg \
+            kprobe/tcp_recvmsg kretprobe/tcp_recvmsg \
+            kprobe/tcp_connect kretprobe/tcp_connect \
+            tracepoint/sock/inet_sock_set_state maps
+          check tcp.o kprobe/tcp_retransmit_skb kretprobe/tcp_retransmit_skb \
+            kprobe/tcp_send_active_reset maps
+          check process.o tracepoint/sched/sched_process_exec \
+            tracepoint/sched/sched_process_exit tracepoint/sched/sched_process_fork maps
+
+          # map 数量必须与源码里的 `#[map]` 声明数一致：legacy `bpf_map_def` 每条 28 字节。
+          # 这条断言能抓住「新增了 map 但构建脚本/程序名不一致」这类静默漂移。
+          # 注意：段索引的位数会让列位置漂移（`[ 9]` 与 `[15]` 差一列），
+          # 所以先把 `[ Nr]` 前缀剥掉再取列，不要直接 awk '{print $6}'。
+          maps_count() {
+            local size
+            size=$(llvm-readelf -S "$1" | grep -E "^ *\[ *[0-9]+\] maps " |
+                     sed -E 's/^ *\[ *[0-9]+\] +//' | awk '{print $5}')
+            echo $((16#$size / 28))
+          }
+          expect_maps() {
+            local file="packaging/ebpf/$1" count
+            count=$(maps_count "$file")
+            if [[ "$count" != "$2" ]]; then
+              echo "$file 的 map 数应为 $2，实测 $count" >&2
+              exit 1
+            fi
+            echo "$file map 数=$count"
+          }
+          # network: CONN_AGG/CONN_START/ENTRY/CFG；tcp: TCP_AGG/ENTRY/CFG；process: PROC_AGG/EVENTS/CFG
+          expect_maps network.o 4
+          expect_maps tcp.o 3
+          expect_maps process.o 3

@@ -105,6 +105,11 @@ graph TD
 
 ### 用户态加载与采集循环（实现期补充）
 
+- **对象文件的真实结构**（CI 实测，aya-bpf 0.2 + LLVM 23）：程序段就是 `kprobe/<函数名>`、`kretprobe/<函数名>`、
+  `tracepoint/<category>/<name>`；map 段叫 **`maps`（没有点号）**，内容是 legacy `bpf_map_def` 数组（每条 28 字节），
+  **没有 `.BTF` 段**。因此 `#[tracepoint]` 要显式写 `name`/`category`（否则段名退化成 `tracepoint`，核对时容易看漏），
+  aya 用户态按**程序名**（函数名）取程序，不依赖段名。CI 的 `ebpf-objects` 作业按这些段名与 map 数量做断言，
+  能抓住「编出来了但内容不对」和「新增 map 后名称/数量漂移」两类问题。
 - **目标文件嵌入**：`packaging/ebpf/*.o` 由 `build.rs` 生成 `OUT_DIR/ebpf_objects.rs`（存在则 `include_bytes!` 绝对路径，不存在则空切片）。直接写 `include_bytes!` 会让「没构建过 eBPF 的仓库」编译失败，而空切片能让仓库始终可编译，同时运行时给出「先跑 `scripts/build-ebpf.sh`」的明确错误。注意区分这个错误与「内核不支持」（那是 preflight 的结论）。
 - **每个采集项一份 map**：`ebpf_network` 用 `CONN_AGG`、`ebpf_tcp` 用 `TCP_AGG`、`ebpf_process` 用 `PROC_AGG`。若两者共享同一 map，两个采集项会各读一次同一批增量 → 重复计数。同理 `ebpf_tcp` **只出指标不出边记录**：边记录按 `record_id` 覆盖写，两路都发会让同一连接的字段互相覆盖。
 - **`aya::Pod` 与孤儿规则**：`ebpf-abi` 是内核态共享 crate，不能依赖 `aya`；用户态用 `#[repr(transparent)]` 包装类型在本地实现 `aya::Pod`，读写时取出内层值。

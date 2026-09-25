@@ -6,6 +6,12 @@
 
 - [ ] 1. P1 前置：eBPF 构建链与前置校验
   - [x] 1.1 新增 `crates/gse-ebpf-programs`（`#![no_std]`，aya-bpf 风格），产出 `*.o`；CI 单独一步用 `bpfel-unknown-none` 构建，产物入库 `packaging/ebpf/`
+    - 产物链（PR #56 补齐）：**不把 `.o` 提交进 git**，改为「构建期内嵌 + 发布期产出」。理由与做法见 `packaging/ebpf/README.md`：
+      二进制入库会陈旧（源码改了、产物忘了重编，运行的是旧程序且看不出来）且评审噪音大；而 `build.rs` 已能区分
+      「没有产物」（报「先跑 scripts/build-ebpf.sh」）与「内核不支持」（preflight 结论）。
+      `packaging/build-package.sh` 在本机有 `bpf-linker` 时先构建 `.o` 再打二进制；
+      CI 新增**手动触发**的 `ebpf-objects` 作业（LLVM 21 + bpf-linker）产出 artifact 供下载。
+      bpf-linker 0.11 默认 feature 是 LLVM 23，本机 LLVM 14 装不上 —— 这也是本机产不出 `.o` 的原因
     - 对应需求 17.6 与设计 Pitfalls 第一条
     - 状态：已实现（PR #48）。三个 bin（`network`/`tcp`/`process`）用 aya-ebpf 0.2 编写，`crates/ebpf-abi`（`no_std` 无依赖）保存与用户态共享的 `#[repr(C)]` 布局；
       该 crate **排除在工作区之外**（`exclude`），CI 新增 `ebpf-programs` 作业跑 `scripts/build-ebpf.sh --check`（只做类型检查，不依赖 bpf-linker）。
