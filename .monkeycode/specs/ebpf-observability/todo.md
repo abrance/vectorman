@@ -361,6 +361,44 @@ PR 描述里写明重建过。
 - `ns → µs` 用 `>> 10`（偏差约 2.4%），因为内核态不能出现常量除法；
 - `p95` 是由直方图槽上界近似，**不能与 OTLP 侧的精确 p95 相加**。
 
+## 四、下一版候选（v1.2，按优先级）
+
+每项先出设计再实现；**待定决策**列出需要产品/环境确认的点（设计评审时逐项落定）。
+
+### V2-1 `ebpf_dns`：DNS 延迟（P2 收尾，最高优先）
+
+- **现状**：需求 7 与设计已有骨架（`DNS_PENDING`、`ebpf_dns_duration_micros`、
+  `ebpf_dns_timeouts_total`），内核态与用户态都未实现 —— 是本 feature 最后一块**已写进需求但没做**的能力。
+- **为什么难**：需要在 `udp_sendmsg/recvmsg`（或 syscall tracepoint）上取**报文内容**才能解析
+  question 段的域名；`msghdr.msg_iter` 是 `iov_iter`（联合体 + 位域、布局随版本变），
+  与「内核态不硬编码结构体偏移」的原则冲突。
+- **候选方案**（详见 `docs` 与下节设计）：
+  1. **syscall tracepoint**（`sys_enter/sys_exit_sendto|recvfrom|send|recv`）+ `bpf_probe_read_user` 读**用户缓冲**：
+     不依赖内核结构体内部布局；已 `connect()` 的 socket 走 `send/recv` 时目标端口需从 socket 反查。
+  2. `kprobe/udp_sendmsg|udp_recvmsg` + 读 `iov_iter`：覆盖最全（含内核态调用方），但布局风险最高。
+  3. 最小集：只做 `sendto/recvfrom`（覆盖常见解析器形态，已 connect 的场景漏采）。
+- **待定决策**：挂载点方案、`query_name` 解析位置（内核 vs 用户态）、是否覆盖 TCP 53、超时口径。
+- **验收**：需求 7.1–7.5；上机能看到真实域名解析耗时（`dig`/`getent hosts` 触发）。
+
+### V2-2 `ebpf_cpu_profile`：CPU profile 与火焰图（P3）
+
+- **现状**：需求 8 与设计已有骨架（`perf_event_open` + `STACKS` + 折叠栈 + `ebpf_profile_index` +
+  `/v1/ebpf/profiles` + `/ebpf/profile` 页），全部未实现。
+- **为什么难**：① 采样与符号化的开销控制；② 用户栈质量依赖编译选项（帧指针）与语言运行时；
+  ③ 火焰图渲染形态（本仓库图表此前已从 echarts 改为手绘 SVG，需按现状定）。
+- **待定决策**：采样方式（per-tid vs per-CPU）、符号化位置、是否本版支持 Go/Java 语言级符号、
+  火焰图渲染形态、profile 保留期。
+
+### V2-3 工程与验证债（可与上面并行，成本低）
+
+| 项 | 内容 | 成本 |
+| --- | --- | --- |
+| 真集群验证 | Pod **名**反查（现只有 uid）、多 Agent 限流与容量、内核版本矩阵 | 依赖环境 |
+| 部署形态 | 恢复 helm charts（`charts/` 目录与 `helm-ci` 曾存在但当前仓库没有）；或有 k8s 清单即可 | 小–中 |
+| 前端真浏览器 e2e | Playwright（现有为 jsdom + 真实接口，覆盖不到 CSS/布局/真实事件循环） | 中（CI 成本） |
+| 规格一致性 | 需求 9.3 仍写着「与上一周期差分」的口径（实现已改为「每次 drain 即增量」）；设计里图表选型写着 echarts（实现改为手绘 SVG） | 小 |
+| 旧数据口径 | v1.1.0 之前采集的聚合同样少计；是否需要清理/标记（`/v1/ts/delete` 已可删） | 小 |
+
 ## 附录：本机跑闭环的命令
 
 ```bash
