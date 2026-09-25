@@ -15,8 +15,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use prometheus::{
-    Counter, Encoder, Gauge, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry,
-    TextEncoder,
+    Counter, CounterVec, Encoder, Gauge, HistogramOpts, HistogramVec, IntCounterVec, Opts,
+    Registry, TextEncoder,
 };
 
 use crate::process::ProcessSampler;
@@ -49,6 +49,8 @@ pub struct SelfMetrics {
     http_duration: HistogramVec,
     gauges: Mutex<HashMap<String, Gauge>>,
     counters: Mutex<HashMap<String, Counter>>,
+    /// `name → (标签名, 计数器)`：标签名要留着，才能挡住「同名不同标签」的调用。
+    labeled_counters: Mutex<HashMap<String, (Vec<String>, CounterVec)>>,
     sampler: ProcessSampler,
     hook: RwLock<Option<Arc<dyn ScrapeHook>>>,
 }
@@ -116,6 +118,7 @@ impl SelfMetrics {
             http_duration,
             gauges: Mutex::new(HashMap::new()),
             counters: Mutex::new(HashMap::new()),
+            labeled_counters: Mutex::new(HashMap::new()),
             sampler: ProcessSampler::new(),
             hook: RwLock::new(None),
         }))
@@ -158,6 +161,51 @@ impl SelfMetrics {
         }
         c.inc_by(by);
         map.insert(name.to_string(), c);
+    }
+
+    /// 带标签的计数器：`label_names` 决定序列身份（首次调用时固定），`label_values` 是本条的值。
+    ///
+    /// 为什么需要它：接入计数要按 `data_type` 拆分，用名字硬编码会变成
+    /// `..._records_ebpf_edges_total` 这种名字爆炸。标签个数不一致时**丢弃本次计数**
+    /// 而不是 panic —— 自监控出问题不该带崩数据面。
+    ///
+    /// 约束：**同一个名字不要既当普通计数器又当带标签计数器**（Prometheus 注册表按名字唯一，
+    /// 后注册的那个会被忽略）。
+    pub fn inc_counter_labeled(
+        &self,
+        name: &str,
+        label_names: &[&str],
+        label_values: &[&str],
+        by: f64,
+    ) {
+        if by <= 0.0 || label_names.len() != label_values.len() {
+            return;
+        }
+        let mut map = self.labeled_counters.lock().unwrap();
+        if let Some((known, counter)) = map.get(name) {
+            if known.len() == label_names.len() {
+                if let Ok(c) = counter.get_metric_with_label_values(label_values) {
+                    c.inc_by(by);
+                }
+            }
+            return;
+        }
+        let Ok(counter) = CounterVec::new(Opts::new(name, name), label_names) else {
+            return;
+        };
+        if self.registry.register(Box::new(counter.clone())).is_err() {
+            return;
+        }
+        if let Ok(c) = counter.get_metric_with_label_values(label_values) {
+            c.inc_by(by);
+            map.insert(
+                name.to_string(),
+                (
+                    label_names.iter().map(|l| (*l).to_string()).collect(),
+                    counter,
+                ),
+            );
+        }
     }
 
     pub fn observe_http(&self, method: &str, path: &str, status: &str, seconds: f64) {
@@ -314,6 +362,60 @@ mod tests {
             .expect("collect")
             .to_bytes();
         (status, String::from_utf8_lossy(&bytes).into_owned(), ctype)
+    }
+
+    /// 带标签的计数器：按值分序列、标签名固定、个数不符时丢弃而不是 panic。
+    #[tokio::test]
+    async fn labeled_counters_split_by_value_and_ignore_mismatch() {
+        let metrics = SelfMetrics::new("dataserver", "0.0.0.0:8081").unwrap();
+        let name = "dataserver_ingest_batches_total";
+        metrics.inc_counter_labeled(name, &["data_type", "status"], &["ebpf_edges", "ok"], 1.0);
+        metrics.inc_counter_labeled(name, &["data_type", "status"], &["ebpf_edges", "ok"], 1.0);
+        metrics.inc_counter_labeled(name, &["data_type", "status"], &["ebpf", "partial"], 1.0);
+        // 标签个数不符：丢弃，不 panic。
+        metrics.inc_counter_labeled(name, &["data_type", "status"], &["ebpf"], 5.0);
+        // 非正增量忽略。
+        metrics.inc_counter_labeled(name, &["data_type", "status"], &["ebpf", "ok"], 0.0);
+
+        // 渲染时注册表会补上 instance/component 等公共标签，按前缀 + 行尾取值断言。
+        let value_of = |text: &str, prefix: &str| -> Option<String> {
+            text.lines()
+                .find(|l| l.starts_with(prefix))
+                .and_then(|l| l.rsplit(' ').next())
+                .map(str::to_string)
+        };
+        let text = metrics.render().await.unwrap();
+        assert_eq!(
+            value_of(
+                &text,
+                r#"dataserver_ingest_batches_total{data_type="ebpf_edges",status="ok""#
+            )
+            .as_deref(),
+            Some("2"),
+            "{text}"
+        );
+        assert_eq!(
+            value_of(
+                &text,
+                r#"dataserver_ingest_batches_total{data_type="ebpf",status="partial""#
+            )
+            .as_deref(),
+            Some("1"),
+            "{text}"
+        );
+
+        // 同名再注册普通计数器会被注册表拒绝（名字唯一），且不 panic、不影响已有序列。
+        metrics.inc_counter(name, 7.0);
+        let text = metrics.render().await.unwrap();
+        assert_eq!(
+            value_of(
+                &text,
+                r#"dataserver_ingest_batches_total{data_type="ebpf_edges",status="ok""#
+            )
+            .as_deref(),
+            Some("2"),
+            "同名冲突不应改变已有计数：{text}"
+        );
     }
 
     #[tokio::test]

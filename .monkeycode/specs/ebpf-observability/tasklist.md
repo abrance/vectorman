@@ -80,7 +80,14 @@
     - 对应需求 3.4-3.6、10.1、10.7
   - [ ] 3.6 1 分钟指标汇总：保留最近 6 个 10 秒桶，输出 `ebpf_*` 与 `apm_edge_*`（`source=ebpf`）
     - 对应需求 10.2 与设计指标产出映射表
-  - [ ] 3.7 资源限制汇总与本地自监控计数（`agent_ebpf_*`）
+  - [x] 3.7 资源限制汇总与本地自监控计数（`agent_ebpf_*`）
+    - 状态：**已完成**（需求 12.3）。`stats_metrics()` 把 8 个计数（flush/边/指标点/过滤/空差分/
+      读取失败/map 满丢弃/限流丢弃）发成 `agent_ebpf_*_total`，两个采集循环每轮各发一次；
+      检查点工具复用同一函数（否则工具会验证出假通过）。实测 Prom 查回 `agent_ebpf_flushes_total=3`、
+      `agent_ebpf_metric_points_total=604`。
+    - 接入侧（需求 12.4）：`dataserver_ingest_batches_total{data_type,status}` 与
+      `dataserver_ingest_records_total{data_type,result}`，`data_type=~"ebpf.*"` 即 eBPF 口径。
+      实测 `{data_type="ebpf",result="accepted"} 1241` 与上报数一致。
     - 对应需求 12.1-12.6
     - 状态：部分实现（PR #46 起）：`EbpfStats`/`EbpfSnapshot` 已有 flushes/edges/metrics/filtered/idle_keys/read_errors/map_overflow_dropped 计数与能力状态指标 `agent_ebpf_capability`；`agent_ebpf_*` 指标点与 CPU 占用采集随加载器（下一 PR）
   - [ ] 3.8 单测：假 map 快照驱动差分、过滤矩阵、桶对齐与 P95 近似、`record_id` 规则、退避序列、上限汇总

@@ -210,6 +210,11 @@ pub async fn run_loop(
         if limited > 0 {
             stats.rate_limited.fetch_add(limited, Ordering::Relaxed);
         }
+        // 自监控：限流丢弃/map 满/读取失败这些「没报错但出事了」的情况要能在 Prom 上看见。
+        sink.metrics(
+            &item_id,
+            stats_metrics(&agent_id, &item_id, &stats.snapshot()),
+        );
         let bucket_ts = bucket_start(now_micros(), cfg.bucket_secs);
 
         let mut edges = Vec::new();
@@ -593,6 +598,45 @@ pub fn capability_metric(
     })
 }
 
+/// 约束统计快照 → `agent_ebpf_*` 指标点（需求 12.3：统计算并输出每项限制的触发次数与被丢弃的数据量）。
+///
+/// 为什么要有：内核态限流、map 满丢弃、map 读取失败这些「出事了但没报错」的情况，
+/// 如果只留在内存里的计数器，运维在 Prom 上什么都看不到 —— 采集看起来一直「正常」。
+/// 每个字段一条点（`field_name` 固定 `value`，指标名区分口径），标签带 `agent_id`/`item_id`。
+#[must_use]
+pub fn stats_metrics(
+    agent_id: &str,
+    item_id: &str,
+    snapshot: &EbpfSnapshot,
+) -> Vec<serde_json::Value> {
+    let ts = now_micros();
+    let rows: [(&str, u64); 8] = [
+        ("agent_ebpf_flushes_total", snapshot.flushes),
+        ("agent_ebpf_edges_total", snapshot.edges),
+        ("agent_ebpf_metric_points_total", snapshot.metrics),
+        ("agent_ebpf_filtered_total", snapshot.filtered),
+        ("agent_ebpf_idle_keys_total", snapshot.idle_keys),
+        ("agent_ebpf_read_errors_total", snapshot.read_errors),
+        (
+            "agent_ebpf_map_overflow_dropped_total",
+            snapshot.map_overflow_dropped,
+        ),
+        ("agent_ebpf_rate_limited_total", snapshot.rate_limited),
+    ];
+    rows.iter()
+        .map(|(measurement, value)| {
+            serde_json::json!({
+                "record_id": format!("{agent_id}:{item_id}:{measurement}:{ts}"),
+                "timestamp": ts,
+                "measurement": measurement,
+                "tags": {"agent_id": agent_id, "item_id": item_id},
+                "field_name": "value",
+                "field_value": *value as f64,
+            })
+        })
+        .collect()
+}
+
 /// 当前 Unix 微秒。
 #[must_use]
 pub fn now_micros() -> i64 {
@@ -803,6 +847,44 @@ mod tests {
             raw_event_record("agent-1", &unknown, 0)["event_type"],
             "unknown_99"
         );
+    }
+
+    /// 自监控指标点：每个计数字段一条，名字与需求 12.3 的口径对齐。
+    #[test]
+    fn stats_metrics_cover_every_counter() {
+        let snapshot = EbpfSnapshot {
+            flushes: 4,
+            edges: 9,
+            metrics: 2,
+            filtered: 3,
+            idle_keys: 7,
+            read_errors: 1,
+            map_overflow_dropped: 5,
+            rate_limited: 6,
+        };
+        let points = stats_metrics("agent-1", "item-1", &snapshot);
+        assert_eq!(points.len(), 8, "每个计数字段一条点");
+        let value_of = |name: &str| -> f64 {
+            points
+                .iter()
+                .find(|p| p["measurement"] == name)
+                .unwrap_or_else(|| panic!("缺 {name}"))["field_value"]
+                .as_f64()
+                .unwrap()
+        };
+        assert_eq!(value_of("agent_ebpf_rate_limited_total"), 6.0);
+        assert_eq!(value_of("agent_ebpf_map_overflow_dropped_total"), 5.0);
+        assert_eq!(value_of("agent_ebpf_read_errors_total"), 1.0);
+        assert_eq!(value_of("agent_ebpf_edges_total"), 9.0);
+        // 记录 ID 唯一（接入侧按 record_id 去重，重复 ID 会让后续点被吃掉）。
+        let ids: std::collections::HashSet<&str> = points
+            .iter()
+            .filter_map(|p| p["record_id"].as_str())
+            .collect();
+        assert_eq!(ids.len(), 8);
+        assert_eq!(points[0]["tags"]["agent_id"], "agent-1");
+        assert_eq!(points[0]["tags"]["item_id"], "item-1");
+        assert_eq!(points[0]["field_name"], "value");
     }
 
     #[test]

@@ -319,6 +319,7 @@ async fn ingest(
             );
         }
     };
+    let kind = envelope.data_type.as_str();
     // 接入保护：只对 trace 批次限流（采样仍由应用侧决定）。
     if envelope.data_type == DataType::Traces {
         if let Some(limiter) = state.apm_limiter.as_ref() {
@@ -380,6 +381,26 @@ async fn ingest(
                 );
                 m.inc_counter(
                     "vectorman_ingest_records_failed_total",
+                    reply.failures.len() as f64,
+                );
+                // 需求 12.4（eBPF 的批次数/记录数/非法记录数）落地在这里：按 `data_type` 拆分，
+                // 因此 `data_type=~"ebpf.*"` 就是 eBPF 的口径，顺带也覆盖 traces/logs/metrics。
+                m.inc_counter_labeled(
+                    "dataserver_ingest_batches_total",
+                    &["data_type", "status"],
+                    &[kind, reply.status.as_str()],
+                    1.0,
+                );
+                m.inc_counter_labeled(
+                    "dataserver_ingest_records_total",
+                    &["data_type", "result"],
+                    &[kind, "accepted"],
+                    f64::from(reply.accepted),
+                );
+                m.inc_counter_labeled(
+                    "dataserver_ingest_records_total",
+                    &["data_type", "result"],
+                    &[kind, "invalid"],
                     reply.failures.len() as f64,
                 );
             }
