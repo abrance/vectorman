@@ -31,6 +31,25 @@ v0.1 实现了最小闭环：连接建立 → 身份认证 → 心跳保活 → 
 - **链路验证指令**：`ping` 回 `pong`；未知指令返回 `ok:false` 并携带指令名。
 - **配置**：TOML 文件 + `GSE_` 前缀环境变量覆盖；配置缺失或非法时以退出码 1 结束，stderr 含 `config_invalid`。
 
+### 3.1 采集项类型（Agent 侧执行）
+
+| 类型 | 采集内容 | 依赖 |
+| --- | --- | --- |
+| `metrics_host` | 主机 CPU/内存等指标 | — |
+| `log_file` | 文件日志（glob 路径，支持清洗/抽取） | — |
+| `log_k8s_stdout` | Kubernetes Pod stdout 日志（按命名空间与 Pod 名 glob） | kubeconfig / in-cluster 凭据 |
+| `apm_otlp` | OTLP/HTTP trace 接收后转投数据面 | Agent 本地 `otlp_enabled` |
+| `ebpf_network` | 连接建立/关闭、字节数、建连耗时、失败原因；产出**服务边**记录 | Linux 内核 ≥5.8 + BTF + root |
+| `ebpf_tcp` | TCP 重传、RST、失败原因（只出指标，不出边记录） | 同上 |
+| `ebpf_process` | 进程 exec/exit/fork 计数与生命周期事件 | 同上 |
+| `ebpf_syscall` | `openat`/`read`/`write`/`fsync` 延迟与错误码；超阈值时上报慢调用（含路径，截断 256 字节） | 同上 |
+
+eBPF 采集项的参数在采集项 `collector` JSON 里（`flush_interval_secs`、`bucket_secs`、
+`max_events_per_sec`、`max_cpu_percent`、`map_max_entries`、`ring_buffer_bytes`、
+`raw_events_enabled`、`raw_events_sample_ratio`、`slow_threshold_micros`，以及
+`cgroup_*` / `process_*` / `port_*` 的 include/exclude 与 `include_loopback`）。
+前置条件不满足时**只降级该采集项**：Agent 上报 `agent_ebpf_capability` 说明原因，其它采集项照常。
+
 ## 4. 接口
 
 ### 4.1 RPC 接口（geminio 方法级）
@@ -160,6 +179,14 @@ heartbeat_timeout_secs = 90
 | `agent_id` | `agent-1` | `GSE_AGENT_ID` |
 | `token` | 空 | `GSE_AGENT_TOKEN` |
 | `heartbeat_interval_secs` | `30` | `GSE_AGENT_HEARTBEAT` |
+| `allowed_interpreters` | `["bash","sh","python3"]` | `GSE_AGENT_INTERPRETERS` |
+| `job_default_interpreter` | `bash` | `GSE_AGENT_JOB_INTERPRETER` |
+| `max_concurrent_jobs` | `1` | `GSE_AGENT_MAX_JOBS` |
+| `job_work_dir` | 空（系统临时目录） | `GSE_AGENT_JOB_WORK_DIR` |
+| `otlp_enabled` | `false` | — |
+| `otlp_listen` | `0.0.0.0:4318` | — |
+| `otlp_max_body_bytes` | `8388608` | — |
+| `otlp_token` / `otlp_allowed_cidrs` | 空 | — |
 
 ## 6. 会话状态机与生命周期
 

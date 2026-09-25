@@ -163,6 +163,45 @@ pub fn load_config(path: &str) -> Result<AgentConfig, String> {
 mod tests {
     use super::*;
 
+    /// `gse-agent.toml.example` 必须能解析，且其中**未注释的**值与 `AgentConfig::default()` 一致。
+    ///
+    /// 这条锁的是「示例里写的缺省值不能和代码里的缺省值对不上」——示例曾经只有 5 行，
+    /// OTLP 接收器与作业相关的开关一个都没写。
+    #[test]
+    fn config_example_parses_and_matches_defaults() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("bins")
+            .join("gse-agent")
+            .join("gse-agent.toml.example");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!("跳过：{} 不存在", path.display());
+            return;
+        };
+        let cfg: AgentConfig = toml::from_str(&text).expect("示例配置必须能解析");
+        let default = AgentConfig::default();
+        // 逐项比较（`AgentConfig` 没实现 `PartialEq`，也不必为测试加 derive）。
+        assert_eq!(cfg.server_addr, default.server_addr);
+        assert_eq!(cfg.agent_id, default.agent_id);
+        assert_eq!(cfg.token, default.token);
+        assert_eq!(cfg.heartbeat_interval_secs, default.heartbeat_interval_secs);
+        assert_eq!(cfg.otlp_enabled, default.otlp_enabled);
+        assert_eq!(cfg.otlp_listen, default.otlp_listen);
+        assert_eq!(cfg.max_concurrent_jobs, default.max_concurrent_jobs);
+        // 文档化的开关必须在示例里出现（注释掉的也算），避免「加了配置项却没人知道」。
+        for key in [
+            "otlp_enabled",
+            "otlp_listen",
+            "max_concurrent_jobs",
+            "allowed_interpreters",
+            "slow_threshold_micros",
+            "ebpf_network",
+        ] {
+            assert!(text.contains(key), "示例里应提到 {key}");
+        }
+    }
+
     /// 串行化环境变量测试，避免并行用例互相覆盖。
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
