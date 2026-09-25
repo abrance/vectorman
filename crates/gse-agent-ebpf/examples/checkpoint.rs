@@ -490,6 +490,23 @@ fn main() -> ExitCode {
         println!("构造进程指标 {emitted} 条");
     }
 
+    // 与采集循环同一套 CPU 采样（`max_cpu_percent` 的作用点）。
+    let mut cpu_tracker = gse_agent_ebpf::cpu::CpuTracker::new(config.max_cpu_percent);
+    // 有两次以上采样才能算出占比：这里按采集轮数采几次。
+    for _ in 0..3 {
+        cpu_tracker.observe(
+            std::time::Instant::now(),
+            gse_agent_ebpf::cpu::read_self_cpu_ticks(),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    println!(
+        "CPU 采样：{:.1}%（max_cpu_percent={}，降级={}）",
+        cpu_tracker.percent(),
+        config.max_cpu_percent,
+        cpu_tracker.degraded()
+    );
+
     // 自监控指标点：与 `run_loop`/`run_process_loop` 走同一个构造函数（否则工具会「验证」出
     // 假的通过 —— 生产路径上漏发的点，工具也照样漏发）。
     // 工具只填它真正统计到的项（其余为 0 而不是编造）：验证目标是「发射路径通」，
@@ -504,6 +521,9 @@ fn main() -> ExitCode {
         map_overflow_dropped: 0,
         rate_limited: totals.rate_limited,
         buffer_dropped: 0,
+        // 与采集循环同源：工具也用真实的 CPU 采样器。
+        cpu_percent: cpu_tracker.percent(),
+        degraded: cpu_tracker.degraded(),
     };
     pending_metrics.extend(gse_agent_ebpf::stats_metrics(
         &args.agent_id,
