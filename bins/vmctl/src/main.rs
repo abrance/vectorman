@@ -93,6 +93,12 @@ enum JobsCmd {
         to_path: Option<String>,
         #[arg(long)]
         upload: Option<String>,
+        /// `--kind agent_upgrade`：目标机上已就位的二进制路径。
+        #[arg(long)]
+        binary_path: Option<String>,
+        /// `--kind agent_upgrade`：期望的 sha256（64 位十六进制）。
+        #[arg(long)]
+        sha256: Option<String>,
     },
     Rerun {
         job_id: String,
@@ -179,6 +185,8 @@ fn main() -> ExitCode {
                 to_agent,
                 to_path,
                 upload,
+                binary_path,
+                sha256,
             } => client.jobs_submit(&JobSubmitSpec {
                 kind: kind.unwrap_or_default(),
                 agent_id: agent_id.unwrap_or_default(),
@@ -194,6 +202,8 @@ fn main() -> ExitCode {
                 to_agent,
                 to_path,
                 upload,
+                binary_path,
+                sha256,
             }),
             JobsCmd::Rerun {
                 job_id,

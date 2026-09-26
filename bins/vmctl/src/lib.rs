@@ -175,6 +175,10 @@ pub struct JobSubmitSpec {
     pub to_agent: Option<String>,
     pub to_path: Option<String>,
     pub upload: Option<String>,
+    /// `--kind agent_upgrade`：目标机上已就位的二进制路径。
+    pub binary_path: Option<String>,
+    /// `--kind agent_upgrade`：期望的 sha256（64 位十六进制）。
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -417,11 +421,43 @@ impl<'a, T: Transport> Client<'a, T> {
         match normalize_kind(&spec.kind).as_str() {
             "script" => self.jobs_submit_script(spec),
             "file_transfer" => self.jobs_submit_file(spec),
+            "agent_upgrade" => self.jobs_submit_agent_upgrade(spec),
             other => Output::err(
                 1,
-                format!("unsupported --kind {other}, want script or file_transfer"),
+                format!("unsupported --kind {other}, want script, file_transfer or agent_upgrade"),
             ),
         }
+    }
+
+    /// 提交 `agent_upgrade` 作业：`--binary-path`（目标机上已就位的二进制）
+    /// 与 `--sha256`（期望校验值）组成载荷，放进 `script` 字段的 JSON 里。
+    fn jobs_submit_agent_upgrade(&self, spec: &JobSubmitSpec) -> Output {
+        let Some(binary_path) = opt_filled(&spec.binary_path) else {
+            return Output::err(1, "--kind agent_upgrade 需要 --binary-path".to_string());
+        };
+        let Some(sha256) = opt_filled(&spec.sha256) else {
+            return Output::err(1, "--kind agent_upgrade 需要 --sha256".to_string());
+        };
+        if spec.agent_id.trim().is_empty() {
+            return Output::err(1, "--kind agent_upgrade 需要 --agent-id".to_string());
+        }
+        let agent_id = spec.agent_id.trim();
+        if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Output::err(1, "--sha256 必须是 64 位十六进制".to_string());
+        }
+        let payload = serde_json::json!({
+            "binary_path": binary_path,
+            "sha256": sha256,
+        });
+        let body = serde_json::json!({
+            "agent_id": agent_id,
+            "kind": "agent_upgrade",
+            "script": payload.to_string(),
+            "timeout_secs": spec.timeout_secs.unwrap_or(120),
+        });
+        let url = format!("{}/api/gse/jobs", self.base_url);
+        let body = body.to_string();
+        http_to_output(self.transport.send("POST", &url, Some(&body)))
     }
 
     fn jobs_submit_script(&self, spec: &JobSubmitSpec) -> Output {
@@ -1024,6 +1060,54 @@ mod tests {
         let body = mock.calls()[0].2.clone().expect("body");
         assert!(!body.contains("\"kind\""));
         assert!(body.contains("\"agent_id\":\"agent-1\""));
+    }
+
+    #[test]
+    fn submit_agent_upgrade_posts_structured_payload() {
+        let mock = Mock::new(vec![Ok((201, "{\"job_id\":\"j-up\"}".into()))]);
+        let c = client(&mock, WaitPolicy::default());
+        let out = c.jobs_submit(&JobSubmitSpec {
+            kind: "agent_upgrade".into(),
+            agent_id: "web-01".into(),
+            binary_path: Some("/tmp/gse-agent-new".into()),
+            sha256: Some("a".repeat(64)),
+            ..JobSubmitSpec::default()
+        });
+        assert_eq!(out.code, 0);
+        let body: serde_json::Value =
+            serde_json::from_str(mock.calls()[0].2.as_deref().expect("body")).expect("json");
+        assert_eq!(body["kind"], "agent_upgrade");
+        assert_eq!(body["agent_id"], "web-01");
+        // 载荷放在 script 字段的 JSON 字符串里
+        let spec: serde_json::Value =
+            serde_json::from_str(body["script"].as_str().expect("script")).expect("spec json");
+        assert_eq!(spec["binary_path"], "/tmp/gse-agent-new");
+        assert_eq!(spec["sha256"].as_str().expect("sha").len(), 64);
+    }
+
+    #[test]
+    fn submit_agent_upgrade_requires_binary_path_and_sha256() {
+        let mock = Mock::new(vec![]);
+        let c = client(&mock, WaitPolicy::default());
+        let missing_bin = c.jobs_submit(&JobSubmitSpec {
+            kind: "agent_upgrade".into(),
+            agent_id: "a".into(),
+            sha256: Some("a".repeat(64)),
+            ..JobSubmitSpec::default()
+        });
+        assert_eq!(missing_bin.code, 1);
+        assert!(missing_bin.stderr.contains("--binary-path"));
+
+        let bad_sha = c.jobs_submit(&JobSubmitSpec {
+            kind: "agent_upgrade".into(),
+            agent_id: "a".into(),
+            binary_path: Some("/tmp/x".into()),
+            sha256: Some("zz".into()),
+            ..JobSubmitSpec::default()
+        });
+        assert_eq!(bad_sha.code, 1);
+        assert!(bad_sha.stderr.contains("64 位十六进制"));
+        assert_eq!(mock.calls().len(), 0, "参数不合法时不得发请求");
     }
 
     #[test]

@@ -96,11 +96,11 @@
 
 ## 6. 收尾
 
-- [ ] 6.1 提供运维入口：一个 `scripts/upgrade-agent.sh`（封装 file_transfer + 下发 upgrade 作业 +
+- [x] 6.1 提供运维入口：一个 `scripts/upgrade-agent.sh`（封装 file_transfer + 下发 upgrade 作业 +
       轮询结果），使升级是一条命令。
 - [ ] 6.2 README 补「如何升级 agent」一节（含回滚说明）。
-- [ ] 6.3 跑齐 `cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features -- -D warnings`、
+- [x] 6.3 跑齐 `cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features -- -D warnings`、
       `cargo test --all-features`；前端无改动则跳过。
-- [ ] 6.4 把本 feature 的结论（尤其「agent 不能停自己」的实测依据）保留在 `design.md`。
+- [x] 6.4 把本 feature 的结论（尤其「agent 不能停自己」的实测依据）保留在 `design.md`。
 
 - **检查点 G**：CI 全绿；README 有升级指引；后续维护者能只读设计文档就理解为什么用 cron。
