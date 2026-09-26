@@ -68,6 +68,22 @@ packaging/deploy/install.sh all --dest /opt/vectorman --with-systemd
 /opt/vectorman/deploy/ctl.sh dataserver start   # 单组件：start|stop|status|restart
 ```
 
+Kubernetes / k3s 部署（server 侧三组件）：
+
+```bash
+# 手工部署（不依赖外部 CD）：构建/导入镜像后 apply 这份清单
+kubectl apply -f packaging/deploy/k8s/server-stack.yaml
+
+# Agent 的 DaemonSet（每个节点一份；需 hostPID + 特权）
+kubectl apply -f packaging/deploy/k8s/gse-agent-daemonset.yaml
+```
+
+- 生产环境的 **server 侧现由 cops CD 接管**（cops 仓库 `apps/vectorman/`，`DEPLOY_MODE=k8s`），
+  上文的清单与它**同构**，保留为手工参考。镜像由 `.github/workflows/release-image.yml` 推 GHCR。
+- 详见 `packaging/deploy/k8s/README.md`（节点前提核验、造镜像、灰度、验证、回滚）。
+- ⚠️ **客户端配置写「域名:30710」**（如 `server_addr = "vectorman.xiaoyxq.top:30710"`）：
+  server 的 `7100` 只在集群内监听，对外只有 NodePort `30710`。域名只做 DNS A 解析，不过 Traefik。
+
 服务端默认端口：dataserver `8081`（SQL/接入/UI）、`9090`（Prom 查询）、`9091`（自监控）；
 gse-server `7100`（RPC）、`7101`（台账 HTTP）、`7102`（自监控）。
 

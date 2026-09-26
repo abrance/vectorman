@@ -47,10 +47,18 @@ flowchart LR
 要点：
 
 - **（2026-09-25 用户决定，口径更新）server 侧整体上集群**：gse-server / dataserver / console 以
-  Deployment（单副本、`strategy: Recreate`）+ NodePort Service 跑在 k3s 里，数据与 web dist 走
-  节点 hostPath（`/opt/vectorman-k8s/*`）；Agent 的 `server_addr` 指向 `{node}:30710`（RPC NodePort）。
+  Deployment（单副本、`strategy: Recreate`）+ NodePort Service 跑在 k3s 里，数据走
+  节点 hostPath（`/opt/vectorman-k8s/*`），web dist 打进镜像（不再挂载）。
+  Agent 的 `server_addr` 指向 `vectorman.xiaoyxq.top:30710`（RPC NodePort，域名只做 DNS A 解析）。
   材料见 `packaging/deploy/k8s/server-stack.yaml` 与 README 第 5b 节（含 cloud3 实测结论）。
   CLI（`dpc`/`vmctl`）不进集群；helm 化仍排 v1.3。
+- **（2026-09-26 更新）发布口径改为 cops CD**：server 侧的期望状态由 cops 仓库的
+  `apps/vectorman/k8s.yaml`（`DEPLOY_MODE=k8s / DEPLOY_TARGET=cloud3`）管理，与
+  `server-stack.yaml` **同构**（同为 18 个对象）。`server-stack.yaml` 保留为
+  「不经 cops 的手工部署参考」。
+  差异只有三处：镜像来自 `ghcr.io/abrance/vectorman-server:<tag>`（取代本地导入）、
+  配置放在 `k8s.yaml` 内的 ConfigMap（取代 `conf/*.toml` 同步到主机）、
+  Deployment 的 podTemplate 带 ConfigMap checksum 注解（内容变则自动滚动）。
 - **Agent 看到的是宿主机视图**：`hostPID: true` 让容器内 `/proc` 即宿主机 procfs，
   因此 `crates/gse-agent-ebpf/src/cgroup.rs` 读 `/proc/<pid>/cgroup` 能拿到宿主机的 cgroup 路径
   （含 `pod<uid>` 与容器 ID），无需额外挂载 `/proc`，也不需要改代码。
@@ -101,7 +109,7 @@ kind: ConfigMap
 metadata: { name: gse-agent-conf, namespace: vectorman }
 data:
   gse-agent.toml: |
-    server_addr = "10.0.0.10:7100"     # 集群外的 gse-server
+    server_addr = "vectorman.xiaoyxq.top:30710"   # server 的 RPC NodePort（域名只做 DNS A 解析）
     agent_id = "node-1"                # 实际用 Downward API 覆盖为节点名
     token = ""
     heartbeat_interval_secs = 30
