@@ -30,6 +30,9 @@ fn server_config(db: &str, auth_enabled: bool, timeout_secs: u64) -> ServerConfi
         http_web_dir: None,
         heartbeat_interval_secs: 1,
         heartbeat_timeout_secs: timeout_secs,
+        // 测试里把连接活性探测压到 1 秒：默认 15 秒会让「断开后清理」相关
+        // 测试等太久（也就测不到清理路径本身）。
+        session_probe_interval_secs: 1,
         metrics_listen: "127.0.0.1:0".to_string(),
         ..Default::default()
     }

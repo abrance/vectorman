@@ -29,6 +29,10 @@ pub struct ServerConfig {
     /// 心跳超时窗口（秒），窗口内无消息判离线。
     #[serde(default = "default_timeout")]
     pub heartbeat_timeout_secs: u64,
+    /// 连接活性探测间隔（秒）：定期在会话上发一次调用，失败即判连接结束
+    /// 并清理会话。默认 15 秒 —— 太短会增加无谓调用，太长则僵尸会话存活更久。
+    #[serde(default = "default_probe_interval")]
+    pub session_probe_interval_secs: u64,
     /// 是否启用作业执行（dispatch 与 HTTP /jobs）。
     #[serde(default = "default_true")]
     pub jobs_enabled: bool,
@@ -79,6 +83,7 @@ impl Default for ServerConfig {
             http_web_dir: None,
             heartbeat_interval_secs: default_interval(),
             heartbeat_timeout_secs: default_timeout(),
+            session_probe_interval_secs: default_probe_interval(),
             jobs_enabled: true,
             job_default_timeout_secs: default_job_timeout(),
             job_max_timeout_secs: default_job_max_timeout(),
@@ -131,6 +136,10 @@ fn default_interval() -> u64 {
 
 fn default_timeout() -> u64 {
     90
+}
+
+fn default_probe_interval() -> u64 {
+    15
 }
 
 fn default_job_timeout() -> u64 {

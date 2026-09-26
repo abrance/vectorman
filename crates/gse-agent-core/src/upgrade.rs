@@ -273,7 +273,9 @@ chmod 755 "{bin}"
 sleep 5
 TO_VER=$("{bin}" --version 2>/dev/null | awk '{{print $2}}')
 
-if pgrep -f "gse-agent" >/dev/null 2>&1; then
+# 注意：判活模式必须够精确 —— 脚本自身路径含 "gse-agent"，
+# 若只用二进制名做模糊匹配，会匹配到脚本自身，导致永远判定"起来了"、回滚不触发。
+if pgrep -f "{bin}" >/dev/null 2>&1; then
   OUTCOME=succeeded
   DETAIL=""
 else
@@ -283,7 +285,7 @@ else
   cp -a "{backup}" "{bin}"
   {start}
   TO_VER=$("{bin}" --version 2>/dev/null | awk '{{print $2}}')
-  pgrep -f "gse-agent" >/dev/null 2>&1 || {{
+  pgrep -f "{bin}" >/dev/null 2>&1 || {{
     OUTCOME=failed
     DETAIL="rollback also failed; manual recovery: cp {backup} {bin} && restart"
   }}
@@ -575,7 +577,13 @@ mod tests {
         };
         let script = render_inner_script(&deploy, Path::new("/tmp/newbin"), "TS");
         assert!(script.contains("manual recovery"));
-        assert!(script.contains("pgrep -f \"gse-agent\""));
+        // 判活模式必须是**完整二进制路径**，不能是 "gse-agent"
+        // （脚本自身路径含该串，会匹配到自己 → 回滚永不触发）。
+        assert!(script.contains("pgrep -f \"/opt/vectorman/gse-agent/bin/gse-agent\""));
+        assert!(
+            !script.contains("pgrep -f \"gse-agent\""),
+            "不得用模糊模式判活"
+        );
     }
 
     #[test]
