@@ -24,6 +24,9 @@ RUN if [ -d apps/desktop ]; then npm run build:desktop; fi
 
 # ── 2) Rust 静态二进制（musl）────────────────────────────────────────────
 FROM rust:1-bookworm AS rust
+# 版本注入：build-push-action 的 build-args 传 VECTORMAN_VERSION（与 tag 一致）；
+# 本地 docker build 不传时回退 git describe（仓库语义不变）。
+ARG VECTORMAN_VERSION
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends musl-tools && rm -rf /var/lib/apt/lists/* \
     && rustup target add x86_64-unknown-linux-musl
@@ -31,6 +34,7 @@ COPY . .
 # 与 build-package.sh 相同的环境语义；一次构建全部六个静态二进制。
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     CC_x86_64_unknown_linux_musl=musl-gcc \
+    VECTORMAN_VERSION="${VECTORMAN_VERSION}" \
     cargo build --release --workspace --target x86_64-unknown-linux-musl
 
 # ── 3a) server 运行镜像：scratch + 五件二进制 + web dist ────────────────
