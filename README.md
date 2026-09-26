@@ -83,6 +83,9 @@ kubectl apply -f packaging/deploy/k8s/gse-agent-daemonset.yaml
 - 详见 `packaging/deploy/k8s/README.md`（节点前提核验、造镜像、灰度、验证、回滚）。
 - ⚠️ **客户端配置写「域名:30710」**（如 `server_addr = "vectorman.xiaoyxq.top:30710"`）：
   server 的 `7100` 只在集群内监听，对外只有 NodePort `30710`。域名只做 DNS A 解析，不过 Traefik。
+- 🔴 **对外暴露前必读：`dataserver` 默认无鉴权**（`[auth] enabled = false`）。
+  SQL 口与数据接入口在公网可达时等同公开接口 —— 任何人可 `POST /v1/sql` 查库、
+  `POST /v1/ingest` 写数据。**上公网前请开启鉴权**，或把入口限制在受信网络内。
 
 服务端默认端口：dataserver `8081`（SQL/接入/UI）、`9090`（Prom 查询）、`9091`（自监控）；
 gse-server `7100`（RPC）、`7101`（台账 HTTP）、`7102`（自监控）。
