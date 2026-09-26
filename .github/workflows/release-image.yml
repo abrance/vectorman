@@ -1,0 +1,129 @@
+name: release-image
+
+# 发布由 tag 触发：tag 约定 <镜像>/v<semver> —— server/v1.2.0、agent/v1.2.0。
+# 流程与 modelman 的发布链路一致：本仓库只负责产出镜像；部署由 cops 改 tag 完成。
+#
+# 产物（多功能镜像，见 packaging/deploy/k8s/Dockerfile）：
+#   ghcr.io/abrance/vectorman-server:<v>-<短sha>   （--target server：五件二进制 + 三份 web dist）
+#   ghcr.io/abrance/vectorman-gse-agent:<v>-<短sha>（--target agent：eBPF .o 已入库，构建不需要 bpf-linker）
+#
+# tag 里的版本必须与 vectorman_version 的解析结果一致（本地 cargo 构建回退 git describe，
+# tag 构建时注入 VECTORMAN_VERSION=<tag>），保证镜像里 --version 与 tag 对得上。
+
+on:
+  push:
+    tags:
+      - "server/v*"
+      - "agent/v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "已存在的 tag（例如 server/v1.2.0 或 agent/v1.2.0），用于重跑发布"
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: release-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: 构建并推送镜像
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: 解析版本与提交
+        id: meta
+        run: |
+          set -euo pipefail
+          ref="${{ github.event.inputs.tag || github.ref_name }}"
+          kind="${ref%%/*}"          # server | agent
+          version="${ref#*/}"        # v1.2.3
+          if ! printf '%s' "${version}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "tag 必须形如 server/v1.2.3 或 agent/v1.2.3，实际为 ${ref}" >&2
+            exit 1
+          fi
+          case "${kind}" in
+            server) target=server; image=ghcr.io/${{ github.repository_owner }}/vectorman-server ;;
+            agent)  target=agent;  image=ghcr.io/${{ github.repository_owner }}/vectorman-gse-agent ;;
+          esac
+          short_sha="$(git rev-parse --short=7 "${ref}^{commit}")"
+          echo "kind=${kind}"       >> "${GITHUB_OUTPUT}"
+          echo "target=${target}"   >> "${GITHUB_OUTPUT}"
+          echo "image=${image}"     >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "short_sha=${short_sha}"      >> "${GITHUB_OUTPUT}"
+          echo "image_tag=${version}-${short_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: 登录 GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: 构建并推送镜像
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: packaging/deploy/k8s/Dockerfile
+          target: ${{ steps.meta.outputs.target }}
+          push: true
+          platforms: linux/amd64
+          # 镜像里没有 .git：版本与构建时间构建期注入（--version 与 tag 一致）
+          build-args: |
+            VECTORMAN_VERSION=${{ steps.meta.outputs.version }}
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.image_tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.title=vectorman-${{ steps.meta.outputs.kind }}
+            org.opencontainers.image.description=Vectorman ${{ steps.meta.outputs.kind }} image (static musl binaries + web dist)
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 容器冒烟测试
+        # 验证的是刚推上 GHCR 的那个制品：入口能跑、--version 与 tag 一致。
+        run: |
+          set -euo pipefail
+          image="${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.image_tag }}"
+          expected="${{ steps.meta.outputs.version }}"
+          docker pull "$image"
+          case "${{ steps.meta.outputs.kind }}" in
+            server)
+              got="$(docker run --rm --entrypoint /usr/local/bin/dataserver "$image" --version)"
+              ;;
+            agent)
+              got="$(docker run --rm "$image" --version)"
+              ;;
+          esac
+          echo "镜像版本: ${got}（期望含 ${expected}）"
+          case "${got}" in
+            *"${expected}"*) echo "版本一致" ;;
+            *) echo "版本不一致：${got} 不含 ${expected}" >&2; exit 1 ;;
+          esac
+
+      - name: 发布信息
+        run: |
+          set -euo pipefail
+          {
+            echo "## Vectorman ${{ steps.meta.outputs.kind }} 镜像已发布"
+            echo
+            echo "镜像：\`${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.image_tag }}\`"
+            echo "digest：\`${{ steps.push.outputs.digest }}\`"
+            echo
+            echo "### 部署入口"
+            echo
+            echo "- **cops 接管**：改 \`apps/vectorman/.env\` 的 \`VECTORMAN_IMAGE_TAG\`（只 bump tag 行），开 PR 合入 main；"
+            echo "- **手动（单机 k3s 无 registry）**：\`docker pull\` 后 \`docker save | ssh <host> 'k3s ctr images import -'\`。"
+            echo
+            echo "server 镜像内已含三份 web dist（/app/web/{gse,dataplane,console}），无需另行分发前端。"
+          } >> "${GITHUB_STEP_SUMMARY}"

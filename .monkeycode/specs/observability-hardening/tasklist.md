@@ -60,7 +60,10 @@
       musl release 产物），dist 打进镜像（实测 server 镜像 58.5MB，三份 dist 从镜像内
       /app/web/{gse,dataplane,console} 就地托管）；`docker build --target server|agent` 双 target，
       `--pkg` 旧路径保留兼容
-- [ ] 1.13 （未做，等 release workflow 轮次）vectorman release workflow 增加「构建多功能镜像 → push `ghcr.io/abrance/vectorman-server:<tag>`」
+- [x] 1.13 新增 `.github/workflows/release-image.yml`：tag 触发（`server/v*`、`agent/v*`）+
+      workflow_dispatch 重跑；构建多功能镜像 → push `ghcr.io/abrance/vectorman-{server,gse-agent}:<v>-<短sha>`；
+      推送后跑容器冒烟（--version 必须含 tag 版本）；发布 summary 给出 cops 侧只 bump tag 的指引
+      （与 modelman 的 release-logcluster.yml 同构）
       （cops 的 check-registries 守卫只放行 ghcr.io）；镜像 tag 与 cops 单元 `.env` 的
       `*_IMAGE_TAG` 对齐（只 bump tag 行）
 - [x] 1.14 `server-stack.yaml` 增加三条域名 × 两条 IngressRoute（web 跳转 + websecure +
@@ -127,7 +130,7 @@
 
 ## 5. 明确不做的收口（对应需求 7）
 
-- [ ] 5.1 删除 `.github/workflows/helm-ci.yml`（`charts/**` 已不存在，属悬空配置），
+- [x] 5.1 删除 `.github/workflows/helm-ci.yml`（`charts/**` 已不存在，属悬空配置），
       在 `todo.md` 记录「charts 排 v1.3、届时一并恢复该工作流」
 - [ ] 5.2 在 `ebpf-observability/todo.md` 记明「前端浏览器 e2e 本版不做」及其覆盖边界
 - [ ] 5.3 在 `todo.md` 记明 `ebpf_dns` 与 `ebpf_cpu_profile` 排在本 feature 之后（各自先出设计）
