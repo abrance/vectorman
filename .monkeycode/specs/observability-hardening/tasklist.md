@@ -63,7 +63,12 @@
 - [x] 1.13 新增 `.github/workflows/release-image.yml`：tag 触发（`server/v*`、`agent/v*`）+
       workflow_dispatch 重跑；构建多功能镜像 → push `ghcr.io/abrance/vectorman-{server,gse-agent}:<v>-<短sha>`；
       推送后跑容器冒烟（--version 必须含 tag 版本）；发布 summary 给出 cops 侧只 bump tag 的指引
-      （与 modelman 的 release-logcluster.yml 同构）
+      （与 modelman 的 release-logcluster.yml 同构）。
+      **已端到端验证**：`server/v1.2.0` tag → GHCR 推送成功（容器冒烟 --version 一致），
+      cloud3 `k3s ctr images pull ghcr.io/abrance/vectorman-server:v1.2.0-6d7131e` 4.1 秒拉完。
+      实推踩坑两个：① docker driver 不支持 gha cache export，必须 `docker/setup-buildx-action`；
+      ② 冒烟断言要用剥掉 v 的版本（vectorman-version 设计如此）；
+      ③ tag 必须打在**包含 workflow 文件的 commit** 上，否则不触发（tag 用 tag 指向 commit 的定义）。
       （cops 的 check-registries 守卫只放行 ghcr.io）；镜像 tag 与 cops 单元 `.env` 的
       `*_IMAGE_TAG` 对齐（只 bump tag 行）
 - [x] 1.14 `server-stack.yaml` 增加三条域名 × 两条 IngressRoute（web 跳转 + websecure +
