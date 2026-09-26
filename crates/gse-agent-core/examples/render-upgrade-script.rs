@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use gse_agent_core::upgrade::{detect_deploy, render_inner_script};
+use gse_agent_core::upgrade::{detect_deploy, render_inner_script, systemd_unit_exists};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -18,16 +18,7 @@ fn main() {
         .map(String::as_str)
         .unwrap_or("/tmp/new-gse-agent");
 
-    let Some(deploy) = detect_deploy(
-        |p| Path::new(p).exists(),
-        |unit| {
-            std::process::Command::new("systemctl")
-                .args(["list-unit-files", unit])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        },
-    ) else {
+    let Some(deploy) = detect_deploy(|p| Path::new(p).exists(), systemd_unit_exists) else {
         eprintln!("找不到已安装的 gse-agent —— 无法探测部署形式");
         std::process::exit(1);
     };

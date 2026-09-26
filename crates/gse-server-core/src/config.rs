@@ -33,6 +33,10 @@ pub struct ServerConfig {
     /// 并清理会话。默认 15 秒 —— 太短会增加无谓调用，太长则僵尸会话存活更久。
     #[serde(default = "default_probe_interval")]
     pub session_probe_interval_secs: u64,
+    /// 连续多少次活性探测失败才认定连接结束。默认 3 —— 单次超时
+    /// （例如连接正忙于大文件传输）不足以拆掉活着的会话。
+    #[serde(default = "default_probe_failures")]
+    pub session_probe_failures_before_close: u32,
     /// 是否启用作业执行（dispatch 与 HTTP /jobs）。
     #[serde(default = "default_true")]
     pub jobs_enabled: bool,
@@ -84,6 +88,7 @@ impl Default for ServerConfig {
             heartbeat_interval_secs: default_interval(),
             heartbeat_timeout_secs: default_timeout(),
             session_probe_interval_secs: default_probe_interval(),
+            session_probe_failures_before_close: default_probe_failures(),
             jobs_enabled: true,
             job_default_timeout_secs: default_job_timeout(),
             job_max_timeout_secs: default_job_max_timeout(),
@@ -140,6 +145,10 @@ fn default_timeout() -> u64 {
 
 fn default_probe_interval() -> u64 {
     15
+}
+
+fn default_probe_failures() -> u32 {
+    3
 }
 
 fn default_job_timeout() -> u64 {

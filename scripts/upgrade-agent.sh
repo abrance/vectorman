@@ -108,12 +108,20 @@ agent_state || {
 # ── 3. 传二进制到目标机（必须 --wait，否则升级作业会找不到文件）──────────────
 remote="/tmp/gse-agent-new-$sha"
 echo "==> 传输二进制到 $agent:$remote"
+# `|| true`：vmctl 在作业失败时仍可能以 0 退出，但若它以非 0 退出，
+# `set -e` 会在下面的判断之前就把脚本杀掉（拿不到可读错误）。
 transfer="$("$vmctl" --url "$url" jobs submit --kind file_transfer \
-  --upload "$bin_path" --to-agent "$agent" --to-path "$remote" --wait 2>&1)"
-printf '%s' "$transfer" | grep -q '"status":"succeeded"' || {
-  echo "传输失败: $transfer" >&2; exit 1
-}
-echo "    传输完成"
+  --upload "$bin_path" --to-agent "$agent" --to-path "$remote" --wait 2>&1 || true)"
+if printf '%s' "$transfer" | grep -q '"status":"succeeded"'; then
+  echo "    传输完成"
+elif printf '%s' "$transfer" | grep -q '"error":"already_exists"'; then
+  # 远端路径由 sha 派生，同名文件必然是同一份内容 → 直接复用。
+  # （file_transfer 不覆盖已有文件，重复升级同一版本时会走到这里。）
+  echo "    目标机已有同 sha 的二进制，复用"
+else
+  echo "传输失败: $transfer" >&2
+  exit 1
+fi
 
 # ── 4. 下发升级作业 ──────────────────────────────────────────────────────────
 echo "==> 下发 agent_upgrade 作业"

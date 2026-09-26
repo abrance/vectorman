@@ -585,12 +585,17 @@ async fn handle_conn(
 
     let registry_heartbeat = registry.clone();
     let ledger_heartbeat = ledger.clone();
+    let end_heartbeat = end.clone();
+    let authed_heartbeat = authed.clone();
+    let conn_client_id = end.client_id();
     if let Err(e) = end
         .register("heartbeat", move |req: Bytes| {
             let registry = registry_heartbeat.clone();
             let ledger = ledger_heartbeat.clone();
+            let end = end_heartbeat.clone();
+            let authed = authed_heartbeat.clone();
             async move {
-                handle_heartbeat(&req, &registry, &ledger).await;
+                handle_heartbeat(&req, &end, conn_client_id, &authed, &registry, &ledger).await;
                 Ok(Bytes::new())
             }
         })
@@ -652,6 +657,7 @@ async fn handle_conn(
     // 不这样做就会出现僵尸会话：连接早已断开，而心跳通道独立于连接存活、
     // 持续刷新 last_seen，使会话永远停在 Online；作业下发拿到它必然失败。
     let client_id = end.client_id();
+    let mut consecutive_failures: u32 = 0;
     loop {
         tokio::time::sleep(Duration::from_secs(cfg.session_probe_interval_secs.max(1))).await;
         let probe = tokio::time::timeout(
@@ -659,24 +665,42 @@ async fn handle_conn(
             end.call(SESSION_PROBE_METHOD, Bytes::new()),
         )
         .await;
-        match probe {
+        let alive = match probe {
             // 正常回应（对端注册了同名方法）
-            Ok(Ok(_)) => continue,
+            Ok(Ok(_)) => true,
             // 对端回了业务错误（未注册该方法）→ 连接是活的
             Ok(Err(e)) => {
                 let msg = e.to_string();
-                if msg.contains("multiplexer closed") || msg.contains("end closed") {
-                    break;
-                }
-                continue;
+                !(msg.contains("multiplexer closed") || msg.contains("end closed"))
             }
-            // 超时 → 连接失活
-            Err(_) => break,
+            // 超时：**不能直接判死** —— 连接可能只是忙。
+            // 实测踩到：向 agent 传 10MB 时探测 5 秒超时，把**活着的会话**摘掉了，
+            // 于是心跳继续到达（台账 online）而作业通道永久不可用。
+            Err(_) => false,
+        };
+        if alive {
+            consecutive_failures = 0;
+            continue;
+        }
+        consecutive_failures += 1;
+        // 连续 N 次失败才认定连接结束：单次超时/抖动不足以拆会话。
+        if probe_should_close(
+            consecutive_failures,
+            cfg.session_probe_failures_before_close,
+        ) {
+            break;
         }
     }
 
     let conn_agent_id = authed.lock().ok().and_then(|g| g.clone());
     cleanup_connection(&registry, &ledger, conn_agent_id, client_id).await;
+}
+
+/// 活性探测的累计判定：**连续**失败达到阈值才认定连接结束。
+///
+/// 单次失败（尤其是超时）不足以拆会话 —— 连接可能只是忙于大文件传输。
+fn probe_should_close(consecutive_failures: u32, threshold: u32) -> bool {
+    consecutive_failures >= threshold.max(1)
 }
 
 /// 连接结束时的清理：摘掉本连接建立的会话，并（仅在真的摘掉时）把台账置离线。
@@ -829,9 +853,50 @@ async fn handle_dataplane_addr(
     }
 }
 
-async fn handle_heartbeat(req: &Bytes, registry: &SessionRegistry, ledger: &Ledger) {
+async fn handle_heartbeat(
+    req: &Bytes,
+    end: &End,
+    client_id: u64,
+    authed: &Arc<Mutex<Option<String>>>,
+    registry: &SessionRegistry,
+    ledger: &Ledger,
+) {
     if let Ok(hb) = serde_json::from_slice::<Heartbeat>(req) {
-        registry.touch(&hb.agent_id, now_micros()).await;
+        // 心跳到达即证明**这条连接是活的** —— 若注册表里没有该会话
+        // （例如上一次活性探测误判、会话已被清理），据此重建，
+        // 使作业通道自动恢复而不必等 agent 重连。
+        //
+        // 只对**已认证**连接重建；`Closed` 是终止态，不复活。
+        let conn_agent_id = authed.lock().ok().and_then(|g| g.clone());
+        if let Some(agent_id) = conn_agent_id {
+            if agent_id == hb.agent_id {
+                match registry.get(&agent_id).await {
+                    None => {
+                        let now = now_micros();
+                        registry
+                            .insert(Session::new(agent_id.clone(), end.clone(), now))
+                            .await;
+                        println!(
+                            "gse-server: agent {agent_id} session rebuilt from heartbeat (client_id={client_id})"
+                        );
+                        if let Err(e) = ledger.mark_online(&agent_id, &now.to_string()).await {
+                            eprintln!(
+                                "gse-server: mark_online {agent_id} on heartbeat rebuild failed: {}",
+                                e.message
+                            );
+                        }
+                    }
+                    Some(s) if s.state == SessionState::Closed => {
+                        // 终止态不复活，也不 touch
+                    }
+                    Some(_) => {
+                        registry.touch(&hb.agent_id, now_micros()).await;
+                    }
+                }
+            } else {
+                registry.touch(&hb.agent_id, now_micros()).await;
+            }
+        }
         let now = now_micros().to_string();
         if let Err(e) = ledger.mark_heartbeat(&hb.agent_id, &now).await {
             eprintln!(
@@ -1197,6 +1262,127 @@ mod tests {
     /// **重连接管回归**（实测踩到的 bug）：旧连接结束时，若注册表里已是
     /// 新连接建立的会话（不同 client_id），**不得**把台账置 offline ——
     /// 否则在线的 agent 会被误标离线（现象：status=offline 而 session_state=online）。
+    /// **单次探测失败不得拆会话**（实测踩到：传 10MB 时探测超时，
+    /// 把活着的会话摘掉了，于是心跳还在到达但作业通道永久不可用）。
+    #[test]
+    fn probe_requires_consecutive_failures_before_closing() {
+        assert!(!probe_should_close(1, 3), "单次失败不足以拆会话");
+        assert!(!probe_should_close(2, 3));
+        assert!(probe_should_close(3, 3), "连续 3 次才认定连接结束");
+        assert!(probe_should_close(4, 3));
+        // 阈值下限为 1，配置成 0 也不至于「零次失败就拆」
+        assert!(probe_should_close(1, 0));
+        assert!(!probe_should_close(0, 0));
+    }
+
+    /// 心跳可**重建**会话（规格 Requirement 2）：心跳到达即证明连接活着，
+    /// 据此恢复作业通道，不必等 agent 重连。
+    #[tokio::test]
+    async fn heartbeat_rebuilds_missing_session() {
+        use geminio::{dial, DialOptions};
+
+        let ledger = ledger("hb-rebuild").await;
+        online_agent(&ledger, "a-1").await;
+        let listener = EndListener::bind("127.0.0.1:0", ListenOptions::default())
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let accept_task = tokio::spawn(async move {
+            let (e, _d) = listener.accept().await.expect("accept");
+            e
+        });
+        let (_c, _cd) = dial(addr, DialOptions::default()).await.expect("dial");
+        let end = accept_task.await.expect("accept task");
+        let cid = end.client_id();
+
+        let registry = SessionRegistry::new();
+        let authed: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(Some("a-1".to_string())));
+        // 注册表里没有会话（模拟被误清理）
+        assert!(registry.get("a-1").await.is_none());
+
+        let hb = Heartbeat {
+            agent_id: "a-1".to_string(),
+            ts_micros: now_micros(),
+            upgrade_result: None,
+        };
+        let body = Bytes::from(serde_json::to_vec(&hb).expect("encode"));
+        handle_heartbeat(&body, &end, cid, &authed, &registry, &ledger).await;
+
+        let s = registry.get("a-1").await.expect("心跳应重建会话");
+        assert_eq!(s.client_id, cid);
+        assert_eq!(s.state, SessionState::Online);
+    }
+
+    /// 未认证连接的心跳**不得**建会话。
+    #[tokio::test]
+    async fn heartbeat_does_not_build_session_for_unauthenticated_connection() {
+        use geminio::{dial, DialOptions};
+
+        let ledger = ledger("hb-unauth").await;
+        let listener = EndListener::bind("127.0.0.1:0", ListenOptions::default())
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let accept_task = tokio::spawn(async move {
+            let (e, _d) = listener.accept().await.expect("accept");
+            e
+        });
+        let (_c, _cd) = dial(addr, DialOptions::default()).await.expect("dial");
+        let end = accept_task.await.expect("accept task");
+        let cid = end.client_id();
+
+        let registry = SessionRegistry::new();
+        let authed: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let hb = Heartbeat {
+            agent_id: "a-1".to_string(),
+            ts_micros: now_micros(),
+            upgrade_result: None,
+        };
+        let body = Bytes::from(serde_json::to_vec(&hb).expect("encode"));
+        handle_heartbeat(&body, &end, cid, &authed, &registry, &ledger).await;
+        assert!(
+            registry.get("a-1").await.is_none(),
+            "未认证连接的心跳不得建会话"
+        );
+    }
+
+    /// `Closed` 是终止态：心跳不得复活它。
+    #[tokio::test]
+    async fn heartbeat_does_not_revive_closed_session() {
+        use geminio::{dial, DialOptions};
+
+        let ledger = ledger("hb-closed").await;
+        online_agent(&ledger, "a-1").await;
+        let listener = EndListener::bind("127.0.0.1:0", ListenOptions::default())
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let accept_task = tokio::spawn(async move {
+            let (e, _d) = listener.accept().await.expect("accept");
+            e
+        });
+        let (_c, _cd) = dial(addr, DialOptions::default()).await.expect("dial");
+        let end = accept_task.await.expect("accept task");
+        let cid = end.client_id();
+
+        let registry = SessionRegistry::new();
+        let mut closed = Session::new("a-1", end.clone(), now_micros());
+        closed.close();
+        registry.insert(closed).await;
+
+        let authed: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(Some("a-1".to_string())));
+        let hb = Heartbeat {
+            agent_id: "a-1".to_string(),
+            ts_micros: now_micros(),
+            upgrade_result: None,
+        };
+        let body = Bytes::from(serde_json::to_vec(&hb).expect("encode"));
+        handle_heartbeat(&body, &end, cid, &authed, &registry, &ledger).await;
+
+        let s = registry.get("a-1").await.expect("会话仍在");
+        assert_eq!(s.state, SessionState::Closed, "Closed 不得被心跳复活");
+    }
+
     #[tokio::test]
     async fn cleanup_keeps_ledger_online_when_newer_session_took_over() {
         use geminio::{dial, DialOptions};
@@ -1349,6 +1535,7 @@ mod tests {
 
         let err = server
             .submit_job(JobSubmit {
+                kind: gse_proto::default_job_kind(),
                 agent_id: "zombie".to_string(),
                 interpreter: None,
                 script: "echo hi".to_string(),
