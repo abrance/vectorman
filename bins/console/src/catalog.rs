@@ -18,6 +18,9 @@ pub struct App {
     pub url: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// 打开该 App 的累计点击数；计数服务端持久化，前端打开时 +1。
+    #[serde(default)]
+    pub clicks: u64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -142,6 +145,7 @@ impl Catalog {
             name,
             url,
             tags,
+            clicks: 0,
             created_at: ts.clone(),
             updated_at: ts,
         };
@@ -183,6 +187,23 @@ impl Catalog {
         inner.apps[idx].url = url;
         inner.apps[idx].tags = tags;
         inner.apps[idx].updated_at = now_micros_string();
+        let updated = inner.apps[idx].clone();
+        if let Err(e) = persist(&self.data_file, &inner.apps) {
+            inner.apps[idx] = snapshot;
+            return Err(e);
+        }
+        Ok(updated)
+    }
+
+    pub async fn record_click(&self, app_id: &str) -> Result<App, CatalogError> {
+        let mut inner = self.inner.lock().await;
+        let idx = inner
+            .apps
+            .iter()
+            .position(|a| a.app_id == app_id)
+            .ok_or(CatalogError::NotFound)?;
+        let snapshot = inner.apps[idx].clone();
+        inner.apps[idx].clicks = inner.apps[idx].clicks.saturating_add(1);
         let updated = inner.apps[idx].clone();
         if let Err(e) = persist(&self.data_file, &inner.apps) {
             inner.apps[idx] = snapshot;
@@ -375,6 +396,7 @@ mod tests {
                     name: format!("n{i}"),
                     url: "http://127.0.0.1".into(),
                     tags: vec![],
+                    clicks: 0,
                     created_at: "1".into(),
                     updated_at: "1".into(),
                 });
@@ -465,6 +487,29 @@ mod tests {
         let listed = cat.list().await;
         assert_eq!(listed.len(), 1);
         assert!(listed[0].tags.is_empty());
+        assert_eq!(listed[0].clicks, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn record_click_increments_and_persists() {
+        let path = tmp_file("clicks");
+        let _ = std::fs::remove_file(&path);
+        let cat = Catalog::open(&path).unwrap();
+        let app = cat
+            .create("A".into(), "http://127.0.0.1".into(), vec![])
+            .await
+            .unwrap();
+        assert_eq!(app.clicks, 0);
+        let updated = cat.record_click(&app.app_id).await.unwrap();
+        assert_eq!(updated.clicks, 1);
+        let again = cat.record_click(&app.app_id).await.unwrap();
+        assert_eq!(again.clicks, 2);
+        drop(cat);
+        let cat2 = Catalog::open(&path).unwrap();
+        assert_eq!(cat2.list().await[0].clicks, 2);
+        let nf = cat2.record_click("app-nope-1").await.unwrap_err();
+        assert_eq!(nf.code(), "not_found");
         let _ = std::fs::remove_file(&path);
     }
 }

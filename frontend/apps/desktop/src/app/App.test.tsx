@@ -7,6 +7,7 @@ type FakeApp = {
   name: string;
   url: string;
   tags: string[];
+  clicks: number;
   created_at: string;
   updated_at: string;
 };
@@ -41,11 +42,22 @@ beforeEach(() => {
           name: body.name,
           url: body.url,
           tags: body.tags ?? [],
+          clicks: 0,
           created_at: "1",
           updated_at: "1",
         };
         store = [...store, app];
         return json(app, 201);
+      }
+      const clickMatch = url.match(/\/api\/console\/apps\/([^/]+)\/clicks$/);
+      if (clickMatch && method === "POST") {
+        const id = decodeURIComponent(clickMatch[1]);
+        const found = store.find((a) => a.app_id === id);
+        if (!found) return json({ error: "not_found", message: "no" }, 404);
+        store = store.map((a) =>
+          a.app_id === id ? { ...a, clicks: a.clicks + 1 } : a,
+        );
+        return json(store.find((a) => a.app_id === id));
       }
       if (url.includes("/api/console/apps/") && method === "PUT") {
         const id = url.split("/").pop() || "";
@@ -91,6 +103,7 @@ describe("desktop", () => {
         name: "GSE",
         url: "http://127.0.0.1:7101",
         tags: [],
+        clicks: 0,
         created_at: "1",
         updated_at: "1",
       },
@@ -98,7 +111,7 @@ describe("desktop", () => {
     const open = vi.fn();
     vi.stubGlobal("open", open);
     render(<App />);
-    fireEvent.click(await screen.findByText("GSE"));
+    fireEvent.click(await screen.findByText("GSE", { selector: ".label" }));
     expect(open).toHaveBeenCalledWith("http://127.0.0.1:7101", "_blank", "noopener,noreferrer");
   });
 
@@ -114,7 +127,7 @@ describe("desktop", () => {
       } as unknown as FakeApp,
     ];
     render(<App />);
-    expect(await screen.findByText("GSE")).toBeTruthy();
+    expect(await screen.findByText("GSE", { selector: ".label" })).toBeTruthy();
     expect(screen.queryByText("全部")).toBeTruthy();
   });
 
@@ -125,6 +138,7 @@ describe("desktop", () => {
         name: "GSE",
         url: "http://127.0.0.1:7101",
         tags: [],
+        clicks: 0,
         created_at: "1",
         updated_at: "1",
       },
@@ -133,7 +147,7 @@ describe("desktop", () => {
     render(<App />);
     fireEvent.click(await screen.findByText("删除"));
     await waitFor(() => {
-      expect(screen.queryByText("GSE")).toBeNull();
+      expect(screen.queryByText("GSE", { selector: ".label" })).toBeNull();
     });
   });
 
@@ -169,12 +183,13 @@ describe("desktop", () => {
         name: "GSE",
         url: "http://127.0.0.1:7101",
         tags: ["prod"],
+        clicks: 0,
         created_at: "1",
         updated_at: "1",
       },
     ];
     render(<App />);
-    fireEvent.click(await screen.findByText("编辑"));
+    fireEvent.click(await screen.findByText("编辑", { selector: ".actions button" }));
     expect(screen.getByLabelText("移除 prod")).toBeTruthy();
     fireEvent.click(screen.getByLabelText("移除 prod"));
     fireEvent.click(screen.getByText("保存"));
@@ -202,13 +217,104 @@ describe("desktop", () => {
         name: "GSE",
         url: "http://127.0.0.1:7101",
         tags: ["prod"],
+        clicks: 0,
         created_at: "1",
         updated_at: "1",
       },
     ];
     render(<App />);
-    expect(await screen.findByText("GSE")).toBeTruthy();
+    expect(await screen.findByText("GSE", { selector: ".label" })).toBeTruthy();
     expect(screen.getByText("prod", { selector: ".tile-tags .chip" })).toBeTruthy();
+  });
+
+  it("groups clicked apps into 喜欢 row and tags into sections sorted by total clicks", async () => {
+    store = [
+      {
+        app_id: "app-1",
+        name: "A",
+        url: "http://127.0.0.1/a",
+        tags: ["dev"],
+        clicks: 1,
+        created_at: "1",
+        updated_at: "1",
+      },
+      {
+        app_id: "app-2",
+        name: "B",
+        url: "http://127.0.0.1/b",
+        tags: ["prod", "dev"],
+        clicks: 5,
+        created_at: "2",
+        updated_at: "2",
+      },
+      {
+        app_id: "app-3",
+        name: "C",
+        url: "http://127.0.0.1/c",
+        tags: ["prod"],
+        clicks: 0,
+        created_at: "3",
+        updated_at: "3",
+      },
+      {
+        app_id: "app-4",
+        name: "D",
+        url: "http://127.0.0.1/d",
+        tags: ["prod"],
+        clicks: 0,
+        created_at: "4",
+        updated_at: "4",
+      },
+    ];
+    render(<App />);
+    await screen.findByText("A", { selector: ".nav-row .label" });
+    // 喜欢栏：点过的一定在 nav-row，没点过的一定不在
+    const navRow = screen.getByText("喜欢").closest("section") as HTMLElement;
+    expect(navRow.querySelector(".label")?.textContent).toBe("B");
+    const tilesInNav = [...navRow.querySelectorAll(".label")].map((el) => el.textContent);
+    expect(tilesInNav).toEqual(["B", "A"]);
+    // prod section (5 clicks) 在 dev section (1 click) 之前
+    const prodSection = screen.getByText("prod", { selector: ".section-title" }).closest("section") as HTMLElement;
+    const devSection = screen.getByText("dev", { selector: ".section-title" }).closest("section") as HTMLElement;
+    expect(prodSection.textContent).toContain("5");
+    expect(devSection.textContent).toContain("1");
+    const prodLabels = [...prodSection.querySelectorAll(".label")].map((el) => el.textContent);
+    expect(prodLabels).toEqual(["B", "C", "D"]); // B 5 clicks first, C/D 0 by name
+    const devLabels = [...devSection.querySelectorAll(".label")].map((el) => el.textContent);
+    expect(devLabels).toEqual(["B", "A"]);
+    expect(screen.getByRole("button", { name: /prod/ })).toBeTruthy(); // filter bar still works
+  });
+
+  it("increments clicks when opening an app", async () => {
+    store = [
+      {
+        app_id: "app-1",
+        name: "GSE",
+        url: "http://127.0.0.1:7101",
+        tags: [],
+        clicks: 2,
+        created_at: "1",
+        updated_at: "1",
+      },
+    ];
+    const open = vi.fn();
+    vi.stubGlobal("open", open);
+    render(<App />);
+    fireEvent.click(
+      (await screen.findAllByText("GSE", { selector: ".label" }))[0].closest("button")!,
+    );
+    expect(open).toHaveBeenCalled();
+    await waitFor(() => {
+      const post = vi
+        .mocked(fetch)
+        .mock.calls.find(
+          ([input, init]) =>
+            String(input).endsWith("/api/console/apps/app-1/clicks") &&
+            (init?.method || "").toUpperCase() === "POST",
+        );
+      expect(post).toBeTruthy();
+    });
+    await screen.findByText("3", { selector: ".nav-row .clicks" });
   });
 
   it("filters icons with AND and restores on 全部", async () => {
@@ -218,6 +324,7 @@ describe("desktop", () => {
         name: "GSE",
         url: "http://127.0.0.1:7101",
         tags: ["prod", "gse"],
+        clicks: 0,
         created_at: "1",
         updated_at: "1",
       },
@@ -226,28 +333,29 @@ describe("desktop", () => {
         name: "Job",
         url: "http://127.0.0.1:7101/jobs",
         tags: ["prod"],
+        clicks: 0,
         created_at: "2",
         updated_at: "2",
       },
     ];
     render(<App />);
-    expect(await screen.findByText("GSE")).toBeTruthy();
-    expect(screen.getByText("Job")).toBeTruthy();
+    expect((await screen.findAllByText("GSE", { selector: ".label" })).length).toBeGreaterThan(0);
+    expect(screen.getByText("Job", { selector: ".label" })).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "prod" }));
-    expect(screen.getByText("GSE")).toBeTruthy();
-    expect(screen.getByText("Job")).toBeTruthy();
+    expect(screen.getAllByText("GSE", { selector: ".label" }).length).toBeGreaterThan(0);
+    expect(screen.getByText("Job", { selector: ".label" })).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "gse" }));
-    expect(screen.getByText("GSE")).toBeTruthy();
-    expect(screen.queryByText("Job")).toBeNull();
+    expect(screen.getAllByText("GSE", { selector: ".label" }).length).toBeGreaterThan(0);
+    expect(screen.queryByText("Job", { selector: ".label" })).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "gse" }));
-    expect(screen.getByText("Job")).toBeTruthy();
+    expect(screen.getByText("Job", { selector: ".label" })).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "全部" }));
-    expect(screen.getByText("GSE")).toBeTruthy();
-    expect(screen.getByText("Job")).toBeTruthy();
+    expect(screen.getAllByText("GSE", { selector: ".label" }).length).toBeGreaterThan(0);
+    expect(screen.getByText("Job", { selector: ".label" })).toBeTruthy();
   });
 
   it("does not open the app when clicking a tile tag", async () => {
@@ -257,6 +365,7 @@ describe("desktop", () => {
         name: "GSE",
         url: "http://127.0.0.1:7101",
         tags: ["prod"],
+        clicks: 0,
         created_at: "1",
         updated_at: "1",
       },
