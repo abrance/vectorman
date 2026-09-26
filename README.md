@@ -90,6 +90,39 @@ kubectl apply -f packaging/deploy/k8s/gse-agent-daemonset.yaml
 服务端默认端口：dataserver `8081`（SQL/接入/UI）、`9090`（Prom 查询）、`9091`（自监控）；
 gse-server `7100`（RPC）、`7101`（台账 HTTP）、`7102`（自监控）。
 
+## 升级 Agent
+
+一条命令升级一台 agent（不需要登目标机、也不需要人工重启）：
+
+```bash
+# 用本地构建的二进制
+scripts/upgrade-agent.sh --agent testbkee --binary ./target/x86_64-unknown-linux-musl/release/gse-agent
+
+# 从 release 取
+scripts/upgrade-agent.sh --agent testbkee --from-release v1.1.0 --wait
+
+# 只看当前会话状态（作业通道是否可用）
+scripts/upgrade-agent.sh --agent testbkee --status
+```
+
+流程：脚本把二进制经 `file_transfer` 落到目标机 → 下发 `agent_upgrade` 作业 →
+**agent 不自己停自己**，而是写一个 cron 一次性任务 → 由 cron 以独立进程完成
+「停 → 备份 → 替换 → 起」→ 新 agent 启动后在**心跳**里补报结果。
+
+**为什么这么绕**：停 agent 会连带杀掉正在执行升级的作业（实测三种脱离方式都失败：
+`ctl.sh` 直停被连带杀、`setsid` 不脱 cgroup、`systemd-run` 外层仍卡 running）。
+详见 `.monkeycode/specs/gse-agent-self-update/design.md`。
+
+**失败会怎样**：新二进制起不来时**自动回滚**到备份并重启；回滚也失败则保留现场
+并在日志里给出手工恢复命令。结果落在安装目录的 `upgrade-result.json`
+（含 outcome / 新旧版本 / 新旧 sha256），由心跳上报后在 server 侧可见。
+
+**先看一眼再放行**（dry-run 打印将要执行的调度脚本）：
+
+```bash
+cargo run -p gse-agent-core --example render-upgrade-script -- /path/to/new-gse-agent
+```
+
 ## 接口速查
 
 | 组件 | 路由 |

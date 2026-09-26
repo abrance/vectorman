@@ -25,6 +25,27 @@ pub struct AuthReply {
 pub struct Heartbeat {
     pub agent_id: String,
     pub ts_micros: i64,
+    /// 尚未上报的升级结果（有则带一次，server 收到后 agent 标记已上报）。
+    ///
+    /// 为什么走心跳：升级过程中 agent 会被重启，作业结果通道那时已断，
+    /// 结果只能由新启动的 agent 在后续心跳里补报。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade_result: Option<UpgradeReport>,
+}
+
+/// 升级结果的上行表示（与 agent 侧 `UpgradeResult` 字段对应）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpgradeReport {
+    pub started_at: String,
+    pub finished_at: String,
+    pub from_version: String,
+    pub to_version: String,
+    pub from_sha256: String,
+    pub to_sha256: String,
+    /// `succeeded` / `rolled_back` / `failed`。
+    pub outcome: String,
+    #[serde(default)]
+    pub detail: String,
 }
 
 /// Server 下发给 Agent 的指令。
@@ -106,6 +127,11 @@ impl std::fmt::Display for JobStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobExec {
     pub job_id: String,
+    /// 作业类型：`script`（默认，执行 `script` 字段）或 `agent_upgrade`
+    /// （自更新：`script` 字段携带 `AgentUpgradeSpec` 的 JSON）。
+    /// 缺省为 `script`，使旧 server 发的报文在旧/新 agent 上都按原语义执行。
+    #[serde(default = "default_job_kind")]
+    pub kind: String,
     pub interpreter: String,
     pub script: String,
     #[serde(default)]
@@ -117,6 +143,23 @@ pub struct JobExec {
     pub timeout_secs: u64,
     pub stdout_limit_bytes: u64,
     pub stderr_limit_bytes: u64,
+}
+
+/// `JobExec::kind` 的默认值（向后兼容：无 kind 即普通脚本作业）。
+pub fn default_job_kind() -> String {
+    "script".to_string()
+}
+
+/// `agent_upgrade` 作业的载荷（放在 `JobExec.script` 里，JSON）。
+///
+/// 二进制由调用方先前用 `file_transfer` 落到 `binary_path`；
+/// 本结构只描述「要换成哪个二进制」以及校验值。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentUpgradeSpec {
+    /// 已在目标机上、准备启用的新二进制绝对路径。
+    pub binary_path: String,
+    /// 期望的 sha256（不匹配则拒绝执行 —— 防半截传输或投毒）。
+    pub sha256: String,
 }
 
 /// Agent → Server：作业受理应答（`job_exec` 的返回值）。
@@ -417,6 +460,7 @@ mod tests {
         roundtrip(&Heartbeat {
             agent_id: "web-01".to_string(),
             ts_micros: 1_700_000_000_000_000,
+            upgrade_result: None,
         });
     }
 
@@ -489,6 +533,7 @@ mod tests {
         env.insert("LANG".to_string(), "C".to_string());
         roundtrip(&JobExec {
             job_id: "job-1".to_string(),
+            kind: "script".to_string(),
             interpreter: "bash".to_string(),
             script: "echo hello".to_string(),
             args: vec!["-e".to_string()],
@@ -614,5 +659,82 @@ mod tests {
             file_sha256: Some("cd".to_string()),
             error: None,
         });
+    }
+}
+
+#[cfg(test)]
+mod job_kind_compat_tests {
+    use super::*;
+
+    fn exec_json(kind_field: &str) -> String {
+        format!(
+            r#"{{"job_id":"j1"{kind_field},"interpreter":"bash","script":"echo hi",
+                "timeout_secs":30,"stdout_limit_bytes":1024,"stderr_limit_bytes":1024}}"#
+        )
+    }
+
+    #[test]
+    fn missing_kind_defaults_to_script() {
+        // 旧 server 发的报文没有 kind 字段 —— 必须按普通脚本作业处理。
+        let e: JobExec = serde_json::from_str(&exec_json("")).expect("decode");
+        assert_eq!(e.kind, "script");
+    }
+
+    #[test]
+    fn explicit_kind_is_preserved() {
+        let e: JobExec =
+            serde_json::from_str(&exec_json(r#","kind":"agent_upgrade""#)).expect("decode");
+        assert_eq!(e.kind, "agent_upgrade");
+    }
+
+    #[test]
+    fn heartbeat_without_upgrade_result_still_parses() {
+        // 旧 agent 不发该字段；旧 server 也不能因为缺字段而报错。
+        let hb: Heartbeat =
+            serde_json::from_str(r#"{"agent_id":"a","ts_micros":1}"#).expect("decode");
+        assert!(hb.upgrade_result.is_none());
+    }
+
+    #[test]
+    fn heartbeat_omits_absent_upgrade_result_on_encode() {
+        let hb = Heartbeat {
+            agent_id: "a".to_string(),
+            ts_micros: 1,
+            upgrade_result: None,
+        };
+        let json = serde_json::to_string(&hb).expect("encode");
+        assert!(!json.contains("upgrade_result"), "无结果时不应出现在报文里");
+    }
+
+    #[test]
+    fn heartbeat_carries_upgrade_result_when_present() {
+        let hb = Heartbeat {
+            agent_id: "a".to_string(),
+            ts_micros: 1,
+            upgrade_result: Some(UpgradeReport {
+                started_at: "t0".into(),
+                finished_at: "t1".into(),
+                from_version: "1.1.0".into(),
+                to_version: "1.2.0".into(),
+                from_sha256: "a".into(),
+                to_sha256: "b".into(),
+                outcome: "succeeded".into(),
+                detail: String::new(),
+            }),
+        };
+        let json = serde_json::to_string(&hb).expect("encode");
+        let back: Heartbeat = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back, hb);
+    }
+
+    #[test]
+    fn agent_upgrade_spec_roundtrips() {
+        let spec = AgentUpgradeSpec {
+            binary_path: "/tmp/gse-agent-new".to_string(),
+            sha256: "56ca0df6".to_string(),
+        };
+        let s = serde_json::to_string(&spec).expect("encode");
+        let back: AgentUpgradeSpec = serde_json::from_str(&s).expect("decode");
+        assert_eq!(back, spec);
     }
 }

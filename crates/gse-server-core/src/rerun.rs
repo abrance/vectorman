@@ -51,6 +51,7 @@ pub fn build_rerun_submit(source: &JobRecord, req: RerunRequest) -> JobSubmit {
     };
 
     JobSubmit {
+        kind: gse_proto::default_job_kind(),
         agent_id,
         interpreter: Some(
             req.interpreter

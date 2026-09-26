@@ -134,6 +134,7 @@ impl ExpandedJob {
     /// 拼装为 `submit_job` 的请求体。
     pub fn into_submit(self, agent_id: impl Into<String>) -> JobSubmit {
         JobSubmit {
+            kind: gse_proto::default_job_kind(),
             agent_id: agent_id.into(),
             interpreter: Some(self.interpreter),
             script: self.script,

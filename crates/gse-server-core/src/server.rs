@@ -27,8 +27,6 @@ fn heartbeat_window_micros() -> i64 {
     90 * 1_000_000
 }
 
-/// 连接活性探测间隔（秒）。探测失败即判定连接结束并清理会话。
-const SESSION_PROBE_INTERVAL_SECS: u64 = 15;
 /// 单次活性探测的超时（秒）。
 const SESSION_PROBE_TIMEOUT_SECS: u64 = 5;
 const COMMAND_TIMEOUT_SECS: u64 = 60;
@@ -40,6 +38,9 @@ static JOB_SEQ: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct JobSubmit {
     pub agent_id: String,
+    /// 作业类型：`script`（默认）或 `agent_upgrade`。
+    #[serde(default = "gse_proto::default_job_kind")]
+    pub kind: String,
     #[serde(default)]
     pub interpreter: Option<String>,
     pub script: String,
@@ -317,6 +318,25 @@ pub async fn submit_job_with_source(
             ));
         }
     }
+    let kind = if req.kind.trim().is_empty() {
+        gse_proto::default_job_kind()
+    } else {
+        req.kind.clone()
+    };
+    if kind == "agent_upgrade" {
+        // 升级载荷必须是合法的 AgentUpgradeSpec —— 在受理阶段就挡住坏输入。
+        let spec: gse_proto::AgentUpgradeSpec = serde_json::from_str(&req.script)
+            .map_err(|e| GseError::new("invalid_argument", format!("bad upgrade spec: {e}")))?;
+        if spec.binary_path.trim().is_empty() {
+            return Err(GseError::new("invalid_argument", "binary_path required"));
+        }
+        if spec.sha256.trim().len() != 64 {
+            return Err(GseError::new(
+                "invalid_argument",
+                "sha256 must be 64 hex chars",
+            ));
+        }
+    }
     let interpreter = req
         .interpreter
         .filter(|i| !i.trim().is_empty())
@@ -342,6 +362,7 @@ pub async fn submit_job_with_source(
 
     let exec = JobExec {
         job_id: job_id.clone(),
+        kind,
         interpreter,
         script: req.script,
         args: req.args,
@@ -632,7 +653,7 @@ async fn handle_conn(
     // 持续刷新 last_seen，使会话永远停在 Online；作业下发拿到它必然失败。
     let client_id = end.client_id();
     loop {
-        tokio::time::sleep(Duration::from_secs(SESSION_PROBE_INTERVAL_SECS)).await;
+        tokio::time::sleep(Duration::from_secs(cfg.session_probe_interval_secs.max(1))).await;
         let probe = tokio::time::timeout(
             Duration::from_secs(SESSION_PROBE_TIMEOUT_SECS),
             end.call(SESSION_PROBE_METHOD, Bytes::new()),
@@ -655,23 +676,38 @@ async fn handle_conn(
     }
 
     let conn_agent_id = authed.lock().ok().and_then(|g| g.clone());
-    match conn_agent_id {
-        Some(agent_id) => {
-            let removed = registry.remove_if_client(&agent_id, client_id).await;
-            if let Err(e) = ledger.mark_offline(&agent_id).await {
-                eprintln!(
-                    "gse-server: mark_offline {agent_id} on disconnect failed: {}",
-                    e.message
-                );
-            }
-            println!(
-                "gse-server: agent {agent_id} connection ended (client_id={client_id}, session_removed={removed})"
+    cleanup_connection(&registry, &ledger, conn_agent_id, client_id).await;
+}
+
+/// 连接结束时的清理：摘掉本连接建立的会话，并（仅在真的摘掉时）把台账置离线。
+///
+/// 抽成独立函数是为了可测：`removed == false` 的分支是实测踩到的 bug ——
+/// agent 重连后旧连接的清理把在线的 agent 误标成 offline。
+async fn cleanup_connection(
+    registry: &SessionRegistry,
+    ledger: &Ledger,
+    conn_agent_id: Option<String>,
+    client_id: u64,
+) {
+    let Some(agent_id) = conn_agent_id else {
+        println!("gse-server: unauthenticated connection ended (client_id={client_id})");
+        return;
+    };
+    let removed = registry.remove_if_client(&agent_id, client_id).await;
+    // **只有真的摘掉了会话才置 offline**：`removed == false` 说明期间 agent
+    // 已重连、注册表里是新会话（别的 client_id）—— 那种情况下把台账置 offline
+    // 会把在线的 agent 误标为离线。
+    if removed {
+        if let Err(e) = ledger.mark_offline(&agent_id).await {
+            eprintln!(
+                "gse-server: mark_offline {agent_id} on disconnect failed: {}",
+                e.message
             );
         }
-        None => {
-            println!("gse-server: unauthenticated connection ended (client_id={client_id})");
-        }
     }
+    println!(
+        "gse-server: agent {agent_id} connection ended (client_id={client_id}, session_removed={removed})"
+    );
 }
 
 /// 连接活性探测使用的方法名。agent 不会注册它，对端会回「未知方法」——
@@ -802,6 +838,25 @@ async fn handle_heartbeat(req: &Bytes, registry: &SessionRegistry, ledger: &Ledg
                 "gse-server: mark_heartbeat {} failed: {}",
                 hb.agent_id, e.message
             );
+        }
+        // agent 自更新结果补报：落库并打日志（升级时作业通道已断，
+        // 这是唯一的回报路径）。
+        if let Some(r) = hb.upgrade_result.as_ref() {
+            println!(
+                "gse-server: agent {} upgrade {} ({} -> {}, detail={})",
+                hb.agent_id, r.outcome, r.from_version, r.to_version, r.detail
+            );
+            match serde_json::to_string(r) {
+                Ok(json) => {
+                    if let Err(e) = ledger.mark_upgrade_result(&hb.agent_id, &json).await {
+                        eprintln!(
+                            "gse-server: mark_upgrade_result {} failed: {}",
+                            hb.agent_id, e.message
+                        );
+                    }
+                }
+                Err(e) => eprintln!("gse-server: encode upgrade result failed: {e}"),
+            }
         }
     }
 }
@@ -1120,6 +1175,114 @@ mod tests {
         let _ = client_end;
     }
 
+    /// 测试用：登记一个 agent 并置为 online。
+    async fn online_agent(ledger: &Ledger, agent_id: &str) {
+        ledger
+            .upsert_agent(&crate::ledger::Agent {
+                agent_id: agent_id.to_string(),
+                host_id: "h-1".to_string(),
+                access_point_id: None,
+                token: "tok".to_string(),
+                version: "1".to_string(),
+                install_path: String::new(),
+                status: "unknown".to_string(),
+                last_heartbeat_at: None,
+                registered_at: ledger_stamp(),
+            })
+            .await
+            .expect("agent");
+        ledger.mark_online(agent_id, "1").await.expect("online");
+    }
+
+    /// **重连接管回归**（实测踩到的 bug）：旧连接结束时，若注册表里已是
+    /// 新连接建立的会话（不同 client_id），**不得**把台账置 offline ——
+    /// 否则在线的 agent 会被误标离线（现象：status=offline 而 session_state=online）。
+    #[tokio::test]
+    async fn cleanup_keeps_ledger_online_when_newer_session_took_over() {
+        use geminio::{dial, DialOptions};
+
+        let ledger = ledger("cleanup-takeover").await;
+        online_agent(&ledger, "a-1").await;
+
+        // 同一条 listener 上两条连接 → 两个不同的 client_id
+        let listener = EndListener::bind("127.0.0.1:0", ListenOptions::default())
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let accept_task = tokio::spawn(async move {
+            let (e1, _d1) = listener.accept().await.expect("accept 1");
+            let (e2, _d2) = listener.accept().await.expect("accept 2");
+            (e1, e2)
+        });
+        let (_c1, _cd1) = dial(addr, DialOptions::default()).await.expect("dial 1");
+        let (_c2, _cd2) = dial(addr, DialOptions::default()).await.expect("dial 2");
+        let (old_end, new_end) = accept_task.await.expect("accept task");
+        let old_cid = old_end.client_id();
+        let new_cid = new_end.client_id();
+        assert_ne!(old_cid, new_cid);
+
+        let registry = SessionRegistry::new();
+        registry
+            .insert(Session::new("a-1", old_end, now_micros()))
+            .await;
+        registry
+            .insert(Session::new("a-1", new_end, now_micros()))
+            .await;
+
+        // 旧连接现在才结束 —— 会话不得被摘、台账不得被置离线
+        cleanup_connection(&registry, &ledger, Some("a-1".to_string()), old_cid).await;
+
+        let cur = registry.get("a-1").await.expect("新会话必须保留");
+        assert_eq!(cur.client_id, new_cid);
+        let a = ledger.get_agent("a-1").await.expect("get").expect("exists");
+        assert_eq!(a.status, "online", "重连接管时不得把在线的 agent 误标离线");
+    }
+
+    /// 对照：会话确实是自己的（无接管）→ 摘掉并置 offline。
+    #[tokio::test]
+    async fn cleanup_removes_session_and_marks_offline_without_takeover() {
+        use geminio::{dial, DialOptions};
+
+        let ledger = ledger("cleanup-plain").await;
+        online_agent(&ledger, "a-1").await;
+
+        let listener = EndListener::bind("127.0.0.1:0", ListenOptions::default())
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let accept_task = tokio::spawn(async move {
+            let (e, _d) = listener.accept().await.expect("accept");
+            e
+        });
+        let (_c, _cd) = dial(addr, DialOptions::default()).await.expect("dial");
+        let end = accept_task.await.expect("accept task");
+        let cid = end.client_id();
+
+        let registry = SessionRegistry::new();
+        registry
+            .insert(Session::new("a-1", end, now_micros()))
+            .await;
+
+        cleanup_connection(&registry, &ledger, Some("a-1".to_string()), cid).await;
+
+        assert!(registry.get("a-1").await.is_none(), "会话应被摘掉");
+        let a = ledger.get_agent("a-1").await.expect("get").expect("exists");
+        assert_eq!(a.status, "offline");
+    }
+
+    /// 未认证连接结束时只打日志，不动任何会话。
+    #[tokio::test]
+    async fn cleanup_ignores_unauthenticated_connection() {
+        let ledger = ledger("cleanup-unauth").await;
+        online_agent(&ledger, "a-1").await;
+
+        let registry = SessionRegistry::new();
+        cleanup_connection(&registry, &ledger, None, 1).await;
+
+        let a = ledger.get_agent("a-1").await.expect("get").expect("exists");
+        assert_eq!(a.status, "online", "未认证连接的结束不得影响台账");
+    }
+
     #[tokio::test]
     async fn submit_job_rejects_offline_agent() {
         let cfg = ServerConfig {
@@ -1132,6 +1295,7 @@ mod tests {
         let (server, _addr) = Server::bind(cfg).await.expect("bind");
         let err = server
             .submit_job(JobSubmit {
+                kind: gse_proto::default_job_kind(),
                 agent_id: "ghost".to_string(),
                 interpreter: None,
                 script: "echo hi".to_string(),
@@ -1222,6 +1386,7 @@ mod tests {
 
         let empty = server
             .submit_job(JobSubmit {
+                kind: gse_proto::default_job_kind(),
                 agent_id: "ghost".to_string(),
                 interpreter: None,
                 script: "  ".to_string(),
@@ -1236,6 +1401,7 @@ mod tests {
 
         let too_long = server
             .submit_job(JobSubmit {
+                kind: gse_proto::default_job_kind(),
                 agent_id: "ghost".to_string(),
                 interpreter: None,
                 script: "123456789".to_string(),
@@ -1250,6 +1416,7 @@ mod tests {
 
         let bad_timeout = server
             .submit_job(JobSubmit {
+                kind: gse_proto::default_job_kind(),
                 agent_id: "ghost".to_string(),
                 interpreter: None,
                 script: "hi".to_string(),
@@ -1276,6 +1443,7 @@ mod tests {
         let (server, _addr) = Server::bind(cfg).await.expect("bind");
         let err = server
             .submit_job(JobSubmit {
+                kind: gse_proto::default_job_kind(),
                 agent_id: "ghost".to_string(),
                 interpreter: None,
                 script: "echo hi".to_string(),
