@@ -64,12 +64,21 @@
 
 **User Story:** AS 运维人员, I want Agent 尽早发现半死连接并快速重连, so that 作业通道的中断窗口尽量短。
 
+> **2026-09-26 修订**：原计划「给 Agent 加 TCP keepalive」，但读 geminio 源码后确认
+> `DialOptions` 不暴露底层 socket（做不到）。**不需要了** —— geminio **自带连接层心跳**：
+> 默认 `Heartbeat::Seconds5`，closewait = 5s × 6 = **30 秒**无包即拆连接，比系统默认的
+> TCP keepalive（600s）快 20 倍。问题不在检测慢，而在服务端**没监听检测结果**（Requirement 1）。
+
 #### Acceptance Criteria
 
-1. THE `gse-agent` SHALL 为其与 Server 的 TCP 连接启用 keepalive，探测间隔量级为**分钟以内**（当前系统默认 10 分钟过慢）。
+1. THE `gse-agent` SHALL 依赖 **geminio 的连接层心跳**（默认 30 秒 closewait）检测半死连接，
+   不引入 TCP keepalive（`DialOptions` 不暴露 socket，做不到）。
+   `DialOptions.heartbeat` 作为**可调旋钮**保留：现场若发现 30 秒过于敏感，可调至 `Seconds20`（120 秒窗口）。
 2. THE Agent 的重连退避 SHALL 在**连接成功建立后重置**，使一次成功连接后若再断，不必等待 60s。
 3. WHEN 心跳 RPC 失败, THE Agent SHALL 视为连接已死并进入重连，不得在已死连接上继续发心跳。
 4. THE Agent SHALL 在日志中记录重连的原因与当前退避值（现状已记录措辞，需保持）。
+   WHEN 半死连接被连接层心跳判定超时, THE Agent SHALL 让该错误**向上传播触发重连**
+   （现状 `heartbeat_loop` 用 `?` 传播 `Err`，符合；加测试钉住）。
 
 ### Requirement 5: 回归可验证
 

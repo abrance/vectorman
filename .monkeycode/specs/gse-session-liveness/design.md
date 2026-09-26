@@ -54,7 +54,7 @@ geminio 的 multiplexer 支持多条逻辑流。心跳是**每次新建 stream**
 
 ## 架构决策
 
-### 决策 1：会话清理用「连接身份」而非 `agent_id`
+### 决策 1：连接身份直接用 geminio 的 `client_id`（**0.1 已确认**）
 
 **问题**：若只按 `agent_id` 移除，会有竞态 ——
 
@@ -65,25 +65,58 @@ geminio 的 multiplexer 支持多条逻辑流。心跳是**每次新建 stream**
          → 把 T2 刚建立的新会话摘掉了
 ```
 
-**方案**：给 `Session` 加一个**连接唯一标识**（`conn_id`），清理时校验「当前会话是否仍是我这条连接建立的」。
+**方案**：用 geminio 自带的 **`End::client_id() -> u64`**，无需自造。
+
+`geminio-rs` 的源码注释（`crates/app/src/end_tcp.rs:134`）：
+
+> `/// Stable peer identity assigned during the conn-layer handshake.`
+
+且 `EndListener` 用 `next_client_id: AtomicU64`（`first_client_id = 1`）**单调分配**，保证同一 listener 下不同连接拿到的 `client_id` 不同。**这正是注册表内可区分的要求。**
 
 ```rust
+pub struct Session {
+    pub agent_id: String,
+    pub end: End,
+    pub client_id: u64,        // ← geminio 握手分配，非自造
+    ...
+}
+
 impl SessionRegistry {
-    /// 仅当注册表中该 agent 的会话仍属于 conn_id 时移除，返回是否移除。
-    pub async fn remove_if_conn(&self, agent_id: &str, conn_id: u64) -> bool;
+    /// 仅当注册表中该 agent 的会话仍属于 client_id 时移除，返回是否移除。
+    pub async fn remove_if_client(&self, agent_id: &str, client_id: u64) -> bool;
 }
 ```
 
-`conn_id` 用进程内单调递增的 `AtomicU64`（无需全局唯一，只需注册表内可区分）。
+### 决策 2：连接结束通知用 `EndDrivers.hub_driver`（**0.1 已确认，无需退化**）
 
-### 决策 2：连接结束的等待点
+**结论：geminio 没有 `End::closed()` / `on_close()`，但提供了等价能力。**
 
-`handle_conn` 注册完 handler 后需要**等待连接结束**。geminio 的 `End` 提供的能力需确认：
+`EndListener::accept()` 返回 `(End, EndDrivers)`：
 
-- 若有 `end.closed()` / `end.on_close()` 之类的 future → 直接 await
-- 若没有 → 用**心跳超时**兜底：连接结束后心跳自然停止，`run_liveness` 在 `heartbeat_timeout_secs` 后把会话推进到 `Offline`（**已有逻辑**），但需要保证存档路径也会 `remove`
+```rust
+pub struct EndDrivers {
+    /// Handle for the `mux::DialogueHub` router.
+    pub hub_driver: JoinHandle<Result<(), mux::Error>>,
+}
+```
 
-⚠️ **这一条在实现前必须读 geminio 的 API 确认**（见 tasklist 第 1 步）。若没有关闭通知，则退化为「超时清理」，本 feature 的 Requirement 1 验收标准需相应放宽并记录原因。
+源码注释（`end_tcp.rs:159`）明确：
+
+> `/// `DialogueHub`'s router will follow once the conn driver exits.`
+
+即 **连接结束（含超时、RST、正常关闭）时 `hub_driver` 会 resolve** —— 这就是连接关闭通知。
+
+**当前代码把它丢弃了**（`server.rs:167`）：
+
+```rust
+Ok((end, _drivers)) => {          // ← _drivers 被丢弃
+    tokio::spawn(handle_conn(end, registry, cfg, ledger));
+}
+```
+
+**修复**：把 `_drivers` 交给 `handle_conn`，在它内部 await `hub_driver`，resolve 后执行清理。
+
+**为什么这解释了 3.5 小时不恢复**：geminio 的连接层心跳**工作正常**（默认 `Heartbeat::Seconds5`，closewait = 5s × 6 = **30 秒**就判定对端死亡并拆连接），`hub_driver` 也确实 resolve 了 —— **只是没人监听它**。连接在 30 秒内就被拆了，而会话在注册表里留了 3.5 小时。
 
 ### 决策 3：心跳重建会话
 
@@ -140,14 +173,36 @@ async fn handle_heartbeat(
 
 `dispatch_job` 的两个失败分支（早退 / RPC 失败 / 超时）也应给不同措辞，便于排查。
 
-### 决策 6：TCP keepalive
+### 决策 6：不引入 TCP keepalive；依赖 geminio 连接层心跳（**0.2 已确认**）
 
-在 `gse-agent` 建立连接后设置 socket 选项。keepalive 是 OS 层能力：
+**0.2 结论：`DialOptions` 不暴露底层 socket**（字段只有 `client_id` / `heartbeat` / `meta` / `timeout`），`End` 也不暴露。因此**无法**在 dial 后设置 `TCP_KEEPIDLE` 等 socket 选项。
 
-- Linux: `TCP_KEEPIDLE`（起始等待）、`TCP_KEEPINTVL`（探测间隔）、`TCP_KEEPCNT`（探测次数）
-- 目标：**60s 起始 + 15s 间隔 × 4 次** ⇒ 死连接约 2 分钟内被发现（vs 现在的 10 分钟）
+**但这不重要，因为 geminio 自带更好的机制。** 源码 `crates/conn/src/heartbeat.rs`：
 
-⚠️ **实现约束**：`geminio::dial()` 返回的 `End` 是否暴露底层 socket？若不暴露，则需要在 dial 之前设置（可能不可行）。**实现前需确认**（tasklist 第 2 步）；若不可行，退化为「给心跳 RPC 加超时」——同样能达到「尽早发现」的目的。
+```rust
+pub const CLOSEWAIT_MULTIPLIER: u32 = 6;
+pub enum Tick { Idle, SendPing, Timeout }
+// "any inbound packet — not just HeartbeatAck — counts as liveness"
+```
+
+`Heartbeater::from_negotiated(heartbeat, now)` 取 `closewait = interval × 6`，默认 `Heartbeat::Seconds5` ⇒ **30 秒无包即 `Tick::Timeout` → `Event::Error` → 拆连接**。
+
+**对比**：
+
+| 方案 | 检测时间 | 是否可改 |
+| --- | --- | --- |
+| 系统 TCP keepalive（现状） | **600s** | 需 root 改 sysctl，且 agent 侧连接半死时依然生效但很慢 |
+| geminio 连接层心跳（已有） | **30s** | 通过 `DialOptions.heartbeat` 协商，可在 agent 侧调 |
+| 自加 TCP keepalive socket 选项 | 目标 ~2 分钟 | ❌ `DialOptions` 不暴露 socket，**做不到** |
+
+**决策**：**不做 TCP keepalive**（Requirement 4 的第 1 条据此修订）。已有的 30 秒连接层心跳比自加 keepalive 快得多，问题只在于**服务端没监听它的结果**（决策 2）。
+
+Agent 侧真正要改的是：
+
+1. **退避重置**（Requirement 4.2）—— 现状 `backoff` 在 `run()` 里跨 `connect_once` 持续增长，一次成功后若再断要等 60s
+2. **心跳 RPC 失败立即重连**（已有，加测试钉住）
+
+`DialOptions.heartbeat` 可作为**可调旋钮**保留（若现场发现 30 秒太敏感导致误判，可调到 `Seconds20` ⇒ 120 秒窗口）。
 
 ## 数据模型变更
 
