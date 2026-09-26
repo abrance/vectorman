@@ -89,13 +89,12 @@
 
 - [x] 5.1 **本机（systemd 部署）**：一次完整升级 —— 下发 → 等待 → agent 重启 →
       回到 online → 心跳带出成功结果。
-- [ ] 5.2 **testbkee（ctl.sh direct 部署）**：同上。
-- [ ] 5.3 验证升级期间**不需要人工重启**（这是本 feature 的存在理由）。
-- [ ] 5.4 记录耗时（cron 调度 + 重启）与观察到的任何异常。
-- [ ] 5.5 失败路径真机验证：sha256 不匹配 → 拒绝且 agent 不受影响。
+- [x] 5.2 **testbkee（ctl.sh direct 部署）**：同上。
+- [x] 5.3 验证升级期间**不需要人工重启**（这是本 feature 的存在理由）。
+- [x] 5.4 记录耗时（cron 调度 + 重启）与观察到的任何异常。
+- [x] 5.5 失败路径真机验证：sha256 不匹配 → 拒绝且 agent 不受影响。
 
-- **检查点 F**（部分）：5.1 已通过（脚本层真机演练）；5.2/5.3/5.5 需先部署
-      带 `agent_upgrade` 支持的新 server 才能走全链路。
+- **检查点 F ✅**：5.1–5.3、5.5 全部通过（详见下方「真集群全链路验证」）。
 
 ## 6. 收尾
 
@@ -107,3 +106,65 @@
 - [x] 6.4 把本 feature 的结论（尤其「agent 不能停自己」的实测依据）保留在 `design.md`。
 
 - **检查点 G ✅**：CI 全绿；README 有升级指引（含回滚与 dry-run）；design.md 记录了为什么用 cron。
+
+## 10. 真集群全链路验证（2026-09-27，cloud3 + testbkee）
+
+镜像 `ghcr.io/abrance/vectorman-server:v1.2.4-6b5b5f8`（tag `server/v1.2.4`）。
+
+### 5.1 本机 debian12（systemd 部署）✅
+
+`scripts/upgrade-agent.sh --agent debian12-agent --binary <新二进制>`
+
+- 受理 → cron 调度 → 升级 → 结果 `succeeded`（`reported` false→true）
+- 全程无需人工重启
+
+### 5.2 testbkee（ctl.sh direct 部署）✅
+
+```
+21:42:02  cron 触发（test 用户自己的 crontab，无需 sudo）
+21:42:08  完成（6 秒）
+outcome=succeeded, reported=true
+crontab 自清理 ✔，agent running ✔
+```
+
+server 侧：`agent testbkee upgrade succeeded`，结果落库 `agents.upgrade_result_json`。
+
+### 5.3 全程不需要人工重启 ✅
+
+两次升级（本机 systemd / testbkee ctl.sh）都由 cron 独立进程完成，
+agent 重启后自动重连，**没有任何人工干预**。
+
+### 5.4 耗时与异常
+
+| 项 | 值 |
+| --- | --- |
+| 升级动作本身 | 5–6 秒 |
+| cron 调度等待 | 最多 60 秒（分钟级粒度）|
+| 大文件传输 | 10MB 约 20 秒 |
+
+### 5.5 失败路径 ✅
+
+| 输入 | 结果 |
+| --- | --- |
+| sha256 不匹配 | `rejected: sha256 mismatch` |
+| binary_path 不存在 | `rejected: binary_path not found` |
+| 两者 | agent 不受影响，**未写 crontab** |
+
+### 验证过程中发现并修掉的 4 个真 bug
+
+1. **crontab 内容缺结尾换行** → `crontab -` 报「missing newline before EOF」，
+   升级被拒（`b7cd0c4`）。
+2. **`systemctl list-unit-files` 对不存在的 unit 也返回 0** → ctl.sh 部署被误判成
+   systemd 部署 → 走 `sudo -n crontab` → 无免密 sudo 时失败
+   （`sudo: 需要密码`）。改用 `systemctl cat`。
+3. **单次探测失败拆会话**：向 agent 传 10MB 时连接被占满、探测 5 秒超时，
+   代码把超时当「连接已死」，**摘掉了活着的会话** ——
+   现象是「心跳新鲜但 session=absent、作业通道不可用」。
+   改为连续 3 次失败才判死（`6b5b5f8`）。
+4. **心跳不重建会话**（规格 Requirement 2 漏实现）→ 上面那个误判**无法自愈**。
+   补上后，心跳到达即重建会话，误判可自动恢复。
+
+### 遗留风险
+
+- **ctl.sh direct 模式无进程守护**：agent 进程若崩溃，没有 systemd 自动重启，
+  会永久失联。建议后续加进程守护（或改 systemd）。
