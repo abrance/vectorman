@@ -52,7 +52,7 @@
 ## 1c. cops CD 接管（用户已确认口径，2026-09-25 问卷定稿）
 
 > 决策记录：空库起（不搬 cloud2 数据）；cloud2 Agent 改连 cloud3（server_addr 用域名
-> `gse.xiaoyxq.top:30710`，server 监听维持 NodePort，不加 TCPRoute）；DaemonSet 排下一轮；
+> `vectorman.xiaoyxq.top:30710`，server 监听维持 NodePort，不加 TCPRoute）；DaemonSet 排下一轮；
 > dist 打进镜像（构建上下文改源码树）；metrics 口不建 Service；cops 一次改造到位；
 > cloud2 退役 = cops CD 稳定 2 天后。
 
@@ -79,14 +79,33 @@
       域名以 DNS 实际注册为准：`vectorman`/`dataserver`/`console`（早期写的 gse./data. 未注册，已改口径）
 - [ ] 1.15 删 Pod 重建数据仍在、`rollout restart` 无 CrashLoop、cron 全量 apply 幂等
       （连续两晚 Pod AGE 增长）—— 作为 cops 接管后的验收
-- [x] 1.16 cloud2 Agent 迁移（2026-09-26 完成）：
-      ① 集群侧：namespaces + agent cloud2-agent 台账登记完成；deploy.yml 增加 VECTORMAN_AGENT_TOKEN 的密钥派发；
-      ② cloud2 侧：gse-agent 重启后 `GET /api/gse/agents` → status=online（心跳持续推进）；
-         server 端日志「agent cloud2-agent authenticated」；
-      ③ 数据流：checkpoint 未在 cloud2 运行，无 ingest（预期）——checkpoint 在真机上跑起来后自然出数；
-      ④ 旧 server（cloud2 的 127.0.0.1:7100）暂未停（不搬运数据，等 cron 幂等验收后一并退役）：台账重新登记（host+agent，token 一致）、
-      `server_addr = "gse.xiaoyxq.top:30710"`、重启 systemd、心跳 online；
-      迁移 PR 描述写死「空库起」决定
+- [x] 1.16 **三个 Agent 全部迁移到 cloud3 的 server**（2026-09-26 完成）：
+      台账：`hosts/{cloud2,debian12,bkee5}` + `agents/{cloud2-agent,debian12-agent,testbkee}`；
+      三者均 `server_addr = "vectorman.xiaoyxq.top:30710"`，`GET /api/gse/agents` 全部 **online**
+      （心跳持续推进），server 端日志「agent cloud2-agent authenticated」；
+      testbkee 另验证了下发作业通道（`vmctl jobs submit` → succeeded/exit 0）。
+      ④ 旧 server（cloud2 的 127.0.0.1:7100）暂未停（不搬运数据，等 cron 幂等验收后一并退役）。
+      **三处踩的是同一个坑**：端口写成 `7100`（只在 k3s 集群内监听）而非 `30710`；
+      token 用的是旧 server 关鉴权时的占位值（新 server `auth_enabled=true`，必须台账登记后重发）。
+
+- [x] 1.17 **cops CD 接管 server 侧**（2026-09-26 完成，cops PR #61）：
+      `apps/vectorman/` 由 native 改为 k8s 单元 —— 新增 `k8s.yaml`（18 个对象：
+      1 Namespace + 1 Middleware + 3 ConfigMap + 3 Deployment + 4 Service + 6 IngressRoute），
+      `app.conf` 改 `DEPLOY_MODE=k8s / DEPLOY_TARGET=cloud3`，`.env` 改镜像 + 域名 + hostPath；
+      删除 `native/` 与 `conf/`（配置进 ConfigMap，二进制进镜像）；
+      `deploy.yml` 去掉 `VECTORMAN_SUDO_PASS`。
+      **通用机制**：`deploy-k8s.sh` 新增 ConfigMap checksum 注解 —— apply 后把每个 Deployment
+      引用的 ConfigMap 内容哈希写进 podTemplate.annotations，内容变则自动滚动。
+      没有它时改 ConfigMap 是「部署成功但仍跑旧配置」的静默漂移，健康探测看不出来。
+      只处理本单元声明的 ConfigMap；对无 ConfigMap 的单元（model-ocr/model-logcluster）实测 no-op。
+      **cloud3 实测**：渲染产物与迁移前手工部署的现网 manifest 同对象集（18 个）、三个 ConfigMap
+      逐字一致；跑三次 `deploy-k8s.sh`：首次注入+滚动 → 二次全部「未变」Pod 名不变（幂等）
+      → 改一个 ConfigMap **只滚动 dataserver**（精准）；三域名 /health 全 200、Agent RPC 30710 通。
+      踩坑（已写进脚本注释）：`kubectl annotate deploy` 改的是 Deployment 自身 metadata、
+      **不改 podTemplate 因而不触发滚动**，必须 patch `spec.template.metadata.annotations`；
+      jsonpath 含点注解 key 必须转义（否则读回空值 → 每次部署都滚动）；
+      `kubectl -o json` 是 4 空格缩进，awk/sed 按 2 空格解析会静默失配（改用 `-o jsonpath={.data}`）；
+      k3s 主机**没有 jq**、不保证有 python3（checksum 段只用 kubectl/awk/grep/sha256sum）。
 
 ## 2. 单机回归清单（对应需求 5、9）
 

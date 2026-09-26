@@ -34,10 +34,17 @@ v1.1.0 已交付 APM 全链路与 eBPF 四类采集项（`ebpf_network` / `ebpf_
 > 的表述随之修正，验收以 `packaging/deploy/k8s/server-stack.yaml` 与 README 第 5b 节为准。
 >
 > **对外入口口径（用户定稿）**：server 侧只负责「IP:port 监听」；**客户端配置一律写「域名:port」**。
-> 三个子域名 `gse.` / `data.` / `console.`（解析到节点 IP）：前两个经 Traefik（websecure + 两条
-> IngressRoute 惯例），Agent RPC 走 NodePort 30710 直连（`server_addr = "gse.xiaoyxq.top:30710"`，
-> 不加 TCPRoute）。存量数据**空库起**（cloud2 的 49MB 测试数据不迁移）；cops CD 接管与 dist 进镜像
-> 一次改造到位；cloud2 旧 systemd 在 cops CD 稳定 2 天后退役。
+> 三个子域名 `vectorman.` / `dataserver.` / `console.`（解析到 cloud3 节点 IP）：三者都经 Traefik
+> （websecure + 两条 IngressRoute 惯例），Agent RPC 走 NodePort 30710 直连
+> （`server_addr = "vectorman.xiaoyxq.top:30710"`，不加 TCPRoute）。
+> ⚠️ 早期文档写的 `gse.` / `data.` 从未注册，已全部改口径（以腾讯云 DNS 实际注册为准）。
+> 存量数据**空库起**（cloud2 的 49MB 测试数据不迁移）；cops CD 接管与 dist 进镜像一次改造到位；
+> cloud2 旧 systemd 在 cops CD 稳定 2 天后退役。
+>
+> **2026-09-26 更新（迁移完成）**：server 侧已由 **cops CD 接管**（cops PR #61，`DEPLOY_MODE=k8s`、
+> `DEPLOY_TARGET=cloud3`）。cloud2 的 native（`DEPLOY_MODE=native` + systemd 五件套）已退役，
+> 配置从「仓库 conf/*.toml 同步到主机」改为「k8s.yaml 内的 ConfigMap」。
+> 三个 Agent（cloud2 / debian12 / testbkee）已改连 `vectorman.xiaoyxq.top:30710` 并全部 online。
 
 ### Requirement 1: 集群内以 DaemonSet 形态部署 Agent
 
@@ -153,6 +160,8 @@ v1.1.0 已交付 APM 全链路与 eBPF 四类采集项（`ebpf_network` / `ebpf_
 2. THE 验证 SHALL 需要：节点可用特权容器、gse-server 与 dataserver 从集群内可达
    （_2026-09-25 更新：两者已以 Deployment + NodePort 跑进集群，见 `server-stack.yaml`；
    对 Agent 只要求 `{node}:30710` 可达，不要求 Ingress/域名_）。
+   （_2026-09-26 更新：集群内发布口径改为 cops CD（`apps/vectorman/k8s.yaml`），
+   `server-stack.yaml` 保留为「不依赖 cops 的手工部署参考」，两者同构。_）
 3. THE 验证影响面 SHALL 限于轻量：只部署 Agent、下发采集项、观察指标与页面，不制造压力与异常。
 4. THE 本 feature SHALL NOT 改变任一已交付采集项的数据模型与指标命名（只做验证、口径与文档对齐）。
 

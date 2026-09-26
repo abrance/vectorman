@@ -102,7 +102,8 @@ curl -sS $GSE/api/gse/agents | head -c 400
 
 ```bash
 # gse-agent-daemonset.yaml 里替换：
-#   ConfigMap  server_addr = "REPLACE_ME:7100"   -> gse-server 地址（节点能访问到）
+#   ConfigMap  server_addr = "vectorman.xiaoyxq.top:30710"   -> server 的 RPC NodePort
+#              （域名只做 DNS A 解析；客户端不要写 :7100，那是集群内端口）
 #   Secret     token: "REPLACE_ME"               -> 上一步登记用的 token
 #   DaemonSet  image: vectorman-gse-agent:1.2.0  -> 第 1 步造的 tag
 kubectl apply --dry-run=server -f packaging/deploy/k8s/gse-agent-daemonset.yaml   # 先干跑
@@ -203,7 +204,7 @@ kubectl -n vectorman get pods,svc,ingressroute
 > 对外推荐统一走 HTTPS 域名。
 
 **DNS 与 Agent 连接口径**（2026-09-25 定稿）：server 侧只负责「IP:port 监听」（NodePort），
-**客户端配置一律写「域名:port」**——`gse-agent` 的 `server_addr = "gse.xiaoyxq.top:30710"`。
+**客户端配置一律写「域名:port」**——`gse-agent` 的 `server_addr = "vectorman.xiaoyxq.top:30710"`。
 三个子域名都解析到节点 IP（`186.244.201.55`）：
 
 | DNS 记录（实际注册名） | 指向 | 用途 |
