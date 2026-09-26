@@ -56,14 +56,19 @@
 > dist 打进镜像（构建上下文改源码树）；metrics 口不建 Service；cops 一次改造到位；
 > cloud2 退役 = cops CD 稳定 2 天后。
 
-- [ ] 1.12 `Dockerfile` 改 multi-stage：构建上下文改为**源码树**（`npm build:console/dataplane` +
-      musl release 产物），dist 打进镜像；`build-image.sh` 增加 `--src` 用法（保留 `--pkg` 兼容）
-- [ ] 1.13 vectorman release workflow 增加「构建多功能镜像 → push `ghcr.io/abrance/vectorman-server:<tag>`」
+- [x] 1.12 `Dockerfile` 改 multi-stage：构建上下文改为**源码树**（`npm build:console/dataplane` +
+      musl release 产物），dist 打进镜像（实测 server 镜像 58.5MB，三份 dist 从镜像内
+      /app/web/{gse,dataplane,console} 就地托管）；`docker build --target server|agent` 双 target，
+      `--pkg` 旧路径保留兼容
+- [ ] 1.13 （未做，等 release workflow 轮次）vectorman release workflow 增加「构建多功能镜像 → push `ghcr.io/abrance/vectorman-server:<tag>`」
       （cops 的 check-registries 守卫只放行 ghcr.io）；镜像 tag 与 cops 单元 `.env` 的
       `*_IMAGE_TAG` 对齐（只 bump tag 行）
-- [ ] 1.14 `server-stack.yaml` 增加三条域名 × 两条 IngressRoute（web 跳转 + websecure +
+- [x] 1.14 `server-stack.yaml` 增加三条域名 × 两条 IngressRoute（web 跳转 + websecure +
       `tls.certResolver letsencrypt`，沿用 cops whoami/model-logcluster 的已验证写法）；
-      ConfigMap/Deployment 不动；**DNS 先生效再 apply**
+      ConfigMap/Deployment 不动；**DNS 先生效再 apply**。
+      已实测：三域名证书签发成功（verify=0，SAN 正确）、80→443 308 跳转、
+      三 UI + API 同域可用、30710 TCP 握手通、幂等 apply 不重启 Pod。
+      域名以 DNS 实际注册为准：`vectorman`/`dataserver`/`console`（早期写的 gse./data. 未注册，已改口径）
 - [ ] 1.15 删 Pod 重建数据仍在、`rollout restart` 无 CrashLoop、cron 全量 apply 幂等
       （连续两晚 Pod AGE 增长）—— 作为 cops 接管后的验收
 - [ ] 1.16 cloud2 Agent 迁移：台账重新登记（host+agent，token 一致）、

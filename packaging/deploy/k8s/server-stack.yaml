@@ -1,30 +1,39 @@
 # Vectorman server 侧的 K8s 部署（gse-server / dataserver / console）
 #
-# 形态：三个 Deployment（单副本）+ 各自 Service(NodePort)。数据与前端 dist 走节点 hostPath
-# （单节点 k3s，如 cloud3；多节点时再换 local-path/PVC）。
+# 形态：三个 Deployment（单副本，strategy: Recreate）+ 各自 Service + 六条 IngressRoute。
+# 镜像是 multi-stage 构建的多功能镜像（web dist 已打进镜像，见 Dockerfile）；
+# 数据走节点 hostPath /opt/vectorman-k8s/*（单节点 k3s；多节点时换 PVC/local-path）。
 #
-# 与二进制安装（install.sh + systemd）的差异：
-#   - 进程工作目录 = /app/<component>（数据/相对路径配置都落在挂载点）；
-#   - 配置文件由 ConfigMap 挂到 /app/<component>/*.toml；
-#   - 前端 dist 用 hostPath（scp 到节点即可更新，不重造镜像）；
-#   - 对外端口全部 NodePort（k3s 单节点自带 ServiceLB，绑定节点端口）。
+# 端口规划（对外唯一入口矩阵，与 Service/IngressRoute 一一对应）：
+#   Agent RPC:   {节点IP 或 vectorman.xiaoyxq.top}:30710   -> NodePort 30710（不过 Traefik）
+#   GSE 控制台:  https://vectorman.xiaoyxq.top            -> Traefik -> gse-server:7101
+#   数据面前端:  https://dataserver.xiaoyxq.top     -> Traefik -> dataserver:8081（同源托管 dist + 全部 API + Prom）
+#   桌面门户:    https://console.xiaoyxq.top        -> Traefik -> console:7200
+#   metrics:     7102/9091/7201 不建 Service（无消费者）
 #
-# 端口规划（节点 IP + NodePort）：
-#   gse-server  RPC 7100 -> 30710   Agent 连 {node}:30710
-#               HTTP 7101 -> 30711  台账 API + GSE 前端
-#   dataserver  SQL HTTP 8081 -> 30881  数据面前端 + 查询
-#               Prom 9090  -> 30990  Prom 查询口
-#               metrics 9091（容器内自监控，不对外）
-#   console     7200 -> 30720      桌面门户
-#
-# 用法：见同目录 README.md「server 组件上 k3s」一节。
+# 注意（都是踩过的坑）：
+#   1. IngressRoute 必须每个域名拆两条（web 跳转 + websecure+tls）；
+#      合写只生效 websecure，80 端口与 ACME HTTP-01 都 404。
+#   2. dataserver 的 http_web_dir / gse_admin_url 是 TOML 顶层键，写进 [sql_http] 段会静默失效。
+#   3. 镜像 tag 必须与导入/推送的 tag 逐字一致。
+#   4. DNS 先生效再 apply（ACME 签发依赖 HTTP-01 到得了 Traefik）。
 ---
 apiVersion: v1
 kind: Namespace
 metadata:
   name: vectorman
 ---
-# gse-server：台账与 Agent 数据面。db 用 hostPath，Pod 重建不丢。
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: redirect-https
+  namespace: vectorman
+spec:
+  redirectScheme:
+    scheme: https
+    permanent: true
+---
+# ── gse-server ──────────────────────────────────────────────────────────────
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -33,7 +42,7 @@ metadata:
   labels: { app: gse-server }
 spec:
   replicas: 1
-  strategy: { type: Recreate }        # sqlite 数据库，滚动更新会双写同一个文件，必须 Recreate
+  strategy: { type: Recreate }        # sqlite，滚动更新会双进程写同一文件
   selector: { matchLabels: { app: gse-server } }
   template:
     metadata: { labels: { app: gse-server } }
@@ -41,7 +50,7 @@ spec:
       terminationGracePeriodSeconds: 20
       containers:
         - name: gse-server
-          image: vectorman-server:1.2.0-dev
+          image: vectorman-server:1.2.0-rc1
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/gse-server"]
           workingDir: /app/gse-server
@@ -51,10 +60,8 @@ spec:
           ports:
             - { name: rpc,  containerPort: 7100 }
             - { name: http, containerPort: 7101 }
-            - { name: prom, containerPort: 7102 }
           volumeMounts:
-            - { name: conf, mountPath: /app/gse-server, readOnly: true }
-            - { name: web, mountPath: /app/gse-server/web, readOnly: true }
+            - { name: conf, mountPath: /app/gse-server/gse-server.toml, subPath: gse-server.toml, readOnly: true }
             - { name: db, mountPath: /app/gse-server/data }
           readinessProbe:
             httpGet: { path: /health, port: http }
@@ -70,9 +77,6 @@ spec:
       volumes:
         - name: conf
           configMap: { name: gse-server-conf }
-        # GSE 前端 dist（console 应用的产物，与二进制安装的 gse-server/web 同源）
-        - name: web
-          hostPath: { path: /opt/vectorman-k8s/web/gse, type: Directory }
         - name: db
           hostPath: { path: /opt/vectorman-k8s/gse-server, type: DirectoryOrCreate }
 ---
@@ -83,17 +87,15 @@ metadata:
   namespace: vectorman
 data:
   gse-server.toml: |
-    # 前端（GSE 控制台）由节点 hostPath 挂到 ./web；db 落 ./data。
     listen = "0.0.0.0:7100"
     auth_enabled = true
     heartbeat_interval_secs = 30
     heartbeat_timeout_secs = 90
-    # 台账 sqlite：落在挂载点（Pod 重建不丢）。
     db = "data/gse-server.db"
     http_enabled = true
     http_listen = "0.0.0.0:7101"
-    # 前端 dist 由节点 hostPath 挂进来（见 DaemonSet 下方的 web 卷）。
-    http_web_dir = "web"
+    # 前端 dist 在镜像内 /app/web/gse（绝对路径，无需挂载）
+    http_web_dir = "/app/web/gse"
     metrics_listen = "0.0.0.0:7102"
     dataplane_probe_interval_secs = 30
 ---
@@ -109,7 +111,18 @@ spec:
     - { name: rpc,  port: 7100, targetPort: rpc,  nodePort: 30710 }
     - { name: http, port: 7101, targetPort: http, nodePort: 30711 }
 ---
-# dataserver：数据面（SQL/Prom HTTP + LogStore/tsink/edge）。data_path 用 hostPath。
+apiVersion: v1
+kind: Service
+metadata:
+  name: gse-server-internal
+  namespace: vectorman
+spec:
+  type: ClusterIP
+  selector: { app: gse-server }
+  ports:
+    - { name: http, port: 7101, targetPort: http }
+---
+# ── dataserver ──────────────────────────────────────────────────────────────
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -118,7 +131,7 @@ metadata:
   labels: { app: dataserver }
 spec:
   replicas: 1
-  strategy: { type: Recreate }        # sqlite/tsink 同上
+  strategy: { type: Recreate }
   selector: { matchLabels: { app: dataserver } }
   template:
     metadata: { labels: { app: dataserver } }
@@ -126,7 +139,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: dataserver
-          image: vectorman-server:1.2.0-dev
+          image: vectorman-server:1.2.0-rc1
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/dataserver", "--config", "/app/dataserver/config.toml"]
           workingDir: /app/dataserver
@@ -136,10 +149,8 @@ spec:
           ports:
             - { name: sql,      containerPort: 8081 }
             - { name: prom,     containerPort: 9090 }
-            - { name: metrics,  containerPort: 9091 }
           volumeMounts:
-            - { name: conf, mountPath: /app/dataserver, readOnly: true }
-            - { name: web, mountPath: /app/dataserver/web, readOnly: true }
+            - { name: conf, mountPath: /app/dataserver/config.toml, subPath: config.toml, readOnly: true }
             - { name: data, mountPath: /app/dataserver/data }
           readinessProbe:
             httpGet: { path: /health, port: sql }
@@ -155,9 +166,6 @@ spec:
       volumes:
         - name: conf
           configMap: { name: dataserver-conf }
-        # 前端 dist：scp 到节点 /opt/vectorman-k8s/web/dataplane 后重启 Pod 即可更新。
-        - name: web
-          hostPath: { path: /opt/vectorman-k8s/web/dataplane, type: Directory }
         - name: data
           hostPath: { path: /opt/vectorman-k8s/dataserver, type: DirectoryOrCreate }
 ---
@@ -179,9 +187,9 @@ data:
     apm_ingest_max_batches_per_sec = 0
     apm_min_duration_micros_for_detail = 0
 
-    # 注意：http_web_dir 与 gse_admin_url 是**顶层键**（不进任何 [段]）。
-    # 前端 dist 由节点 hostPath 挂到 ./web；同端口托管（SPA 回退 index.html）。
-    http_web_dir = "web"
+    # 顶层键（不进任何 [段]！）：http_web_dir 同端口托管前端（镜像内 /app/web/dataplane）；gse_admin_url 台账联动。
+    http_web_dir = "/app/web/dataplane"
+    gse_admin_url = "http://gse-server-internal.vectorman.svc:7101"
 
     [sql_http]
     listen = "0.0.0.0:8081"
@@ -194,9 +202,6 @@ data:
 
     [auth]
     enabled = false
-
-    # GSE 管理口（顶层键）：台账联动（live 采集项决定保留范围）走集群内 Service。
-    gse_admin_url = "http://gse-server-internal.vectorman.svc:7101"
 ---
 apiVersion: v1
 kind: Service
@@ -210,7 +215,7 @@ spec:
     - { name: sql,  port: 8081, targetPort: sql,  nodePort: 30881 }
     - { name: prom, port: 9090, targetPort: prom, nodePort: 30990 }
 ---
-# console：桌面门户（应用目录里登记各组件的 NodePort 地址）。
+# ── console ─────────────────────────────────────────────────────────────────
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -219,13 +224,14 @@ metadata:
   labels: { app: console }
 spec:
   replicas: 1
+  strategy: { type: Recreate }
   selector: { matchLabels: { app: console } }
   template:
     metadata: { labels: { app: console } }
     spec:
       containers:
         - name: console
-          image: vectorman-server:1.2.0-dev
+          image: vectorman-server:1.2.0-rc1
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/console"]
           workingDir: /app/console
@@ -235,22 +241,11 @@ spec:
           ports:
             - { name: http, containerPort: 7200 }
           volumeMounts:
-            # conf 挂到子路径，避免盖住同目录的可写 apps.json
             - { name: conf, mountPath: /app/console/console.toml, subPath: console.toml, readOnly: true }
-            - { name: web, mountPath: /app/console/web, readOnly: true }
             - { name: data, mountPath: /app/console }
-          readinessProbe:
-            httpGet: { path: /, port: http }
-            initialDelaySeconds: 3
-            periodSeconds: 10
-          resources:
-            requests: { cpu: 20m, memory: 32Mi }
-            limits: { memory: 128Mi }
       volumes:
         - name: conf
           configMap: { name: console-conf }
-        - name: web
-          hostPath: { path: /opt/vectorman-k8s/web/console, type: Directory }
         - name: data
           hostPath: { path: /opt/vectorman-k8s/console, type: DirectoryOrCreate }
 ---
@@ -262,8 +257,7 @@ metadata:
 data:
   console.toml: |
     listen = "0.0.0.0:7200"
-    web_dir = "web"
-    # 应用目录 JSON（cwd 即可写卷 /app/console，hostPath /opt/vectorman-k8s/console）。
+    web_dir = "/app/web/console"
     data_file = "apps.json"
     metrics_listen = "0.0.0.0:7201"
 ---
@@ -278,15 +272,91 @@ spec:
   ports:
     - { name: http, port: 7200, targetPort: http, nodePort: 30720 }
 ---
-# 集群内互访的内部 Service（ClusterIP，不占 NodePort）：
-# dataserver -> gse-server 的台账联动等。
-apiVersion: v1
-kind: Service
+# ── 公网入口（六条 IngressRoute：每域名两条，见文件头注释 1）───────────────
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
 metadata:
-  name: gse-server-internal
+  name: gse-server-web
   namespace: vectorman
 spec:
-  type: ClusterIP
-  selector: { app: gse-server }
-  ports:
-    - { name: http, port: 7101, targetPort: http }
+  entryPoints: [web]
+  routes:
+    - match: Host(`vectorman.xiaoyxq.top`)
+      kind: Rule
+      middlewares: [{ name: redirect-https }]
+      services:
+        - { name: gse-server, port: 7101 }
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: gse-server-tls
+  namespace: vectorman
+spec:
+  entryPoints: [websecure]
+  routes:
+    - match: Host(`vectorman.xiaoyxq.top`)
+      kind: Rule
+      services:
+        - { name: gse-server, port: 7101 }
+  tls:
+    certResolver: letsencrypt
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: dataserver-web
+  namespace: vectorman
+spec:
+  entryPoints: [web]
+  routes:
+    - match: Host(`dataserver.xiaoyxq.top`)
+      kind: Rule
+      middlewares: [{ name: redirect-https }]
+      services:
+        - { name: dataserver, port: 8081 }
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: dataserver-tls
+  namespace: vectorman
+spec:
+  entryPoints: [websecure]
+  routes:
+    # 整域名全路径给同一个 Service（A3 同源约束：/v1/...、/api/v1/...、/assets/... 同端口）。
+    - match: Host(`dataserver.xiaoyxq.top`)
+      kind: Rule
+      services:
+        - { name: dataserver, port: 8081 }
+  tls:
+    certResolver: letsencrypt
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: console-web
+  namespace: vectorman
+spec:
+  entryPoints: [web]
+  routes:
+    - match: Host(`console.xiaoyxq.top`)
+      kind: Rule
+      middlewares: [{ name: redirect-https }]
+      services:
+        - { name: console, port: 7200 }
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: console-tls
+  namespace: vectorman
+spec:
+  entryPoints: [websecure]
+  routes:
+    - match: Host(`console.xiaoyxq.top`)
+      kind: Rule
+      services:
+        - { name: console, port: 7200 }
+  tls:
+    certResolver: letsencrypt
