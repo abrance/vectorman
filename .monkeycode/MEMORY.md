@@ -60,3 +60,12 @@ Entries discovered by the Agent during task execution should follow this format:
 - Instructions:
   - This repo ships a local `.git/hooks/prepare-commit-msg` that auto-appends `Co-authored-by: monkeycode-ai <monkeycode-ai@chaitin.com>` from git config `coauthor.*`. Do not add the co-author trailer manually; doing so produces duplicate trailers.
   - Rust CI (`abrance/yoc/.github/workflows/rust-ci.yml@v1.0.0`) runs, in order: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`, `cargo build --all-features`. Verify these four locally before pushing; the fmt step is a common failure.
+
+[User Instruction Summary]
+- Date: 2026-09-26
+- Context: 文档规整专项（spec 压缩 + 索引 + 死链检查）
+- Instructions:
+  - `.monkeycode/specs/` 的 `design.md` 是长效档案，随代码演进维护；已实现 feature 的 `requirements.md` 压缩为需求索引（编号 + User Story + 验收摘要），完整 EARS 条款查 git 历史。源码注释按「requirements.md Requirement N」引用，Requirement 编号与文件名不可改。
+  - 功能现状以 README「能力清单」与代码为准；`.monkeycode/specs/README.md` 的索引表记状态与截至日期。
+  - 文档死链检查：`scripts/check-docs.sh`（已挂 rust-ci.yml 的 `doc-links` job），改 md 或挪文件后本地先跑。
+  - 踩坑记录分流：能进代码注释的进代码注释（随代码走）；流程性/跨会话的进 `.monkeycode/MEMORY.md`；README 只留使用者会踩的。

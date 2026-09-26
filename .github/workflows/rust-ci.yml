@@ -14,6 +14,13 @@ jobs:
       working-directory: .
       rust-toolchain: stable
 
+  # 文档相对链接存在性检查（md 死链会让源码注释里的 spec 引用静默腐烂）。
+  doc-links:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/check-docs.sh
+
   # eBPF 内核态程序不在工作区里（用 bpfel-unknown-none + nightly），单独类型检查。
   # 只做 check：产 .o 需要 bpf-linker，用 scripts/build-ebpf.sh（构建链见设计 Pitfalls 第一条）。
   ebpf-programs:

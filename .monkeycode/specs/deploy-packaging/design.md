@@ -193,4 +193,5 @@ vectorman-<REL>-linux-x86_64/
 [^2]: (Filename) - [现打包流程](.github/workflows/release.yml)
 [^3]: (Filename) - [gse-server 配置示例（web_dir 键名随本 feature 修正为 http_web_dir）](bins/gse-server/gse-server.toml.example)
 [^4]: (Filename) - [前端构建脚本定义](frontend/package.json)
-[^5]: (Filename) - [apiserver 配置加载（CWD config.toml）](bins/apiserver/src/main.rs)
+[^5]: (Filename) - [apiserver 配置加载（CWD config.toml）](bins/dataserver/src/main.rs)
+    （写作时路径为 `bins/apiserver/`，后重命名为 `bins/dataserver/`）

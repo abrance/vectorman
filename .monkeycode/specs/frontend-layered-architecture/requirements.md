@@ -1,5 +1,7 @@
 # Requirements Document
 
+> **已归档**（2026-09-26 文档整理）：本 feature 已实现并合入 main，本文件压缩为需求索引——完整 EARS 条款见 git 历史（本文件重写前的最后一个版本），design.md 全文保留为实施细节档案。
+
 ## Introduction
 
 vectorman 前端采用分层架构，并以 npm workspaces 拆成可独立编译的包。v1 交付：原子能力包、适配器包、控制台应用与作业应用的装配入口。本期不交付业务页面。后续 CMDB、节点、作业等页面在对应应用内增加业务模块，并复用同一套原子能力。
@@ -29,135 +31,45 @@ vectorman 前端采用分层架构，并以 npm workspaces 拆成可独立编译
 
 ### Requirement 1: 分层与依赖方向
 
-**User Story:** AS 前端开发者, I want 页面、业务、原子能力、适配器分层且依赖只向下, so that 后续业务代码不绑死具体实现。
-
-#### Acceptance Criteria
-
-1. THE 每个应用包 SHALL 将代码划分为页面层、业务模块层，并依赖原子能力层与适配器层。
-2. THE 页面层 SHALL 只依赖业务模块与布局，不直接调用适配器实现。
-3. THE 业务模块 SHALL 只通过原子能力接口与后端适配器的领域接口访问远程能力。
-4. THE 原子能力层 SHALL 定义接口与类型，不绑定某一 HTTP 库或某一 UI 组件库。
-5. THE 适配器层 SHALL 实现原子能力接口与后端协议映射，并作为唯一接触浏览器 API 与后端协议的层。
-
+- AS 前端开发者, I want 页面、业务、原子能力、适配器分层且依赖只向下, so that 后续业务代码不绑死具体实现。
+- 验收：THE 每个应用包 SHALL 将代码划分为页面层、业务模块层，并依赖原子能力层与适配器层；THE 页面层 SHALL 只依赖业务模块与布局，不直接调用适配器实现。
 ### Requirement 2: 原子能力清单
 
-**User Story:** AS 前端开发者, I want v1 先沉淀网络与状态相关的原子能力, so that 多个应用可以复用同一底座。
-
-#### Acceptance Criteria
-
-1. THE 原子能力层 SHALL 提供以下五个接口：`HttpClient`、`ErrorMapper`、`AuthSession`、`QueryStore`、`Notifier`。
-2. THE 每个原子能力接口 SHALL 在模块文档中使用本文件 Glossary 或本节给出的名称。
-3. THE 原子能力接口 SHALL 可被单元测试用内存实现替换。
-4. WHEN 新增业务模块，THE 业务模块 SHALL 复用上述五个接口访问网络、会话、查询状态与提示，不并行引入第二套同职责底座。
-
+- AS 前端开发者, I want v1 先沉淀网络与状态相关的原子能力, so that 多个应用可以复用同一底座。
+- 验收：THE 原子能力层 SHALL 提供以下五个接口：`HttpClient`、`ErrorMapper`、`AuthSession`、`QueryStore`、`Notifier`；THE 每个原子能力接口 SHALL 在模块文档中使用本文件 Glossary 或本节给出的名称。
 ### Requirement 3: HTTP 原子能力
 
-**User Story:** AS 业务模块, I want 统一的异步 HTTP 调用, so that 超时、取消、错误码与追踪标识处理方式一致。
-
-#### Acceptance Criteria
-
-1. THE `HttpClient` SHALL 提供 `request` 方法，入参包含 method、url、headers、body 与 Request Context。
-2. WHEN 调用成功，THE `HttpClient` SHALL 返回状态码与已解析的响应体。
-3. WHEN 后端返回 JSON 且包含 `code` 字段，THE `ErrorMapper` SHALL 将该字段映射进错误契约的 `code`。
-4. IF 网络不可达或超过 Request Context 中的超时，THE `HttpClient` SHALL 返回错误契约，`code` 为 `unavailable`。
-5. IF 请求体无法序列化或响应体无法按约定解析，THE `HttpClient` SHALL 返回错误契约，`code` 为 `invalid_argument`。
-
+- AS 业务模块, I want 统一的异步 HTTP 调用, so that 超时、取消、错误码与追踪标识处理方式一致。
+- 验收：THE `HttpClient` SHALL 提供 `request` 方法，入参包含 method、url、headers、body 与 Request Context；WHEN 调用成功，THE `HttpClient` SHALL 返回状态码与已解析的响应体。
 ### Requirement 4: 会话原子能力
 
-**User Story:** AS 业务模块, I want 登录态走统一入口, so that 各模块不必各自解析凭据。
-
-#### Acceptance Criteria
-
-1. THE `AuthSession` SHALL 提供读取当前会话、写入会话、清除会话三个方法。
-2. THE `AuthSession` 的 v1 实现 SHALL 将会话保存在进程内存中；页面刷新后会话为空。
-3. WHILE 会话包含鉴权信息，THE `HttpClient` SHALL 在发出请求时附带该会话的鉴权信息。
-4. IF 会话为空，THE `HttpClient` SHALL 仍发出请求，请求头不含鉴权信息。
-5. WHILE v1 后端鉴权默认关闭，THE 每个应用包 SHALL 装配 `AuthSession`，并允许空会话访问后端适配器。
-
+- AS 业务模块, I want 登录态走统一入口, so that 各模块不必各自解析凭据。
+- 验收：THE `AuthSession` SHALL 提供读取当前会话、写入会话、清除会话三个方法；THE `AuthSession` 的 v1 实现 SHALL 将会话保存在进程内存中；页面刷新后会话为空。
 ### Requirement 5: 查询状态与通知
 
-**User Story:** AS 业务模块, I want 查询状态与错误提示有统一接口, so that 后续页面不必各自维护 loading 与报错。
-
-#### Acceptance Criteria
-
-1. THE `QueryStore` SHALL 为一次远程查询保存 idle、loading、success、error 四种状态中的一种。
-2. WHEN 查询进入 success，THE `QueryStore` SHALL 保存该次查询的结果数据。
-3. WHEN 查询进入 error，THE `QueryStore` SHALL 保存错误契约。
-4. THE `Notifier` SHALL 提供成功、警告、错误三类提示方法，以及按条订阅提示的 `subscribe` 方法。
-5. WHEN 调用错误提示方法，THE `Notifier` SHALL 使用错误契约的 `message` 作为提示正文，并将该条提示推入内存队列。
-6. THE v1 各应用装配入口 SHALL 装配内存订阅实现，不渲染 Toast UI。
-
+- AS 业务模块, I want 查询状态与错误提示有统一接口, so that 后续页面不必各自维护 loading 与报错。
+- 验收：THE `QueryStore` SHALL 为一次远程查询保存 idle、loading、success、error 四种状态中的一种；WHEN 查询进入 success，THE `QueryStore` SHALL 保存该次查询的结果数据。
 ### Requirement 6: 后端适配器边界
 
-**User Story:** AS 前端开发者, I want 每个后端协议有独立适配器, so that GSE 与 dataplane 的 URL、载荷形状变化不影响后续业务模块。
-
-#### Acceptance Criteria
-
-1. THE 适配器层 SHALL 提供 `GseAdminAdapter`、`SqlHttpAdapter`、`PromQueryAdapter` 三个适配器。
-2. THE `GseAdminAdapter` SHALL 覆盖 GSE 管理 HTTP 的 hosts、access_points、agents、agent_configs 四类资源的列表、读取、写入与删除。
-3. THE `SqlHttpAdapter` SHALL 将一条 SQL 语句与参数映射为 `POST /v1/sql` 的 JSON 体 `{"sql":"<statement>","params":[<values>]}`。
-4. THE `PromQueryAdapter` SHALL 将即时查询映射为 `GET /api/v1/query`，将区间查询映射为 `GET /api/v1/query_range`。
-5. THE 三个适配器 SHALL 只通过 `HttpClient` 发请求。
-
+- AS 前端开发者, I want 每个后端协议有独立适配器, so that GSE 与 dataplane 的 URL、载荷形状变化不影响后续业务模块。
+- 验收：THE 适配器层 SHALL 提供 `GseAdminAdapter`、`SqlHttpAdapter`、`PromQueryAdapter` 三个适配器；THE `GseAdminAdapter` SHALL 覆盖 GSE 管理 HTTP 的 hosts、access_points、agents、agent_configs 四类资源的列表、读取、写入与删除。
 ### Requirement 7: 开发期反向代理与单入口
 
-**User Story:** AS 前端开发者, I want 每个应用只暴露一个浏览器入口, so that 预览环境单端口即可打到 GSE 与 dataplane。
-
-#### Acceptance Criteria
-
-1. THE 每个应用包的开发服务器 SHALL 将 `/api/gse` 前缀转发到 GSE 管理 HTTP。
-2. THE 每个应用包的开发服务器 SHALL 将 `/api/sql` 前缀转发到 SQL HTTP。
-3. THE 每个应用包的开发服务器 SHALL 将 `/api/prom` 前缀转发到 Prom 查询 HTTP。
-4. THE 适配器 SHALL 只使用上述相对前缀，不硬编码主机名或绝对后端地址。
-5. THE 每个应用包的开发服务器 SHALL 允许通过 `*.monkeycode-ai.online` 主机名访问。
-
+- AS 前端开发者, I want 每个应用只暴露一个浏览器入口, so that 预览环境单端口即可打到 GSE 与 dataplane。
+- 验收：THE 每个应用包的开发服务器 SHALL 将 `/api/gse` 前缀转发到 GSE 管理 HTTP；THE 每个应用包的开发服务器 SHALL 将 `/api/sql` 前缀转发到 SQL HTTP。
 ### Requirement 8: v1 交付范围
 
-**User Story:** AS 前端开发者, I want v1 只落地骨架, so that 分层与原子能力可以先被测试和被多个应用复用。
-
-#### Acceptance Criteria
-
-1. THE `@vectorman/console` SHALL 提供 React 装配入口，将五个原子能力的具体实现与三个后端适配器注入到运行时。
-2. THE `@vectorman/job` SHALL 提供独立的 React 装配入口，将同一套原子能力与适配器注入到该应用运行时。
-3. THE `@vectorman/node` SHALL 提供独立的 React 装配入口；其台账页面范围由 `gse-node-app` 规格定义。
-4. THE `@vectorman/console` 与 `@vectorman/job` SHALL 将业务页面与领域模块列为后续范围。
-5. THE 页面层与业务模块层 SHALL 在每个应用包源码目录中保留对应位置，供后续功能写入。
-6. THE 每个应用的装配入口 SHALL 在该应用开发服务器启动后可被浏览器打开，用于确认分层装配成功。
-
+- AS 前端开发者, I want v1 只落地骨架, so that 分层与原子能力可以先被测试和被多个应用复用。
+- 验收：THE `@vectorman/console` SHALL 提供 React 装配入口，将五个原子能力的具体实现与三个后端适配器注入到运行时；THE `@vectorman/job` SHALL 提供独立的 React 装配入口，将同一套原子能力与适配器注入到该应用运行时。
 ### Requirement 9: 技术栈与工作区目录
 
-**User Story:** AS 前端开发者, I want React 与 Vite 的多包工作区, so that 原子能力可被多个应用独立编译。
-
-#### Acceptance Criteria
-
-1. THE 仓库 SHALL 将前端工作区放在根目录 `frontend/`，与 Rust crates 分离。
-2. THE 工作区与各应用包 SHALL 使用 React、Vite 与 TypeScript。
-3. THE `@vectorman/primitives` SHALL 同时包含五个原子能力的 TypeScript 接口与对应内存实现。
-4. THE `@vectorman/primitives` 的 TypeScript 接口定义与内存实现 SHALL 不从 `react` 包导入类型。
-5. THE 应用包 SHALL 通过 workspace 依赖引用库包，不复制原子能力或适配器源码。
-
+- AS 前端开发者, I want React 与 Vite 的多包工作区, so that 原子能力可被多个应用独立编译。
+- 验收：THE 仓库 SHALL 将前端工作区放在根目录 `frontend/`，与 Rust crates 分离；THE 工作区与各应用包 SHALL 使用 React、Vite 与 TypeScript。
 ### Requirement 10: 可测试性
 
-**User Story:** AS 前端开发者, I want 原子能力与适配器可脱离页面测试, so that 骨架在没有业务页时也能验证。
-
-#### Acceptance Criteria
-
-1. WHEN 运行前端单元测试，THE 测试 SHALL 在不启动 gse-server 与 apiserver 的前提下覆盖五个原子能力接口的成功与失败路径。
-2. THE 适配器测试 SHALL 使用可注入的 `HttpClient` 假实现验证 URL、方法与 JSON 体，不发起真实网络请求。
-3. THE 五个原子能力 SHALL 各提供一份内存实现，供测试与各应用装配入口选用。
-
+- AS 前端开发者, I want 原子能力与适配器可脱离页面测试, so that 骨架在没有业务页时也能验证。
+- 验收：WHEN 运行前端单元测试，THE 测试 SHALL 在不启动 gse-server 与 apiserver 的前提下覆盖五个原子能力接口的成功与失败路径；THE 适配器测试 SHALL 使用可注入的 `HttpClient` 假实现验证 URL、方法与 JSON 体，不发起真实网络请求。
 ### Requirement 11: 多包编译
 
-**User Story:** AS 前端开发者, I want 用同一套原子能力分别构建多个应用, so that 控制台与作业前端可以独立发版。
-
-#### Acceptance Criteria
-
-1. THE `frontend/` SHALL 使用 npm workspaces，成员包含 `packages/*` 与 `apps/*`。
-2. THE workspace SHALL 提供库包 `@vectorman/primitives` 与 `@vectorman/adapters`。
-3. THE workspace SHALL 提供应用包 `@vectorman/console`、`@vectorman/job` 与 `@vectorman/node`。
-4. THE `@vectorman/adapters` SHALL 依赖 `@vectorman/primitives`。
-5. THE 应用包 SHALL 依赖 `@vectorman/primitives` 与 `@vectorman/adapters`。
-6. THE `@vectorman/primitives` SHALL 不依赖 `@vectorman/adapters` 与任一应用包。
-7. WHEN 执行针对 `@vectorman/console` 的构建命令，THE 构建系统 SHALL 产出控制台应用的独立产物。
-8. WHEN 执行针对 `@vectorman/job` 的构建命令，THE 构建系统 SHALL 产出作业应用的独立产物，且该命令不要求先构建控制台应用产物。
-9. WHEN 执行针对 `@vectorman/node` 的构建命令，THE 构建系统 SHALL 产出节点应用的独立产物，且该命令不要求先构建控制台或作业应用产物。
+- AS 前端开发者, I want 用同一套原子能力分别构建多个应用, so that 控制台与作业前端可以独立发版。
+- 验收：THE `frontend/` SHALL 使用 npm workspaces，成员包含 `packages/*` 与 `apps/*`；THE workspace SHALL 提供库包 `@vectorman/primitives` 与 `@vectorman/adapters`。
