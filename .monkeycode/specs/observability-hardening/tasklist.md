@@ -118,6 +118,14 @@
       数据源 —— 依据：①连接收发队列恒为 0；②dataserver 的 `/v1/streams` 计数两次采样完全
       不变（`accepted` 停在 27/2）；③旧 server 台账里 `gs`/`testbkee` 均已 offline；
       ④停服后连接立即消失。
+- [ ] 1.20 **gse-server 会话生命周期修复 → 已拆为独立规格**（2026-09-26）：
+      1.18 升级 testbkee 时发现的第二个真 bug —— 连接断开后会话不被清理、
+      心跳又不断刷新 `last_seen`，导致死会话永远停在 `Online`，作业下发拿到它
+      必失败（`multiplexer closed` → `lost`，错误措辞还写成「agent offline」）。
+      根因：`server.rs:170` 的 `handle_conn` 只注册 handler 就返回，
+      **没有任何连接生命周期管理**。
+      该修复涉及会话状态机、心跳语义、API/前端展示三层，已拆为独立规格
+      **`.monkeycode/specs/gse-session-liveness/`**（沿革：本条只作指向）。
 - [ ] 1.19 **dataserver 鉴权加固（用户决定「以后再做」，2026-09-26 记录）**：
       `dataserver` 的 SQL/接入口（cloud3 的 `8081`，公网 `https://dataserver.xiaoyxq.top`）
       当前 `[auth] enabled = false` —— **公网任何人扫到即可 `POST /v1/sql` 查库、
