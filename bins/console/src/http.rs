@@ -75,7 +75,10 @@ fn build_router(
             "/api/console/apps/{app_id}",
             axum::routing::put(update_app).delete(delete_app),
         )
-        .route("/api/console/apps/{app_id}/clicks", axum::routing::post(record_click))
+        .route(
+            "/api/console/apps/{app_id}/clicks",
+            axum::routing::post(record_click),
+        )
         .with_state(AppState { catalog });
     let app = match web_dir {
         Some(dir) => {
@@ -313,7 +316,11 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let (st, body) = send(&app, req("POST", &format!("/api/console/apps/{id}/clicks"), None)).await;
+        let (st, body) = send(
+            &app,
+            req("POST", &format!("/api/console/apps/{id}/clicks"), None),
+        )
+        .await;
         assert_eq!(st, StatusCode::OK, "{body}");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&body).unwrap()["clicks"],
