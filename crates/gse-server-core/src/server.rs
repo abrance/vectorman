@@ -213,7 +213,7 @@ impl Server {
         if session.state != SessionState::Online {
             return Err(GseError::new(
                 "unavailable",
-                format!("agent {agent_id} not online"),
+                format!("agent {agent_id} not online (session unavailable)"),
             ));
         }
         let seq = CMD_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -305,10 +305,16 @@ pub async fn submit_job_with_source(
     match registry.get(&req.agent_id).await {
         Some(s) if s.state == SessionState::Online => {}
         _ => {
+            // 措辞区分：Agent 确实离线 vs 心跳在线但会话不可用（连接已死）。
+            // 这一处是用户最先看到的错误，尤其不能把连接问题说成 Agent 离线。
+            let window = heartbeat_window_micros();
+            let reason = ledger
+                .lost_reason_for(&req.agent_id, now_micros(), window)
+                .await;
             return Err(GseError::new(
                 "unavailable",
-                format!("agent {} not online", req.agent_id),
-            ))
+                format!("agent {} not online ({reason})", req.agent_id),
+            ));
         }
     }
     let interpreter = req
@@ -1137,6 +1143,69 @@ mod tests {
             .await
             .expect_err("offline agent must be rejected");
         assert_eq!(err.code, "unavailable");
+        // 从未登记过该 agent ⇒ 措辞是 agent offline（不是 session unavailable）。
+        assert!(
+            err.message.contains("agent offline"),
+            "未登记过的 agent 应报 agent offline，实际: {}",
+            err.message
+        );
+    }
+
+    /// 措辞区分：心跳在窗口内但会话不存在 ⇒ `session unavailable`。
+    ///
+    /// 这正是本次事故的形态 —— 此前一律报 `agent offline`，
+    /// 把「连接已死」误报成「Agent 离线」，误导排查。
+    #[tokio::test]
+    async fn submit_job_reports_session_unavailable_when_heartbeat_is_fresh() {
+        let cfg = ServerConfig {
+            listen: "127.0.0.1:0".to_string(),
+            db: tmp_db("session-unavail"),
+            auth_enabled: false,
+            http_enabled: false,
+            ..Default::default()
+        };
+        let (server, _addr) = Server::bind(cfg).await.expect("bind");
+        // 心跳新鲜（刚刚上报）但注册表里没有会话 → 连接已死。
+        let now = now_micros().to_string();
+        server
+            .ledger
+            .upsert_agent(&crate::ledger::Agent {
+                agent_id: "zombie".to_string(),
+                host_id: "h-1".to_string(),
+                access_point_id: None,
+                token: "tok".to_string(),
+                version: "1".to_string(),
+                install_path: String::new(),
+                status: "online".to_string(),
+                last_heartbeat_at: Some(now.clone()),
+                registered_at: now,
+            })
+            .await
+            .expect("agent");
+
+        let err = server
+            .submit_job(JobSubmit {
+                agent_id: "zombie".to_string(),
+                interpreter: None,
+                script: "echo hi".to_string(),
+                args: vec![],
+                env: BTreeMap::new(),
+                working_dir: None,
+                timeout_secs: None,
+            })
+            .await
+            .expect_err("no session must be rejected");
+        assert_eq!(err.code, "unavailable");
+        assert!(
+            err.message.contains("session unavailable"),
+            "心跳新鲜但无会话应报 session unavailable（僵尸会话形态），实际: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("agent offline"),
+            "不得把连接已死误报为 agent offline，实际: {}",
+            err.message
+        );
     }
 
     #[tokio::test]

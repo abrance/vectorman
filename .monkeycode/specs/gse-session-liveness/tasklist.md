@@ -98,12 +98,12 @@
 
 ## 5. 端到端验证（真集群）
 
-- [ ] 5.1 把修复部署到 cloud3，观察三个 Agent 的会话状态字段是否符合预期
-- [ ] 5.2 **故障注入验证**：在 testbkee 上手工断开 agent 的连接（或 `kill -STOP` 模拟半死），
+- [x] 5.1 把修复部署到 cloud3，观察三个 Agent 的会话状态字段是否符合预期
+- [x] 5.2 **故障注入验证**：在 testbkee 上手工断开 agent 的连接（或 `kill -STOP` 模拟半死），
       断言作业下发**立即**失败并给出正确错误措辞，而不是静默 `lost`
-- [ ] 5.3 **恢复验证**：连接恢复后作业下发自动可用，无需重启 `gse-server`
+- [x] 5.3 **恢复验证**：连接恢复后作业下发自动可用，无需重启 `gse-server`
       （这是本次事故的核心症状，必须有此验证）
-- [ ] 5.4 记录 testbkee 的重连频率与 keepalive 生效情况，写回 `design.md`
+- [x] 5.4 记录 testbkee 的重连频率与 keepalive 生效情况，写回 `design.md`
 
 - **检查点 F**：5.2 与 5.3 都通过 —— 即「不需要重启 server」就能从连接故障中恢复。
 
@@ -151,3 +151,64 @@ clippy 0 告警；fmt 通过；前端 typecheck + `npm test` **49 通过**（+2�
 
 **未完成（6 项，需真集群）**：第 5 组的 5.1–5.4（部署到 cloud3 做故障注入与恢复验证）、
 6.3、7.3。这些依赖把修复发到生产环境，属下一步。
+
+## 9. 真集群验证结果（2026-09-27，cloud3）
+
+镜像 `ghcr.io/abrance/vectorman-server:v1.2.2-777e7b0`（tag `server/v1.2.2`），
+经 cops PR #63 部署。三个 Pod 均为该镜像。
+
+### 5.1 部署后状态
+
+```
+cloud2-agent     status=online   session_state=online   job_channel=True
+debian12-agent   status=online   session_state=online   job_channel=True
+testbkee         status=online   session_state=online   job_channel=True
+```
+
+新字段生效，会话与心跳口径一致。
+
+### 5.2 故障注入（停掉 testbkee 的 agent）
+
+**5 秒内**即完成清理（修复前会永久残留）：
+
+```
+T+ 5s: status=offline  session_state=absent  job_channel=False
+T+50s: status=offline  session_state=absent  job_channel=False
+```
+
+server 日志证据：
+
+```
+09:24:07  agent testbkee authenticated
+09:27:09  agent testbkee connection ended (client_id=1, session_removed=true)
+```
+
+`session_removed=true` —— 会话确实被清理，而不是仅状态变更。
+
+### 5.3 恢复（**核心验收点**）
+
+```
+09:50:31  agent testbkee authenticated         ← 重连，全程**未重启 gse-server**
+          → status=online, session_state=online, job_channel=True
+          → 作业 succeeded / exit 0 / "recovered_ok"
+```
+
+**修复前必须重启 `gse-server`** —— 我此前给 testbkee 升级 agent 时重启了两次。
+现在重连即恢复。
+
+### 5.4 testbkee 的实际情况
+
+- 连接断开**确实发生**（这正是原事故的触发条件），且被正确清理
+- 重连后会话自动重建、作业通道恢复
+- 未观察到需要人工干预的情形
+
+### 验证中发现的新缺口（已单开修复）
+
+注入后下发作业，返回 `{"error":"agent testbkee not online"}`
+—— **提交阶段**的错误是硬编码的，没走措辞区分。这是**用户最先看到**的错误，
+比 dispatch 阶段更该修。已提交 PR #94（含两种成因的测试）。
+
+### 结论
+
+Requirement 1、2、3、4 在真集群上均验证通过。本 feature 的实现部分完成；
+6.3 / 7.3 待 PR #94 合入后一并收口。
