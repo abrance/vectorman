@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::extract::Multipart;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -155,12 +156,31 @@ fn ledger_routes(admin: AdminState) -> Router {
             "/job-templates/{template_id}/submit",
             post(submit_job_template),
         )
-        .route("/job-files", get(list_job_files).post(upload_job_file))
+        // 作业文件上传走 multipart，body 上限提高到配置里的 `job_max_file_bytes`
+        // （默认 64MB）。axum 的 `DefaultBodyLimit` 默认只有 2MB，不覆盖它会让
+        // 上传在 2MB 处被截断，且报错是「multipart 解析失败」，看不出是限额。
+        .route(
+            "/job-files",
+            get(list_job_files)
+                .post(upload_job_file)
+                .layer(DefaultBodyLimit::max(job_file_body_limit(&admin))),
+        )
         .route(
             "/job-files/{file_id}",
             get(download_job_file).delete(delete_job_file),
         )
         .with_state(admin)
+}
+
+/// 作业文件上传的 body 上限：取 `job_max_file_bytes`，再留出 multipart 边框余量。
+/// 管理端口独立部署时 `cfg` 为 None（文件接口本就不可用），退回 axum 默认值。
+fn job_file_body_limit(admin: &AdminState) -> usize {
+    admin
+        .cfg
+        .as_ref()
+        .map(|c| (c.job_max_file_bytes.saturating_add(4096)).min(usize::MAX as u64) as usize)
+        // ponytail: 走 axum 默认 2MB；cfg 缺失时该接口不可用，无需更宽
+        .unwrap_or(2 * 1024 * 1024)
 }
 
 /// 构造 HTTP 服务路由：台账 API 挂在 `/api/gse` 前缀，根路径保留 `/health`。
@@ -2526,6 +2546,35 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert!(body.contains("unavailable"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn job_files_upload_accepts_payload_above_axum_default_limit() {
+        // 回归：axum 的 DefaultBodyLimit 默认 2MB，而 job_max_file_bytes 是 64MB。
+        // 不覆盖时 2MB 以上的上传会被截断，且报错是「multipart 解析失败」，
+        // 看不出是限额 —— 用 3MB 钉住这个行为。
+        let (mut app, _ledger) = app_with_jobs("job-files-big").await;
+        let boundary = "----gsebig";
+        let payload = vec![b'x'; 3 * 1024 * 1024];
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"big.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(&payload);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/gse/job-files")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .expect("multipart");
+        let (status, body) = send(&mut app, request).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(body.contains("big.bin"), "{body}");
+        assert!(body.contains(&payload.len().to_string()), "{body}");
     }
 
     #[tokio::test]
