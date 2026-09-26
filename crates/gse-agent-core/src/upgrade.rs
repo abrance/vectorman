@@ -57,6 +57,21 @@ const CTL_CANDIDATES: &[&str] = &[
 /// systemd unit 名（存在即认为是 systemd 部署）。
 pub const SYSTEMD_UNIT: &str = "vectorman-gse-agent.service";
 
+/// 判定 systemd unit 是否真的存在。
+///
+/// **不能用 `systemctl list-unit-files <unit>`**：unit 不存在时它照样返回
+/// 退出码 0（输出「0 unit files listed.」），于是 ctl.sh 部署会被误判成
+/// systemd 部署，进而去走 `sudo -n crontab` —— 在无免密 sudo 的机器上
+/// 直接失败（实测：testbkee 报 `sudo: 需要密码`）。
+/// `systemctl cat` 在 unit 不存在时返回非 0，是可靠判定。
+pub fn systemd_unit_exists(unit: &str) -> bool {
+    std::process::Command::new("systemctl")
+        .args(["cat", unit])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// 探测部署形式。
 ///
 /// `exists` 与 `has_systemd_unit` 是注入的判定函数，使本函数可测
@@ -154,17 +169,8 @@ pub async fn accept_upgrade(spec: &AgentUpgradeSpec) -> Result<String, String> {
         ));
     }
     // 3. 探测部署形式
-    let deploy = detect_deploy(
-        |p| Path::new(p).exists(),
-        |unit| {
-            std::process::Command::new("systemctl")
-                .args(["list-unit-files", unit])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        },
-    )
-    .ok_or_else(|| "no installed gse-agent found".to_string())?;
+    let deploy = detect_deploy(|p| Path::new(p).exists(), systemd_unit_exists)
+        .ok_or_else(|| "no installed gse-agent found".to_string())?;
     // 4. cron 必须在跑，否则一次性任务永远不会执行 —— 宁可拒绝，不让运维干等
     if !cron_active() {
         return Err("cron is not running on this host; upgrade cannot be scheduled".to_string());
@@ -369,7 +375,11 @@ fn install_one_shot_cron(inner: &Path, kind: DeployKind) -> Result<(), String> {
         .map(|l| l.to_string())
         .collect();
     next.push(line);
-    write_crontab(kind, &next.join("\n"))
+    // **结尾必须带换行**：crontab 拒绝「missing newline before EOF」的内容
+    // （实测：不带换行时 `crontab -` 报错，升级被拒）。
+    let mut body = next.join("\n");
+    body.push('\n');
+    write_crontab(kind, &body)
 }
 
 fn self_cleanup_snippet(inner: &Path) -> String {
@@ -673,6 +683,25 @@ mod tests {
             !script.contains("pgrep"),
             "判活不得用 pgrep（会误匹配无关进程）"
         );
+    }
+
+    /// **crontab 内容格式回归**：结尾必须带换行，否则 `crontab -` 报
+    /// 「missing newline before EOF, can't install」，升级会被拒（实测踩到）。
+    #[test]
+    fn crontab_body_ends_with_newline() {
+        // 复现 install_one_shot_cron 的拼接逻辑
+        let inner = inner_script_path();
+        let line = format!(
+            "* * * * * {}; {}",
+            inner.display(),
+            self_cleanup_snippet(&inner)
+        );
+        let mut body = line;
+        body.push('\n');
+        assert!(body.ends_with('\n'), "crontab 内容必须以换行结尾");
+        assert!(body.lines().count() >= 1);
+        // 一次性任务必须包含自清理片段，否则 cron 会每分钟重复执行
+        assert!(body.contains("grep -v"));
     }
 
     #[test]
