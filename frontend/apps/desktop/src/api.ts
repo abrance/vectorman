@@ -3,14 +3,15 @@ export type DesktopApp = {
   name: string;
   url: string;
   tags: string[];
+  clicks: number;
   created_at: string;
   updated_at: string;
 };
 
-// 旧版本后端可能不返回 tags，统一补空数组以保证 DesktopApp 不变量，
-// 避免渲染层对 tags 取值时崩溃。
+// 旧版本后端可能不返回 tags/clicks，统一补默认值以保证 DesktopApp 不变量，
+// 避免渲染层对字段取值时崩溃。
 function normalizeApp(app: DesktopApp): DesktopApp {
-  return { ...app, tags: app.tags ?? [] };
+  return { ...app, tags: app.tags ?? [], clicks: app.clicks ?? 0 };
 }
 
 async function readError(res: Response): Promise<string> {
@@ -61,6 +62,13 @@ export async function updateApp(
 export async function deleteApp(appId: string): Promise<void> {
   const res = await fetch(`/api/console/apps/${encodeURIComponent(appId)}`, {
     method: "DELETE",
+  });
+  if (!res.ok) throw new Error(await readError(res));
+}
+
+export async function recordAppClick(appId: string): Promise<void> {
+  const res = await fetch(`/api/console/apps/${encodeURIComponent(appId)}/clicks`, {
+    method: "POST",
   });
   if (!res.ok) throw new Error(await readError(res));
 }

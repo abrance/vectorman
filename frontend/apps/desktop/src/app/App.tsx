@@ -3,11 +3,50 @@ import {
   createApp,
   deleteApp,
   listApps,
+  recordAppClick,
   updateApp,
   type DesktopApp,
 } from "../api";
 
+const NAV_TAG = "__nav__"; // 喜欢栏的虚拟 tag，仅用于分组，不落库、不参与筛选
+
 type Dialog = { mode: "create" } | { mode: "edit"; app: DesktopApp };
+
+type Section = { tag: string; apps: DesktopApp[]; totalClicks: number };
+
+function topApps(apps: DesktopApp[], n: number): DesktopApp[] {
+  return apps
+    .filter((a) => (a.clicks ?? 0) > 0)
+    .sort(
+      (a, b) =>
+        (b.clicks ?? 0) - (a.clicks ?? 0) ||
+        a.created_at.localeCompare(b.created_at),
+    )
+    .slice(0, n);
+}
+
+function groupSections(apps: DesktopApp[]): Section[] {
+  const byTag = new Map<string, DesktopApp[]>();
+  for (const app of apps) {
+    for (const tag of app.tags ?? []) {
+      const list = byTag.get(tag) ?? [];
+      list.push(app);
+      byTag.set(tag, list);
+    }
+  }
+  return [...byTag.entries()]
+    .map(([tag, list]) => ({
+      tag,
+      apps: [...list].sort(
+        (a, b) => b.clicks - a.clicks || a.name.localeCompare(b.name),
+      ),
+      totalClicks: list.reduce((sum, a) => sum + a.clicks, 0),
+    }))
+    .sort(
+      (x, y) =>
+        y.totalClicks - x.totalClicks || x.tag.localeCompare(y.tag),
+    );
+}
 
 const TAG_MAX_LEN = 32;
 const TAGS_PER_APP_MAX = 10;
@@ -101,6 +140,15 @@ export function App() {
     setSelectedTags((cur) => (cur.includes(tag) ? cur.filter((t) => t !== tag) : [...cur, tag]));
   }
 
+  function asyncOpen(app: DesktopApp) {
+    openApp(app.url);
+    void recordAppClick(app.app_id)
+      .then(load)
+      .catch(() => {
+        // 计数失败不影响打开，不弹全局错误。
+      });
+  }
+
   function openCreate() {
     setName("");
     setUrl("http://");
@@ -162,6 +210,42 @@ export function App() {
     }
   }
 
+  const navApps = useMemo(() => topApps(visibleApps, 8), [visibleApps]);
+  const sections = useMemo(() => groupSections(visibleApps), [visibleApps]);
+  const untagged = useMemo(
+    () => visibleApps.filter((a) => (a.tags ?? []).length === 0),
+    [visibleApps],
+  );
+
+  function renderTile(app: DesktopApp) {
+    return (
+      <div key={app.app_id}>
+        <button type="button" className="tile" onClick={() => asyncOpen(app)}>
+          <div className="glyph">{firstGlyph(app.name)}</div>
+          <div className="label">{app.name}</div>
+        </button>
+        {app.tags.length > 0 ? (
+          <div className="tile-tags">
+            {app.tags.map((tag) => (
+              <span key={tag} className="chip chip-static">
+                {tag}
+              </span>
+            ))}
+          </div>
+        ) : null}
+        <div className="actions">
+          <span className="clicks" title="打开次数">{app.clicks}</span>
+          <button type="button" onClick={() => openEdit(app)}>
+            编辑
+          </button>
+          <button type="button" onClick={() => void onDelete(app)}>
+            删除
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="desktop">
       <div className="watermark">VECTORMAN</div>
@@ -201,40 +285,38 @@ export function App() {
           );
         })}
       </div>
-      <div className="grid">
-        {visibleApps.map((app) => (
-          <div key={app.app_id}>
-            <button type="button" className="tile" onClick={() => openApp(app.url)}>
-              <div className="glyph">{firstGlyph(app.name)}</div>
-              <div className="label">{app.name}</div>
-            </button>
-            {app.tags.length > 0 ? (
-              <div className="tile-tags">
-                {app.tags.map((tag) => (
-                  <span key={tag} className="chip chip-static">
-                    {tag}
-                  </span>
-                ))}
-              </div>
-            ) : null}
-            <div className="actions">
-              <button type="button" onClick={() => openEdit(app)}>
-                编辑
-              </button>
-              <button type="button" onClick={() => void onDelete(app)}>
-                删除
-              </button>
-            </div>
+      <section className="nav-row" aria-label="喜欢">
+        <h2 className="section-title">喜欢</h2>
+        <div className="grid">
+          {navApps.map(renderTile)}
+        </div>
+      </section>
+      {sections.map((section) => (
+        <section key={section.tag} className="tag-section" aria-label={section.tag}>
+          <h2 className="section-title">
+            {section.tag}
+            <span className="section-clicks" title="组内打开次数合计">{section.totalClicks}</span>
+          </h2>
+          <div className="grid">
+            {section.apps.map(renderTile)}
           </div>
-        ))}
-        <button type="button" className="tile add" onClick={openCreate}>
-          <div className="glyph">+</div>
-          <div className="label">添加 App</div>
-        </button>
-        {apps.length === 0 && !error ? (
-          <div className="empty">目录是空的。把 GSE 或其他页面加进来。</div>
-        ) : null}
-      </div>
+        </section>
+      ))}
+      {untagged.length > 0 ? (
+        <section className="tag-section" aria-label="未分组">
+          <h2 className="section-title">未分组</h2>
+          <div className="grid">
+            {untagged.map(renderTile)}
+          </div>
+        </section>
+      ) : null}
+      <button type="button" className="tile add" onClick={openCreate}>
+        <div className="glyph">+</div>
+        <div className="label">添加 App</div>
+      </button>
+      {apps.length === 0 && !error ? (
+        <div className="empty">目录是空的。把 GSE 或其他页面加进来。</div>
+      ) : null}
       {dialog ? (
         <div className="modal-backdrop">
           <form className="modal" onSubmit={(e) => void onSubmit(e)}>

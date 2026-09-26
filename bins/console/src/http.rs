@@ -75,6 +75,7 @@ fn build_router(
             "/api/console/apps/{app_id}",
             axum::routing::put(update_app).delete(delete_app),
         )
+        .route("/api/console/apps/{app_id}/clicks", axum::routing::post(record_click))
         .with_state(AppState { catalog });
     let app = match web_dir {
         Some(dir) => {
@@ -202,6 +203,13 @@ async fn delete_app(State(state): State<AppState>, Path(app_id): Path<String>) -
     }
 }
 
+async fn record_click(State(state): State<AppState>, Path(app_id): Path<String>) -> Response {
+    match state.catalog.record_click(&app_id).await {
+        Ok(app) => Json(app).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::Body;
@@ -282,6 +290,39 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::NO_CONTENT, "{body}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn record_click_endpoint() {
+        let path = tmp_file("clicks-endpoint");
+        let _ = std::fs::remove_file(&path);
+        let app = router(Arc::new(Catalog::open(&path).unwrap()), None);
+        let (st, body) = send(
+            &app,
+            req(
+                "POST",
+                "/api/console/apps",
+                Some(r#"{"name":"GSE","url":"http://127.0.0.1:7101"}"#),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "{body}");
+        let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["app_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (st, body) = send(&app, req("POST", &format!("/api/console/apps/{id}/clicks"), None)).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["clicks"],
+            serde_json::json!(1)
+        );
+
+        let (st, body) = send(&app, req("POST", "/api/console/apps/missing/clicks", None)).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert!(body.contains("not_found"));
         let _ = std::fs::remove_file(&path);
     }
 
