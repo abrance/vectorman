@@ -225,9 +225,17 @@ async fn heartbeat_loop(end: &End, agent_id: &str, interval_secs: u64) -> Result
             serde_json::to_vec(&hb)
                 .map_err(|e| AgentError::ConnError(ConnError::new(e.to_string())))?,
         );
+        let carried_result = hb.upgrade_result.is_some();
         end.call("heartbeat", body).await.map_err(|e| {
             AgentError::ConnError(ConnError::after_connected(format!("heartbeat rpc: {e}")))
         })?;
+        // **心跳成功送达之后**才标记已上报：发送失败时下次心跳继续带，
+        // 否则结果会丢（重启一次就没了）。
+        if carried_result {
+            if let Err(e) = upgrade::mark_reported() {
+                eprintln!("gse-agent: mark upgrade result reported failed: {e}");
+            }
+        }
         tokio::time::sleep(Duration::from_secs(interval_secs)).await;
     }
 }

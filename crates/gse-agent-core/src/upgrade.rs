@@ -230,7 +230,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 /// 渲染实际干活的脚本。它由 cron 以**独立 cgroup** 拉起，因此
 /// agent 被停/起都不影响它（这正是本方案成立的原因）。
-fn render_inner_script(deploy: &Deploy, new_bin: &Path, stamp: &str) -> String {
+pub fn render_inner_script(deploy: &Deploy, new_bin: &Path, stamp: &str) -> String {
     let bin = deploy.bin.display();
     let new = new_bin.display();
     let backup = plan_backup(&deploy.bin, stamp, 0);
@@ -242,14 +242,21 @@ fn render_inner_script(deploy: &Deploy, new_bin: &Path, stamp: &str) -> String {
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
-    let (stop, start) = match deploy.kind {
+    // 重启命令写成 shell **函数**而不是变量：命令里含 `||` 与重定向，
+    // 存进变量再用 `$VAR` 调用会被按空格拆词（`||` 变成 systemctl 的参数）——
+    // 实测踩到：日志里出现 `Failed to stop \x7c\x7c.service`。
+    let (stop_fn, start_fn, status_fn) = match deploy.kind {
         DeployKind::Systemd => (
-            "SUDO=\"\"; sudo -n true 2>/dev/null && SUDO=\"sudo -n\"\n$SUDO systemctl stop vectorman-gse-agent".to_string(),
-            "SUDO=\"\"; sudo -n true 2>/dev/null && SUDO=\"sudo -n\"\n$SUDO systemctl start vectorman-gse-agent".to_string(),
+            "sudo -n systemctl stop vectorman-gse-agent 2>/dev/null || systemctl stop vectorman-gse-agent"
+                .to_string(),
+            "sudo -n systemctl start vectorman-gse-agent 2>/dev/null || systemctl start vectorman-gse-agent"
+                .to_string(),
+            "systemctl is-active --quiet vectorman-gse-agent".to_string(),
         ),
         DeployKind::CtlDirect => (
             format!("\"{ctl}\" gse-agent stop"),
             format!("\"{ctl}\" gse-agent start"),
+            format!("\"{ctl}\" gse-agent status >/dev/null 2>&1"),
         ),
     };
 
@@ -257,42 +264,87 @@ fn render_inner_script(deploy: &Deploy, new_bin: &Path, stamp: &str) -> String {
         r#"#!/bin/sh
 # 由 gse-agent 生成、cron 拉起。独立于 agent 的 cgroup。
 exec >/tmp/gse-agent-upgrade.log 2>&1
-set -x
 
-FROM_VER=$("{bin}" --version 2>/dev/null | awk '{{print $2}}')
-FROM_SHA=$(sha256sum "{bin}" 2>/dev/null | cut -d' ' -f1)
-NEW_SHA=$(sha256sum "{new}" 2>/dev/null | cut -d' ' -f1)
+BIN="{bin}"
+NEW="{new}"
+BACKUP="{backup}"
+RESULT="{result}"
+
+do_stop() {{ {stop_fn}; }}
+do_start() {{ {start_fn}; }}
+# 判活用部署形式自己的状态命令，**不用进程名模糊匹配** ——
+# 模糊匹配会命中任何命令行含该串的进程（实测命中无关 shell，
+# 于是坏二进制被误判为"起来了"、回滚不触发）。
+do_status() {{ {status_fn}; }}
+
+SUDO=""
+sudo -n true 2>/dev/null && SUDO="sudo -n"
+
+# 文件操作可能落在 root 属主的目录里（systemd 部署下 agent 以 root 跑）。
+# 先直接试，失败再走 sudo —— 两种部署形式都能覆盖。
+fs_cp() {{
+  cp "$1" "$2" 2>/dev/null || $SUDO cp "$1" "$2"
+}}
+fs_cp_a() {{
+  cp -a "$1" "$2" 2>/dev/null || $SUDO cp -a "$1" "$2"
+}}
+fs_chmod() {{
+  chmod 755 "$1" 2>/dev/null || $SUDO chmod 755 "$1"
+}}
+fs_write_result() {{
+  cat > "$RESULT" 2>/dev/null || $SUDO sh -c "cat > '$RESULT'"
+}}
+
+FROM_VER=$("$BIN" --version 2>/dev/null | awk '{{print $2}}')
+FROM_SHA=$(sha256sum "$BIN" 2>/dev/null | cut -d' ' -f1)
+NEW_SHA=$(sha256sum "$NEW" 2>/dev/null | cut -d' ' -f1)
 STARTED=$(date -Iseconds)
 
-{stop} || {{ echo "FATAL: stop failed"; }}
-cp -a "{bin}" "{backup}" || {{ echo "FATAL: backup failed"; }}
-cp "{new}" "{bin}" || {{ echo "FATAL: replace failed"; }}
-chmod 755 "{bin}"
-{start} || {{ echo "FATAL: start failed"; }}
+# 任一 FATAL 都要先把 agent 起回来再退出 —— 不能把机器上的 agent 停着不管。
+abort_after_stop() {{
+  OUTCOME=failed
+  DETAIL="$1"
+  do_start 2>/dev/null || true
+  TO_VER=$("$BIN" --version 2>/dev/null | awk '{{print $2}}')
+  FINISHED=$(date -Iseconds)
+  fs_write_result <<JSON
+{{"started_at":"$STARTED","finished_at":"$FINISHED",
+ "from_version":"$FROM_VER","to_version":"$TO_VER",
+ "from_sha256":"$FROM_SHA","to_sha256":"$NEW_SHA",
+ "outcome":"$OUTCOME","detail":"$DETAIL","reported":false}}
+JSON
+  echo "UPGRADE-DONE $OUTCOME"
+  exit 1
+}}
+
+do_stop || abort_after_stop "stop failed"
+fs_cp_a "$BIN" "$BACKUP" || abort_after_stop "backup failed"
+fs_cp "$NEW" "$BIN" || abort_after_stop "replace failed"
+fs_chmod "$BIN" || abort_after_stop "chmod failed"
+do_start || abort_after_stop "start failed"
 
 sleep 5
-TO_VER=$("{bin}" --version 2>/dev/null | awk '{{print $2}}')
+TO_VER=$("$BIN" --version 2>/dev/null | awk '{{print $2}}')
 
-# 注意：判活模式必须够精确 —— 脚本自身路径含 "gse-agent"，
-# 若只用二进制名做模糊匹配，会匹配到脚本自身，导致永远判定"起来了"、回滚不触发。
-if pgrep -f "{bin}" >/dev/null 2>&1; then
+if do_status; then
   OUTCOME=succeeded
   DETAIL=""
 else
   OUTCOME=rolled_back
-  DETAIL="new binary did not come up; restoring backup"
-  {stop}
-  cp -a "{backup}" "{bin}"
-  {start}
-  TO_VER=$("{bin}" --version 2>/dev/null | awk '{{print $2}}')
-  pgrep -f "{bin}" >/dev/null 2>&1 || {{
+  DETAIL="new binary did not come up; restored backup"
+  do_stop
+  fs_cp_a "$BACKUP" "$BIN"
+  do_start
+  sleep 3
+  TO_VER=$("$BIN" --version 2>/dev/null | awk '{{print $2}}')
+  do_status || {{
     OUTCOME=failed
-    DETAIL="rollback also failed; manual recovery: cp {backup} {bin} && restart"
+    DETAIL="rollback also failed; manual recovery: cp $BACKUP $BIN && restart"
   }}
 fi
 
 FINISHED=$(date -Iseconds)
-cat > "{result}" <<JSON
+fs_write_result <<JSON
 {{"started_at":"$STARTED","finished_at":"$FINISHED",
  "from_version":"$FROM_VER","to_version":"$TO_VER",
  "from_sha256":"$FROM_SHA","to_sha256":"$NEW_SHA",
@@ -383,21 +435,40 @@ pub fn result_file_path() -> PathBuf {
 /// 返回 `Ok(None)` 表示没有结果文件（首次运行或已被清理）；
 /// 文件存在但内容坏时返回 `Err`（调用方决定是否告警）。
 pub fn read_result() -> Result<Option<UpgradeResult>, String> {
+    read_result_at(&result_file_path())
+}
+
+/// 把结果标记为已上报（保留文件便于事后查证，只改 `reported`）。
+pub fn mark_reported() -> Result<(), String> {
+    mark_reported_at(&result_file_path())
+}
+
+/// 尚未上报的升级结果（心跳用）。读失败时返回 None 并打日志 —— 不能因为
+/// 一个坏文件让心跳停摆。
+pub fn unreported_result() -> Option<UpgradeResult> {
     let path = result_file_path();
+    // 先探一次读错误：坏文件要告警，但不能因此让心跳停摆。
+    if let Err(e) = read_result_at(&path) {
+        eprintln!("gse-agent: upgrade result unreadable: {e}");
+        return None;
+    }
+    unreported_at(&path)
+}
+
+// ── 下面是带显式路径的实现，便于用临时文件测试（公开包装用默认路径）。──
+
+fn read_result_at(path: &Path) -> Result<Option<UpgradeResult>, String> {
     if !path.is_file() {
         return Ok(None);
     }
-    let raw =
-        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let parsed: UpgradeResult =
         serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
     Ok(Some(parsed))
 }
 
-/// 把结果标记为已上报（保留文件便于事后查证，只改 `reported`）。
-pub fn mark_reported() -> Result<(), String> {
-    let path = result_file_path();
-    let Some(mut r) = read_result()? else {
+fn mark_reported_at(path: &Path) -> Result<(), String> {
+    let Some(mut r) = read_result_at(path)? else {
         return Ok(());
     };
     if r.reported {
@@ -405,19 +476,14 @@ pub fn mark_reported() -> Result<(), String> {
     }
     r.reported = true;
     let body = serde_json::to_string_pretty(&r).map_err(|e| format!("encode: {e}"))?;
-    std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))
+    std::fs::write(path, body).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
-/// 尚未上报的升级结果（心跳用）。读失败时返回 None 并打日志 —— 不能因为
-/// 一个坏文件让心跳停摆。
-pub fn unreported_result() -> Option<UpgradeResult> {
-    match read_result() {
+/// 与 `unreported_result` 同一判定，但接受显式路径（供测试）。
+fn unreported_at(path: &Path) -> Option<UpgradeResult> {
+    match read_result_at(path) {
         Ok(Some(r)) if !r.reported => Some(r),
-        Ok(_) => None,
-        Err(e) => {
-            eprintln!("gse-agent: upgrade result unreadable: {e}");
-            None
-        }
+        _ => None,
     }
 }
 
@@ -543,8 +609,8 @@ mod tests {
             ctl: None,
         };
         let script = render_inner_script(&deploy, Path::new("/tmp/newbin"), "TS");
-        assert!(script.contains("systemctl stop vectorman-gse-agent"));
-        assert!(script.contains("systemctl start vectorman-gse-agent"));
+        assert!(script.contains("do_stop() { sudo -n systemctl stop vectorman-gse-agent"));
+        assert!(script.contains("do_start() { sudo -n systemctl start vectorman-gse-agent"));
         assert!(!script.contains("CTLPLACEHOLDER"), "占位符必须被替换");
         // 备份路径要落在被替换的二进制旁边，且带时间戳
         assert!(script.contains("gse-agent.bak-TS-0"));
@@ -561,10 +627,29 @@ mod tests {
             ctl: Some(PathBuf::from("/home/test/dtx/vectorman/deploy/ctl.sh")),
         };
         let script = render_inner_script(&deploy, Path::new("/tmp/newbin"), "TS");
-        assert!(script.contains("/home/test/dtx/vectorman/deploy/ctl.sh"));
-        assert!(script.contains("gse-agent stop"));
-        assert!(script.contains("gse-agent start"));
-        assert!(!script.contains("systemctl"), "ctl 模式不得混入 systemctl");
+        // 重启命令必须走 ctl.sh，且**不得**混入 systemctl
+        assert!(
+            script.contains(
+                "do_stop() { \"/home/test/dtx/vectorman/deploy/ctl.sh\" gse-agent stop; }"
+            ),
+            "{script}"
+        );
+        assert!(
+            script.contains(
+                "do_start() { \"/home/test/dtx/vectorman/deploy/ctl.sh\" gse-agent start; }"
+            ),
+            "{script}"
+        );
+        assert!(
+            script.contains(
+                "do_status() { \"/home/test/dtx/vectorman/deploy/ctl.sh\" gse-agent status"
+            ),
+            "{script}"
+        );
+        assert!(
+            !script.contains("systemctl"),
+            "ctl 模式不得混入 systemctl（abort 路径也要用它自己的命令）"
+        );
     }
 
     #[test]
@@ -577,12 +662,16 @@ mod tests {
         };
         let script = render_inner_script(&deploy, Path::new("/tmp/newbin"), "TS");
         assert!(script.contains("manual recovery"));
-        // 判活模式必须是**完整二进制路径**，不能是 "gse-agent"
-        // （脚本自身路径含该串，会匹配到自己 → 回滚永不触发）。
-        assert!(script.contains("pgrep -f \"/opt/vectorman/gse-agent/bin/gse-agent\""));
+        // 判活必须用部署形式自己的状态命令，**不得用 pgrep** ——
+        // `pgrep -f <路径>` 会匹配任何命令行含该串的进程（实测匹配到无关 shell，
+        // 坏二进制被误判为"起来了"、回滚不触发）。
         assert!(
-            !script.contains("pgrep -f \"gse-agent\""),
-            "不得用模糊模式判活"
+            script.contains("do_status() { systemctl is-active"),
+            "{script}"
+        );
+        assert!(
+            !script.contains("pgrep"),
+            "判活不得用 pgrep（会误匹配无关进程）"
         );
     }
 
@@ -670,6 +759,77 @@ mod tests {
         // read_result 读的是固定路径；这里直接验证解析层行为
         let err = serde_json::from_str::<UpgradeResult>("not json").is_err();
         assert!(err, "坏内容必须解析失败（read_result 会转成 Err）");
+    }
+
+    fn sample_result(reported: bool) -> UpgradeResult {
+        UpgradeResult {
+            started_at: "t0".into(),
+            finished_at: "t1".into(),
+            from_version: "1.1.0".into(),
+            to_version: "1.2.0".into(),
+            from_sha256: "aa".into(),
+            to_sha256: "bb".into(),
+            outcome: UpgradeOutcome::Succeeded,
+            detail: String::new(),
+            reported,
+        }
+    }
+
+    fn tmp_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("gse-up-{}-{}", std::process::id(), name));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("result.json")
+    }
+
+    /// **补报链路**：结果文件 → 读取 → 心跳取用 → 标记已上报 → 不再重复取用。
+    #[test]
+    fn report_cycle_reads_once_then_marks_reported() {
+        let path = tmp_path("cycle");
+        let _ = std::fs::remove_file(&path);
+
+        // 没有文件 → Ok(None)，心跳不带
+        assert!(read_result_at(&path).expect("read").is_none());
+        assert!(unreported_at(&path).is_none());
+
+        // 写入未上报的结果 → 心跳应带上
+        let body = serde_json::to_string(&sample_result(false)).expect("encode");
+        std::fs::write(&path, body).expect("write");
+        assert_eq!(unreported_at(&path), Some(sample_result(false)));
+
+        // 标记已上报 → 心跳不再带（**关键：避免每次心跳重复上报**）
+        mark_reported_at(&path).expect("mark");
+        assert!(unreported_at(&path).is_none());
+        // 但文件仍在（便于事后查证）
+        assert!(path.is_file());
+        assert!(read_result_at(&path).expect("read").expect("some").reported);
+    }
+
+    #[test]
+    fn mark_reported_is_idempotent() {
+        let path = tmp_path("idem");
+        let body = serde_json::to_string(&sample_result(true)).expect("encode");
+        std::fs::write(&path, body).expect("write");
+        // 已上报再标记不得报错、不得改变内容
+        mark_reported_at(&path).expect("mark 1");
+        mark_reported_at(&path).expect("mark 2");
+        assert!(read_result_at(&path).expect("read").expect("some").reported);
+    }
+
+    #[test]
+    fn mark_reported_without_file_is_ok() {
+        let path = tmp_path("missing");
+        let _ = std::fs::remove_file(&path);
+        mark_reported_at(&path).expect("缺文件时标记应为 no-op");
+    }
+
+    #[test]
+    fn read_result_reports_error_on_corrupt_content() {
+        // 坏内容必须返回 Err（调用方据此告警），而不是当成"没有结果"静默吞掉。
+        let path = tmp_path("corrupt");
+        std::fs::write(&path, "not json at all").expect("write");
+        assert!(read_result_at(&path).is_err());
+        // 而 unreported_at 只取"可用的"，坏文件返回 None（不让心跳停摆）
+        assert!(unreported_at(&path).is_none());
     }
 
     #[test]
