@@ -98,7 +98,9 @@ jobs:
         run: |
           set -euo pipefail
           image="${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.image_tag }}"
+          # vectorman-version 刻意剥掉前导 v（v1.2.0 与 1.2.0 打印相同），断言用剥过的
           expected="${{ steps.meta.outputs.version }}"
+          expected="${expected#v}"
           docker pull "$image"
           case "${{ steps.meta.outputs.kind }}" in
             server)
