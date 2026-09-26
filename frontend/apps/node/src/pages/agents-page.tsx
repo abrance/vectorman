@@ -18,6 +18,27 @@ function statusTag(status?: string) {
   return <Tag>{status || "unknown"}</Tag>;
 }
 
+/// 会话口径。关键是显示**心跳口径与会话口径的差异**：
+/// `status=online` 但会话 absent/closed 意味着「心跳还在发、连接已死」，
+/// 作业下发必然失败 —— 此前这种状态在页面上完全看不出来。
+function sessionTag(row: Agent) {
+  const state = row.session_state;
+  if (!state) {
+    return <Tag>—</Tag>;
+  }
+  if (state === "online" && row.job_channel_available) {
+    return <Tag color="green">online</Tag>;
+  }
+  const label = state === "absent" ? "no session" : state;
+  const color = state === "checking" ? "orange" : "red";
+  return <Tag color={color}>{label}</Tag>;
+}
+
+/// 心跳说在线、但作业通道不可用 → 视为异常，单独高亮。
+function isHeartbeatSessionMismatch(row: Agent) {
+  return row.status === "online" && row.job_channel_available === false;
+}
+
 export function AgentsPage() {
   const { notifier } = useRuntime();
   const { list, refresh, getOne, save, remove } = useAgents({ poll: true });
@@ -96,6 +117,23 @@ export function AgentsPage() {
           { title: "agent_id", dataIndex: "agent_id" },
           { title: "host_id", dataIndex: "host_id" },
           { title: "status", dataIndex: "status", render: statusTag },
+          {
+            title: "session",
+            dataIndex: "session_state",
+            render: (_, row) => sessionTag(row),
+          },
+          {
+            title: "job channel",
+            dataIndex: "job_channel_available",
+            render: (_, row) =>
+              isHeartbeatSessionMismatch(row) ? (
+                <Tag color="red">心跳在线但会话不可用</Tag>
+              ) : row.job_channel_available ? (
+                <Tag color="green">available</Tag>
+              ) : (
+                <Tag>unavailable</Tag>
+              ),
+          },
           { title: "last_heartbeat_at", dataIndex: "last_heartbeat_at", render: (v: string | null) => formatTimestamp(v) },
           { title: "version", dataIndex: "version" },
           {

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use geminio::app::Error;
-use geminio::{Bytes, End, EndListener, ListenOptions};
+use geminio::{Bytes, End, EndDrivers, EndListener, ListenOptions};
 use gse_proto::{
     AuthReply, AuthRequest, CollectItemsReply, Command, DataplaneAddrReply, DataplaneAddrRequest,
     GseError, Heartbeat, JobAck, JobExec, JobResult, Receipt,
@@ -20,6 +20,17 @@ use crate::rerun::{build_rerun_submit, RerunRequest};
 use crate::session::{now_micros, Session, SessionRegistry, SessionState};
 
 const LIVENESS_SCAN_INTERVAL_SECS: u64 = 5;
+
+/// 心跳超时窗口（微秒），与 `ServerConfig::heartbeat_timeout_secs` 默认值一致，
+/// 用于判定「心跳是否新鲜」。取 90s（配置默认值）。
+fn heartbeat_window_micros() -> i64 {
+    90 * 1_000_000
+}
+
+/// 连接活性探测间隔（秒）。探测失败即判定连接结束并清理会话。
+const SESSION_PROBE_INTERVAL_SECS: u64 = 15;
+/// 单次活性探测的超时（秒）。
+const SESSION_PROBE_TIMEOUT_SECS: u64 = 5;
 const COMMAND_TIMEOUT_SECS: u64 = 60;
 
 static CMD_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -163,11 +174,13 @@ impl Server {
         }
         loop {
             match self.listener.accept().await {
-                Ok((end, _drivers)) => {
+                Ok((end, drivers)) => {
                     let registry = self.registry.clone();
                     let cfg = self.cfg.clone();
                     let ledger = self.ledger.clone();
-                    tokio::spawn(handle_conn(end, registry, cfg, ledger));
+                    // `drivers` 必须持有（见 handle_conn 末尾注释：它不能用 await
+                    // 探测连接结束，但持有它不影响探测路径）。
+                    tokio::spawn(handle_conn(end, drivers, registry, cfg, ledger));
                 }
                 Err(e) => {
                     // 单个连接的握手/解码失败（如非法 wire-format）只影响该连接，
@@ -371,7 +384,11 @@ async fn dispatch_job(
     let session = match registry.get(agent_id).await {
         Some(s) if s.state == SessionState::Online => s,
         _ => {
-            ledger.mark_lost_by_agent(agent_id).await?;
+            // 措辞区分：心跳窗口内却没有可用会话 ⇒ 连接已死（session unavailable），
+            // 而不是「Agent 离线」—— 此前一律写 agent offline，误导排查。
+            let window = heartbeat_window_micros();
+            let reason = ledger.lost_reason_for(agent_id, now_micros(), window).await;
+            ledger.mark_lost_by_agent(agent_id, &reason).await?;
             return Ok(());
         }
     };
@@ -397,11 +414,17 @@ async fn dispatch_job(
         },
         Ok(Err(e)) => {
             eprintln!("gse-server: job_exec {job_id} rpc failed: {e}");
-            ledger.mark_lost_by_agent(agent_id).await?;
+            // 会话对象在、但调用失败 ⇒ 应用层已确认连接不可用，措辞用 session unavailable。
+            ledger
+                .mark_lost_by_agent(agent_id, "session unavailable")
+                .await?;
         }
         Err(_) => {
             eprintln!("gse-server: job_exec {job_id} timed out");
-            ledger.mark_lost_by_agent(agent_id).await?;
+            // 超时是「下发后无回应」，不代表 Agent 离线；用独立措辞。
+            ledger
+                .mark_lost_by_agent(agent_id, "job_exec timeout")
+                .await?;
         }
     }
     Ok(())
@@ -463,7 +486,10 @@ async fn run_liveness(
                 }
             }
             if matches!(session.state, SessionState::Offline | SessionState::Closed) {
-                if let Err(e) = ledger.mark_lost_by_agent(&session.agent_id).await {
+                if let Err(e) = ledger
+                    .mark_lost_by_agent(&session.agent_id, "agent offline")
+                    .await
+                {
                     eprintln!(
                         "gse-server: mark_lost_by_agent {} failed: {}",
                         session.agent_id, e.message
@@ -476,6 +502,7 @@ async fn run_liveness(
 
 async fn handle_conn(
     end: End,
+    _drivers: EndDrivers,
     registry: Arc<SessionRegistry>,
     cfg: Arc<ServerConfig>,
     ledger: Arc<Ledger>,
@@ -529,7 +556,7 @@ async fn handle_conn(
         eprintln!("gse-server: register job_result failed: {e}");
     }
 
-    let registry_heartbeat = registry;
+    let registry_heartbeat = registry.clone();
     let ledger_heartbeat = ledger.clone();
     if let Err(e) = end
         .register("heartbeat", move |req: Bytes| {
@@ -582,7 +609,68 @@ async fn handle_conn(
     {
         eprintln!("gse-server: register collect_items failed: {e}");
     }
+
+    // ——— 连接生命周期：主动探测连接活性，失活即清理本连接建立的会话 ———
+    //
+    // 为什么不用 `drivers.hub_driver`：**实测它不会在对端断开后 resolve**
+    // （用真 agent 验证：60 秒仍未 resolve）。原因是 `DialogueHub::Router::run`
+    // 的退出条件是 `inbound_rx` / `cmd_rx` 双双关闭，而 `cmd_tx` 由 `End` 持有 ——
+    // 服务端自己还握着 `End`，`cmd_rx` 就不为 None。即「等 hub_driver 要先 drop End，
+    // 而 drop End 前又要 await hub_driver」，构成死锁。
+    //
+    // 可用的活性信号是 `End::call`：对端断开后它在亚秒级返回传输层错误。
+    // 这里周期性 probe：`Ok(_)`（含对端回的「未知方法」）说明连接活着；
+    // 超时或传输层错误（multiplexer/end closed）说明连接已结束。
+    //
+    // 不这样做就会出现僵尸会话：连接早已断开，而心跳通道独立于连接存活、
+    // 持续刷新 last_seen，使会话永远停在 Online；作业下发拿到它必然失败。
+    let client_id = end.client_id();
+    loop {
+        tokio::time::sleep(Duration::from_secs(SESSION_PROBE_INTERVAL_SECS)).await;
+        let probe = tokio::time::timeout(
+            Duration::from_secs(SESSION_PROBE_TIMEOUT_SECS),
+            end.call(SESSION_PROBE_METHOD, Bytes::new()),
+        )
+        .await;
+        match probe {
+            // 正常回应（对端注册了同名方法）
+            Ok(Ok(_)) => continue,
+            // 对端回了业务错误（未注册该方法）→ 连接是活的
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                if msg.contains("multiplexer closed") || msg.contains("end closed") {
+                    break;
+                }
+                continue;
+            }
+            // 超时 → 连接失活
+            Err(_) => break,
+        }
+    }
+
+    let conn_agent_id = authed.lock().ok().and_then(|g| g.clone());
+    match conn_agent_id {
+        Some(agent_id) => {
+            let removed = registry.remove_if_client(&agent_id, client_id).await;
+            if let Err(e) = ledger.mark_offline(&agent_id).await {
+                eprintln!(
+                    "gse-server: mark_offline {agent_id} on disconnect failed: {}",
+                    e.message
+                );
+            }
+            println!(
+                "gse-server: agent {agent_id} connection ended (client_id={client_id}, session_removed={removed})"
+            );
+        }
+        None => {
+            println!("gse-server: unauthenticated connection ended (client_id={client_id})");
+        }
+    }
 }
+
+/// 连接活性探测使用的方法名。agent 不会注册它，对端会回「未知方法」——
+/// 拿到任何回应都说明连接活着；超时或传输层错误才判定失活。
+const SESSION_PROBE_METHOD: &str = "__vectorman_probe__";
 
 /// Agent → Server 拉取本 Agent 应执行的采集项；未认证返回空表。
 async fn handle_collect_items(conn_agent_id: Option<&str>, ledger: &Ledger) -> CollectItemsReply {

@@ -1086,17 +1086,51 @@ impl Ledger {
     }
 
     /// 将会话离线 Agent 的在途作业标记为 lost。
-    pub async fn mark_lost_by_agent(&self, agent_id: &str) -> Result<(), GseError> {
-        let sql = "UPDATE jobs SET status = 'lost', error = COALESCE(error, 'agent offline'), updated_at = ?
+    ///
+    /// `reason` 用于区分两种成因：Agent 确实离线（心跳窗口外，`agent offline`）
+    /// 与会话不可用（心跳在窗口内但会话不存在/非 Online，`session unavailable`）。
+    /// 此前一律写 `agent offline`，把连接已死误报成 Agent 离线，误导排查。
+    pub async fn mark_lost_by_agent(&self, agent_id: &str, reason: &str) -> Result<(), GseError> {
+        let sql = "UPDATE jobs SET status = 'lost', error = COALESCE(error, ?), updated_at = ?
                    WHERE (agent_id = ? OR source_agent_id = ? OR dest_agent_id = ?)
                      AND status IN ('pending', 'dispatched', 'running')";
         let stamp = text(&ledger_stamp());
         self.execute(
             sql,
-            &[stamp, text(agent_id), text(agent_id), text(agent_id)],
+            &[
+                text(reason),
+                stamp,
+                text(agent_id),
+                text(agent_id),
+                text(agent_id),
+            ],
         )
         .await?;
         Ok(())
+    }
+
+    /// 作业下发时判定「Agent 确实离线」还是「会话不可用」。
+    ///
+    /// 心跳窗口内（`last_heartbeat_at` 距现在小于 `window_micros`）却没有可用会话
+    /// ⇒ 连接已死；否则才是 Agent 离线。
+    pub async fn lost_reason_for(
+        &self,
+        agent_id: &str,
+        now_micros: i64,
+        window_micros: i64,
+    ) -> String {
+        if let Ok(Some(agent)) = self.get_agent(agent_id).await {
+            if let Some(hb) = agent
+                .last_heartbeat_at
+                .as_deref()
+                .and_then(|s| s.parse::<i64>().ok())
+            {
+                if now_micros.saturating_sub(hb) < window_micros {
+                    return "session unavailable".to_string();
+                }
+            }
+        }
+        "agent offline".to_string()
     }
 
     /// 服务启动时将所有在途作业标记为 lost。
@@ -2016,7 +2050,10 @@ mod tests {
             .await
             .expect("finish again");
         ledger.mark_rejected("j-1", "busy").await.expect("rejected");
-        ledger.mark_lost_by_agent("a-1").await.expect("lost");
+        ledger
+            .mark_lost_by_agent("a-1", "agent offline")
+            .await
+            .expect("lost");
 
         let final_job = ledger.get_job("j-1").await.expect("get").expect("exists");
         assert_eq!(final_job.status, JobStatus::Succeeded);
@@ -2049,7 +2086,10 @@ mod tests {
             .expect("insert 2");
         ledger.mark_running("j-2", "10").await.expect("running");
 
-        ledger.mark_lost_by_agent("a-1").await.expect("lost");
+        ledger
+            .mark_lost_by_agent("a-1", "agent offline")
+            .await
+            .expect("lost");
         assert_eq!(
             ledger
                 .get_job("j-1")
@@ -2325,7 +2365,10 @@ mod tests {
             .expect("other")
             .is_empty());
 
-        ledger.mark_lost_by_agent("src-1").await.expect("lost");
+        ledger
+            .mark_lost_by_agent("src-1", "agent offline")
+            .await
+            .expect("lost");
         let lost = ledger.get_job("j-ft").await.expect("get").expect("exists");
         assert_eq!(lost.status, JobStatus::Lost);
     }

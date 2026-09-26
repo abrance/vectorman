@@ -31,6 +31,11 @@ export type Agent = {
   status?: string;
   last_heartbeat_at?: string | null;
   registered_at?: string;
+  /// 会话口径（由 gse-server 的内存会话注册表实时投影，非台账字段）。
+  /// `status` 是心跳口径，两者可以不一致 —— 「心跳在线但作业通道已死」
+  /// 就是 `status = online` 而 `session_state = absent`。
+  session_state?: "online" | "checking" | "offline" | "closed" | "absent";
+  job_channel_available?: boolean;
 };
 
 export type AgentConfig = {

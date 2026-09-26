@@ -70,6 +70,186 @@ async fn wait_online(server: &Server, agent_id: &str) {
     .expect("agent never came online");
 }
 
+/// 会话生命周期回归（本次事故核心）：**连接断开后会话必须被清理**。
+///
+/// 要用真 `Server::run()` 跑服务端（这样才能覆盖 `handle_conn` 的真实生命周期），
+/// 但客户端用裸 geminio —— `run_agent` 的 driver 是独立 spawn 的，abort 它
+/// 不会断开连接（实测探测会一直成功），无法构造「连接断开」这个场景。
+/// 裸客户端的 `End` 一 drop，连接即断。
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_session_cleaned_after_connection_ends() {
+    use geminio::{dial, DialOptions};
+
+    let db = tmp_db("session-cleanup");
+    let (server, addr) = Server::bind(server_config(&db, true, 30))
+        .await
+        .expect("bind");
+    register(&server, "web-01", "tok-1").await;
+    let server_ref = server.clone();
+    tokio::spawn(async move {
+        let _ = server_ref.run().await;
+    });
+
+    // 客户端连上并认证 —— 与真 agent 的认证路径一致。
+    let (client, client_drivers) = dial(addr.to_string(), DialOptions::default())
+        .await
+        .expect("dial");
+    // 服务端的 handle_conn 会注册若干 handler，每个都要对端回 RegisterAck。
+    // 裸客户端不注册任何 handler 时，dispatcher 无路由可用、ack 不发出，
+    // 服务端的 register 会永久挂起 —— 这是测试构造问题（真 agent 会注册）。
+    // 这里注册足量的 handler 让流程走完。
+    for m in [
+        "job_exec",
+        "file_read",
+        "file_write",
+        "collect_items",
+        "exec",
+    ] {
+        client
+            .register(m, |_r: Bytes| async move { Ok(Bytes::new()) })
+            .await
+            .expect("register");
+    }
+    let resp = client
+        .call(
+            "auth",
+            Bytes::from(r#"{"agent_id":"web-01","token":"tok-1"}"#),
+        )
+        .await
+        .expect("auth rpc");
+    let reply: serde_json::Value = serde_json::from_slice(&resp).expect("reply");
+    assert_eq!(reply["ok"], true, "auth should pass: {reply}");
+
+    wait_online(&server, "web-01").await;
+
+    // 断开连接：drop End 与 drivers。
+    drop(client);
+    drop(client_drivers);
+
+    // 会话应在有限时间内被清理（探测间隔 15s + 超时 5s，留足余量）。
+    tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            if server
+                .sessions()
+                .await
+                .iter()
+                .all(|s| s.agent_id != "web-01")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("连接断开后会话必须被清理（僵尸会话回归）");
+
+    let agent = server
+        .ledger
+        .get_agent("web-01")
+        .await
+        .expect("get agent")
+        .expect("agent exists");
+    assert_eq!(agent.status, "offline", "断开后台账应为 offline");
+}
+
+/// 重连后会话必须重建、台账回到 online（同样不重启 server）。
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_session_rebuilds_after_reconnect() {
+    use geminio::{dial, DialOptions};
+
+    let db = tmp_db("session-rebuild");
+    let (server, addr) = Server::bind(server_config(&db, true, 30))
+        .await
+        .expect("bind");
+    register(&server, "web-01", "tok-1").await;
+    let server_ref = server.clone();
+    tokio::spawn(async move {
+        let _ = server_ref.run().await;
+    });
+
+    let (client, client_drivers) = dial(addr.to_string(), DialOptions::default())
+        .await
+        .expect("dial 1");
+    for m in [
+        "job_exec",
+        "file_read",
+        "file_write",
+        "collect_items",
+        "exec",
+    ] {
+        client
+            .register(m, |_r: Bytes| async move { Ok(Bytes::new()) })
+            .await
+            .expect("register");
+    }
+    client
+        .call(
+            "auth",
+            Bytes::from(r#"{"agent_id":"web-01","token":"tok-1"}"#),
+        )
+        .await
+        .expect("auth rpc");
+    wait_online(&server, "web-01").await;
+
+    drop(client);
+    drop(client_drivers);
+    tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            if server
+                .sessions()
+                .await
+                .iter()
+                .all(|s| s.agent_id != "web-01")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("会话应被清理");
+
+    // 重连 → 会话重建、台账回 online。
+    let (client2, client_drivers2) = dial(addr.to_string(), DialOptions::default())
+        .await
+        .expect("dial 2");
+    for m in [
+        "job_exec",
+        "file_read",
+        "file_write",
+        "collect_items",
+        "exec",
+    ] {
+        client2
+            .register(m, |_r: Bytes| async move { Ok(Bytes::new()) })
+            .await
+            .expect("register");
+    }
+    client2
+        .call(
+            "auth",
+            Bytes::from(r#"{"agent_id":"web-01","token":"tok-1"}"#),
+        )
+        .await
+        .expect("auth rpc 2");
+    wait_online(&server, "web-01").await;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(Some(a)) = server.ledger.get_agent("web-01").await {
+                if a.status == "online" {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("重连后台账应回到 online");
+
+    drop(client2);
+    drop(client_drivers2);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_auth_heartbeat_ping_pong_update_ledger() {
     let db = tmp_db("ping-pong");
