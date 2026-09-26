@@ -45,6 +45,13 @@ v1.1.0 已交付 APM 全链路与 eBPF 四类采集项（`ebpf_network` / `ebpf_
 > `DEPLOY_TARGET=cloud3`）。cloud2 的 native（`DEPLOY_MODE=native` + systemd 五件套）已退役，
 > 配置从「仓库 conf/*.toml 同步到主机」改为「k8s.yaml 内的 ConfigMap」。
 > 三个 Agent（cloud2 / debian12 / testbkee）已改连 `vectorman.xiaoyxq.top:30710` 并全部 online。
+> cloud2 旧 server 三个 unit 已 `stop` + `disable`（`gse-agent` 保留）。
+>
+> **2026-09-26 新增待办（安全）**：迁移完成后发现 `dataserver` 的 SQL/接入口
+> （cloud3 `8081` / 公网 `https://dataserver.xiaoyxq.top`）为 **`[auth] enabled = false`** ——
+> 公网任何人扫到即可 `POST /v1/sql` 查库、`POST /v1/ingest` 写数据；cloud3 侧仅多了 TLS
+> （Traefik），**无认证**。同一时段已实测到公网主动探测（cloud2 的 8081 上有来自
+> 非本项目主机的 ESTAB 长连接）。用户决定**本轮不做**，登记为 tasklist 1.19。
 
 ### Requirement 1: 集群内以 DaemonSet 形态部署 Agent
 

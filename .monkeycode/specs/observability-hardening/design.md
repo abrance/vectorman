@@ -52,6 +52,11 @@ flowchart LR
   Agent 的 `server_addr` 指向 `vectorman.xiaoyxq.top:30710`（RPC NodePort，域名只做 DNS A 解析）。
   材料见 `packaging/deploy/k8s/server-stack.yaml` 与 README 第 5b 节（含 cloud3 实测结论）。
   CLI（`dpc`/`vmctl`）不进集群；helm 化仍排 v1.3。
+- **（2026-09-26 更新，已知风险）dataserver 无鉴权对外**：`config.toml` 的 `[auth] enabled = false`，
+  公网入口 `https://dataserver.xiaoyxq.top` 只经 Traefik 加 TLS，**没有认证**。
+  实测已存在公网主动探测（cloud2 的 8081 上有非本项目主机的长连接）。
+  收敛方式与 gse-server 对齐：开 `[auth] enabled = true` + 客户端带 token；
+  登记为 tasklist 1.19（用户决定本轮不做）。**在此之前，dataserver 的对外入口等同公开接口。**
 - **（2026-09-26 更新）发布口径改为 cops CD**：server 侧的期望状态由 cops 仓库的
   `apps/vectorman/k8s.yaml`（`DEPLOY_MODE=k8s / DEPLOY_TARGET=cloud3`）管理，与
   `server-stack.yaml` **同构**（同为 18 个对象）。`server-stack.yaml` 保留为

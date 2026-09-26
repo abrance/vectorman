@@ -107,6 +107,26 @@
       `kubectl -o json` 是 4 空格缩进，awk/sed 按 2 空格解析会静默失配（改用 `-o jsonpath={.data}`）；
       k3s 主机**没有 jq**、不保证有 python3（checksum 段只用 kubectl/awk/grep/sha256sum）。
 
+- [x] 1.18 **cloud2 旧 server 退役**（2026-09-26 完成）：
+      `vectorman-{gse-server,dataserver,console}` 三个 unit 已 `stop` + `disable`
+      （`vectorman-gse-agent` 保留运行 —— 它已改连 cloud3）；旧端口 7100/7101/8081/9090/7200
+      全部释放；开机不再自启。退役后 cloud3 全链路复验：三 Agent online、三域名 /health 200、
+      Agent RPC 30710 通。**按「空库起」决定，cloud2 的 49MB 数据未迁移**，旧数据留在
+      `/opt/vectorman/dataserver/data/`（unit 已停，仅作归档）。
+      **退役前的排查发现（值得记）**：cloud2 的 `8081` 上曾有 3 个来自 `115.231.78.4`
+      （杭州电信 IDC，非本项目任何主机）的 ESTAB 长连接。排查判定为**端口探测型扫描**而非
+      数据源 —— 依据：①连接收发队列恒为 0；②dataserver 的 `/v1/streams` 计数两次采样完全
+      不变（`accepted` 停在 27/2）；③旧 server 台账里 `gs`/`testbkee` 均已 offline；
+      ④停服后连接立即消失。
+- [ ] 1.19 **dataserver 鉴权加固（用户决定「以后再做」，2026-09-26 记录）**：
+      `dataserver` 的 SQL/接入口（cloud3 的 `8081`，公网 `https://dataserver.xiaoyxq.top`）
+      当前 `[auth] enabled = false` —— **公网任何人扫到即可 `POST /v1/sql` 查库、
+      `POST /v1/ingest` 写数据**。cloud3 侧仅多了 TLS（Traefik），**没有认证**。
+      1.18 的扫描事件已证实公网存在主动探测（虽然只探了端口没探路径）。
+      加固动作：`dataserver` 开 `[auth] enabled = true` + 客户端带 token（与 gse-server 的
+      台账鉴权口径对齐）；同步更新 `k8s.yaml` 的 ConfigMap 与 Agent 侧配置。
+      ⚠️ 与 1.18 的扫描事件是同一根因，优先级不低。
+
 ## 2. 单机回归清单（对应需求 5、9）
 
 - [ ] 2.1 把设计里的 V12 三条命令固化成可复制的清单（写进 `ebpf-observability/todo.md` 附录或
