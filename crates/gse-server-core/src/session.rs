@@ -18,6 +18,10 @@ pub enum SessionState {
 pub struct Session {
     pub agent_id: String,
     pub end: End,
+    /// geminio 握手分配的稳定连接身份（`End::client_id`）。
+    /// 连接失活时**只清理本连接建立的会话**：若期间 agent 已重连，
+    /// 注册表里是新连接的新会话（不同 client_id），不得误删。
+    pub client_id: u64,
     pub state: SessionState,
     pub last_seen_micros: i64,
     pub connected_at_micros: i64,
@@ -26,9 +30,11 @@ pub struct Session {
 impl Session {
     pub fn new(agent_id: impl Into<String>, end: End, now_micros: i64) -> Self {
         let agent_id = agent_id.into();
+        let client_id = end.client_id();
         Self {
             agent_id,
             end,
+            client_id,
             state: SessionState::Online,
             last_seen_micros: now_micros,
             connected_at_micros: now_micros,
@@ -83,6 +89,18 @@ impl SessionRegistry {
 
     pub async fn remove(&self, agent_id: &str) -> Option<Session> {
         self.inner.lock().await.remove(agent_id)
+    }
+
+    /// 仅当注册表中该 agent 的会话仍属于 `client_id` 时移除。
+    ///
+    /// 连接失活时调用：若期间 agent 已重连，注册表里是新连接的新会话，
+    /// 此处不动它并返回 `false`。这是「清理」与「重连接管」之间的竞态防线。
+    pub async fn remove_if_client(&self, agent_id: &str, client_id: u64) -> bool {
+        let mut guard = self.inner.lock().await;
+        match guard.get(agent_id) {
+            Some(s) if s.client_id == client_id => guard.remove(agent_id).is_some(),
+            _ => false,
+        }
     }
 
     pub async fn list(&self) -> Vec<Session> {
@@ -295,6 +313,68 @@ mod tests {
             SessionState::Offline
         );
         assert!(!registry.set_state("ghost", SessionState::Offline).await);
+    }
+
+    /// 同一条 listener 上接受两个连接 —— `client_id` 由 listener 单调分配，
+    /// 因此两个会话的 `client_id` 必然不同（跨 listener 则都从 1 开始，不可用于区分）。
+    async fn two_sessions_same_listener(agent_id: &str) -> (Session, Session) {
+        let listener = EndListener::bind("127.0.0.1:0", ListenOptions::default())
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let accept_task = tokio::spawn(async move {
+            let (e1, _d1) = listener.accept().await.expect("accept 1");
+            let (e2, _d2) = listener.accept().await.expect("accept 2");
+            (e1, e2)
+        });
+        let (_c1, _cd1) = dial(addr, DialOptions::default()).await.expect("dial 1");
+        let (_c2, _cd2) = dial(addr, DialOptions::default()).await.expect("dial 2");
+        let (e1, e2) = accept_task.await.expect("accept task");
+        (
+            Session::new(agent_id, e1, 1_000),
+            Session::new(agent_id, e2, 2_000),
+        )
+    }
+
+    #[tokio::test]
+    async fn remove_if_client_only_removes_matching_connection() {
+        let registry = SessionRegistry::new();
+        let s = session_fixture("web-01", 1_000).await;
+        let cid = s.client_id;
+        registry.insert(s).await;
+
+        // 不是我的 client_id → 不动
+        assert!(
+            !registry
+                .remove_if_client("web-01", cid.wrapping_add(999))
+                .await
+        );
+        assert!(registry.get("web-01").await.is_some());
+
+        // 是我的 → 移除
+        assert!(registry.remove_if_client("web-01", cid).await);
+        assert!(registry.get("web-01").await.is_none());
+
+        // 已经没了 → false
+        assert!(!registry.remove_if_client("web-01", cid).await);
+    }
+
+    #[tokio::test]
+    async fn remove_if_client_keeps_reconnected_session() {
+        // 重连接管：旧连接失活时不得摘掉新连接建立的同名会话。
+        let registry = SessionRegistry::new();
+        let (old, new) = two_sessions_same_listener("web-01").await;
+        let old_cid = old.client_id;
+        let new_cid = new.client_id;
+        assert_ne!(old_cid, new_cid, "同 listener 的 client_id 应递增");
+
+        registry.insert(old).await;
+        registry.insert(new).await;
+
+        // 旧连接这时候才结束 → 不能摘掉新会话
+        assert!(!registry.remove_if_client("web-01", old_cid).await);
+        let current = registry.get("web-01").await.expect("新会话仍在");
+        assert_eq!(current.client_id, new_cid);
     }
 
     #[test]

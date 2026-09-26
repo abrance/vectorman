@@ -17,10 +17,22 @@ use job::{JobConfig, JobExecutor};
 
 const BACKOFF_MAX_SECS: u64 = 60;
 
+/// 重连退避的下一步。
+///
+/// 曾经连上过（`connected`）说明这是一次「连上又断」，退避必须重置为 1s；
+/// 否则连续失败时指数增长、封顶 `BACKOFF_MAX_SECS`。
+/// 抽成独立函数是为了可测：`run` 里的策略与测试验证的是同一份实现。
+fn next_backoff(current: u64, connected: bool) -> u64 {
+    if connected {
+        return 1;
+    }
+    (current * 2).min(BACKOFF_MAX_SECS)
+}
+
 #[derive(Debug)]
 pub enum AgentError {
     AuthFailed(String),
-    ConnError(String),
+    ConnError(ConnError),
 }
 
 /// 连接 Server 并保持心跳，断线后指数退避重连。
@@ -34,10 +46,42 @@ pub async fn run(cfg: AgentConfig) -> Result<(), String> {
                 return Err(format!("auth rejected: {reason}"));
             }
             Err(AgentError::ConnError(e)) => {
-                eprintln!("gse-agent: connection error: {e}, retry in {backoff}s");
+                // 曾经成功建立过连接（认证通过 + 心跳跑起来）后失败，说明这是一次
+                // 「连上又断」而非「一直连不上」——退避必须重置，否则一次成功后
+                // 再断要白等 60s（原来 backoff 跨 connect_once 单调增长）。
+                eprintln!(
+                    "gse-agent: connection error: {}, retry in {backoff}s",
+                    e.message
+                );
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
-                backoff = (backoff * 2).min(BACKOFF_MAX_SECS);
+                backoff = next_backoff(backoff, e.connected);
             }
+        }
+    }
+}
+
+/// 连接失败的原因，区分「从未连上」与「连上后断开」。
+#[derive(Debug)]
+pub struct ConnError {
+    pub message: String,
+    /// 本次失败前是否曾成功建立连接（认证通过）。
+    pub connected: bool,
+}
+
+impl ConnError {
+    /// 连接尚未建立就失败（dial / register / auth 阶段）。
+    fn new(message: String) -> Self {
+        Self {
+            message,
+            connected: false,
+        }
+    }
+
+    /// 连接已建立（认证通过、心跳跑过）之后失败。
+    fn after_connected(message: String) -> Self {
+        Self {
+            message,
+            connected: true,
         }
     }
 }
@@ -45,7 +89,7 @@ pub async fn run(cfg: AgentConfig) -> Result<(), String> {
 async fn connect_once(cfg: &AgentConfig) -> Result<(), AgentError> {
     let (end, _drivers) = dial(&cfg.server_addr, DialOptions::default())
         .await
-        .map_err(|e| AgentError::ConnError(format!("dial: {e}")))?;
+        .map_err(|e| AgentError::ConnError(ConnError::new(format!("dial: {e}"))))?;
     if let Err(e) = end
         .register(
             "exec",
@@ -53,7 +97,9 @@ async fn connect_once(cfg: &AgentConfig) -> Result<(), AgentError> {
         )
         .await
     {
-        return Err(AgentError::ConnError(format!("register exec: {e}")));
+        return Err(AgentError::ConnError(ConnError::new(format!(
+            "register exec: {e}"
+        ))));
     }
     let executor = JobExecutor::new(JobConfig::from_agent(cfg));
     let jobs_end = end.clone();
@@ -69,7 +115,9 @@ async fn connect_once(cfg: &AgentConfig) -> Result<(), AgentError> {
         })
         .await
     {
-        return Err(AgentError::ConnError(format!("register job_exec: {e}")));
+        return Err(AgentError::ConnError(ConnError::new(format!(
+            "register job_exec: {e}"
+        ))));
     }
     let file_io = file_io::FileIo::new();
     let file_read = file_io.clone();
@@ -80,7 +128,9 @@ async fn connect_once(cfg: &AgentConfig) -> Result<(), AgentError> {
         })
         .await
     {
-        return Err(AgentError::ConnError(format!("register file_read: {e}")));
+        return Err(AgentError::ConnError(ConnError::new(format!(
+            "register file_read: {e}"
+        ))));
     }
     let file_write = file_io.clone();
     if let Err(e) = end
@@ -90,7 +140,9 @@ async fn connect_once(cfg: &AgentConfig) -> Result<(), AgentError> {
         })
         .await
     {
-        return Err(AgentError::ConnError(format!("register file_write: {e}")));
+        return Err(AgentError::ConnError(ConnError::new(format!(
+            "register file_write: {e}"
+        ))));
     }
     let collector = collect::CollectorHandle::new_with_otlp(
         cfg.agent_id.clone(),
@@ -117,9 +169,9 @@ async fn connect_once(cfg: &AgentConfig) -> Result<(), AgentError> {
         })
         .await
     {
-        return Err(AgentError::ConnError(format!(
+        return Err(AgentError::ConnError(ConnError::new(format!(
             "register collect_items: {e}"
-        )));
+        ))));
     }
     authenticate(&end, &cfg.agent_id, &cfg.token).await?;
     pull_collect_items(&end, &collector).await;
@@ -143,12 +195,14 @@ async fn authenticate(end: &End, agent_id: &str, token: &str) -> Result<(), Agen
         agent_id: agent_id.to_string(),
         token: token.to_string(),
     };
-    let body =
-        Bytes::from(serde_json::to_vec(&req).map_err(|e| AgentError::ConnError(e.to_string()))?);
+    let body = Bytes::from(
+        serde_json::to_vec(&req)
+            .map_err(|e| AgentError::ConnError(ConnError::new(e.to_string())))?,
+    );
     let resp = end
         .call("auth", body)
         .await
-        .map_err(|e| AgentError::ConnError(format!("auth rpc: {e}")))?;
+        .map_err(|e| AgentError::ConnError(ConnError::new(format!("auth rpc: {e}"))))?;
     let reply: AuthReply = serde_json::from_slice(&resp)
         .map_err(|e| AgentError::AuthFailed(format!("bad auth reply: {e}")))?;
     if !reply.ok {
@@ -163,11 +217,13 @@ async fn heartbeat_loop(end: &End, agent_id: &str, interval_secs: u64) -> Result
             agent_id: agent_id.to_string(),
             ts_micros: now_micros(),
         };
-        let body =
-            Bytes::from(serde_json::to_vec(&hb).map_err(|e| AgentError::ConnError(e.to_string()))?);
-        end.call("heartbeat", body)
-            .await
-            .map_err(|e| AgentError::ConnError(format!("heartbeat rpc: {e}")))?;
+        let body = Bytes::from(
+            serde_json::to_vec(&hb)
+                .map_err(|e| AgentError::ConnError(ConnError::new(e.to_string())))?,
+        );
+        end.call("heartbeat", body).await.map_err(|e| {
+            AgentError::ConnError(ConnError::after_connected(format!("heartbeat rpc: {e}")))
+        })?;
         tokio::time::sleep(Duration::from_secs(interval_secs)).await;
     }
 }
@@ -209,4 +265,30 @@ fn now_micros() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_grows_on_repeated_failures() {
+        assert_eq!(next_backoff(1, false), 2);
+        assert_eq!(next_backoff(2, false), 4);
+        assert_eq!(next_backoff(32, false), 60, "封顶 60s");
+        assert_eq!(next_backoff(60, false), 60);
+    }
+
+    #[test]
+    fn backoff_resets_after_a_successful_connection() {
+        // 「连上又断」：退避回到 1s，不必白等 60s。
+        assert_eq!(next_backoff(60, true), 1);
+        assert_eq!(next_backoff(1, true), 1);
+    }
+
+    #[test]
+    fn conn_error_distinguishes_never_connected_from_disconnected() {
+        assert!(!ConnError::new("dial: refused".to_string()).connected);
+        assert!(ConnError::after_connected("heartbeat rpc".to_string()).connected);
+    }
 }

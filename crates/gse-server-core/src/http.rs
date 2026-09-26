@@ -346,11 +346,60 @@ async fn delete_access_point(State(admin): State<AdminState>, Path(id): Path<Str
 
 // ---- agents ----
 
-async fn list_agents(State(admin): State<AdminState>) -> Response {
-    match admin.ledger.list_agents().await {
-        Ok(v) => ok(&v),
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
+/// Agent 台账列表，附**会话口径**的字段。
+///
+/// `status` 是心跳口径（窗口内有心跳即 online），而作业下发用的是内存会话
+/// （`SessionRegistry`）。两者可以不一致 —— 这正是「心跳在线但作业通道已死」
+/// 这一故障的形态。`session_state` / `job_channel_available` 让这种差异可被查询，
+/// 不必翻日志。
+#[derive(serde::Serialize)]
+struct AgentView {
+    #[serde(flatten)]
+    agent: crate::ledger::Agent,
+    /// 会话状态：online | checking | offline | closed | absent（无会话）。
+    session_state: String,
+    /// 作业通道是否可用 —— 仅当会话为 Online 时为 true。
+    job_channel_available: bool,
+}
+
+fn session_state_name(state: crate::session::SessionState) -> &'static str {
+    use crate::session::SessionState;
+    match state {
+        SessionState::Online => "online",
+        SessionState::Checking => "checking",
+        SessionState::Offline => "offline",
+        SessionState::Closed => "closed",
     }
+}
+
+async fn list_agents(State(admin): State<AdminState>) -> Response {
+    let agents = match admin.ledger.list_agents().await {
+        Ok(v) => v,
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let sessions = match admin.registry.as_ref() {
+        Some(r) => r.list().await,
+        None => Vec::new(),
+    };
+    let views: Vec<AgentView> = agents
+        .into_iter()
+        .map(|agent| {
+            let session = sessions.iter().find(|s| s.agent_id == agent.agent_id);
+            let (state_name, available) = match session {
+                Some(s) => (
+                    session_state_name(s.state),
+                    s.state == crate::session::SessionState::Online,
+                ),
+                None => ("absent", false),
+            };
+            AgentView {
+                agent,
+                session_state: state_name.to_string(),
+                job_channel_available: available,
+            }
+        })
+        .collect();
+    ok(&views)
 }
 
 async fn create_agent(
@@ -2022,6 +2071,55 @@ mod tests {
         assert!(body.contains("["), "{body}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 3.3 回归（本次事故形态）：台账 `status = online`（心跳新鲜）但会话
+    /// `absent`（连接已死）时，`GET /api/gse/agents` 必须能体现差异 ——
+    /// `session_state = absent` 且 `job_channel_available = false`。
+    #[tokio::test]
+    async fn list_agents_exposes_session_state_distinct_from_heartbeat_status() {
+        let db = test_db("agents-session-state");
+        let ledger = Arc::new(Ledger::new(&db).expect("open"));
+        ledger.init().await.expect("init");
+        // 台账：心跳新鲜 → status = online
+        ledger
+            .upsert_agent(&Agent {
+                agent_id: "a-1".to_string(),
+                host_id: "h-1".to_string(),
+                access_point_id: None,
+                token: "tok".to_string(),
+                version: "1".to_string(),
+                install_path: String::new(),
+                status: "online".to_string(),
+                last_heartbeat_at: Some("1".to_string()),
+                registered_at: String::new(),
+            })
+            .await
+            .expect("agent");
+        // 注册表里**没有**该 agent 的会话 → 连接已死
+        let app = router(
+            AdminState {
+                ledger: ledger.clone(),
+                registry: Some(Arc::new(SessionRegistry::new())),
+                cfg: None,
+                file_store: None,
+            },
+            None,
+        );
+        let mut app = app;
+        let (status, body) = send(&mut app, req("GET", "/api/gse/agents", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        let a = &v[0];
+        assert_eq!(a["status"], "online", "心跳口径仍是 online：{body}");
+        assert_eq!(
+            a["session_state"], "absent",
+            "会话口径应显示 absent（连接已死）：{body}"
+        );
+        assert_eq!(
+            a["job_channel_available"], false,
+            "作业通道不可用必须可查询：{body}"
+        );
     }
 
     async fn app_with_jobs(name: &str) -> (Router, Arc<Ledger>) {
