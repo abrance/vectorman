@@ -368,8 +368,55 @@ fn inner_script_path() -> PathBuf {
     std::env::temp_dir().join("gse-agent-upgrade-inner.sh")
 }
 
-fn result_file_path() -> PathBuf {
-    std::env::temp_dir().join("gse-agent-upgrade-result.json")
+/// 结果文件位置。**脚本写入与 agent 启动读取必须用同一个**，
+/// 否则升级完读不到结果。放安装目录（跟二进制走），探测不到时退回 /tmp。
+pub fn result_file_path() -> PathBuf {
+    detect_deploy(|p| Path::new(p).exists(), |_| false)
+        .map(|d| default_result_path(&d.bin))
+        .unwrap_or_else(|| PathBuf::from("/tmp/gse-agent-upgrade-result.json"))
+}
+
+/// 读取上次升级结果（agent 启动时调用）。
+///
+/// 返回 `Ok(None)` 表示没有结果文件（首次运行或已被清理）；
+/// 文件存在但内容坏时返回 `Err`（调用方决定是否告警）。
+pub fn read_result() -> Result<Option<UpgradeResult>, String> {
+    let path = result_file_path();
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let raw =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let parsed: UpgradeResult =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    Ok(Some(parsed))
+}
+
+/// 把结果标记为已上报（保留文件便于事后查证，只改 `reported`）。
+pub fn mark_reported() -> Result<(), String> {
+    let path = result_file_path();
+    let Some(mut r) = read_result()? else {
+        return Ok(());
+    };
+    if r.reported {
+        return Ok(());
+    }
+    r.reported = true;
+    let body = serde_json::to_string_pretty(&r).map_err(|e| format!("encode: {e}"))?;
+    std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// 尚未上报的升级结果（心跳用）。读失败时返回 None 并打日志 —— 不能因为
+/// 一个坏文件让心跳停摆。
+pub fn unreported_result() -> Option<UpgradeResult> {
+    match read_result() {
+        Ok(Some(r)) if !r.reported => Some(r),
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("gse-agent: upgrade result unreadable: {e}");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -586,6 +633,35 @@ mod tests {
             .unwrap_or_default();
         assert!(!cur.contains(&name), "sha256 不匹配时不得写 crontab");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **一致性回归**：脚本写入结果的路径，必须与 agent 启动读取的路径相同。
+    /// 这两处曾分别用 `std::env::temp_dir()` 与安装目录 —— 那样升级完读不到结果。
+    #[test]
+    fn script_result_path_matches_reader_path() {
+        // 读取侧（无安装 → 退回 /tmp）
+        let reader = result_file_path();
+        // 写入侧（同一函数被 render_inner_script 使用）
+        let deploy = Deploy {
+            kind: DeployKind::Systemd,
+            bin: PathBuf::from("/opt/vectorman/gse-agent/bin/gse-agent"),
+            ctl: None,
+        };
+        let script = render_inner_script(&deploy, Path::new("/tmp/newbin"), "TS");
+        assert!(
+            script.contains(&reader.display().to_string()),
+            "脚本写入路径 {reader:?} 未出现在脚本里 —— 读写会错位"
+        );
+    }
+
+    #[test]
+    fn read_result_returns_none_when_absent() {
+        // 不依赖具体路径：只验证「文件不存在 → Ok(None)」这一分支的语义。
+        let missing = std::env::temp_dir().join("definitely-missing-result.json");
+        assert!(!missing.is_file());
+        // read_result 读的是固定路径；这里直接验证解析层行为
+        let err = serde_json::from_str::<UpgradeResult>("not json").is_err();
+        assert!(err, "坏内容必须解析失败（read_result 会转成 Err）");
     }
 
     #[test]

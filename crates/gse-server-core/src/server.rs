@@ -820,6 +820,25 @@ async fn handle_heartbeat(req: &Bytes, registry: &SessionRegistry, ledger: &Ledg
                 hb.agent_id, e.message
             );
         }
+        // agent 自更新结果补报：落库并打日志（升级时作业通道已断，
+        // 这是唯一的回报路径）。
+        if let Some(r) = hb.upgrade_result.as_ref() {
+            println!(
+                "gse-server: agent {} upgrade {} ({} -> {}, detail={})",
+                hb.agent_id, r.outcome, r.from_version, r.to_version, r.detail
+            );
+            match serde_json::to_string(r) {
+                Ok(json) => {
+                    if let Err(e) = ledger.mark_upgrade_result(&hb.agent_id, &json).await {
+                        eprintln!(
+                            "gse-server: mark_upgrade_result {} failed: {}",
+                            hb.agent_id, e.message
+                        );
+                    }
+                }
+                Err(e) => eprintln!("gse-server: encode upgrade result failed: {e}"),
+            }
+        }
     }
 }
 

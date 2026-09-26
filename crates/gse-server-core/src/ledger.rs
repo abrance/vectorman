@@ -383,6 +383,7 @@ impl Ledger {
         self.migrate_jobs_template_id().await?;
         self.migrate_jobs_rerun_of().await?;
         self.migrate_jobs_file_transfer().await?;
+        self.migrate_agents_upgrade_result().await?;
         Ok(())
     }
 
@@ -427,6 +428,29 @@ impl Ledger {
     }
 
     /// 兼容旧库：补齐文件传输列，重复调用幂等。
+    /// `agents` 表加 `upgrade_result_json`：agent 自更新结果（由心跳补报）。
+    async fn migrate_agents_upgrade_result(&self) -> Result<(), String> {
+        let info = self
+            .store
+            .execute("PRAGMA table_info(agents)", &[])
+            .await
+            .map_err(|e| format!("init ledger: {}", e.message))?;
+        let present = info
+            .rows
+            .iter()
+            .any(|row| field_text(&info.columns, row, "name") == "upgrade_result_json");
+        if !present {
+            self.store
+                .execute(
+                    "ALTER TABLE agents ADD COLUMN upgrade_result_json TEXT",
+                    &[],
+                )
+                .await
+                .map_err(|e| format!("init ledger: {}", e.message))?;
+        }
+        Ok(())
+    }
+
     async fn migrate_jobs_file_transfer(&self) -> Result<(), String> {
         let info = self
             .store
@@ -635,6 +659,16 @@ impl Ledger {
         self.execute(
             "UPDATE agents SET last_heartbeat_at = ? WHERE agent_id = ?",
             &[text(now), text(agent_id)],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// 记录 agent 上报的自更新结果（整段 JSON 落一列，便于原样回读）。
+    pub async fn mark_upgrade_result(&self, agent_id: &str, json: &str) -> Result<(), GseError> {
+        self.execute(
+            "UPDATE agents SET upgrade_result_json = ? WHERE agent_id = ?",
+            &[text(json), text(agent_id)],
         )
         .await?;
         Ok(())
@@ -2071,6 +2105,45 @@ mod tests {
         let rejected = ledger.get_job("j-1").await.expect("get").expect("exists");
         assert_eq!(rejected.status, JobStatus::Rejected);
         assert_eq!(rejected.error.as_deref(), Some("busy"));
+    }
+
+    /// 升级结果落库后能原样读回（整段 JSON 存一列）。
+    #[tokio::test]
+    async fn upgrade_result_round_trips_through_ledger() {
+        let ledger = fresh_ledger("upgrade-result").await;
+        ledger
+            .upsert_agent(&agent("a-1", "tok-a"))
+            .await
+            .expect("agent");
+        let json = r#"{"outcome":"rolled_back","detail":"new binary did not come up"}"#;
+        ledger.mark_upgrade_result("a-1", json).await.expect("mark");
+        let info = ledger
+            .store
+            .execute(
+                "SELECT upgrade_result_json FROM agents WHERE agent_id = ?",
+                &[text("a-1")],
+            )
+            .await
+            .expect("query");
+        let got = info
+            .rows
+            .first()
+            .map(|r| field_text(&info.columns, r, "upgrade_result_json"))
+            .unwrap_or_default();
+        assert_eq!(got, json);
+    }
+
+    /// 迁移幂等：`init` 跑两次不得因为列已存在而报错。
+    #[tokio::test]
+    async fn agents_upgrade_result_migration_is_idempotent() {
+        let db = std::env::temp_dir()
+            .join(format!("gse-up-mig-{}.db", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let l1 = Ledger::new(&db).expect("open");
+        l1.init().await.expect("first init");
+        let l2 = Ledger::new(&db).expect("reopen");
+        l2.init().await.expect("second init must not fail");
     }
 
     #[tokio::test]

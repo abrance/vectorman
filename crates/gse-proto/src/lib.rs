@@ -25,6 +25,27 @@ pub struct AuthReply {
 pub struct Heartbeat {
     pub agent_id: String,
     pub ts_micros: i64,
+    /// 尚未上报的升级结果（有则带一次，server 收到后 agent 标记已上报）。
+    ///
+    /// 为什么走心跳：升级过程中 agent 会被重启，作业结果通道那时已断，
+    /// 结果只能由新启动的 agent 在后续心跳里补报。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade_result: Option<UpgradeReport>,
+}
+
+/// 升级结果的上行表示（与 agent 侧 `UpgradeResult` 字段对应）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpgradeReport {
+    pub started_at: String,
+    pub finished_at: String,
+    pub from_version: String,
+    pub to_version: String,
+    pub from_sha256: String,
+    pub to_sha256: String,
+    /// `succeeded` / `rolled_back` / `failed`。
+    pub outcome: String,
+    #[serde(default)]
+    pub detail: String,
 }
 
 /// Server 下发给 Agent 的指令。
@@ -439,6 +460,7 @@ mod tests {
         roundtrip(&Heartbeat {
             agent_id: "web-01".to_string(),
             ts_micros: 1_700_000_000_000_000,
+            upgrade_result: None,
         });
     }
 
@@ -663,6 +685,46 @@ mod job_kind_compat_tests {
         let e: JobExec =
             serde_json::from_str(&exec_json(r#","kind":"agent_upgrade""#)).expect("decode");
         assert_eq!(e.kind, "agent_upgrade");
+    }
+
+    #[test]
+    fn heartbeat_without_upgrade_result_still_parses() {
+        // 旧 agent 不发该字段；旧 server 也不能因为缺字段而报错。
+        let hb: Heartbeat =
+            serde_json::from_str(r#"{"agent_id":"a","ts_micros":1}"#).expect("decode");
+        assert!(hb.upgrade_result.is_none());
+    }
+
+    #[test]
+    fn heartbeat_omits_absent_upgrade_result_on_encode() {
+        let hb = Heartbeat {
+            agent_id: "a".to_string(),
+            ts_micros: 1,
+            upgrade_result: None,
+        };
+        let json = serde_json::to_string(&hb).expect("encode");
+        assert!(!json.contains("upgrade_result"), "无结果时不应出现在报文里");
+    }
+
+    #[test]
+    fn heartbeat_carries_upgrade_result_when_present() {
+        let hb = Heartbeat {
+            agent_id: "a".to_string(),
+            ts_micros: 1,
+            upgrade_result: Some(UpgradeReport {
+                started_at: "t0".into(),
+                finished_at: "t1".into(),
+                from_version: "1.1.0".into(),
+                to_version: "1.2.0".into(),
+                from_sha256: "a".into(),
+                to_sha256: "b".into(),
+                outcome: "succeeded".into(),
+                detail: String::new(),
+            }),
+        };
+        let json = serde_json::to_string(&hb).expect("encode");
+        let back: Heartbeat = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back, hb);
     }
 
     #[test]

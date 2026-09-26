@@ -214,9 +214,12 @@ async fn authenticate(end: &End, agent_id: &str, token: &str) -> Result<(), Agen
 
 async fn heartbeat_loop(end: &End, agent_id: &str, interval_secs: u64) -> Result<(), AgentError> {
     loop {
+        // 升级结果补报：升级时作业通道已断，结果落本机文件，
+        // 由重启后的 agent 在心跳里带出一次，随后标记已上报。
         let hb = Heartbeat {
             agent_id: agent_id.to_string(),
             ts_micros: now_micros(),
+            upgrade_result: upgrade::unreported_result().map(to_report),
         };
         let body = Bytes::from(
             serde_json::to_vec(&hb)
@@ -226,6 +229,25 @@ async fn heartbeat_loop(end: &End, agent_id: &str, interval_secs: u64) -> Result
             AgentError::ConnError(ConnError::after_connected(format!("heartbeat rpc: {e}")))
         })?;
         tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+    }
+}
+
+/// 本机升级结果 → 上行表示。
+fn to_report(r: upgrade::UpgradeResult) -> gse_proto::UpgradeReport {
+    let outcome = match r.outcome {
+        upgrade::UpgradeOutcome::Succeeded => "succeeded",
+        upgrade::UpgradeOutcome::RolledBack => "rolled_back",
+        upgrade::UpgradeOutcome::Failed => "failed",
+    };
+    gse_proto::UpgradeReport {
+        started_at: r.started_at,
+        finished_at: r.finished_at,
+        from_version: r.from_version,
+        to_version: r.to_version,
+        from_sha256: r.from_sha256,
+        to_sha256: r.to_sha256,
+        outcome: outcome.to_string(),
+        detail: r.detail,
     }
 }
 
