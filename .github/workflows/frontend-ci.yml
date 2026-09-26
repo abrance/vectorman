@@ -7,7 +7,7 @@ on:
     branches: [main]
     paths: ['frontend/**']
 
-# 复用 yoc 的 React 可复用流水线（与 rust-ci / helm-ci 同一约定）。
+# 复用 yoc 的 React 可复用流水线（与 rust-ci 同一约定）。
 #
 # 这个作业是补上的：此前前端**完全不在流水线里**，`/ebpf`（PR #55）、`/topology`、`/apm`
 # 等页面都是「本地跑绿 + 人工确认」合入的，之后任何前端改动都不会被拦住。
