@@ -73,6 +73,11 @@ impl JobExecutor {
         if exec.interpreter.is_empty() {
             exec.interpreter = self.cfg.default_interpreter.clone();
         }
+        // 自更新作业走独立分支：它不做脚本执行，而是把升级动作交给 cron
+        // 调度（见 upgrade 模块文档 —— 「agent 停自己」不可靠）。
+        if exec.kind == "agent_upgrade" {
+            return self.handle_upgrade(exec).await;
+        }
         if !self.interpreter_allowed(&exec.interpreter) {
             return JobAck {
                 job_id: exec.job_id,
@@ -101,6 +106,35 @@ impl JobExecutor {
             job_id: ack_job_id,
             accepted: true,
             reason: None,
+        }
+    }
+
+    /// 受理自更新作业：校验 → 探测部署 → 写 cron 一次性任务 → 立即返回。
+    ///
+    /// **立即返回**很重要：作业通道随后会因 agent 重启而断开，
+    /// 结果改由结果文件 + 心跳补报（见 `upgrade` 模块）。
+    async fn handle_upgrade(&self, exec: JobExec) -> JobAck {
+        let spec: crate::upgrade::AgentUpgradeSpec = match serde_json::from_str(&exec.script) {
+            Ok(v) => v,
+            Err(e) => {
+                return JobAck {
+                    job_id: exec.job_id,
+                    accepted: false,
+                    reason: Some(format!("bad upgrade spec: {e}")),
+                }
+            }
+        };
+        match crate::upgrade::accept_upgrade(&spec).await {
+            Ok(detail) => JobAck {
+                job_id: exec.job_id,
+                accepted: true,
+                reason: Some(detail),
+            },
+            Err(e) => JobAck {
+                job_id: exec.job_id,
+                accepted: false,
+                reason: Some(e),
+            },
         }
     }
 }
@@ -400,6 +434,7 @@ mod tests {
     fn exec(script: &str, timeout_secs: u64) -> JobExec {
         JobExec {
             job_id: format!("job-test-{}", now_micros()),
+            kind: "script".to_string(),
             interpreter: "bash".to_string(),
             script: script.to_string(),
             args: vec![],

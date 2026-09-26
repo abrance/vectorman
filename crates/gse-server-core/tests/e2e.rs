@@ -803,6 +803,7 @@ fn job_submit(
     timeout_secs: Option<u64>,
 ) -> JobSubmit {
     JobSubmit {
+        kind: gse_proto::default_job_kind(),
         agent_id: agent_id.to_string(),
         interpreter: interpreter.map(str::to_string),
         script: script.to_string(),

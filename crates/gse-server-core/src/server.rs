@@ -40,6 +40,9 @@ static JOB_SEQ: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct JobSubmit {
     pub agent_id: String,
+    /// 作业类型：`script`（默认）或 `agent_upgrade`。
+    #[serde(default = "gse_proto::default_job_kind")]
+    pub kind: String,
     #[serde(default)]
     pub interpreter: Option<String>,
     pub script: String,
@@ -311,6 +314,25 @@ pub async fn submit_job_with_source(
             ))
         }
     }
+    let kind = if req.kind.trim().is_empty() {
+        gse_proto::default_job_kind()
+    } else {
+        req.kind.clone()
+    };
+    if kind == "agent_upgrade" {
+        // 升级载荷必须是合法的 AgentUpgradeSpec —— 在受理阶段就挡住坏输入。
+        let spec: gse_proto::AgentUpgradeSpec = serde_json::from_str(&req.script)
+            .map_err(|e| GseError::new("invalid_argument", format!("bad upgrade spec: {e}")))?;
+        if spec.binary_path.trim().is_empty() {
+            return Err(GseError::new("invalid_argument", "binary_path required"));
+        }
+        if spec.sha256.trim().len() != 64 {
+            return Err(GseError::new(
+                "invalid_argument",
+                "sha256 must be 64 hex chars",
+            ));
+        }
+    }
     let interpreter = req
         .interpreter
         .filter(|i| !i.trim().is_empty())
@@ -336,6 +358,7 @@ pub async fn submit_job_with_source(
 
     let exec = JobExec {
         job_id: job_id.clone(),
+        kind,
         interpreter,
         script: req.script,
         args: req.args,
@@ -1126,6 +1149,7 @@ mod tests {
         let (server, _addr) = Server::bind(cfg).await.expect("bind");
         let err = server
             .submit_job(JobSubmit {
+                kind: gse_proto::default_job_kind(),
                 agent_id: "ghost".to_string(),
                 interpreter: None,
                 script: "echo hi".to_string(),
@@ -1153,6 +1177,7 @@ mod tests {
 
         let empty = server
             .submit_job(JobSubmit {
+                kind: gse_proto::default_job_kind(),
                 agent_id: "ghost".to_string(),
                 interpreter: None,
                 script: "  ".to_string(),
@@ -1167,6 +1192,7 @@ mod tests {
 
         let too_long = server
             .submit_job(JobSubmit {
+                kind: gse_proto::default_job_kind(),
                 agent_id: "ghost".to_string(),
                 interpreter: None,
                 script: "123456789".to_string(),
@@ -1181,6 +1207,7 @@ mod tests {
 
         let bad_timeout = server
             .submit_job(JobSubmit {
+                kind: gse_proto::default_job_kind(),
                 agent_id: "ghost".to_string(),
                 interpreter: None,
                 script: "hi".to_string(),
@@ -1207,6 +1234,7 @@ mod tests {
         let (server, _addr) = Server::bind(cfg).await.expect("bind");
         let err = server
             .submit_job(JobSubmit {
+                kind: gse_proto::default_job_kind(),
                 agent_id: "ghost".to_string(),
                 interpreter: None,
                 script: "echo hi".to_string(),

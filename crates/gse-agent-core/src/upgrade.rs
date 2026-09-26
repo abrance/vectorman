@@ -19,6 +19,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// 升级载荷类型定义在 proto 层（server 与 agent 共用同一份校验规则）。
+pub use gse_proto::AgentUpgradeSpec;
 
 /// 部署形式与关键路径，由 [`detect_deploy`] 探测得出。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +135,243 @@ pub fn default_result_path(bin: &Path) -> PathBuf {
 /// 等待「新二进制启动成功」的窗口。
 pub const STARTUP_GRACE: Duration = Duration::from_secs(5);
 
+/// 受理一次升级：校验 sha256 → 探测部署 → 写调度脚本与 cron 一次性任务。
+///
+/// 返回 `Ok(detail)` 是**受理成功**的说明（会作为作业受理原因回给 server），
+/// 不是「升级已完成」—— 升级由 cron 在下一分钟拉起独立进程执行。
+pub async fn accept_upgrade(spec: &AgentUpgradeSpec) -> Result<String, String> {
+    // 1. 二进制必须已由 file_transfer 落到本机
+    let new_bin = PathBuf::from(&spec.binary_path);
+    if !new_bin.is_file() {
+        return Err(format!("binary_path not found: {}", spec.binary_path));
+    }
+    // 2. sha256 必须匹配（不匹配不得写 crontab —— 防半截传输/投毒）
+    let actual = sha256_file(&new_bin)?;
+    if !verify_sha256(&actual, &spec.sha256) {
+        return Err(format!(
+            "sha256 mismatch: expected {}, got {actual}",
+            spec.sha256
+        ));
+    }
+    // 3. 探测部署形式
+    let deploy = detect_deploy(
+        |p| Path::new(p).exists(),
+        |unit| {
+            std::process::Command::new("systemctl")
+                .args(["list-unit-files", unit])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        },
+    )
+    .ok_or_else(|| "no installed gse-agent found".to_string())?;
+    // 4. cron 必须在跑，否则一次性任务永远不会执行 —— 宁可拒绝，不让运维干等
+    if !cron_active() {
+        return Err("cron is not running on this host; upgrade cannot be scheduled".to_string());
+    }
+    // 5. 写调度脚本 + crontab
+    let now = std::time::SystemTime::now();
+    let stamp = stamp_of(now);
+    let inner = inner_script_path();
+    std::fs::write(&inner, render_inner_script(&deploy, &new_bin, &stamp))
+        .map_err(|e| format!("write {}: {e}", inner.display()))?;
+    let _ = std::process::Command::new("chmod")
+        .args(["+x", &inner.to_string_lossy()])
+        .status();
+    install_one_shot_cron(&inner, deploy.kind)?;
+
+    Ok(format!(
+        "upgrade scheduled via cron within 1 minute; new binary {} (sha256 {})",
+        spec.binary_path, spec.sha256
+    ))
+}
+
+/// 计算文件 sha256（十六进制小写）。
+pub fn sha256_file(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf).map_err(|e| format!("read: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex_encode(&hasher.finalize()))
+}
+
+fn cron_active() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["is-active", "cron"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn stamp_of(t: std::time::SystemTime) -> String {
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{secs}")
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    out
+}
+
+/// 渲染实际干活的脚本。它由 cron 以**独立 cgroup** 拉起，因此
+/// agent 被停/起都不影响它（这正是本方案成立的原因）。
+fn render_inner_script(deploy: &Deploy, new_bin: &Path, stamp: &str) -> String {
+    let bin = deploy.bin.display();
+    let new = new_bin.display();
+    let backup = plan_backup(&deploy.bin, stamp, 0);
+    let backup = backup.display();
+    let result = result_file_path();
+    let result = result.display();
+    let ctl = deploy
+        .ctl
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let (stop, start) = match deploy.kind {
+        DeployKind::Systemd => (
+            "SUDO=\"\"; sudo -n true 2>/dev/null && SUDO=\"sudo -n\"\n$SUDO systemctl stop vectorman-gse-agent".to_string(),
+            "SUDO=\"\"; sudo -n true 2>/dev/null && SUDO=\"sudo -n\"\n$SUDO systemctl start vectorman-gse-agent".to_string(),
+        ),
+        DeployKind::CtlDirect => (
+            format!("\"{ctl}\" gse-agent stop"),
+            format!("\"{ctl}\" gse-agent start"),
+        ),
+    };
+
+    format!(
+        r#"#!/bin/sh
+# 由 gse-agent 生成、cron 拉起。独立于 agent 的 cgroup。
+exec >/tmp/gse-agent-upgrade.log 2>&1
+set -x
+
+FROM_VER=$("{bin}" --version 2>/dev/null | awk '{{print $2}}')
+FROM_SHA=$(sha256sum "{bin}" 2>/dev/null | cut -d' ' -f1)
+NEW_SHA=$(sha256sum "{new}" 2>/dev/null | cut -d' ' -f1)
+STARTED=$(date -Iseconds)
+
+{stop} || {{ echo "FATAL: stop failed"; }}
+cp -a "{bin}" "{backup}" || {{ echo "FATAL: backup failed"; }}
+cp "{new}" "{bin}" || {{ echo "FATAL: replace failed"; }}
+chmod 755 "{bin}"
+{start} || {{ echo "FATAL: start failed"; }}
+
+sleep 5
+TO_VER=$("{bin}" --version 2>/dev/null | awk '{{print $2}}')
+
+if pgrep -f "gse-agent" >/dev/null 2>&1; then
+  OUTCOME=succeeded
+  DETAIL=""
+else
+  OUTCOME=rolled_back
+  DETAIL="new binary did not come up; restoring backup"
+  {stop}
+  cp -a "{backup}" "{bin}"
+  {start}
+  TO_VER=$("{bin}" --version 2>/dev/null | awk '{{print $2}}')
+  pgrep -f "gse-agent" >/dev/null 2>&1 || {{
+    OUTCOME=failed
+    DETAIL="rollback also failed; manual recovery: cp {backup} {bin} && restart"
+  }}
+fi
+
+FINISHED=$(date -Iseconds)
+cat > "{result}" <<JSON
+{{"started_at":"$STARTED","finished_at":"$FINISHED",
+ "from_version":"$FROM_VER","to_version":"$TO_VER",
+ "from_sha256":"$FROM_SHA","to_sha256":"$NEW_SHA",
+ "outcome":"$OUTCOME","detail":"$DETAIL","reported":false}}
+JSON
+echo "UPGRADE-DONE $OUTCOME"
+"#
+    )
+}
+
+/// 写一次性 cron 任务：下一分钟执行一次，执行后自我清理。
+fn install_one_shot_cron(inner: &Path, kind: DeployKind) -> Result<(), String> {
+    let cur = read_crontab(kind)?;
+    let line = format!(
+        "* * * * * {}; {}",
+        inner.display(),
+        self_cleanup_snippet(inner)
+    );
+    let mut next: Vec<String> = cur
+        .lines()
+        .filter(|l| !l.contains(&inner.to_string_lossy().to_string()))
+        .map(|l| l.to_string())
+        .collect();
+    next.push(line);
+    write_crontab(kind, &next.join("\n"))
+}
+
+fn self_cleanup_snippet(inner: &Path) -> String {
+    let name = inner
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+    format!("crontab -l 2>/dev/null | grep -v {name} | crontab -")
+}
+
+fn read_crontab(kind: DeployKind) -> Result<String, String> {
+    let out = match kind {
+        DeployKind::Systemd => std::process::Command::new("sudo")
+            .args(["-n", "crontab", "-l"])
+            .output(),
+        DeployKind::CtlDirect => std::process::Command::new("crontab").arg("-l").output(),
+    }
+    .map_err(|e| format!("read crontab: {e}"))?;
+    // 无 crontab 时 crontab -l 返回非 0，视为空
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn write_crontab(kind: DeployKind, body: &str) -> Result<(), String> {
+    let mut child = match kind {
+        DeployKind::Systemd => std::process::Command::new("sudo")
+            .args(["-n", "crontab", "-"])
+            .stdin(std::process::Stdio::piped())
+            .spawn(),
+        DeployKind::CtlDirect => std::process::Command::new("crontab")
+            .arg("-")
+            .stdin(std::process::Stdio::piped())
+            .spawn(),
+    }
+    .map_err(|e| format!("spawn crontab: {e}"))?;
+    use std::io::Write;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(body.as_bytes())
+            .map_err(|e| format!("write crontab: {e}"))?;
+    }
+    let status = child.wait().map_err(|e| format!("crontab -: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("crontab install failed (permission?)".to_string())
+    }
+}
+
+fn inner_script_path() -> PathBuf {
+    std::env::temp_dir().join("gse-agent-upgrade-inner.sh")
+}
+
+fn result_file_path() -> PathBuf {
+    std::env::temp_dir().join("gse-agent-upgrade-result.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,7 +401,10 @@ mod tests {
         })
         .expect("deploy");
         assert_eq!(d.kind, DeployKind::Systemd);
-        assert_eq!(d.bin, PathBuf::from("/opt/vectorman/gse-agent/bin/gse-agent"));
+        assert_eq!(
+            d.bin,
+            PathBuf::from("/opt/vectorman/gse-agent/bin/gse-agent")
+        );
     }
 
     #[test]
@@ -172,8 +416,7 @@ mod tests {
     fn detect_finds_ctl_script_when_present() {
         let d = detect_deploy(
             |p| {
-                p == "/opt/vectorman/gse-agent/bin/gse-agent"
-                    || p == "/opt/vectorman/deploy/ctl.sh"
+                p == "/opt/vectorman/gse-agent/bin/gse-agent" || p == "/opt/vectorman/deploy/ctl.sh"
             },
             |_| false,
         )
@@ -194,7 +437,9 @@ mod tests {
     fn backup_path_keeps_binary_prefix() {
         let bin = Path::new("/opt/vectorman/gse-agent/bin/gse-agent");
         let b = plan_backup(bin, "T", 0);
-        assert!(b.to_string_lossy().starts_with("/opt/vectorman/gse-agent/bin/gse-agent"));
+        assert!(b
+            .to_string_lossy()
+            .starts_with("/opt/vectorman/gse-agent/bin/gse-agent"));
     }
 
     #[test]
@@ -239,6 +484,108 @@ mod tests {
         let r: UpgradeResult = serde_json::from_str(json).expect("decode");
         assert_eq!(r.detail, "");
         assert!(!r.reported);
+    }
+
+    #[test]
+    fn rendered_script_uses_systemd_branch() {
+        let deploy = Deploy {
+            kind: DeployKind::Systemd,
+            bin: PathBuf::from("/opt/vectorman/gse-agent/bin/gse-agent"),
+            ctl: None,
+        };
+        let script = render_inner_script(&deploy, Path::new("/tmp/newbin"), "TS");
+        assert!(script.contains("systemctl stop vectorman-gse-agent"));
+        assert!(script.contains("systemctl start vectorman-gse-agent"));
+        assert!(!script.contains("CTLPLACEHOLDER"), "占位符必须被替换");
+        // 备份路径要落在被替换的二进制旁边，且带时间戳
+        assert!(script.contains("gse-agent.bak-TS-0"));
+        // 结果文件的三个字段必须都在（回滚判定依赖 outcome）
+        assert!(script.contains("\"outcome\""));
+        assert!(script.contains("rolled_back"));
+    }
+
+    #[test]
+    fn rendered_script_uses_ctl_branch_and_ctl_path() {
+        let deploy = Deploy {
+            kind: DeployKind::CtlDirect,
+            bin: PathBuf::from("/home/test/dtx/vectorman/gse-agent/bin/gse-agent"),
+            ctl: Some(PathBuf::from("/home/test/dtx/vectorman/deploy/ctl.sh")),
+        };
+        let script = render_inner_script(&deploy, Path::new("/tmp/newbin"), "TS");
+        assert!(script.contains("/home/test/dtx/vectorman/deploy/ctl.sh"));
+        assert!(script.contains("gse-agent stop"));
+        assert!(script.contains("gse-agent start"));
+        assert!(!script.contains("systemctl"), "ctl 模式不得混入 systemctl");
+    }
+
+    #[test]
+    fn rendered_script_keeps_backup_and_reports_manual_recovery() {
+        // 回滚也失败时，必须留下手工恢复命令（否则运维得自己猜）。
+        let deploy = Deploy {
+            kind: DeployKind::Systemd,
+            bin: PathBuf::from("/opt/vectorman/gse-agent/bin/gse-agent"),
+            ctl: None,
+        };
+        let script = render_inner_script(&deploy, Path::new("/tmp/newbin"), "TS");
+        assert!(script.contains("manual recovery"));
+        assert!(script.contains("pgrep -f \"gse-agent\""));
+    }
+
+    #[test]
+    fn sha256_file_matches_known_digest() {
+        let dir = std::env::temp_dir().join(format!("up-sha-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("blob");
+        std::fs::write(&f, b"hello").expect("write");
+        // sha256("hello")
+        assert_eq!(
+            sha256_file(&f).expect("hash"),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accept_upgrade_rejects_missing_binary() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let spec = AgentUpgradeSpec {
+            binary_path: "/definitely/not/here/gse-agent".to_string(),
+            sha256: "a".repeat(64),
+        };
+        let err = rt.block_on(accept_upgrade(&spec)).expect_err("must reject");
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn accept_upgrade_rejects_sha256_mismatch_before_scheduling() {
+        // 关键：sha256 不匹配时**不得**写 crontab（否则会升级一个坏二进制）。
+        let dir = std::env::temp_dir().join(format!("up-mismatch-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("newbin");
+        std::fs::write(&f, b"not the expected content").expect("write");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let spec = AgentUpgradeSpec {
+            binary_path: f.to_string_lossy().into_owned(),
+            sha256: "0".repeat(64),
+        };
+        let err = rt.block_on(accept_upgrade(&spec)).expect_err("must reject");
+        assert!(err.contains("sha256 mismatch"), "{err}");
+        // crontab 不应被写入（探测：读当前 crontab，不含 inner 脚本名）
+        let inner = inner_script_path();
+        let name = inner.file_name().unwrap().to_string_lossy().to_string();
+        let cur = std::process::Command::new("crontab")
+            .arg("-l")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        assert!(!cur.contains(&name), "sha256 不匹配时不得写 crontab");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
