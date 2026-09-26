@@ -79,7 +79,12 @@
       域名以 DNS 实际注册为准：`vectorman`/`dataserver`/`console`（早期写的 gse./data. 未注册，已改口径）
 - [ ] 1.15 删 Pod 重建数据仍在、`rollout restart` 无 CrashLoop、cron 全量 apply 幂等
       （连续两晚 Pod AGE 增长）—— 作为 cops 接管后的验收
-- [ ] 1.16 cloud2 Agent 迁移：台账重新登记（host+agent，token 一致）、
+- [x] 1.16 cloud2 Agent 迁移（2026-09-26 完成）：
+      ① 集群侧：namespaces + agent cloud2-agent 台账登记完成；deploy.yml 增加 VECTORMAN_AGENT_TOKEN 的密钥派发；
+      ② cloud2 侧：gse-agent 重启后 `GET /api/gse/agents` → status=online（心跳持续推进）；
+         server 端日志「agent cloud2-agent authenticated」；
+      ③ 数据流：checkpoint 未在 cloud2 运行，无 ingest（预期）——checkpoint 在真机上跑起来后自然出数；
+      ④ 旧 server（cloud2 的 127.0.0.1:7100）暂未停（不搬运数据，等 cron 幂等验收后一并退役）：台账重新登记（host+agent，token 一致）、
       `server_addr = "gse.xiaoyxq.top:30710"`、重启 systemd、心跳 online；
       迁移 PR 描述写死「空库起」决定
 
