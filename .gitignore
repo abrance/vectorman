@@ -9,3 +9,4 @@ frontend/**/.vite
 # gse-server 台账（本地跑 e2e 时生成）
 gse-server.db
 gse-server.db.job-files/
+.pi/

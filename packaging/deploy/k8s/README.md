@@ -59,18 +59,27 @@ kubectl logs ebpf-precheck; kubectl delete pod ebpf-precheck
 
 ## 1. 造镜像并送进集群
 
-Agent 二进制是**静态链接**的，所以镜像是 `scratch` + 一个二进制，没有基础镜像依赖。
+**现在的主路径是从源码树构建**（multi-stage：node 构建前端 dist → rust 构建六件 musl 静态二进制
+→ scratch 运行镜像），dist 不再需要手工 scp：
 
 ```bash
-# 1) 拿到发布包并解压（或在源码树里跑 packaging/build-package.sh 自己打一个）
-tar -xzf vectorman-1.2.0-linux-x86_64.tar.gz -C /tmp/vectorman-1.2.0
-
-# 2) 造镜像；--import cloud3 会在本机 docker build 后 docker save | ssh 送到 k3s 的 containerd
-packaging/deploy/k8s/build-image.sh --pkg /tmp/vectorman-1.2.0 --version 1.2.0 --import cloud3
+# server 镜像（五件二进制 + 三份 dist，实测 58.5MB）
+docker build --target server -t vectorman-server:<tag> -f packaging/deploy/k8s/Dockerfile .
+# agent 镜像（eBPF .o 已入库，不需要 bpf-linker）
+docker build --target agent  -t vectorman-gse-agent:<tag> -f packaging/deploy/k8s/Dockerfile .
 ```
 
-单机 k3s（如 cloud3）**没有 registry**，所以走 `docker save | ssh <host> k3s ctr images import -`。
-集群里有 registry 时，改成 `docker tag` + `docker push`，并把清单里的 `image:` 换成仓库地址。
+`build-image.sh --pkg <发布包目录>` 仍可用（scratch + 发布包里现成二进制的旧路径），
+但从源码构建请直接用上面的 `docker build --target`。
+
+送进单机 k3s（无 registry）：
+
+```bash
+docker save vectorman-server:<tag> | ssh cloud3 'sudo -n k3s ctr images import -'
+```
+
+集群里有 registry 时（cops CD 接管后是 ghcr.io）：`docker tag` + `docker push`，
+清单里的 `image:` 换成仓库地址。
 
 ## 2. 台账预登记（每个节点一个 Agent）
 
@@ -78,7 +87,7 @@ Agent 必须先登记才能注册心跳；`agent_id` 用**节点名**（清单�
 `token` 与清单的 Secret 保持一致：
 
 ```bash
-GSE=http://<gse-server>:7100
+GSE=https://vectorman.xiaoyxq.top   # 台账 API 走 443（RPC 是 30710）
 # 主机（host_id 用节点名即可）
 curl -sS -X POST $GSE/api/gse/hosts -H 'Content-Type: application/json' \
   -d '{"host_id":"ser539375215934"}'
@@ -117,12 +126,12 @@ kubectl -n vectorman get pods -o wide                     # 每节点 1 个 Read
 kubectl -n vectorman logs ds/gse-agent --tail=50          # 看挂载/降级日志
 
 # 集群侧：纳管与能力
-curl -sS $GSE/api/gse/agents | head -c 400                # 状态 online、心跳推进
-curl -sS $GSE/api/gse/agents/<node>/collect-items         # 采集项下发了什么
+curl -sS https://vectorman.xiaoyxq.top/api/gse/agents | head -c 400  # 状态 online、心跳推进
+curl -sS https://vectorman.xiaoyxq.top/api/gse/agents/<node>/collect-items  # 采集项下发了什么
 
 # 数据面：能力、边记录与 Pod 名
-curl -sS http://<dataserver>:7200/v1/ebpf/capability | head -c 400
-curl -sS -X POST http://<dataserver>:7200/v1/edges/search \
+curl -sS https://dataserver.xiaoyxq.top/v1/ebpf/capability | head -c 400
+curl -sS -X POST https://dataserver.xiaoyxq.top/v1/edges/search \
   -H 'Content-Type: application/json' -d '{"limit":5}' | head -c 800
 #   关注 src_container_id 是真实容器 ID、src_pod 是真实 Pod 名（不是 pod<uid>）
 ```
@@ -166,43 +175,41 @@ sudo bpftool map list  | grep -c gse || echo "无残留"
 server 侧也可以整体进集群（与 Agent 的 DaemonSet 同一命名空间 `vectorman`）：
 
 ```bash
-# 1) 造镜像（server 侧五件二进制共用一个 scratch 镜像，入口由 Pod command 指定）
-packaging/deploy/k8s/build-image.sh --pkg /tmp/vectorman-1.2.0 --version 1.2.0 --import cloud3
+# 1) 造镜像（从源码树，dist 已在镜像里；见第 1 节）
+docker build --target server -t vectorman-server:<tag> -f packaging/deploy/k8s/Dockerfile .
+docker save vectorman-server:<tag> | ssh cloud3 'sudo -n k3s ctr images import -'
 
-# 2) 准备节点目录（数据 + 前端 dist；hostPath 不会自动创建父目录）
-ssh cloud3 'mkdir -p /opt/vectorman-k8s/{gse-server,dataserver,web/dataplane,web/console}'
-# 前端 dist（本机构建后 scp；更新前端 = 重传 + 滚动重启，不用重造镜像）
-npm run build:console && npm run build:dataplane
-#   对应关系与二进制安装一致：gse-server/web = console/dist（GSE 前端）、
-#   console/web = desktop/dist（桌面门户）、dataserver/web = dataplane/dist
-scp -r frontend/apps/console/dist/.  cloud3:/opt/vectorman-k8s/web/gse/
-scp -r frontend/apps/desktop/dist/.  cloud3:/opt/vectorman-k8s/web/console/
-scp -r frontend/apps/dataplane/dist/. cloud3:/opt/vectorman-k8s/web/dataplane/
+# 2) 准备节点目录（数据卷；hostPath 不会自动创建父目录）
+ssh cloud3 'sudo -n mkdir -p /opt/vectorman-k8s/gse-server /opt/vectorman-k8s/dataserver /opt/vectorman-k8s/console'
 
-# 3) 干跑 + 应用
+# 3) 干跑 + 应用（公网入口是六条 IngressRoute，三个域名各两条）
 kubectl apply --dry-run=server -f packaging/deploy/k8s/server-stack.yaml
 kubectl apply -f packaging/deploy/k8s/server-stack.yaml
-kubectl -n vectorman get pods,svc
+kubectl -n vectorman get pods,svc,ingressroute
 ```
 
 访问入口（节点 IP + NodePort）：
 
-| 组件 | 用途 | NodePort |
+| 组件 | 用途 | 入口 |
 | --- | --- | --- |
-| gse-server | Agent RPC（Agent 的 `server_addr` 填 `gse.xiaoyxq.top:30710` —— 域名由 DNS 解析到节点 IP，流量直打 NodePort，不过 Traefik） | 30710 |
-| gse-server | 台账 API + GSE 前端 | 30711 |
-| dataserver | 数据面前端 + 查询（同源，相对路径） | 30881 |
-| dataserver | Prom 查询口 | 30990 |
-| console | 桌面门户 | 30720 |
+| gse-server | Agent RPC（`server_addr = "vectorman.xiaoyxq.top:30710"`，DNS 解析到节点 IP 直打 NodePort，不过 Traefik） | NodePort 30710 |
+| gse-server | 台账 API + GSE 前端 | `https://vectorman.xiaoyxq.top` |
+| dataserver | 数据面前端 + 查询（同源，相对路径；含 Prom 路由） | `https://dataserver.xiaoyxq.top` |
+| console | 桌面门户 | `https://console.xiaoyxq.top` |
+
+> 域名名以腾讯云 DNS 实际添加为准（2026-09-26 实测：`vectorman`/`dataserver`/`console` 三条
+> 已生效；早期文档里写的 `gse.`/`data.` 未注册，已按现状改口径）。NodePort 仍保留：
+> 30711/30881/30990/30720 是同一服务的另一条直达路径（CI 探活与排障用），
+> 对外推荐统一走 HTTPS 域名。
 
 **DNS 与 Agent 连接口径**（2026-09-25 定稿）：server 侧只负责「IP:port 监听」（NodePort），
 **客户端配置一律写「域名:port」**——`gse-agent` 的 `server_addr = "gse.xiaoyxq.top:30710"`。
 三个子域名都解析到节点 IP（`186.244.201.55`）：
 
-| DNS 记录 | 指向 | 用途 |
+| DNS 记录（实际注册名） | 指向 | 用途 |
 | --- | --- | --- |
-| `gse.xiaoyxq.top` | 186.244.201.55 | Traefik 80/443 → gse-server:7101（GSE 前端/台账 API）+ Agent RPC 30710（直连 NodePort） |
-| `data.xiaoyxq.top` | 186.244.201.55 | Traefik → dataserver:8081 |
+| `vectorman.xiaoyxq.top` | 186.244.201.55 | Traefik → gse-server:7101（GSE 前端/台账 API）+ Agent RPC 30710（直连 NodePort） |
+| `dataserver.xiaoyxq.top` | 186.244.201.55 | Traefik → dataserver:8081 |
 | `console.xiaoyxq.top` | 186.244.201.55 | Traefik → console:7200 |
 
 Agent RPC 不加 TCPRoute：域名只是 IP 的名字，连 `server_addr` 解析后直打 NodePort。
