@@ -144,10 +144,7 @@ gse-server `7100`（RPC）、`7101`（台账 HTTP）、`7102`（自监控）。
 
 ## 规格与设计文档
 
-- 数据平面分层存储：`.monkeycode/specs/dataplane-layered-storage/`
-- 时序保留策略：`.monkeycode/specs/dataplane-ts-retention/`
-- 可观测数据模型：`.monkeycode/specs/observability-data-model/`
-- APM（trace/拓扑/APM 指标）：`.monkeycode/specs/apm-tracing/`
-- eBPF 可观测：`.monkeycode/specs/ebpf-observability/`（含 `todo.md`：遗留项与已知边界）
-- GSE 采集与数据面接入：`.monkeycode/specs/gse-dataplane-ingest/`
-- 中文介绍文档：`docs/vectorman概述.md`、`docs/gse能力介绍.md`
+- **规格索引**：`.monkeycode/specs/README.md`（每个 feature 的状态、截至日期与一句话摘要；
+  `design.md` 为长效档案随代码演进维护，已实现 feature 的 requirements.md 压缩为索引，完整条款见 git 历史）；
+- 测试用例库：`.monkeycode/docs/testcases/`；
+- 中文介绍：`docs/vectorman概述.md`（定位/存储演进/组件蓝图）、`docs/gse能力介绍.md`（GSE 能力/接口/配置/部署明细）。

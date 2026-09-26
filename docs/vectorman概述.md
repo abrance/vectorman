@@ -75,54 +75,11 @@ BTF 与 tracepoint `format`，取不到即该项不采集（不按猜测值跑�
 
 ## 5. 规划中的组件
 
-### 5.1 cmdb 配置平台
+> 2026-09-26 状态校正：cmdb（gse-server-cmdb）、node（@vectorman/node）、job（@vectorman/job）、
+> GSE Server/Agent v0.1 最小闭环、文件传输、作业模板均已**实现并合入 main**——实现明细见
+> `docs/gse能力介绍.md` 与 `.monkeycode/specs/README.md` 索引，不再在此重复。以下仅列**真正未落地**的规划。
 
-配置管理平台，作为组件基础数据源。
-
-### 5.2 node 节点管理
-
-节点（主机）生命周期与状态管理。
-
-### 5.3 job 作业平台
-
-作业编排与远程执行。建立 ssh 执行作业时使用反向隧道，基于 https://github.com/singchia/geminio-rs 实现 agent 与 server 之间的通信。
-
-> **前端实现（2026-09-10）**：前端已收敛为单一构建产物 `@vectorman/console`（`frontend/apps/console/dist`），由 gse-server `http_web_dir` 同源托管；节点管理与作业平台页面分别以 `@vectorman/node`、`@vectorman/job` UI 包被 console 组合。下方 `job-*` 组件清单为上游完整架构拆分，落地时按需实现。
-
-以下为完整技术架构的组件拆分，落地时可先实现主要组件：
-
-```
-job-frontend
-job-gateway
-job-analysis
-job-backup
-job-config-watcher
-job-crontab
-job-execute
-job-file-gateway
-job-file-worker-headless
-job-logsvr
-job-manage
-```
-
-### 5.4 全局调度引擎（GSE）
-
-组件化拆分，至少含 Server 与 Agent 两个二进制；服务端即使拆多个进程，也优先共用同一二进制通过子命令区分。传输层基于 geminio-rs（singchia/geminio 的 Rust 移植）反向隧道，单连接承载双向 RPC。
-
-**已实现（v0.1 最小闭环 + 台账）：**
-
-- `bins/gse-server` + `crates/gse-server-core`：geminio `EndListener` 监听、Agent 主动外连接入
-  - 认证：查库认证——agent-id + token 对预登记的 `agents` 台账表校验（配置 `[agents]` 静态表已废弃），失败拒绝且 Agent 停止重连
-  - 心跳与存活：heartbeat handler 刷新 last_seen 并回写台账 `last_heartbeat_at`，超时窗口内无消息判离线（Online→Checking→Offline）并同步置台账 `offline`
-  - 会话管理：内存注册表，agent-id 至多一个活跃会话
-  - 信令下发：`send_command` 经下行 `exec` RPC，RPC 返回即回执；目标离线返回 `unavailable`
-  - 资产台账（CMDB）：sqlite 持久化 hosts / access_points / agents / agent_configs 四表，启动自动建表并自登记接入点；提供 HTTP 管理端口（默认 `127.0.0.1:7101`）与同进程 `Ledger` API 做增删改查，删除 Agent 级联清理配置与会话；台账 API 统一挂在 `/api/gse` 前缀，配置 `http_web_dir` 时同一端口可托管前端 dist（SPA 回退 index.html）
-- `bins/gse-agent` + `crates/gse-agent-core`：dial 外连、指数退避重连（1–60s）、认证失败停止重连并以非零退出码结束、周期心跳、`exec` handler（ping/pong 验证链路）
-- `crates/gse-proto`：两端共享 DTO（auth / heartbeat / command / receipt / error）
-- 配置：TOML 文件 + `GSE_` 前缀环境变量覆盖；`db`/`http_enabled`/`http_listen`/`http_web_dir` 支持 `GSE_SERVER_DB`/`GSE_SERVER_HTTP_LISTEN`/`GSE_SERVER_HTTP_WEB_DIR` 覆盖；缺失或非法输出 `config_invalid` 并以退出码 1 结束
-- 集成测试覆盖认证（含未登记与 auth 关闭直通）、心跳、ping/pong、未知指令、台帐状态回写（online/heartbeat/offline）、HTTP 管理 CRUD、删除级联、自登记幂等、静态 web 托管与 SPA 回退
-
-**规划中模块：**
+### 5.1 GSE 规划中模块
 
 | 组件名称 | 所属模块 | 角色定位 | 设计目标 |
 | --- | --- | --- | --- |
