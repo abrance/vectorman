@@ -5,30 +5,39 @@
 
 ## 0. 实现前先确认（不做完不动代码）
 
-- [ ] 0.1 **升级结果是否落库**：确认 server 侧要不要为 `upgrade_result` 加台账字段。
-      倾向落库（否则运维还得翻 server 日志）；若落库，评估改动面（台账表 + 查询接口）。
-      **验收**：给出明确结论并更新 `design.md` 的「待决问题 1」。
-- [ ] 0.2 **两种部署形式下的 crontab 用户**：
-      · `ctl.sh` direct（agent 以 `test` 跑）→ 写该用户自己的 crontab，无需 sudo
-      · systemd（agent 以 root 跑）→ 写 root 的 crontab，需 `sudo -n crontab`
-      在**本机（systemd）与 testbkee（ctl.sh）**上各验证一次「写 crontab → 到点执行 → 自清理」。
-      **验收**：两种形式都能让一次性任务跑起来且 cgroup 与 agent 无关。
-- [ ] 0.3 **cron 未运行的兜底**：确认探测方式（`systemctl is-active cron`）与拒绝时的措辞。
-      **验收**：结论写回 `design.md` 的「待决问题 3」与风险表。
+- [x] 0.1 **升级结果落库：是**（2026-09-27 定）。
+      台账已有成熟的加列迁移模式（`PRAGMA table_info` + `ALTER TABLE`，
+      见 `ledger.rs:435` 的 `migrate_jobs_file_columns`），`agents` 表加一列
+      `upgrade_result_json TEXT` 即可，改动面小。不落库的话运维只能翻 server 日志，
+      与「不必登机/翻日志」的目标相悖。结论已更新到 `design.md` 待决问题 1。
+- [x] 0.2 **crontab 用户：按 agent 的运行用户走**（2026-09-27 实测确认）：
+      · **systemd 部署**：agent 以 **root** 跑（`ps` 实测），unit 无 `User=` 指令
+        → 写 root 的 crontab，用 `sudo -n crontab`
+      · **`ctl.sh` direct 部署**：agent 以 **test** 跑（实测 `whoami`=test, uid 1001）
+        → 写自己的 crontab，**无需 sudo**
+      **真机验证**（testbkee，ctl.sh direct）：
+      `cgroup=0::/user.slice/user-1001.slice/session-38435.scope` —— 与 agent 无关；
+      `user=test`；一次性任务执行后 **crontab 自清理成功**。
+      （本机 systemd 侧的 cron 隔离此前已验证：`/system.slice/cron.service`。）
+- [x] 0.3 **cron 未运行的兜底**（2026-09-27 定）：受理前探测
+      `systemctl is-active cron`（两机实测均为 `active`）；不在运行则**拒绝受理**，
+      措辞说明「目标机 cron 未运行，升级无法调度」，不让运维干等。
 
-- **检查点 A**：三个待决问题都有明确答案；若答案改变方案，先同步更新规格。
+- **检查点 A ✅**：三个待决问题都有明确答案；若答案改变方案，先同步更新规格。
 
 ## 1. 纯逻辑与单测（无副作用，先做）
 
-- [ ] 1.1 `detect_deploy`：探测部署形式与二进制/ctl.sh 路径。
+- [x] 1.1 `detect_deploy`：探测部署形式与二进制/ctl.sh 路径。
       输入是「一批候选路径的存在性」，输出是 `Deploy { kind, bin, ctl }`。
-- [ ] 1.2 `plan_backup`：生成备份路径（`<bin>.bak-<时间戳>`）。
+- [x] 1.2 `plan_backup`：生成备份路径（`<bin>.bak-<时间戳>`）。
       **测试**：不覆盖历史备份；同一秒内两次调用不互相覆盖（加序号或纳秒）。
-- [ ] 1.3 `verify_sha256`：摘要比对（大小写、格式错误、长度不符）。
-- [ ] 1.4 升级结果的**结构体与序列化**（`UpgradeResult`，含 `reported` 标记）。
-- [ ] 1.5 单测覆盖 1.1–1.4；**逐项验证测试有效**（改坏实现则测试失败）。
+- [x] 1.3 `verify_sha256`：摘要比对（大小写、格式错误、长度不符）。
+- [x] 1.4 升级结果的**结构体与序列化**（`UpgradeResult`，含 `reported` 标记）。
+- [x] 1.5 单测覆盖 1.1–1.4；**逐项验证测试有效**（改坏实现则测试失败）。
 
-- **检查点 B**：四个纯函数各有测试；测试有效性已实证；`cargo test` 全绿。
+- **检查点 B ✅**：四个纯函数各有测试；测试有效性已实证
+  （破坏备份命名/空 sha256/systemd 探测三处 → 精确 3 个测试失败）；`cargo test` 全绿。
+  实现落在 `crates/gse-agent-core/src/upgrade.rs`，11 个单测。
 
 ## 2. 升级执行（agent 侧）
 

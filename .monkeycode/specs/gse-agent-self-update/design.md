@@ -169,15 +169,22 @@ pub struct Heartbeat {
 
 server 收到后更新台账（或仅打日志 —— **取决于是否要落库**，见待决问题）。
 
-## 待决问题（实现前需确认）
+## 待决问题（2026-09-27 已确认）
 
-1. **升级结果要不要落库？** 落库的话要加台账表/字段；不落库则只在 server 日志可见。
-   → 倾向**落库**（否则运维还得翻日志），但会扩大改动面。
-2. **crontab 与 agent 用户的关系**：`ctl.sh` direct 部署下 agent 以 `test` 用户跑，
-   cron 任务写在 `test` 的 crontab（无需 sudo）。systemd 部署下 agent 以 root 跑，
-   cron 写 root 的 crontab（`sudo -n crontab`）。**两种都要覆盖**。
-3. **cron 未运行时怎么办**：目标机 cron 停掉时一次性任务不会执行 → agent 永远等不到结果。
-   需要在写 crontab 后**探测 cron 是否在跑**，不在则立刻返回失败（不让运维干等）。
+1. **升级结果落库：是。** 台账已有成熟的加列迁移模式
+   （`PRAGMA table_info` + `ALTER TABLE`，见 `ledger.rs` 的 `migrate_jobs_file_columns`），
+   `agents` 表加一列 `upgrade_result_json TEXT` 即可，改动面小。
+   不落库的话运维只能翻 server 日志，与「不必登机」的目标相悖。
+
+2. **crontab 用户：跟随 agent 的运行用户**（实测确认）：
+   · systemd 部署 → agent 以 **root** 跑（unit 无 `User=`），写 root 的 crontab（`sudo -n crontab`）
+   · `ctl.sh` direct → agent 以 **test** 跑，写自己的 crontab（**无需 sudo**）
+   真机验证（testbkee）：`cgroup=0::/user.slice/user-1001.slice/session-38435.scope`、
+   `user=test`、一次性任务执行后 crontab 自清理成功。
+
+3. **cron 未运行时拒绝受理**：受理前探测 `systemctl is-active cron`；
+   不在运行则立刻返回失败并说明「目标机 cron 未运行，升级无法调度」，
+   不让运维干等一个永远不会到来的结果。
 
 ## 风险
 

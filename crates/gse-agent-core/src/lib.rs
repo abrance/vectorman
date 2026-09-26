@@ -5,6 +5,7 @@ pub mod collect;
 pub mod config;
 pub mod file_io;
 pub mod job;
+pub mod upgrade;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
