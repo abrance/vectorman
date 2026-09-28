@@ -102,8 +102,13 @@ pub fn parse_pod_uid(path: &str) -> Option<String> {
             }
         }
         let uid = uid.trim_matches('-');
+        // 先按原文验（连字符形态），再试 systemd 转义还原（下划线形态，cloud3 实测）。
         if is_pod_uid(uid) {
             return Some(uid.to_string());
+        }
+        let unescaped = unescape_systemd_uid(uid);
+        if is_pod_uid(&unescaped) {
+            return Some(unescaped);
         }
     }
     None
@@ -121,6 +126,13 @@ fn is_pod_uid(value: &str) -> bool {
     matches!(value.len(), 36 | 32)
         && stripped.len() >= 32
         && stripped.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// systemd cgroup 路径转义还原：uid 里的 `-` 被 systemd 转成 `_`
+/// （cloud3 k3s/kernel 6.8 实测：`kubepods-burstable-pod<uid内的-变_>.slice`）。
+/// 纯 hex（32 位）uid 不受影响；只有含连字符的 uuid 形态需要还原。
+fn unescape_systemd_uid(value: &str) -> String {
+    value.replace('_', "-")
 }
 
 /// `/proc/<pid>/cgroup` 的解析（取 `0::` 那行；v1 下取任意一行并合并判断）。
@@ -331,6 +343,27 @@ mod tests {
         assert_eq!(
             parse_pod_uid(path).as_deref(),
             Some("9f8e7d6c-5b4a-3210-9f8e-7d6c5b4a3210")
+        );
+    }
+
+    /// cloud3（k3s v1.37/kernel 6.8/systemd 252+）实测形态：uid 里的 `-` 被 systemd
+    /// 转义成 `_`。不还原就永远解不出 uid，`src_pod` 退化为空（真集群验证抓到的 bug）。
+    #[test]
+    fn parses_systemd_escaped_pod_uid() {
+        let path = "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podb31917ad_9837_492f_af06_d08866560acd.slice/cri-containerd-2d6a29b1fd42fd80bb3f881c5fdecbf298497fc3632a6ec5ad1c56f05867b835.scope";
+        assert_eq!(
+            parse_pod_uid(path).as_deref(),
+            Some("b31917ad-9837-492f-af06-d08866560acd")
+        );
+        assert_eq!(
+            parse_container_id(path).as_deref(),
+            Some("2d6a29b1fd42fd80bb3f881c5fdecbf298497fc3632a6ec5ad1c56f05867b835")
+        );
+        // 无 QoS 子 slice 的形态（besteffort pod 直接挂在 kubepods.slice 下同样转义）。
+        let flat = "/kubepods.slice/kubepods-podf8053428_14e4_4ba2_8f17_464a73929e58.slice/cri-containerd-8994792f4d5815391d5df179ad47efe2b53ec5749c11def024ab8a98c59b96f2.scope";
+        assert_eq!(
+            parse_pod_uid(flat).as_deref(),
+            Some("f8053428-14e4-4ba2-8f17-464a73929e58")
         );
     }
 
