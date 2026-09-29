@@ -35,6 +35,8 @@ fn print_info(bin: &str, about: &str, flag: &str) {
             println!();
             println!("Configuration:");
             println!("  GSE_AGENT_CONFIG   Path to gse-agent.toml (default: ./gse-agent.toml)");
+            println!("  SIGHUP             Reload the config file and hot-apply it");
+            println!("                     (systemctl reload / kill -HUP <pid>)");
         }
         _ => println!("{bin} {}", vectorman_version::VERSION),
     }
@@ -55,7 +57,7 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match run(cfg).await {
+    match run(cfg, cfg_path).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("gse-agent: {e}");

@@ -14,8 +14,10 @@ use tokio::sync::Semaphore;
 
 use crate::AgentConfig;
 
-/// 执行器运行参数，来源于 AgentConfig 的作业相关字段。
-#[derive(Debug, Clone)]
+/// 执行器运行参数，来源于 AgentConfig 的作业相关字段或下发 spec 的 `params`。
+///
+/// `PartialEq` 供热加载判定「是否需要重建执行器」。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobConfig {
     pub allowed_interpreters: Vec<String>,
     pub default_interpreter: String,
@@ -30,6 +32,28 @@ impl JobConfig {
             default_interpreter: cfg.job_default_interpreter.clone(),
             max_concurrent_jobs: cfg.max_concurrent_jobs,
             work_dir: cfg.job_work_dir.clone(),
+        }
+    }
+
+    /// 从下发 spec 的 `params` 构造（热加载路径）。
+    ///
+    /// 空值回落 `AgentConfig` 的缺省：白名单为空会让**所有**作业被拒，
+    /// 解释器为空会让作业起不来 —— 缺省比「按字面取空」安全。
+    pub fn from_spec_params(p: &gse_proto::SpecParams) -> Self {
+        let default = AgentConfig::default();
+        Self {
+            allowed_interpreters: if p.allowed_interpreters.is_empty() {
+                default.allowed_interpreters
+            } else {
+                p.allowed_interpreters.clone()
+            },
+            default_interpreter: if p.job_default_interpreter.is_empty() {
+                default.job_default_interpreter
+            } else {
+                p.job_default_interpreter.clone()
+            },
+            max_concurrent_jobs: p.max_concurrent_jobs.max(1),
+            work_dir: p.job_work_dir.clone().filter(|d| !d.trim().is_empty()),
         }
     }
 }
@@ -48,6 +72,11 @@ impl JobExecutor {
             cfg: Arc::new(cfg),
             permits,
         }
+    }
+
+    /// 当前作业执行配置（热加载重建前用于比对）。
+    pub fn config(&self) -> &JobConfig {
+        &self.cfg
     }
 
     fn interpreter_allowed(&self, interpreter: &str) -> bool {

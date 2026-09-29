@@ -27,7 +27,7 @@ use buffer::{Buffer, DEFAULT_MAX_RECORDS};
 use config::CollectorConfig;
 use envelope::{DataEnvelope, IngestReply};
 use gse_agent_ebpf::attach::EbpfItemKind;
-use gse_proto::{CollectItem, CollectItemsReply, DataplaneAddrReply, DataplaneAddrRequest};
+use gse_proto::{DataplaneAddrReply, DataplaneAddrRequest, SpecItem};
 
 /// 当前时间（微秒）。
 pub fn now_micros() -> i64 {
@@ -45,12 +45,14 @@ pub struct CollectShared {
     host_id: RwLock<Option<String>>,
     ingest_url: RwLock<Option<String>>,
     buffer: Buffer,
-    /// OTLP 接收器的进程级配置（来自 Agent 本地配置，非采集项下发）。
-    pub otlp_enabled: bool,
-    pub otlp_listen: String,
-    pub otlp_max_body_bytes: usize,
-    pub otlp_token: String,
-    pub otlp_allowed_cidrs: Vec<String>,
+    /// OTLP 接收器的进程级配置。**可热改**：改完由 supervisor 重对齐 `apm_otlp` 采集项，
+    /// 使 listener 用新参数重绑（只重启这一类采集项，`log_file` 等不受影响）。
+    otlp: tokio::sync::RwLock<OtlpRuntime>,
+    /// 向 supervisor 投递控制消息的发送端。
+    ///
+    /// 放在共享状态上而不是句柄上：`RuntimeConfig` 持有共享状态、句柄只在建连时出现，
+    /// 而 spec 变更（含 token 变更后的重连）必须能随时投递。
+    control: tokio::sync::RwLock<Option<mpsc::UnboundedSender<Control>>>,
 }
 
 impl CollectShared {
@@ -60,15 +62,12 @@ impl CollectShared {
             host_id: RwLock::new(None),
             ingest_url: RwLock::new(None),
             buffer: Buffer::new(DEFAULT_MAX_RECORDS),
-            otlp_enabled: false,
-            otlp_listen: otlp::DEFAULT_LISTEN.to_string(),
-            otlp_max_body_bytes: otlp::DEFAULT_MAX_BODY_BYTES,
-            otlp_token: String::new(),
-            otlp_allowed_cidrs: Vec::new(),
+            otlp: tokio::sync::RwLock::new(OtlpRuntime::default()),
+            control: tokio::sync::RwLock::new(None),
         }
     }
 
-    /// 设置 OTLP 接收器参数（Agent 启动时从本地配置调用）。
+    /// 设置 OTLP 接收器参数（Agent 启动时从本地配置调用，Arc 化之前）。
     pub fn set_otlp_options(
         &mut self,
         enabled: bool,
@@ -77,15 +76,41 @@ impl CollectShared {
         token: String,
         allowed_cidrs: Vec<String>,
     ) {
-        self.otlp_enabled = enabled;
-        self.otlp_listen = if listen.trim().is_empty() {
-            otlp::DEFAULT_LISTEN.to_string()
-        } else {
-            listen
-        };
-        self.otlp_max_body_bytes = max_body_bytes.max(1_024);
-        self.otlp_token = token;
-        self.otlp_allowed_cidrs = allowed_cidrs;
+        *self.otlp.get_mut() = OtlpRuntime::new(enabled, listen, max_body_bytes, token, allowed_cidrs);
+    }
+
+    /// 热改 OTLP 参数（spec 下发路径）。调用方随后要投递 [`Control::SpecChanged`]
+    /// 让 supervisor 重对齐 `apm_otlp` 项，否则新 listener 不会真的绑上。
+    pub async fn set_otlp_runtime(&self, runtime: OtlpRuntime) {
+        *self.otlp.write().await = runtime;
+    }
+
+    /// 当前 OTLP 参数。
+    pub async fn otlp_runtime(&self) -> OtlpRuntime {
+        self.otlp.read().await.clone()
+    }
+
+    /// 应用一批采集项（可空表，表示停止全部）；`force_otlp_rebind` 见 [`Control::SpecChanged`]。
+    pub async fn apply_spec(&self, items: Vec<SpecItem>, force_otlp_rebind: bool) {
+        let guard = self.control.read().await;
+        match guard.as_ref() {
+            Some(tx) => {
+                let _ = tx.send(Control::SpecChanged {
+                    items,
+                    force_otlp_rebind,
+                });
+            }
+            // supervisor 还没起来（认证前的极短窗口）：宁可留日志也不静默丢，
+            // 反正认证后的拉取会重新来一次。
+            None => eprintln!("gse-agent: collect supervisor not ready, spec change dropped"),
+        }
+    }
+
+    /// 立即重新拉取数据面地址。
+    pub async fn pull_addr_now(&self) {
+        if let Some(tx) = self.control.read().await.as_ref() {
+            let _ = tx.send(Control::PullAddr);
+        }
     }
 
     pub async fn host_id(&self) -> Option<String> {
@@ -168,13 +193,65 @@ fn post_ingest(agent: &ureq::Agent, ingest_url: &str, env: &DataEnvelope) -> Dis
 
 /// 采集项对齐控制消息。
 enum Control {
-    /// GSE 下发/推送的采集项整表。
-    Items(CollectItemsReply),
+    /// spec 变更：采集项整表（可为空表 = 停掉全部）+ 是否需要重绑 OTLP listener。
+    ///
+    /// `force_otlp_rebind` 只在 `otlp_*` 参数变化时为 true：它让 `reconcile` 丢掉
+    /// `apm_otlp` 项的指纹使其重启重绑，而**不动**其它项的指纹 ——
+    /// 否则 `log_file` 会跟着重启并丢掉 tail 位置。
+    SpecChanged {
+        items: Vec<SpecItem>,
+        force_otlp_rebind: bool,
+    },
     /// 立即重新拉取数据面地址。
     PullAddr,
 }
 
-/// OTLP 接收器的进程级参数。
+/// OTLP 接收器的**进程级**运行时参数（可热改）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OtlpRuntime {
+    pub enabled: bool,
+    pub listen: String,
+    pub max_body_bytes: usize,
+    pub token: String,
+    pub allowed_cidrs: Vec<String>,
+}
+
+impl Default for OtlpRuntime {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: otlp::DEFAULT_LISTEN.to_string(),
+            max_body_bytes: otlp::DEFAULT_MAX_BODY_BYTES,
+            token: String::new(),
+            allowed_cidrs: Vec::new(),
+        }
+    }
+}
+
+impl OtlpRuntime {
+    /// 归一化构造：空 listen 落回默认地址，上限至少 1 KiB。
+    pub fn new(
+        enabled: bool,
+        listen: String,
+        max_body_bytes: usize,
+        token: String,
+        allowed_cidrs: Vec<String>,
+    ) -> Self {
+        Self {
+            enabled,
+            listen: if listen.trim().is_empty() {
+                otlp::DEFAULT_LISTEN.to_string()
+            } else {
+                listen
+            },
+            max_body_bytes: max_body_bytes.max(1_024),
+            token,
+            allowed_cidrs,
+        }
+    }
+}
+
+/// OTLP 接收器的进程级参数（启动路径用的入参）。
 #[derive(Debug, Clone, Default)]
 pub struct OtlpOptions {
     pub enabled: bool,
@@ -188,7 +265,6 @@ pub struct OtlpOptions {
 #[derive(Clone)]
 pub struct CollectorHandle {
     shared: Arc<CollectShared>,
-    tx: mpsc::UnboundedSender<Control>,
 }
 
 impl CollectorHandle {
@@ -210,11 +286,24 @@ impl CollectorHandle {
         Self::from_shared(CollectShared::new(agent_id), end)
     }
 
-    fn from_shared(shared: CollectShared, end: End) -> Self {
-        let shared = Arc::new(shared);
+    /// 用**已有**的共享状态创建句柄并启动 supervisor。
+    ///
+    /// Agent 侧需要把同一个 `Arc<CollectShared>` 也交给 `RuntimeConfig`
+    /// （OTLP 参数要能热改），所以必须支持「拿现成的 shared 起句柄」。
+    pub fn new_with_shared(shared: Arc<CollectShared>, end: End) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        // 发送端交给共享状态：`RuntimeConfig` 也只有它，spec 热改才能投递。
+        // 这里刚拿到 shared 的所有权，`try_write` 不可能失败；真失败也只会退回
+        // 「控制消息被丢 + 打日志」，不会让进程挂住。
+        if let Ok(mut guard) = shared.control.try_write() {
+            *guard = Some(tx);
+        }
         tokio::spawn(supervise(shared.clone(), end, rx));
-        Self { shared, tx }
+        Self { shared }
+    }
+
+    fn from_shared(shared: CollectShared, end: End) -> Self {
+        Self::new_with_shared(Arc::new(shared), end)
     }
 
     pub fn shared(&self) -> Arc<CollectShared> {
@@ -222,13 +311,13 @@ impl CollectorHandle {
     }
 
     /// 应用一批采集项（可空表，表示停止全部）。
-    pub fn apply(&self, reply: CollectItemsReply) {
-        let _ = self.tx.send(Control::Items(reply));
+    pub async fn apply_spec(&self, items: Vec<SpecItem>, force_otlp_rebind: bool) {
+        self.shared.apply_spec(items, force_otlp_rebind).await;
     }
 
     /// 认证成功后触发首次地址拉取。
-    pub fn pull_addr_now(&self) {
-        let _ = self.tx.send(Control::PullAddr);
+    pub async fn pull_addr_now(&self) {
+        self.shared.pull_addr_now().await;
     }
 }
 
@@ -247,7 +336,9 @@ async fn supervise(shared: Arc<CollectShared>, end: End, mut rx: mpsc::Unbounded
     loop {
         tokio::select! {
             maybe = rx.recv() => match maybe {
-                Some(Control::Items(reply)) => reconcile(&shared, &mut runners, reply.items),
+                Some(Control::SpecChanged { items, force_otlp_rebind }) => {
+                    reconcile(&shared, &mut runners, items, force_otlp_rebind)
+                }
                 Some(Control::PullAddr) => {
                     started = true;
                     pull_addr(&shared, &end).await;
@@ -267,10 +358,14 @@ async fn supervise(shared: Arc<CollectShared>, end: End, mut rx: mpsc::Unbounded
 }
 
 /// 按 `item_id` 对齐采集器：新增/变更重启，移除或停用则停止。
+///
+/// `force_otlp_rebind` 为 true 时丢弃 `apm_otlp` 项的指纹，使其即便内容未变也重启
+/// （用于 `otlp_listen` 等进程级参数变更后重绑 listener）；其它项不受影响。
 fn reconcile(
     shared: &Arc<CollectShared>,
     runners: &mut HashMap<String, Runner>,
-    items: Vec<CollectItem>,
+    items: Vec<SpecItem>,
+    force_otlp_rebind: bool,
 ) {
     let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
     for item in items {
@@ -279,11 +374,8 @@ fn reconcile(
         }
         keep.insert(item.item_id.clone());
         let fp = fingerprint(&item);
-        if runners
-            .get(&item.item_id)
-            .map(|r| r.fingerprint == fp)
-            .unwrap_or(false)
-        {
+        let current = runners.get(&item.item_id).map(|r| r.fingerprint.as_str());
+        if !must_restart(current, &fp, &item.kind, force_otlp_rebind) {
             continue;
         }
         if let Some(old) = runners.remove(&item.item_id) {
@@ -310,7 +402,24 @@ fn reconcile(
     }
 }
 
-fn fingerprint(item: &CollectItem) -> String {
+/// 该采集项是否必须重启。
+///
+/// `force_otlp_rebind` 只在 `otlp_*` 进程级参数变化时为 true：它专门用来让
+/// `apm_otlp` 项重绑 listener，**不得**波及 `log_file` 等项 —— 那些项重启会丢 tail 位置。
+/// 抽成纯函数是为了可测（这条规则很容易被「顺手清空全部指纹」改坏）。
+fn must_restart(
+    current_fingerprint: Option<&str>,
+    item_fingerprint: &str,
+    kind: &str,
+    force_otlp_rebind: bool,
+) -> bool {
+    if force_otlp_rebind && kind == "apm_otlp" {
+        return true;
+    }
+    current_fingerprint != Some(item_fingerprint)
+}
+
+fn fingerprint(item: &SpecItem) -> String {
     serde_json::json!({
         "kind": item.kind,
         "enabled": item.enabled,
@@ -320,7 +429,7 @@ fn fingerprint(item: &CollectItem) -> String {
     .to_string()
 }
 
-fn spawn_collector(shared: Arc<CollectShared>, item: CollectItem) -> tokio::task::JoinHandle<()> {
+fn spawn_collector(shared: Arc<CollectShared>, item: SpecItem) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let cfg = CollectorConfig::from_value(&item.collector);
         match item.kind.as_str() {
@@ -328,7 +437,8 @@ fn spawn_collector(shared: Arc<CollectShared>, item: CollectItem) -> tokio::task
             "log_file" => logfile::run(shared, item.item_id, cfg).await,
             "log_k8s_stdout" => k8s::run(shared, item.item_id, cfg).await,
             "apm_otlp" => {
-                if !shared.otlp_enabled {
+                let otlp = shared.otlp_runtime().await;
+                if !otlp.enabled {
                     eprintln!(
                         "gse-agent: collect item {} is apm_otlp but otlp_enabled=false; skipped",
                         item.item_id
@@ -340,10 +450,10 @@ fn spawn_collector(shared: Arc<CollectShared>, item: CollectItem) -> tokio::task
                 let receiver = otlp::OtlpConfig::from_item(
                     &item.item_id,
                     &item.collector,
-                    &shared.otlp_listen,
-                    shared.otlp_max_body_bytes,
-                    &shared.otlp_token,
-                    &shared.otlp_allowed_cidrs,
+                    &otlp.listen,
+                    otlp.max_body_bytes,
+                    &otlp.token,
+                    &otlp.allowed_cidrs,
                 );
                 otlp::run(shared, receiver).await
             }
@@ -524,11 +634,36 @@ mod tests {
         );
     }
 
+    /// OTLP 参数变更必须**只**重启 `apm_otlp` 项：重启 `log_file` 会丢 tail 位置。
+    #[test]
+    fn force_otlp_rebind_only_restarts_apm_items() {
+        // 内容没变（指纹相同）时：
+        assert!(
+            !must_restart(Some("fp"), "fp", "log_file", false),
+            "指纹相同不该重启"
+        );
+        assert!(
+            must_restart(Some("fp"), "fp", "apm_otlp", true),
+            "otlp 参数变了必须让 apm_otlp 重绑 listener"
+        );
+        assert!(
+            !must_restart(Some("fp"), "fp", "log_file", true),
+            "同一次变更不得波及 log_file（否则丢 tail 位置）"
+        );
+        assert!(
+            !must_restart(Some("fp"), "fp", "ebpf_network", true),
+            "同一次变更不得波及 eBPF 项"
+        );
+        // 内容变了照常重启。
+        assert!(must_restart(Some("fp"), "other", "log_file", false));
+        // 新项（没有指纹）。
+        assert!(must_restart(None, "fp", "log_file", false));
+    }
+
     #[test]
     fn fingerprint_changes_with_collector_config() {
-        let base = CollectItem {
+        let base = SpecItem {
             item_id: "i-1".to_string(),
-            agent_ids: vec!["a-1".to_string()],
             name: "n".to_string(),
             kind: "metrics_host".to_string(),
             enabled: true,

@@ -2035,19 +2035,20 @@ mod tests {
         send(
             &mut app,
             req(
-                "POST",
-                "/api/gse/agent-configs",
-                Some(r#"{"agent_id":"a-1","host_id":"h-1","cpu_limit_percent":50}"#),
+                "PUT",
+                "/api/gse/agents/a-1/spec",
+                Some(r#"{"params":{"heartbeat_interval_secs":30},"items":[]}"#),
             ),
         )
         .await;
+        assert!(ledger.get_agent_spec("a-1").await.expect("get").is_some());
 
         let (status, _) = send(&mut app, req("DELETE", "/api/gse/agents/a-1", None)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(ledger.get_agent("a-1").await.expect("get").is_none());
         assert!(
-            ledger.get_agent_config("a-1").await.expect("get").is_none(),
-            "agent config should be cascaded away"
+            ledger.get_agent_spec("a-1").await.expect("get").is_none(),
+            "agent spec should be cascaded away"
         );
         // host 不随 agent 删除而消失。
         assert!(ledger.get_host("h-1").await.expect("get").is_some());

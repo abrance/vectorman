@@ -10,7 +10,7 @@
       （`skip_serializing_if`）；另加 `NOT_ENFORCED_FIELDS` 与 `spec_outcome` 常量表。
       **实现补充**：`SpecParams` 手写 `Default`（不能用派生：`heartbeat_interval_secs = 0` 会被自己的校验判非法、
       `allowed_interpreters` 为空会让所有作业被拒）。—— 对应 需求 R1/R2/R8、设计「协议」。
-- [ ] 1.2 **推迟到阶段 5 之后**：删除 `gse-proto::CollectItem` / `CollectItemsReply` 与
+- [x] 1.2 **推迟到阶段 5 之后**：删除 `gse-proto::CollectItem` / `CollectItemsReply` 与
       `ledger::CollectItem` / `AgentConfig` 及各自 CRUD。理由：阶段 3/4/5 逐块替换期间保留旧路径，
       让每个阶段结束时 workspace 都能编译并跑测试；最后一个引用消失后再删。
       —— 对应 需求 R1/R12 破坏性变更 3。
@@ -38,7 +38,7 @@
 - [x] 2.5 实现 `migrate_legacy_specs()`：`agent_configs` → `params`；`collect_items` 按 `agent_ids`
       **展开**成各 Agent 的 `items`（含「只出现在 collect_items 里的 Agent」）；`agent_specs` 非空则跳过。
       —— 对应 需求 R3、设计「一次性迁移」。
-- [ ] 2.6 删除旧 `AgentConfig` / `CollectItem` 的台账类型与全部 CRUD（`upsert_agent_config` 等、
+- [x] 2.6 删除旧 `AgentConfig` / `CollectItem` 的台账类型与全部 CRUD（`upsert_agent_config` 等、
       `list/get/upsert/delete_collect_item` 与 `row_to_*`），保留两张旧表的建表语句并标注「遗留表」；
       同步改 `crates/gse-server-core/src/lib.rs` 的导出。
       —— 对应 需求 R12、设计「一次性迁移」。
@@ -103,34 +103,49 @@
 
 ## 阶段 5：Agent 热加载
 
-- [ ] 5.1 新增 `crates/gse-agent-core/src/spec_apply.rs`：spec → `RuntimeConfig` 的应用、
+- [x] 5.1 新增 `crates/gse-agent-core/src/spec_apply.rs`：spec → `RuntimeConfig` 的应用、
       `outcome` 判定表、`not_enforced` 子集、不可变字段防御（纯函数）。
       —— 对应 需求 R1/R6/R11、设计「outcome 判定」。
-- [ ] 5.2 `lib.rs` 引入 `RuntimeConfig`（心跳周期 `AtomicU64`、`RwLock<JobExecutor>`、
+- [x] 5.2 `lib.rs` 引入 `RuntimeConfig`（心跳周期 `AtomicU64`、`RwLock<JobExecutor>`、
       `applied_revision`、`pending_ack`、`reauth: Notify`、不可变身份与地址、`collector`）。
       —— 对应 需求 R6、设计「Agent 侧运行时」。
-- [ ] 5.3 `bins/gse-agent/src/main.rs` 把 `cfg_path` 传给 `run()`；`run()` 用
+- [x] 5.3 `bins/gse-agent/src/main.rs` 把 `cfg_path` 传给 `run()`；`run()` 用
       `tokio::signal::unix::signal(SignalKind::hangup())`（`#[cfg(unix)]`）监听 `SIGHUP`，
       重读成功走同一条 apply 路径、失败保留当前配置并打 `spec_reload_failed`。
       —— 对应 需求 R6、设计 Pitfall 8。
-- [ ] 5.4 心跳循环改为每轮 `load` 心跳周期；`sleep` 与 `reauth.notified()` 二选一，
+- [x] 5.4 心跳循环改为每轮 `load` 心跳周期；`sleep` 与 `reauth.notified()` 二选一，
       后者返回 `SessionEnd::Reauth` 让 `run()` 以 backoff=1 重连。
       —— 对应 需求 R6。
-- [ ] 5.5 `job.rs` 暴露 `JobConfig` 读访问器；`job_exec` handler 每请求取最新 `JobExecutor`。
+- [x] 5.5 `job.rs` 暴露 `JobConfig` 读访问器；`job_exec` handler 每请求取最新 `JobExecutor`。
       —— 对应 需求 R6、设计 Pitfall 5。
-- [ ] 5.6 `collect/mod.rs`：OTLP 参数改 `RwLock`；`Control::Items` → `Control::SpecChanged`（参数与 items
+- [x] 5.6 `collect/mod.rs`：OTLP 参数改 `RwLock`；`Control::Items` → `Control::SpecChanged`（参数与 items
       一起对齐）；只对 `kind == "apm_otlp"` 项清 fingerprint 后重跑 `reconcile`。
       —— 对应 需求 R5/R6、设计 Pitfall 6。
-- [ ] 5.7 `connect_once` 注册 `agent_spec` handler、认证后 `call("agent_spec")` 拉取、连接后挂首次补报
+- [x] 5.7 `connect_once` 注册 `agent_spec` handler、认证后 `call("agent_spec")` 拉取、连接后挂首次补报
       （含纯本地基线，`revision = ""`）；删除 `collect_items` 相关注册与 `pull_collect_items`。
       —— 对应 需求 R4/R5/R8。
-- [ ] 5.8 `gse-agent.toml.example` 与 `config.rs` 注释：优先级（下发 > 本地重读 > env > TOML > 默认）
+- [x] 5.8 `gse-agent.toml.example` 与 `config.rs` 注释：优先级（下发 > 本地重读 > env > TOML > 默认）
       + `SIGHUP` 重读说明。—— 对应 需求 R1/R6。
-- [ ] 5.9 单测：`spec_apply` 表驱动（四种 outcome、不可变字段拒绝、`not_enforced` 子集）；
+- [x] 5.9 单测：`spec_apply` 表驱动（四种 outcome、不可变字段拒绝、`not_enforced` 子集）；
       revision 稳定性；心跳周期原子量生效；`JobExecutor` 重建后新白名单/上限可见；
       `otlp_*` 变更只重启 `apm_otlp` 项（计数 runner 断言）；`token` 变更触发 `Reauth`；
       `SIGHUP` 成功重读与坏文件保留原配置各一例。
       —— 对应 需求 R5/R6/R11。
+
+**阶段 5 实现补充（与设计有出入的几处，均已落地并测到）**：
+- 控制消息的发送端放在 `CollectShared`（而不是 `CollectorHandle`）上：`RuntimeConfig` 只在
+  `run` 开始时能拿到共享状态，句柄要等 dial 之后才有，而 spec 热改必须随时能投递。
+- 「哪些采集项要重启」抽成纯函数 `must_restart(current_fp, item_fp, kind, force)` 并单测：
+  `force_otlp_rebind` 只允许命中 `apm_otlp`（重启 `log_file` 会丢 tail 位置）。
+- `not_enforced` 的 `log_level` 采取「与缺省 `info` 不同才标」：每台 Agent 都挂一条「未实现」
+  会把信号淹掉；真设了 `debug`/`warn` 照样标。
+- 不可变字段防御放在入站解码前，对**原始 JSON** 做定点检查（不用 `deny_unknown_fields`，
+  否则未来新增字段会被旧 Agent 拒掉）。
+- `run` 新增 `cfg_path` 入参（SIGHUP 重读用）；`SIGHUP` 时若 `server_addr`/`agent_id` 变化则
+  拒绝重载并记 `spec_reload_failed`（需改回并重启进程）。
+- 旧类型删除推迟到本阶段末尾完成：`gse_proto::CollectItem`/`CollectItemsReply`、
+  `ledger::{AgentConfig, CollectItem}` 及其 CRUD、`server.rs` 的 `handle_collect_items` /
+  `push_collect_items(_to)` 与对应两个测试已全部删除（旧表 DDL 保留，仅供一次性搬运）。
 
 **检查点 - 确保所有测试通过**：`cargo test --workspace`。
 

@@ -7,9 +7,8 @@ use std::time::Duration;
 use geminio::app::Error;
 use geminio::{Bytes, End, EndDrivers, EndListener, ListenOptions};
 use gse_proto::{
-    AuthReply, AuthRequest, AgentSpecAck, AgentSpecPush, CollectItemsReply, Command,
-    DataplaneAddrReply, DataplaneAddrRequest, GseError, Heartbeat, HeartbeatReply, JobAck, JobExec,
-    JobResult, Receipt,
+    AgentSpecAck, AgentSpecPush, AuthReply, AuthRequest, Command, DataplaneAddrReply,
+    DataplaneAddrRequest, GseError, Heartbeat, HeartbeatReply, JobAck, JobExec, JobResult, Receipt,
 };
 
 use crate::config::ServerConfig;
@@ -869,61 +868,11 @@ pub async fn push_agent_spec(
     Ok(ack)
 }
 
-/// Agent → Server 拉取本 Agent 应执行的采集项；未认证返回空表。
-async fn handle_collect_items(conn_agent_id: Option<&str>, ledger: &Ledger) -> CollectItemsReply {
-    let Some(agent_id) = conn_agent_id else {
-        return CollectItemsReply::default();
-    };
-    match ledger.list_collect_items(Some(agent_id)).await {
-        Ok(items) => CollectItemsReply {
-            items: items.iter().map(|i| i.to_proto()).collect(),
-        },
-        Err(e) => {
-            eprintln!(
-                "gse-server: list collect_items for {agent_id} failed: {}",
-                e.message
-            );
-            CollectItemsReply::default()
-        }
-    }
-}
 
-/// Server → Agent 推送该 Agent 过滤后的采集项整表；离线会话跳过。
-pub async fn push_collect_items(ledger: &Ledger, registry: &SessionRegistry, agent_id: &str) {
-    let Some(session) = registry.get(agent_id).await else {
-        return;
-    };
-    if session.state != SessionState::Online {
-        return;
-    }
-    let reply = handle_collect_items(Some(agent_id), ledger).await;
-    let body = match serde_json::to_vec(&reply) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("gse-server: encode collect_items for {agent_id} failed: {e}");
-            return;
-        }
-    };
-    if let Err(e) = session.end.call("collect_items", Bytes::from(body)).await {
-        eprintln!("gse-server: push collect_items to {agent_id} failed: {e}");
-    }
-}
 
-/// 向多个 Agent 各推一份过滤后的整表，重复目标只推一次。
-pub async fn push_collect_items_to(
-    ledger: &Ledger,
-    registry: &SessionRegistry,
-    agent_ids: &[String],
-) {
-    let mut seen: Vec<&str> = Vec::new();
-    for id in agent_ids {
-        if seen.contains(&id.as_str()) {
-            continue;
-        }
-        seen.push(id.as_str());
-        push_collect_items(ledger, registry, id).await;
-    }
-}
+
+
+
 
 /// 已认证连接拉取数据面地址；未认证或 agent_id 不符返回 `ok=false`。
 async fn handle_dataplane_addr(
@@ -1307,99 +1256,6 @@ mod tests {
         assert!(reply.ok);
         assert_eq!(reply.ingest_url.as_deref(), Some("http://10.0.0.5:8081"));
         assert_eq!(reply.host_id.as_deref(), Some("h-1"));
-    }
-
-    async fn item(ledger: &Ledger, id: &str, agents: &[&str]) {
-        ledger
-            .upsert_collect_item(&crate::ledger::CollectItem {
-                item_id: id.to_string(),
-                agent_ids: agents.iter().map(|a| a.to_string()).collect(),
-                name: format!("item-{id}"),
-                kind: "metrics_host".to_string(),
-                enabled: true,
-                collector: serde_json::json!({"interval_secs": 15}),
-                storage: serde_json::json!({"retention_days": 1}),
-                updated_at: ledger_stamp(),
-            })
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn collect_items_pull_filters_by_agent_and_reflects_delete() {
-        let ledger = ledger("pull-items").await;
-        item(&ledger, "i-1", &["a-1", "a-2"]).await;
-        item(&ledger, "i-2", &["a-2"]).await;
-
-        // 未认证返回空表。
-        assert!(handle_collect_items(None, &ledger).await.items.is_empty());
-
-        // 只有目标列表包含自己的项。
-        let a1 = handle_collect_items(Some("a-1"), &ledger).await;
-        assert_eq!(a1.items.len(), 1);
-        assert_eq!(a1.items[0].item_id, "i-1");
-        let a2 = handle_collect_items(Some("a-2"), &ledger).await;
-        assert_eq!(a2.items.len(), 2);
-        let a3 = handle_collect_items(Some("a-3"), &ledger).await;
-        assert!(a3.items.is_empty());
-
-        // 删除 i-1 后 a-1 的剩余列表为空，a-2 只剩 i-2。
-        assert!(ledger.delete_collect_item("i-1").await.unwrap());
-        assert!(handle_collect_items(Some("a-1"), &ledger)
-            .await
-            .items
-            .is_empty());
-        let a2 = handle_collect_items(Some("a-2"), &ledger).await;
-        assert_eq!(a2.items.len(), 1);
-        assert_eq!(a2.items[0].item_id, "i-2");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn push_collect_items_reaches_online_agent() {
-        use geminio::{dial, DialOptions};
-
-        let ledger = ledger("push-items").await;
-        item(&ledger, "i-1", &["a-1"]).await;
-        item(&ledger, "i-2", &["a-2"]).await;
-
-        let listener = EndListener::bind("127.0.0.1:0", ListenOptions::default())
-            .await
-            .expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let client_task = tokio::spawn(async move {
-            let (client, _drivers) = dial(addr, DialOptions::default()).await.expect("dial");
-            client
-                .register("collect_items", move |req: Bytes| {
-                    let reply: CollectItemsReply =
-                        serde_json::from_slice(&req).expect("decode push");
-                    let _ = tx.send(reply);
-                    async move { Ok(Bytes::new()) }
-                })
-                .await
-                .expect("register");
-            client
-        });
-        let (server_end, _drivers) = listener.accept().await.expect("accept");
-        let client_end = client_task.await.expect("client");
-
-        let registry = SessionRegistry::new();
-        registry
-            .insert(Session::new("a-1", server_end, now_micros()))
-            .await;
-
-        push_collect_items(&ledger, &registry, "a-1").await;
-        let pushed = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("push timed out")
-            .expect("push received");
-        assert_eq!(pushed.items.len(), 1);
-        assert_eq!(pushed.items[0].item_id, "i-1");
-        assert_eq!(pushed.items[0].agent_ids, vec!["a-1"]);
-
-        // 未知/离线会话静默跳过。
-        push_collect_items(&ledger, &registry, "a-3").await;
-        let _ = client_end;
     }
 
     // ---- per-Agent spec ----

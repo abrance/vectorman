@@ -3,7 +3,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use geminio::Bytes;
-use gse_agent_core::{run as run_agent, AgentConfig};
+use gse_agent_core::AgentConfig;
 use gse_proto::{FileEndpoint, JobStatus};
 use gse_server_core::file_transfer::{submit_file_job, FileJobSubmit};
 use gse_server_core::{
@@ -76,6 +76,12 @@ async fn wait_online(server: &Server, agent_id: &str) {
 /// 会话生命周期回归（本次事故核心）：**连接断开后会话必须被清理**。
 ///
 /// 要用真 `Server::run()` 跑服务端（这样才能覆盖 `handle_conn` 的真实生命周期），
+/// 测试用 agent 入口：`run` 多一个配置文件路径参数（`SIGHUP` 重读用）。
+/// 测试不落盘，给一个不存在的路径即可（只有收到信号才会去读）。
+async fn run_agent(cfg: AgentConfig) -> Result<(), String> {
+    gse_agent_core::run(cfg, "/tmp/gse-agent-e2e-nonexistent.toml".to_string()).await
+}
+
 /// 但客户端用裸 geminio —— `run_agent` 的 driver 是独立 spawn 的，abort 它
 /// 不会断开连接（实测探测会一直成功），无法构造「连接断开」这个场景。
 /// 裸客户端的 `End` 一 drop，连接即断。

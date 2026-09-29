@@ -320,26 +320,6 @@ pub struct DataplaneAddrReply {
     pub reason: Option<String>,
 }
 
-/// 单个采集项：GSE 按 `agent_ids` 过滤后下发，Agent 按 `item_id` 对齐采集器。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CollectItem {
-    pub item_id: String,
-    pub agent_ids: Vec<String>,
-    pub name: String,
-    /// metrics_host | log_file | log_k8s_stdout | apm_otlp。
-    pub kind: String,
-    pub enabled: bool,
-    pub collector: serde_json::Value,
-    pub storage: serde_json::Value,
-}
-
-/// Server → Agent / Agent 拉取：过滤后的采集项整表（可空）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct CollectItemsReply {
-    #[serde(default)]
-    pub items: Vec<CollectItem>,
-}
-
 /// 心跳应答：告诉 Agent 心跳里那份 spec 补报是否已被服务端落库。
 ///
 /// `false` 时 Agent 下一拍继续携带（上限 N 次），否则「发一次丢了」会让服务端
@@ -569,22 +549,6 @@ mod tests {
             host_id: None,
             reason: Some("no online dataplane".to_string()),
         });
-    }
-
-    #[test]
-    fn collect_items_roundtrip() {
-        let item = CollectItem {
-            item_id: "item-1".to_string(),
-            agent_ids: vec!["a-1".to_string(), "a-2".to_string()],
-            name: "cpu".to_string(),
-            kind: "metrics_host".to_string(),
-            enabled: true,
-            collector: serde_json::json!({"interval_secs": 15}),
-            storage: serde_json::json!({"retention_days": 1}),
-        };
-        roundtrip(&item);
-        roundtrip(&CollectItemsReply { items: vec![item] });
-        roundtrip(&CollectItemsReply::default());
     }
 
     #[test]

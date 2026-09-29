@@ -18,7 +18,7 @@ pub use config::{load_config, ServerConfig};
 pub use dataplane::{probe_dataplanes, probe_once};
 pub use http::{router as http_router, AdminState};
 pub use ledger::{
-    AccessPoint, Agent, AgentConfig, AgentSpec, AgentSpecState, DataplaneService, Host, JobRecord,
+    AccessPoint, Agent, AgentSpec, AgentSpecState, AuthOutcome, DataplaneService, Host, JobRecord,
     JobTemplate, Ledger, NewJob, NewJobTemplate,
 };
 pub use rerun::{build_rerun_submit, RerunRequest};
