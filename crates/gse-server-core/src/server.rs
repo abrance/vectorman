@@ -1304,6 +1304,7 @@ mod tests {
             agent_id: "a-1".to_string(),
             ts_micros: now_micros(),
             upgrade_result: None,
+            spec: None,
         };
         let body = Bytes::from(serde_json::to_vec(&hb).expect("encode"));
         handle_heartbeat(&body, &end, cid, &authed, &registry, &ledger).await;
@@ -1337,6 +1338,7 @@ mod tests {
             agent_id: "a-1".to_string(),
             ts_micros: now_micros(),
             upgrade_result: None,
+            spec: None,
         };
         let body = Bytes::from(serde_json::to_vec(&hb).expect("encode"));
         handle_heartbeat(&body, &end, cid, &authed, &registry, &ledger).await;
@@ -1375,6 +1377,7 @@ mod tests {
             agent_id: "a-1".to_string(),
             ts_micros: now_micros(),
             upgrade_result: None,
+            spec: None,
         };
         let body = Bytes::from(serde_json::to_vec(&hb).expect("encode"));
         handle_heartbeat(&body, &end, cid, &authed, &registry, &ledger).await;

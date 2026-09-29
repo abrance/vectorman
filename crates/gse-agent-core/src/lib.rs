@@ -220,6 +220,7 @@ async fn heartbeat_loop(end: &End, agent_id: &str, interval_secs: u64) -> Result
             agent_id: agent_id.to_string(),
             ts_micros: now_micros(),
             upgrade_result: upgrade::unreported_result().map(to_report),
+            spec: None,
         };
         let body = Bytes::from(
             serde_json::to_vec(&hb)

@@ -31,6 +31,13 @@ pub struct Heartbeat {
     /// 结果只能由新启动的 agent 在后续心跳里补报。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgrade_result: Option<UpgradeReport>,
+    /// 生效 spec 的**一次性补报**：连接后的首拍、以及每次应用 spec 后的下一拍各带一次，
+    /// 服务端确认（`HeartbeatReply::spec_synced`）后由 agent 清除。
+    ///
+    /// 为什么要有它：下发回执只在「下发那一刻」到达，若 agent 在服务端落库前掉线、
+    /// 或 agent 侧被人工改回，服务端就永久停在旧 revision。心跳补报是漂移检测的兜底。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<AgentSpecAck>,
 }
 
 /// 升级结果的上行表示（与 agent 侧 `UpgradeResult` 字段对应）。
@@ -333,6 +340,147 @@ pub struct CollectItemsReply {
     pub items: Vec<CollectItem>,
 }
 
+/// 心跳应答：告诉 Agent 心跳里那份 spec 补报是否已被服务端落库。
+///
+/// `false` 时 Agent 下一拍继续携带（上限 N 次），否则「发一次丢了」会让服务端
+/// 永久停在旧 revision（`sync_status = stale`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct HeartbeatReply {
+    #[serde(default)]
+    pub spec_synced: bool,
+}
+
+// ---------- per-Agent spec ----------
+
+/// 本期**没有真实实现**、只记录与上报的 `params` 字段名。
+/// Agent 用它构造 `AgentSpecAck::not_enforced`，服务端与前端据此标注「未实现（仅记录）」。
+/// 升级路径：CPU/内存限制落到作业子进程 `setrlimit`，`log_level` 需要先给 Agent 一个日志级别门控。
+pub const NOT_ENFORCED_FIELDS: [&str; 3] =
+    ["cpu_limit_percent", "mem_limit_percent", "log_level"];
+
+/// `AgentSpecAck::outcome` 的取值。两侧与测试共用这些常量，避免字符串写错。
+pub mod spec_outcome {
+    /// 字段全部生效（`not_enforced` 为空）。
+    pub const APPLIED: &str = "applied";
+    /// revision 与已应用值相同，什么都没做。
+    pub const UNCHANGED: &str = "unchanged";
+    /// 生效，但存在 `not_enforced` 字段。
+    pub const PARTIAL: &str = "partial";
+    /// 拒绝（含不可变字段变更）。
+    pub const REJECTED: &str = "rejected";
+}
+
+/// Agent 运行参数。
+///
+/// 下行为期望值（敏感字段为 `Some`），上行为生效值（敏感字段恒为 `None`，不回声凭据）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpecParams {
+    #[serde(default)]
+    pub heartbeat_interval_secs: u64,
+    #[serde(default)]
+    pub allowed_interpreters: Vec<String>,
+    #[serde(default)]
+    pub job_default_interpreter: String,
+    #[serde(default)]
+    pub max_concurrent_jobs: usize,
+    #[serde(default)]
+    pub job_work_dir: Option<String>,
+    #[serde(default)]
+    pub otlp_enabled: bool,
+    #[serde(default)]
+    pub otlp_listen: String,
+    #[serde(default)]
+    pub otlp_max_body_bytes: usize,
+    /// 敏感：仅下行为 `Some`，Agent 回执恒为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otlp_token: Option<String>,
+    #[serde(default)]
+    pub otlp_allowed_cidrs: Vec<String>,
+    /// 敏感：仅下行为 `Some`，Agent 回执恒为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// 本期仅记录（见 `NOT_ENFORCED_FIELDS`）。
+    #[serde(default)]
+    pub cpu_limit_percent: Option<i64>,
+    /// 本期仅记录。
+    #[serde(default)]
+    pub mem_limit_percent: Option<i64>,
+    /// 本期仅记录。
+    #[serde(default)]
+    pub log_level: String,
+}
+
+/// 手写 `Default`：**不能是 `String::default()` / `0` 那一套**。
+///
+/// 理由具体：`heartbeat_interval_secs = 0` 会同时被本项目的下发校验（> 0）判非法，
+/// 也会让 Agent 退化成零间隔心跳；`allowed_interpreters` 为空会让所有作业被拒；
+/// `otlp_listen` 为空会让 OTLP 采集器绑不上。缺省值必须与
+/// `crates/gse-agent-core/src/config.rs` 的 `AgentConfig::default()` 一致。
+impl Default for SpecParams {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval_secs: 30,
+            allowed_interpreters: vec!["bash".to_string(), "sh".to_string(), "python3".to_string()],
+            job_default_interpreter: "bash".to_string(),
+            max_concurrent_jobs: 1,
+            job_work_dir: None,
+            otlp_enabled: false,
+            otlp_listen: "0.0.0.0:4318".to_string(),
+            otlp_max_body_bytes: 8 * 1024 * 1024,
+            otlp_token: None,
+            otlp_allowed_cidrs: Vec::new(),
+            token: None,
+            cpu_limit_percent: None,
+            mem_limit_percent: None,
+            log_level: "info".to_string(),
+        }
+    }
+}
+
+/// 一条采集项。归属由所在的 spec 决定，**没有 `agent_ids`**。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpecItem {
+    pub item_id: String,
+    pub name: String,
+    /// metrics_host | log_file | log_k8s_stdout | apm_otlp | ebpf_network | ebpf_tcp | ebpf_process | ebpf_syscall。
+    pub kind: String,
+    pub enabled: bool,
+    pub collector: serde_json::Value,
+    pub storage: serde_json::Value,
+}
+
+/// 一台 Agent 的完整期望状态。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct AgentSpecWire {
+    #[serde(default)]
+    pub params: SpecParams,
+    #[serde(default)]
+    pub items: Vec<SpecItem>,
+}
+
+/// Server → Agent（推送与拉取应答共用）。`revision` 为空表示无期望 spec。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct AgentSpecPush {
+    #[serde(default)]
+    pub revision: String,
+    #[serde(default)]
+    pub spec: Option<AgentSpecWire>,
+}
+
+/// Agent → Server 的应用回执。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentSpecAck {
+    pub revision: String,
+    /// 取值见 [`spec_outcome`]。
+    pub outcome: String,
+    pub applied: AgentSpecWire,
+    /// 收到但未真实实现的字段名，见 [`NOT_ENFORCED_FIELDS`]。
+    #[serde(default)]
+    pub not_enforced: Vec<String>,
+    #[serde(default)]
+    pub detail: String,
+}
+
 impl GseError {
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
@@ -461,6 +609,7 @@ mod tests {
             agent_id: "web-01".to_string(),
             ts_micros: 1_700_000_000_000_000,
             upgrade_result: None,
+            spec: None,
         });
     }
 
@@ -660,6 +809,152 @@ mod tests {
             error: None,
         });
     }
+
+    // ---- Agent spec ----
+
+    #[test]
+    fn spec_params_secrets_are_omitted_when_none() {
+        // Agent 回执里的生效值不回声凭据：None 时 JSON 里必须**没有**这两个 key，
+        // 否则「没值」与「值为空串」在两端分不清。
+        let params = SpecParams {
+            heartbeat_interval_secs: 30,
+            token: None,
+            otlp_token: None,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&params).expect("encode");
+        assert!(!json.contains("\"token\""), "{json}");
+        assert!(!json.contains("otlp_token"), "{json}");
+        // 下行可以带凭据。
+        let with_secret = SpecParams {
+            token: Some("t".into()),
+            otlp_token: Some("o".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&with_secret).expect("encode");
+        assert!(json.contains("\"token\":\"t\""), "{json}");
+        roundtrip(&with_secret);
+        roundtrip(&params);
+    }
+
+    #[test]
+    fn agent_spec_wire_roundtrips_and_is_stable() {
+        let wire = AgentSpecWire {
+            params: SpecParams {
+                heartbeat_interval_secs: 15,
+                allowed_interpreters: vec!["bash".into()],
+                job_default_interpreter: "bash".into(),
+                max_concurrent_jobs: 2,
+                job_work_dir: None,
+                otlp_enabled: true,
+                otlp_listen: "0.0.0.0:4318".into(),
+                otlp_max_body_bytes: 1024,
+                otlp_token: None,
+                otlp_allowed_cidrs: vec![],
+                token: None,
+                cpu_limit_percent: Some(50),
+                mem_limit_percent: None,
+                log_level: "info".into(),
+            },
+            items: vec![SpecItem {
+                item_id: "i1".into(),
+                name: "app log".into(),
+                kind: "log_file".into(),
+                enabled: true,
+                collector: serde_json::json!({"path_patterns": ["/var/log/*.log"]}),
+                storage: serde_json::json!({"retention_days": 7}),
+            }],
+        };
+        roundtrip(&wire);
+        // revision 是 spec JSON 的哈希 —— 同一份 wire 两次编码必须逐字节相同。
+        assert_eq!(
+            serde_json::to_string(&wire).expect("encode"),
+            serde_json::to_string(&wire).expect("encode")
+        );
+        // collector / storage 是自由 JSON：键的插入顺序不得影响编码结果
+        // （serde_json 默认 Map 是 BTreeMap，按键排序），否则 revision 会飘。
+        let a = serde_json::json!({"b": 1, "a": 2});
+        let b = serde_json::json!({"a": 2, "b": 1});
+        assert_eq!(
+            serde_json::to_string(&a).expect("encode"),
+            serde_json::to_string(&b).expect("encode")
+        );
+    }
+
+    #[test]
+    fn empty_spec_push_means_no_desired_spec() {
+        let push = AgentSpecPush::default();
+        assert!(push.revision.is_empty());
+        assert!(push.spec.is_none());
+        let back = roundtrip(&push);
+        assert_eq!(back.revision, "");
+        // 空 revision 的语义是「无期望 spec，Agent 保持本地基线」。
+        assert!(back.spec.is_none());
+    }
+
+    #[test]
+    fn agent_spec_ack_roundtrips() {
+        let ack = AgentSpecAck {
+            revision: "ab12".into(),
+            outcome: spec_outcome::PARTIAL.into(),
+            applied: AgentSpecWire::default(),
+            not_enforced: NOT_ENFORCED_FIELDS.iter().map(|s| s.to_string()).collect(),
+            detail: String::new(),
+        };
+        let back = roundtrip(&ack);
+        assert_eq!(back.outcome, "partial");
+        assert_eq!(back.not_enforced.len(), 3);
+    }
+
+    #[test]
+    fn heartbeat_spec_field_is_optional_on_the_wire() {
+        let hb = Heartbeat {
+            agent_id: "a-1".into(),
+            ts_micros: 1,
+            upgrade_result: None,
+            spec: None,
+        };
+        let json = serde_json::to_string(&hb).expect("encode");
+        assert!(!json.contains("\"spec\""), "{json}");
+        roundtrip(&hb);
+        // 旧 agent 发的报文没有 spec 字段 —— 必须能解出来（向后兼容）。
+        let legacy: Heartbeat = serde_json::from_str(
+            r#"{"agent_id":"a-1","ts_micros":7}"#,
+        )
+        .expect("decode legacy");
+        assert!(legacy.spec.is_none());
+        assert!(legacy.upgrade_result.is_none());
+        // 带补报的心跳也要能往返。
+        roundtrip(&Heartbeat {
+            spec: Some(AgentSpecAck {
+                revision: "ab12".into(),
+                outcome: spec_outcome::APPLIED.into(),
+                applied: AgentSpecWire::default(),
+                not_enforced: vec![],
+                detail: "ok".into(),
+            }),
+            ..hb
+        });
+    }
+
+    #[test]
+    fn spec_params_default_is_usable() {
+        // 缺省值必须是「能直接下发的合法配置」，否则迁移与「无期望 spec」路径会推出一份坏配置。
+        let p = SpecParams::default();
+        assert_eq!(p.heartbeat_interval_secs, 30);
+        assert!(!p.allowed_interpreters.is_empty());
+        assert_eq!(p.job_default_interpreter, "bash");
+        assert_eq!(p.max_concurrent_jobs, 1);
+        assert_eq!(p.otlp_listen, "0.0.0.0:4318");
+        assert_eq!(p.otlp_max_body_bytes, 8 * 1024 * 1024);
+        assert_eq!(p.log_level, "info");
+    }
+
+    #[test]
+    fn heartbeat_reply_defaults_to_not_synced() {
+        let reply: HeartbeatReply = serde_json::from_str("{}").expect("decode");
+        assert!(!reply.spec_synced, "缺字段时保守取「未确认」，让 agent 继续补报");
+    }
 }
 
 #[cfg(test)]
@@ -701,6 +996,7 @@ mod job_kind_compat_tests {
             agent_id: "a".to_string(),
             ts_micros: 1,
             upgrade_result: None,
+            spec: None,
         };
         let json = serde_json::to_string(&hb).expect("encode");
         assert!(!json.contains("upgrade_result"), "无结果时不应出现在报文里");
@@ -721,6 +1017,7 @@ mod job_kind_compat_tests {
                 outcome: "succeeded".into(),
                 detail: String::new(),
             }),
+            spec: None,
         };
         let json = serde_json::to_string(&hb).expect("encode");
         let back: Heartbeat = serde_json::from_str(&json).expect("decode");

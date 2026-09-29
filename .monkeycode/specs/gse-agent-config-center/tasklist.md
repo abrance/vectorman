@@ -5,41 +5,47 @@
 
 ## 阶段 1：协议
 
-- [ ] 1.1 `crates/gse-proto/src/lib.rs` 新增 `SpecParams` / `SpecItem` / `AgentSpecWire` /
+- [x] 1.1 `crates/gse-proto/src/lib.rs` 新增 `SpecParams` / `SpecItem` / `AgentSpecWire` /
       `AgentSpecPush` / `AgentSpecAck` / `HeartbeatReply`；`Heartbeat` 增可选一次性补报字段
-      （`skip_serializing_if`）。—— 对应 需求 R1/R2/R8、设计「协议」。
-- [ ] 1.2 删除 `CollectItem` 的 `agent_ids` 与 `CollectItemsReply`，删除 `CollectItem`，
-      改 `pub struct SpecItem`；同步修所有编译错误（`gse-server-core`、`gse-agent-core`）。
+      （`skip_serializing_if`）；另加 `NOT_ENFORCED_FIELDS` 与 `spec_outcome` 常量表。
+      **实现补充**：`SpecParams` 手写 `Default`（不能用派生：`heartbeat_interval_secs = 0` 会被自己的校验判非法、
+      `allowed_interpreters` 为空会让所有作业被拒）。—— 对应 需求 R1/R2/R8、设计「协议」。
+- [ ] 1.2 **推迟到阶段 5 之后**：删除 `gse-proto::CollectItem` / `CollectItemsReply` 与
+      `ledger::CollectItem` / `AgentConfig` 及各自 CRUD。理由：阶段 3/4/5 逐块替换期间保留旧路径，
+      让每个阶段结束时 workspace 都能编译并跑测试；最后一个引用消失后再删。
       —— 对应 需求 R1/R12 破坏性变更 3。
-- [ ] 1.3 单测：新类型序列化（敏感字段 `None` 时不出现 `key:null`）；旧 payload 缺字段走 default；
-      `AgentSpecWire` 字段顺序稳定（revision 依赖）。—— 对应 需求 R2/R8。
+- [x] 1.3 单测：新类型序列化（敏感字段 `None` 时不出现 `key:null`）；旧 payload 缺字段走 default；
+      `AgentSpecWire` 字段顺序稳定（revision 依赖，含 `collector`/`storage` 自由 JSON 的键序稳定性）。
+      —— 对应 需求 R2/R8。实测 `cargo test -p gse-proto` 33 通过。
 
 **检查点 - 确保所有测试通过**：`cargo test -p gse-proto`。
 
 ## 阶段 2：台账与一次性迁移
 
-- [ ] 2.1 `crates/gse-server-core/src/ledger.rs` 新增 `agent_specs` / `agent_spec_states` 建表语句与
-      `AgentSpec` / `AgentSpecState` / `SpecDiff` / `FieldPair` / `ItemDiff` 结构。
+- [x] 2.1 `crates/gse-server-core/src/ledger.rs` 新增 `agent_specs` / `agent_spec_states` 建表语句与
+      `AgentSpec` / `AgentSpecState` 结构；`SpecDiff` / `FieldPair` / `ItemDiff` 落在新模块
+      `crates/gse-server-core/src/spec.rs`（纯逻辑，见 2.4）。
       —— 对应 需求 R3、设计「数据模型」。
-- [ ] 2.2 `agents` 表加 `prev_token`：`ALTER TABLE agents ADD COLUMN prev_token TEXT`，
-      忽略「列已存在」错误（唯一允许的加列场景）。
-      —— 对应 需求 R3/R7、设计 Pitfall 1。
-- [ ] 2.3 实现 spec 台账 CRUD：`upsert_agent_spec` / `get_agent_spec` / `list_agent_specs` /
-      `upsert_agent_spec_state` / `get_agent_spec_state` / `list_agent_spec_states`。
-      —— 对应 需求 R2/R3。
-- [ ] 2.4 实现 `revision(spec)`（`hashutil::sha256_hex` 前 16 位）与 `SpecDiff` 计算
-      （`params` 逐非敏感字段 + `items` 按 `item_id` 的增/删/改）。
+- [x] 2.2 `agents` 表加 `prev_token`：`migrate_agents_prev_token()` 走既有 `PRAGMA table_info` 幂等模式
+      （比「忽略报错」更早发现真问题）。—— 对应 需求 R3/R7、设计 Pitfall 1。
+- [x] 2.3 实现 spec 台账 CRUD：`upsert_agent_spec` / `get_agent_spec` / `list_agent_specs` /
+      `upsert_agent_spec_state` / `get_agent_spec_state` / `list_agent_spec_states`；
+      另加认证凭据三方法 `agent_tokens` / `rotate_agent_token` / `clear_agent_prev_token`
+      （轮换走**单条 UPDATE**，不能分两步）。—— 对应 需求 R2/R3/R7。
+- [x] 2.4 新增 `crates/gse-server-core/src/spec.rs`：`revision(spec)`（`sha256_hex` 前 16 位）与
+      `diff(desired, applied)`（`params` 逐非敏感字段 + `items` 按 `item_id` 的增/删/改，**忽略数组顺序**）。
       —— 对应 需求 R2/R8、设计「revision」。
-- [ ] 2.5 实现 `migrate_legacy_tables()`：`agent_configs` → `params`；`collect_items` 按 `agent_ids`
-      **展开**成各 Agent 的 `items`（含"只出现在 collect_items 里的 Agent"）；`agent_specs` 非空则跳过。
+- [x] 2.5 实现 `migrate_legacy_specs()`：`agent_configs` → `params`；`collect_items` 按 `agent_ids`
+      **展开**成各 Agent 的 `items`（含「只出现在 collect_items 里的 Agent」）；`agent_specs` 非空则跳过。
       —— 对应 需求 R3、设计「一次性迁移」。
 - [ ] 2.6 删除旧 `AgentConfig` / `CollectItem` 的台账类型与全部 CRUD（`upsert_agent_config` 等、
       `list/get/upsert/delete_collect_item` 与 `row_to_*`），保留两张旧表的建表语句并标注「遗留表」；
       同步改 `crates/gse-server-core/src/lib.rs` 的导出。
       —— 对应 需求 R12、设计「一次性迁移」。
-- [ ] 2.7 单测：revision 幂等；diff（params 多/单/零字段、items 增删改）；迁移展开正确 +
-      重复启动不重复写 + 只出现在 collect_items 的 Agent 也建 spec。
-      —— 对应 需求 R2/R3/R8、设计 Correctness Property 1/8。
+- [x] 2.7 单测（13 条新用例）：revision 幂等与内容寻址（含 token 参与哈希）；diff（零/单/多字段、
+      敏感字段忽略、items 增删改、数组顺序无关）；迁移展开 + 只出现在 collect_items 的 Agent 也建 spec
+      + **已有 spec 不被旧表覆盖**；坏 spec 行报错而非静默返回空 spec；token 轮换宽限往返。
+      —— 对应 需求 R2/R3/R8、设计 Correctness Property 1/8/10。实测 `cargo test --workspace` 全绿。
 
 **检查点 - 确保所有测试通过**：`cargo test -p gse-server-core`。
 
