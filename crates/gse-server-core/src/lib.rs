@@ -22,10 +22,10 @@ pub use ledger::{
     JobTemplate, Ledger, NewJob, NewJobTemplate,
 };
 pub use rerun::{build_rerun_submit, RerunRequest};
-pub use spec::{diff as spec_diff, revision as spec_revision, FieldPair, ItemDiff, SpecDiff};
 pub use server::{
     handle_job_result, submit_job, submit_job_with_source, submit_job_with_template, submit_rerun,
     JobSubmit, Server,
 };
 pub use session::{now_micros, Session, SessionRegistry, SessionState};
+pub use spec::{diff as spec_diff, revision as spec_revision, FieldPair, ItemDiff, SpecDiff};
 pub use template::{expand, extract_variables, validate_placeholders, ExpandedJob, TemplateInput};

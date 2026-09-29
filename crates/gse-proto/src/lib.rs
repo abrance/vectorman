@@ -335,8 +335,7 @@ pub struct HeartbeatReply {
 /// 本期**没有真实实现**、只记录与上报的 `params` 字段名。
 /// Agent 用它构造 `AgentSpecAck::not_enforced`，服务端与前端据此标注「未实现（仅记录）」。
 /// 升级路径：CPU/内存限制落到作业子进程 `setrlimit`，`log_level` 需要先给 Agent 一个日志级别门控。
-pub const NOT_ENFORCED_FIELDS: [&str; 3] =
-    ["cpu_limit_percent", "mem_limit_percent", "log_level"];
+pub const NOT_ENFORCED_FIELDS: [&str; 3] = ["cpu_limit_percent", "mem_limit_percent", "log_level"];
 
 /// `AgentSpecAck::outcome` 的取值。两侧与测试共用这些常量，避免字符串写错。
 pub mod spec_outcome {
@@ -882,10 +881,8 @@ mod tests {
         assert!(!json.contains("\"spec\""), "{json}");
         roundtrip(&hb);
         // 旧 agent 发的报文没有 spec 字段 —— 必须能解出来（向后兼容）。
-        let legacy: Heartbeat = serde_json::from_str(
-            r#"{"agent_id":"a-1","ts_micros":7}"#,
-        )
-        .expect("decode legacy");
+        let legacy: Heartbeat =
+            serde_json::from_str(r#"{"agent_id":"a-1","ts_micros":7}"#).expect("decode legacy");
         assert!(legacy.spec.is_none());
         assert!(legacy.upgrade_result.is_none());
         // 带补报的心跳也要能往返。
@@ -917,7 +914,10 @@ mod tests {
     #[test]
     fn heartbeat_reply_defaults_to_not_synced() {
         let reply: HeartbeatReply = serde_json::from_str("{}").expect("decode");
-        assert!(!reply.spec_synced, "缺字段时保守取「未确认」，让 agent 继续补报");
+        assert!(
+            !reply.spec_synced,
+            "缺字段时保守取「未确认」，让 agent 继续补报"
+        );
     }
 }
 

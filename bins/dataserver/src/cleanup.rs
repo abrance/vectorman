@@ -187,7 +187,11 @@ pub fn parse_agent_specs(body: &str) -> Vec<LiveItem> {
             if item_id.is_empty() {
                 continue;
             }
-            if !item.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true) {
+            if !item
+                .get("enabled")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(true)
+            {
                 continue;
             }
             let kind = item
@@ -201,11 +205,13 @@ pub fn parse_agent_specs(body: &str) -> Vec<LiveItem> {
             } else {
                 retention_days_from_item(item)
             };
-            let entry = by_id.entry(item_id.to_string()).or_insert_with(|| LiveItem {
-                item_id: item_id.to_string(),
-                retention_days: days,
-                kind: kind.clone(),
-            });
+            let entry = by_id
+                .entry(item_id.to_string())
+                .or_insert_with(|| LiveItem {
+                    item_id: item_id.to_string(),
+                    retention_days: days,
+                    kind: kind.clone(),
+                });
             entry.retention_days = entry.retention_days.max(days);
             if entry.kind.is_empty() {
                 entry.kind = kind;
@@ -258,8 +264,11 @@ pub async fn mark_removed_items(
         let days = clamp_retention_days(days);
         let until = now_micros + days as i64 * MICROS_PER_DAY;
         let payload = json!({"until_micros": until});
-        kv.set(retain_key(item_id).as_bytes(), payload.to_string().as_bytes())
-            .await?;
+        kv.set(
+            retain_key(item_id).as_bytes(),
+            payload.to_string().as_bytes(),
+        )
+        .await?;
         kv.delete(&key).await?;
         marked += 1;
         println!("retention: item {item_id} left the specs, retain for {days} day(s)");
@@ -763,7 +772,9 @@ mod ebpf_retention_tests {
         );
 
         // 第二轮：i2 消失、i1 保留 → 只给 i2 排删除，按它自己的 1 天。
-        let marked = mark_removed_items(&kv, &[live("i1", 7)], now).await.expect("mark");
+        let marked = mark_removed_items(&kv, &[live("i1", 7)], now)
+            .await
+            .expect("mark");
         assert_eq!(marked, 1);
         let raw = kv.get(retain_key("i2").as_bytes()).await.expect("retain");
         let meta: Value = serde_json::from_slice(&raw).expect("json");
@@ -794,12 +805,17 @@ mod ebpf_retention_tests {
         let kv = dataplane_kv::RedbKvStore::new(dir.path().join("kv")).unwrap();
         let now = 5_000_000i64;
 
-        mark_removed_items(&kv, &[live("i1", 9)], now).await.expect("mark");
+        mark_removed_items(&kv, &[live("i1", 9)], now)
+            .await
+            .expect("mark");
         mark_removed_items(&kv, &[], now).await.expect("mark");
 
         let raw = kv.get(retain_key("i1").as_bytes()).await.expect("retain");
         let meta: Value = serde_json::from_slice(&raw).expect("json");
-        assert_eq!(meta["until_micros"].as_i64(), Some(now + 9 * MICROS_PER_DAY));
+        assert_eq!(
+            meta["until_micros"].as_i64(),
+            Some(now + 9 * MICROS_PER_DAY)
+        );
     }
 }
 

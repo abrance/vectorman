@@ -870,9 +870,9 @@ impl vectorman_metrics::MetricsSink for LocalTsSink {
 
 #[cfg(test)]
 mod tests {
+    use crate::cleanup::{mark_removed_items, LiveItem, MICROS_PER_DAY};
     use axum::body::{Body, Bytes};
     use axum::http::{Method, Request, StatusCode};
-    use crate::cleanup::{mark_removed_items, LiveItem, MICROS_PER_DAY};
     use dataplane_core::{resolve_data_paths, NoopAuth};
     use dataplane_file::DirFileStore;
     use dataplane_kv::RedbKvStore;

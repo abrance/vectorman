@@ -791,7 +791,9 @@ async fn record_spec_report(
     }
     let desired = ledger.get_agent_spec(agent_id).await?;
     let diff = match desired.as_ref() {
-        Some(d) => crate::spec::diff(&d.spec, &ack.applied).map_err(|e| GseError::new("internal", e))?,
+        Some(d) => {
+            crate::spec::diff(&d.spec, &ack.applied).map_err(|e| GseError::new("internal", e))?
+        }
         None => crate::spec::SpecDiff::default(),
     };
     ledger
@@ -867,12 +869,6 @@ pub async fn push_agent_spec(
     }
     Ok(ack)
 }
-
-
-
-
-
-
 
 /// 已认证连接拉取数据面地址；未认证或 agent_id 不符返回 `ok=false`。
 async fn handle_dataplane_addr(
@@ -1339,9 +1335,7 @@ mod tests {
                     let push: AgentSpecPush = serde_json::from_slice(&req).expect("decode push");
                     let ack = ack_of(&push, gse_proto::spec_outcome::APPLIED);
                     let _ = tx.send(push);
-                    async move {
-                        Ok(Bytes::from(serde_json::to_vec(&ack).expect("encode ack")))
-                    }
+                    async move { Ok(Bytes::from(serde_json::to_vec(&ack).expect("encode ack"))) }
                 })
                 .await
                 .expect("register");

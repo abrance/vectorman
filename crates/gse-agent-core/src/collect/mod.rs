@@ -76,7 +76,8 @@ impl CollectShared {
         token: String,
         allowed_cidrs: Vec<String>,
     ) {
-        *self.otlp.get_mut() = OtlpRuntime::new(enabled, listen, max_body_bytes, token, allowed_cidrs);
+        *self.otlp.get_mut() =
+            OtlpRuntime::new(enabled, listen, max_body_bytes, token, allowed_cidrs);
     }
 
     /// 热改 OTLP 参数（spec 下发路径）。调用方随后要投递 [`Control::SpecChanged`]

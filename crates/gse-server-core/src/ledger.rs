@@ -941,7 +941,11 @@ impl Ledger {
     /// 轮换 token：**同一条语句**把旧值挪到 `prev_token` 并写入新值。
     ///
     /// 不能分两步：中间失败会让 Agent 用新 token 重连被拒、也回不到旧 token（永久失联）。
-    pub async fn rotate_agent_token(&self, agent_id: &str, new_token: &str) -> Result<(), GseError> {
+    pub async fn rotate_agent_token(
+        &self,
+        agent_id: &str,
+        new_token: &str,
+    ) -> Result<(), GseError> {
         self.execute(
             "UPDATE agents SET prev_token = token, token = ? WHERE agent_id = ?",
             &[text(new_token), text(agent_id)],
@@ -1496,7 +1500,6 @@ fn text(v: &str) -> SqlValue {
     SqlValue::Text(v.to_string())
 }
 
-
 fn opt_text(v: Option<&str>) -> SqlValue {
     v.map(text).unwrap_or(SqlValue::Null)
 }
@@ -1713,8 +1716,6 @@ fn row_to_dataplane(columns: &[String], row: &[SqlValue]) -> DataplaneService {
     }
 }
 
-
-
 fn row_to_job(columns: &[String], row: &[SqlValue]) -> JobRecord {
     let status = JobStatus::parse(&field_text(columns, row, "status")).unwrap_or(JobStatus::Lost);
     let args: Vec<String> =
@@ -1909,7 +1910,10 @@ mod tests {
             detail: "ok".to_string(),
             reported_at: ledger_stamp(),
         };
-        ledger.upsert_agent_spec_state(&state).await.expect("upsert");
+        ledger
+            .upsert_agent_spec_state(&state)
+            .await
+            .expect("upsert");
         let got = ledger
             .get_agent_spec_state("a-1")
             .await
@@ -2016,10 +2020,7 @@ mod tests {
             )
             .await
             .expect("insert corrupt row");
-        let err = ledger
-            .get_agent_spec("bad")
-            .await
-            .expect_err("必须报错");
+        let err = ledger.get_agent_spec("bad").await.expect_err("必须报错");
         assert_eq!(err.code, "internal");
         assert!(ledger.list_agent_specs().await.is_err());
     }
@@ -2092,16 +2093,25 @@ mod tests {
             .expect("upsert agent");
 
         assert_eq!(
-            ledger.verify_agent_token("a-1", "old").await.expect("verify"),
+            ledger
+                .verify_agent_token("a-1", "old")
+                .await
+                .expect("verify"),
             AuthOutcome::Current,
             "没有轮换时旧值就是当前值"
         );
         assert_eq!(
-            ledger.verify_agent_token("a-1", "nope").await.expect("verify"),
+            ledger
+                .verify_agent_token("a-1", "nope")
+                .await
+                .expect("verify"),
             AuthOutcome::Rejected
         );
         assert_eq!(
-            ledger.verify_agent_token("ghost", "old").await.expect("verify"),
+            ledger
+                .verify_agent_token("ghost", "old")
+                .await
+                .expect("verify"),
             AuthOutcome::Rejected,
             "不存在的 agent 不能认证"
         );
@@ -2113,11 +2123,17 @@ mod tests {
         // 这就是「下发是手动的」带来的窗口：agent 手上可能还是旧 token，
         // 必须放行，否则它会永久失联、也就永远收不到新 token。
         assert_eq!(
-            ledger.verify_agent_token("a-1", "old").await.expect("verify"),
+            ledger
+                .verify_agent_token("a-1", "old")
+                .await
+                .expect("verify"),
             AuthOutcome::Previous
         );
         assert_eq!(
-            ledger.verify_agent_token("a-1", "new").await.expect("verify"),
+            ledger
+                .verify_agent_token("a-1", "new")
+                .await
+                .expect("verify"),
             AuthOutcome::Current
         );
         // check_auth 也必须跟着放行旧值（它是同一份逻辑的布尔投影）。
@@ -2125,7 +2141,10 @@ mod tests {
 
         ledger.clear_agent_prev_token("a-1").await.expect("clear");
         assert_eq!(
-            ledger.verify_agent_token("a-1", "old").await.expect("verify"),
+            ledger
+                .verify_agent_token("a-1", "old")
+                .await
+                .expect("verify"),
             AuthOutcome::Rejected,
             "宽限已结束，旧 token 必须被拒"
         );
@@ -2208,8 +2227,6 @@ mod tests {
             Some("http://b:8081")
         );
     }
-
-
 
     #[tokio::test]
     async fn host_crud_roundtrip() {

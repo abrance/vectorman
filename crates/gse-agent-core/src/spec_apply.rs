@@ -177,8 +177,7 @@ pub fn not_enforced_fields(params: &SpecParams) -> Vec<String> {
             // 每台 Agent 都挂一条「未实现」提示会把信号淹掉，所以只标明显偏离缺省的值。
             // 注意这不是「假装生效」：真设了 `debug`/`warn` 照样会被标出来。
             "log_level" => {
-                !params.log_level.is_empty()
-                    && params.log_level != SpecParams::default().log_level
+                !params.log_level.is_empty() && params.log_level != SpecParams::default().log_level
             }
             _ => false,
         };
@@ -316,9 +315,7 @@ async fn apply_spec(rt: &Arc<RuntimeConfig>, spec: &AgentSpecWire) {
     // 采集项整表对齐（含删除/停用 → 停掉采集器）。
     // 先过一遍归一化：空 item_id / 空 kind 的项会让采集器挂在一个无法对齐的键上。
     let items = normalize_items(spec.items.clone());
-    rt.collector
-        .apply_spec(items.clone(), otlp_changed)
-        .await;
+    rt.collector.apply_spec(items.clone(), otlp_changed).await;
 
     // token：变更即主动重连重认证（唯一需要断连的字段）。
     if let Some(new_token) = params.token.as_deref() {
@@ -395,7 +392,10 @@ mod tests {
     fn push(revision: &str, spec: SpecParams, items: Vec<SpecItem>) -> AgentSpecPush {
         AgentSpecPush {
             revision: revision.to_string(),
-            spec: Some(AgentSpecWire { params: spec, items }),
+            spec: Some(AgentSpecWire {
+                params: spec,
+                items,
+            }),
         }
     }
 
@@ -419,7 +419,10 @@ mod tests {
             cpu_limit_percent: Some(50),
             ..Default::default()
         };
-        assert_eq!(not_enforced_fields(&p), vec!["cpu_limit_percent".to_string()]);
+        assert_eq!(
+            not_enforced_fields(&p),
+            vec!["cpu_limit_percent".to_string()]
+        );
 
         // 与缺省不同的 log_level 才算「配了个值」。
         let p = SpecParams {
@@ -443,7 +446,9 @@ mod tests {
         assert!(rejects_immutable_fields(raw).unwrap().contains("agent_id"));
         // params 层。
         let raw = br#"{"revision":"r","spec":{"params":{"server_addr":"1.2.3.4:7100"}}}"#;
-        assert!(rejects_immutable_fields(raw).unwrap().contains("server_addr"));
+        assert!(rejects_immutable_fields(raw)
+            .unwrap()
+            .contains("server_addr"));
         // 非 JSON：交给下面的类型解码去报错。
         assert!(rejects_immutable_fields(b"not json").is_none());
     }

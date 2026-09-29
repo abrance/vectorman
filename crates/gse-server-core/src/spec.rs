@@ -88,7 +88,12 @@ pub fn diff(desired: &AgentSpecWire, applied: &AgentSpecWire) -> Result<SpecDiff
     let by_id = |items: &[SpecItem]| -> BTreeMap<String, String> {
         items
             .iter()
-            .map(|i| (i.item_id.clone(), serde_json::to_string(i).unwrap_or_default()))
+            .map(|i| {
+                (
+                    i.item_id.clone(),
+                    serde_json::to_string(i).unwrap_or_default(),
+                )
+            })
             .collect()
     };
     let did = by_id(&desired.items);

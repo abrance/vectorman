@@ -27,8 +27,7 @@ use crate::config::ServerConfig;
 use crate::file_transfer::{submit_file_job, submit_file_rerun, FileJobSubmit};
 use crate::job_file_store::JobFileStore;
 use crate::ledger::{
-    ledger_stamp, AccessPoint, Agent, DataplaneService, Host,
-    JobTemplate, Ledger,
+    ledger_stamp, AccessPoint, Agent, DataplaneService, Host, JobTemplate, Ledger,
 };
 use crate::rerun::RerunRequest;
 use crate::server::{submit_job, submit_job_with_template, submit_rerun, JobSubmit};
@@ -1148,7 +1147,10 @@ async fn put_agent_spec(
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
 
-    let params = match body.params.into_params(existing.as_ref().map(|e| &e.spec.params)) {
+    let params = match body
+        .params
+        .into_params(existing.as_ref().map(|e| &e.spec.params))
+    {
         Ok(p) => p,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
     };
@@ -1215,7 +1217,10 @@ async fn put_agent_spec(
 }
 
 /// 下发该 Agent 的期望 spec 并取回执。
-async fn apply_agent_spec(State(admin): State<AdminState>, Path(agent_id): Path<String>) -> Response {
+async fn apply_agent_spec(
+    State(admin): State<AdminState>,
+    Path(agent_id): Path<String>,
+) -> Response {
     let Some(registry) = admin.registry.as_ref() else {
         return err_json(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1992,11 +1997,7 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
 
         // 未登记的 Agent 不能存 spec。
-        let (status, body) = send(
-            &mut app,
-            req("GET", "/api/gse/agents/ghost/spec", None),
-        )
-        .await;
+        let (status, body) = send(&mut app, req("GET", "/api/gse/agents/ghost/spec", None)).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
         let (status, body) = send(
             &mut app,
@@ -2261,11 +2262,17 @@ mod tests {
             r#"{"name":"apm","kind":"apm_otlp","collector":{"service_allowlist":["order-api"],"batch_max_records":50,"flush_interval_secs":10},"storage":{"retention_days":3}}"#,
             r#"{"name":"app log","kind":"log_file","collector":{"path_patterns":["/var/log/*.log"]}}"#,
         ];
-        let body = format!(r#"{{"params":{{"heartbeat_interval_secs":15}},"items":[{}]}}"#, items.join(","));
+        let body = format!(
+            r#"{{"params":{{"heartbeat_interval_secs":15}},"items":[{}]}}"#,
+            items.join(",")
+        );
         let (status, resp) = send(&mut app, put(&body)).await;
         assert_eq!(status, StatusCode::OK, "{resp}");
         assert!(resp.contains("\"retention_days\":3"), "{resp}");
-        assert!(resp.contains("\"retention_days\":1"), "缺省应回落 1 天: {resp}");
+        assert!(
+            resp.contains("\"retention_days\":1"),
+            "缺省应回落 1 天: {resp}"
+        );
         assert!(resp.contains("ebpf_syscall"), "{resp}");
 
         // 生成的 item_id 稳定：读回来还是那一批。
@@ -2285,7 +2292,10 @@ mod tests {
         assert_eq!(view["session_state"], "absent");
 
         // 再存一次同样的 items（带原 item_id）→ revision 不变（幂等）。
-        let rev1 = view["desired"]["revision"].as_str().expect("rev").to_string();
+        let rev1 = view["desired"]["revision"]
+            .as_str()
+            .expect("rev")
+            .to_string();
         let items_with_ids: Vec<String> = view["desired"]["spec"]["items"]
             .as_array()
             .expect("items")
