@@ -54,6 +54,11 @@ data:
     heartbeat_interval_secs = 30
     # 集群内不接收 OTLP（应用要发 span 时再打开，并另配 Service/NodePort）。
     otlp_enabled = false
+    # 解释器：镜像基于 alpine，只有 busybox 的 `sh`（没有 bash / python3）。
+    # 不配这两项的话作业会 spawn 失败 —— 而且**下发 spec 里的同名字段会覆盖这里**，
+    # 所以 spec 里也要是 ["sh"] / "sh"。
+    allowed_interpreters = ["sh"]
+    job_default_interpreter = "sh"
 ---
 # 台账里预登记的 Agent token（与 /api/gse/agents 登记时用的值一致）。
 apiVersion: v1

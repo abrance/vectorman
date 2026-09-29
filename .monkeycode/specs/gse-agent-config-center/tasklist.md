@@ -357,3 +357,41 @@ Agent `e2e-agent` 预登记 token `tok-1`。真机（cloud3 的 debian12 / cloud
 - `POST /api/gse/jobs` 落库的 `kind` 恒为 `script`（`insert_job` 用 `..Default::default()`），
   派发用的是真实 kind —— 只是记录字段不准，排查 `agent_upgrade` 作业时容易被误导。
 - 管理口密码开关（`GSE_SERVER_ADMIN_PASSWORD`）仍未在部署里启用（默认空 = 不认证）。
+
+### 12. 第二个补丁：k8s agent 镜像缺 shell + tsink 静默停写（v1.3.2）
+
+**问题 1：k8s 节点上的 Agent 跑不了脚本作业（既有问题，非本轮引入）**
+
+```
+job-1790700408883181-7  ser539375215934  failed  spawn failed: No such file or directory
+```
+
+镜像 `vectorman-gse-agent` 是 `FROM scratch`，容器里只有 gse-agent 一个二进制 —— 没有 `/bin/sh`、
+没有 bash/python3、连 `/tmp` 都没有，而作业执行器要 spawn 解释器。**旧镜像 `1.2.0-rc2` 也一样没有 shell**
+（实测 `ctr run ... /bin/sh` 两边都报 `no such file or directory`），所以这台节点的作业能力一直是缺的。
+
+修（按用户选择「只装 alpine + 把解释器改成 sh」）：
+- `Dockerfile` 的 agent stage：`scratch` → `alpine`（busybox 自带 `sh`/`/tmp`）
+- daemonset 的 `gse-agent-conf` ConfigMap：`allowed_interpreters = ["sh"]`、`job_default_interpreter = "sh"`
+- **该 Agent 的 spec 里也要同样设置**：下发 spec 会覆盖文件，而它的 spec 是迁移生成的
+  （解释器是默认的 `["bash","sh","python3"]` / `bash`），不改就仍然 spawn 失败。
+
+**问题 2：tsink 后台 fail-fast 闩锁 → 时序写入静默失败 3 小时 41 分**
+
+`/v1/ts/stats`：`degraded: true`、`background_errors_total: 1`、
+`last_background_error: "flush worker error: IO error: No such file or directory"`。
+tsink 0.10 默认 `background_fail_fast: true` —— **任何一次后台 worker 错误就把存储永久置为
+「shutting down」**（无自愈），之后所有写入失败、只有查询才发现；Agent 侧缓冲一路 `drop oldest`。
+
+盘上状态经核查是**自洽的**（926 段目录、每段 5 文件、catalog 引用与磁盘完全一致）；
+用**同一份数据 + 同版本二进制**在本机单进程跑健康（`degraded=false`）→ 触发条件是**启动瞬间的并发竞态**
+（tsink 的 data path「process lock」是进程内对象，挡不住两个进程写同一目录；`kubectl delete pod`
+会让新旧 pod 短暂重叠）。**operational 修复**：`scale 0 → 等进程彻底消失 → scale 1` → 立即恢复
+（`series_count=7504`，数据一直都在；写入实测成功，丢包归零）。
+
+代码修：`dataplane-ts` 里 `with_background_fail_fast(false)` + dataserver 在
+`background_errors_total > 0` 时打一条去重的 warn（这次就是因为它不出声才丢了 3.5 小时）；
+`degraded` / 错误计数 / 最后错误仍保留在 `/v1/ts/stats` 与自监控指标 `dataserver_ts_degraded` 里。
+
+**部署 runbook 补充**：升级 dataserver 时不要 `kubectl delete pod`（会与旧进程重叠）；
+用 `scale 0 → 确认主机上没有 dataserver 进程 → scale 1`。

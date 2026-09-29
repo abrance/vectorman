@@ -333,7 +333,17 @@ impl TsinkTimeSeriesStore {
         }
         let mut builder = StorageBuilder::new()
             .with_data_path(data_path)
-            .with_timestamp_precision(TimestampPrecision::Microseconds);
+            .with_timestamp_precision(TimestampPrecision::Microseconds)
+            // **关掉「后台 worker 出错就永久停写」这个闩锁**（tsink 默认开）。
+            //
+            // 实测代价：2026-09-29 cloud3 上一次 flush 的瞬时 `IO error: No such file or directory`
+            // 把存储置为 degraded 后再也不接受写入，而**只有查询才会发现** —— 时序写入静默失败
+            // 3 小时 41 分，Agent 侧缓冲一路 `drop oldest` 丢数据。
+            //
+            // 关掉之后：后台错误仍然计数（`background_errors_total`）、仍在 `/v1/ts/stats` 与自监控
+            // 指标 `dataserver_ts_degraded` 里可见、且启动时会打 warn 日志；但**真正的写入失败
+            // 依然会以 5xx 返回给调用方**（Agent 会重试并缓冲），而不是把一个进程变成哑巴。
+            .with_background_fail_fast(false);
         if retention.retention_days > 0 {
             builder = builder.with_retention(Duration::from_secs(
                 u64::from(retention.retention_days) * 86_400,

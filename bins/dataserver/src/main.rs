@@ -400,11 +400,25 @@ async fn main() -> ExitCode {
         let stats_metrics = metrics.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
+            // 已经报过的后台错误，避免每分钟刷一条同样的日志。
+            let mut reported_background_error: Option<String> = None;
             loop {
                 ticker.tick().await;
                 let Ok(stats) = stats_state.ts.storage_stats().await else {
                     continue;
                 };
+                // 存储降级必须出声：2026-09-29 那次静默丢数据的代价是 3 小时 41 分，
+                // 期间只有查询 `/v1/ts/stats` 才看得出来。
+                let current = stats.last_background_error.clone().unwrap_or_default();
+                if stats.background_errors_total > 0
+                    && reported_background_error.as_deref() != Some(current.as_str())
+                {
+                    eprintln!(
+                        "dataserver: ts storage degraded（background_errors_total={}, degraded={}）: {current}",
+                        stats.background_errors_total, stats.degraded
+                    );
+                    reported_background_error = Some(current);
+                }
                 stats_metrics.set_gauge("dataserver_ts_series_count", stats.series_count as f64);
                 stats_metrics.set_gauge(
                     "dataserver_ts_memory_used_bytes",
