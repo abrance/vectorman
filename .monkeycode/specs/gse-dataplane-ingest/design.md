@@ -3,6 +3,16 @@
 Feature Name: gse-dataplane-ingest
 Updated: 2026-09-12
 
+> **2026-09-29 修订导语（`gse-agent-config-center`）**：本文件按当时的模型写成 ——
+> 采集项是**全局共享**资源（一条 item 带 `agent_ids`），由 dataserver 反代
+> `/v1/collect-items*` 读写、经 `collect_items` RPC 下发。该模型已被取代：
+> 采集项现在是**每台 Agent 的 spec 的 `items`**（无 `agent_ids`），
+> 下发随 `agent_spec` 整份进行，`/api/gse/collect-items*` 与 `/v1/collect-items*` 已删除，
+> 数据面只保留只读 `GET /v1/agent-specs`；已删采集项的数据清理改由
+> `cleanup.rs::mark_removed_items`（`spec-live/` 记录上一轮 live 集合）负责，
+> 原先由 `DELETE /v1/collect-items/{id}` 写 `retain/{item_id}` 的入口已不存在。
+> 本文件正文保留为历史档案，**实现以代码与 `gse-agent-config-center` 规格为准**。
+
 ## Description
 
 打通 Agent 采集到 dataserver 查询的路径。运维在 GSE Server 手工登记数据面 `ingest_url`；GSE 定期 `GET {ingest_url}/health` 探活；Agent 向 GSE 拉地址后直连 `dataserver` 写入批次。查询与采集链路由 dataserver 自带前端完成。采集以「采集项」为单位在该前端新建/编辑，写入 GSE sqlite，再经 RPC 下发 Agent。`dataserver` 不向 GSE 自登记。

@@ -1,6 +1,9 @@
 # 节点管理测试用例
 
-- 范围：GSE 节点管理，覆盖主机（hosts）、接入点（access-points）、Agent（agents）、Agent 配置（agent-configs）的台账管理，Agent 会话/鉴权/存活探测，以及节点管理前端（`frontend/apps/node`）。
+- 范围：GSE 节点管理，覆盖主机（hosts）、接入点（access-points）、Agent（agents）、**Agent 配置中心**（per-Agent spec：参数 + 采集项）的台账管理，Agent 会话/鉴权/存活探测，以及节点管理前端（`frontend/apps/node`）。
+- **2026-09-29 修订**：`agent-configs` 台账已由 `gse-agent-config-center` 的 per-Agent spec 取代 ——
+  路由为 `GET /api/gse/agent-specs`、`GET|PUT /api/gse/agents/{id}/spec`、`POST /api/gse/agents/{id}/spec/apply`；
+  采集项不再是独立资源（并入 spec 的 `items`），`/api/gse/collect-items*` 已删除。下表相关行已按新模型改写。
 - 分层：API（gse-server HTTP）、Unit（ledger/session/config）、E2E（server+agent 真实进程）、UI（前端组件与交互）。
 - 自动化对应关系：`自动化` 列标注现有测试；`缺口` 表示当前无自动化覆盖，建议后续补充。
 - 自动化执行命令见文末。
@@ -47,16 +50,22 @@
 | NODE-API-203 | 已存在 Agent | `GET /api/gse/agents`、`GET /api/gse/agents/{id}` | 列表/详情正确 | `http::agents_crud_and_validation` |
 | NODE-API-204 | 不存在 id | `GET /api/gse/agents/ghost` | 404 | `http::agents_crud_and_validation` |
 | NODE-API-205 | 已存在 Agent | `DELETE /api/gse/agents/{id}` 后 `GET` | 删除成功、再查 404 | `http::agents_crud_and_validation` |
-| NODE-API-206 | Agent 带运行时配置 | 删除 Agent | 级联删除 agent-config，保留 host | `http::delete_agent_cascades_config_but_keeps_host` |
+| NODE-API-206 | Agent 带期望 spec | 删除 Agent | 级联删除 spec 与生效状态，保留 host | `http::delete_agent_cascades_config_but_keeps_host` |
 
-### 2.4 接入点与 Agent 配置
+### 2.4 接入点与 per-Agent spec
 
 | 用例 ID | 前置 | 步骤/输入 | 预期 | 自动化 |
 | --- | --- | --- | --- | --- |
-| NODE-API-301 | 空库 | 接入点 CRUD（缺必填/合法/查询/删除） | 校验与增删查结果正确 | `http::access_points_and_agent_configs_crud` |
-| NODE-API-302 | 空库 | Agent 配置 CRUD（`agent_id`+`host_id` 必填） | 校验与读写正确 | `http::access_points_and_agent_configs_crud` |
-| NODE-API-303 | 已存在记录 | `GET /api/gse/access-points/ghost` | 404 | `http::access_points_and_agent_configs_crud` |
-| NODE-API-304 | 已存在配置 | `GET /api/gse/agent-configs/{id}` | 返回详情 | `http::access_points_and_agent_configs_crud` |
+| NODE-API-301 | 空库 | 接入点 CRUD（缺必填/合法/查询/删除） | 校验与增删查结果正确 | `http::access_points_crud_and_spec_requires_registered_agent` |
+| NODE-API-302 | Agent 未登记 | `PUT /api/gse/agents/ghost/spec` | 404（先登记 Agent） | `http::access_points_crud_and_spec_requires_registered_agent` |
+| NODE-API-303 | 已存在记录 | `GET /api/gse/access-points/ghost` | 404 | `http::access_points_crud_and_spec_requires_registered_agent` |
+| NODE-API-304 | 已保存 spec | `GET /api/gse/agents/{id}/spec` | 返回期望 + 生效 + diff + `sync_status` | `http::agent_spec_validation_masking_and_roundtrip` |
+| NODE-API-310 | 已登记 Agent | `PUT spec` 带非法 kind / 缺 path_patterns / 心跳 0 或超上限 / item_id 重复 | 400，且台账无改动 | `http::agent_spec_validation_masking_and_roundtrip` |
+| NODE-API-311 | 已登记 Agent | `PUT spec` 带 `token` | 响应脱敏为 `***`；`agents.token` 同步轮换、旧值进 `prev_token` | `http::agent_spec_validation_masking_and_roundtrip` |
+| NODE-API-312 | 已有 `token` | 用 `***` 写回 | 保持原值不丢 | `http::agent_spec_validation_masking_and_roundtrip` |
+| NODE-API-313 | 台账里存在 token 但 spec 里没有 | 用 `***` 写回 | 400（不要自己造占位值） | `http::agent_spec_validation_masking_and_roundtrip` |
+| NODE-API-314 | 无期望 spec | `POST /api/gse/agents/{id}/spec/apply` 且无会话注册表 | 503（管理端口独立部署） | `http::agent_spec_validation_masking_and_roundtrip` |
+| NODE-API-315 | — | `GET /api/gse/collect-items`、`/api/gse/agent-configs` | 404（已删除） | `http::agent_spec_validation_masking_and_roundtrip` |
 
 ## 3. 后端单元/集成本用例
 
@@ -68,7 +77,11 @@
 | NODE-LEDGER-002 | host CRUD 往返 | 各字段读写一致 | `ledger::host_crud_roundtrip` |
 | NODE-LEDGER-003 | access-point CRUD 往返 | 各字段（含可选端口）读写一致 | `ledger::access_point_crud_roundtrip` |
 | NODE-LEDGER-004 | agent CRUD 往返 | 各字段读写一致 | `ledger::agent_crud_roundtrip` |
-| NODE-LEDGER-005 | agent-config CRUD 往返 | 各字段读写一致 | `ledger::agent_config_crud_roundtrip` |
+| NODE-LEDGER-005 | spec CRUD 往返 | 整份 spec（参数 + 采集项）读写一致 | `ledger::agent_spec_crud_roundtrip` |
+| NODE-LEDGER-005b | spec 生效状态往返 | `applied` / `diff` / `not_enforced` 原样读回 | `ledger::agent_spec_state_roundtrip_keeps_diff` |
+| NODE-LEDGER-005c | 坏 spec 行 | `get/list` 报 `internal` 而不是静默返回空 spec | `ledger::corrupt_spec_row_is_an_error_not_a_default_spec` |
+| NODE-LEDGER-005d | token 轮换 | 旧值进 `prev_token`，认证同时接受新旧；用新值成功后清宽限 | `ledger::token_rotation_keeps_previous_value_for_grace`、`ledger::verify_agent_token_accepts_previous_and_flags_current` |
+| NODE-LEDGER-005e | 旧模型一次性搬运 | `agent_configs` → params；全局采集项按 `agent_ids` 展开成 per-Agent items；重启不覆盖已有 spec | `ledger::migration_expands_legacy_items_per_agent_and_is_idempotent`、`ledger::migration_never_overwrites_existing_specs` |
 | NODE-LEDGER-006 | `check_auth` 三态（匹配/不匹配/未登记） | 分别返回允许/拒绝/未登记语义 | `ledger::check_auth_three_states` |
 | NODE-LEDGER-007 | `runtime_state` 状态流转与落库 | 状态与 `last_heartbeat_at` 正确持久化 | `ledger::runtime_state_transitions` |
 | NODE-LEDGER-008 | Agent 重连/再次认证 | 单会话替换，仅保留一个活跃会话 | `session::registry_insert_replace_keeps_single_active_session` |
@@ -156,14 +169,19 @@
 | NODE-UI-306 | 某行删除 | 确认弹窗 | 文案提示同时清理运行时配置与活跃会话 | 缺口 |
 | NODE-UI-307 | 轮询副作用 | 组件卸载 | `clearInterval` 被调用，无泄漏 | `use-agents.test.ts: clears interval`（间接） |
 
-### 5.4 Agent 配置页 `/agent-configs`
+### 5.4 Agent 配置中心 `/agent-configs` 与 `/agent-configs/:agent_id`
 
 | 用例 ID | 前置 | 步骤/输入 | 预期 | 自动化 |
 | --- | --- | --- | --- | --- |
-| NODE-UI-401 | 进入页面 | 加载 | 展示 agent_id/host_id/cpu_limit_percent/mem_limit_percent/log_level | 缺口 |
-| NODE-UI-402 | 缺 agent_id 或 host_id | 提交 | 提示「缺少必填字段：agent_id、host_id」 | 缺口 |
-| NODE-UI-403 | `log_level` 留空 | 提交 | 默认写为 `info` | 缺口 |
-| NODE-UI-404 | 查看/编辑 | 打开抽屉 | 查看只读；编辑时 `agent_id` 禁用 | 缺口 |
+| NODE-UI-401 | 进入列表 | 加载 | 展示 agent_id/host_id/会话/同步状态/revision/时间戳/采集项摘要 | 缺口 |
+| NODE-UI-402 | 行内「下发」 | 点击 | 二次确认；失败提示且不改状态 | 缺口 |
+| NODE-UI-403 | 进入详情 | 加载 | 四个页签：参数 / 采集项 / 差异 / 原始 JSON | 缺口 |
+| NODE-UI-404 | 无期望 spec | 加载详情 | 表单用 Agent 上报的生效值预填 | 缺口 |
+| NODE-UI-405 | 改参数后「保存期望配置」 | 点击 | 只 PUT 不 apply（Agent 侧不变） | 缺口 |
+| NODE-UI-406 | 未实现字段（cpu/mem/log_level） | 加载 | 界面显式标注「未实现（仅记录）」 | `spec-diff.test.ts: notEnforcedLabel` |
+| NODE-UI-407 | 原始 JSON 非法 | 点「按 JSON 保存」 | 内联报错，不发请求 | 缺口 |
+| NODE-UI-408 | 差异页签 | 期望与生效不一致 | 逐字段差异行 + 采集项增/删/改 | `spec-diff.test.ts: paramDiffRows/itemChanges` |
+| NODE-UI-409 | 敏感字段 | 已设置 | 显示 `***`；原样提交不修改 | `spec-diff.test.ts: isSecretSet` |
 
 ### 5.5 公共组件与路由
 

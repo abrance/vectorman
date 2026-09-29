@@ -209,29 +209,29 @@
 
 ## 阶段 7：文档与既有 spec 回改
 
-- [ ] 7.1 `README.md` 与 `docs/gse能力介绍.md`：能力清单补「Agent 配置中心（per-Agent spec：手动下发 + 热加载 + 生效核验）」；
+- [x] 7.1 `README.md` 与 `docs/gse能力介绍.md`：能力清单补「Agent 配置中心（per-Agent spec：手动下发 + 热加载 + 生效核验）」；
       在显眼处标注四条破坏性变更（旧路由删除、`collect_items` RPC 删除、`CollectItem.agent_ids` 删除、
       采集链路页改只读）。
-- [ ] 7.2 `.monkeycode/specs/README.md`：本 feature 行的一句话改为 per-Agent spec 口径。
-- [ ] 7.3 `.monkeycode/specs/vmctl-collect-chain/requirements.md`：在已有「修订记录」里追加一节，
+- [x] 7.2 `.monkeycode/specs/README.md`：本 feature 行的一句话改为 per-Agent spec 口径。
+- [x] 7.3 `.monkeycode/specs/vmctl-collect-chain/requirements.md`：在已有「修订记录」里追加一节，
       说明 collect 部分**整体重新定范围**（per-item CRUD + `agent_ids` 与 per-Agent spec 模型不符），
       新的 CLI 形态应为 `vmctl agent spec get|put|apply`（本期不做）；data 子命令不受影响。
       —— 对应 需求 R12。
-- [ ] 7.4 `.monkeycode/specs/gse-dataplane-ingest/`：采集项下发通道口径改为「随 `agent_spec` 下发」；
+- [x] 7.4 `.monkeycode/specs/gse-dataplane-ingest/`：采集项下发通道口径改为「随 `agent_spec` 下发」；
       `requirements.md` R13 已补修订说明，还需在 `design.md` 顶部加一条修订导语（它整篇按全局共享
       `collect_items` + `/v1/collect-items*` 转发写的，涉及 5 条转发路由与 `cleanup` 数据源）。
       —— 对应 需求 R4/R10/R12。
-- [ ] 7.5 `.monkeycode/specs/gse-node-app/{requirements,design}.md`：R6 与路由表/表单字段改为
+- [x] 7.5 `.monkeycode/specs/gse-node-app/{requirements,design}.md`：R6 与路由表/表单字段改为
       「Agent 配置中心（列表 + 整页详情四视图 + 采集项随 spec）」，删掉上一版里「补上删除动作」的说法。
       —— 对应 需求 R10/R12。
-- [ ] 7.6 `.monkeycode/specs/frontend-layered-architecture/design.md`：适配器方法表替换为
+- [x] 7.6 `.monkeycode/specs/frontend-layered-architecture/design.md`：适配器方法表替换为
       `listAgentSpecs` / `getAgentSpec` / `putAgentSpec` / `applyAgentSpec`，删掉旧的 agent-configs 与
       collect-items 方法行。—— 对应 需求 R10/R12。
-- [ ] 7.7 `.monkeycode/specs/observability-hardening/`：ConfigMap 口径（已是引导值）补「采集项也随 spec 下发」；
+- [x] 7.7 `.monkeycode/specs/observability-hardening/`：ConfigMap 口径（已是引导值）补「采集项也随 spec 下发」；
       1.19 鉴权风险条维持。
-- [ ] 7.8 `packaging/deploy/k8s/README.md`：两处排障 `curl` 打在将被删除的路由上
+- [x] 7.8 `packaging/deploy/k8s/README.md`：两处排障 `curl` 打在将被删除的路由上
       （`/api/gse/agents/<node>/collect-items`、`DELETE /api/gse/collect-items/<id>`），改为 spec 路径。
-- [ ] 7.9 `.monkeycode/docs/testcases/node.md`：节点页测试用例按新页面结构（列表 + 整页详情四视图）更新。
+- [x] 7.9 `.monkeycode/docs/testcases/node.md`：节点页测试用例按新页面结构（列表 + 整页详情四视图）更新。
 
 **检查点**：本目录三份文档复跑占位符检查为空；mermaid 围栏成对；跨文档引用的路径存在；
 `grep -rn "agent-configs\|collect-items" .monkeycode/specs/` 命中处都有明确的「已删除/已改」标注。

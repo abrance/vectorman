@@ -17,7 +17,8 @@
 | APM 指标 | 服务 RED（请求/错误/耗时）与端点表 | `/apm` |
 | eBPF 可观测 | 采集项 `ebpf_network` / `ebpf_tcp` / `ebpf_process` / `ebpf_syscall`：连接边、TCP 异常、进程生命周期、文件与 syscall 延迟、慢调用原始事件 | `/ebpf` |
 | 服务名归一 | 静态映射（进程名/前缀/Pod 前缀/CIDR）→ 端点表 → `unknown-<ip>`；eBPF 与 APM 共用 | `/settings`（含别名 CRUD） |
-| 采集链路 | Agent 注册与心跳、采集项下发/启停、流索引、eBPF 能力状态 | `/` |
+| 采集链路 | Agent 注册与心跳、流索引、eBPF 能力状态；**跨 Agent 只读总览**（采集项与上报状态） | `/` |
+| Agent 配置中心 | 一台 Agent 一份 **spec**（运行参数 + 该 Agent 的采集项）：保存期望 → 手动下发 → 逐字段生效核验；`token` 轮换带双凭据宽限 | console：`/agent-configs`、`/agent-configs/:agent_id` |
 | 作业与台账 | Host/Agent/AccessPoint/DataPlane 台账、作业提交/查询/重做、模板、文件传输 | console：`/hosts` `/agents` `/jobs` … |
 | 运维 CLI | `dpc`（dataserver 全接口）、`vmctl`（gse-server 台账与作业） | — |
 
@@ -26,8 +27,8 @@
 ```text
 bins/dataserver   数据平面：接入 + 五类存储 + 查询（SQL HTTP / Prom HTTP / 自监控 HTTP）
 bins/dpc          dataserver 运维命令行（health/sql/query/logs/ts/traces/edges/ebpf-events/…）
-bins/gse-server   GSE 调度端：Agent 会话、心跳、采集项下发、作业与台账（RPC + HTTP 管理口）
-bins/gse-agent    GSE 执行端：部署在被观测机器，主动外连，执行采集项与作业
+bins/gse-server   GSE 调度端：Agent 会话、心跳、per-Agent spec 下发、作业与台账（RPC + HTTP 管理口）
+bins/gse-agent    GSE 执行端：部署在被观测机器，主动外连；spec 热加载（含 SIGHUP 重读本地配置）
 bins/vmctl        gse-server 的 HTTP 客户端 CLI
 bins/console      桌面门户（聚合其它组件入口）
 
@@ -56,8 +57,9 @@ cd frontend && npm ci && npm run dev:dataplane    # → http://localhost:5175
 #    b. 单进程托管：构建 dist 后在 dataserver 配置里加 http_web_dir = "<...>/apps/dataplane/dist"
 cd frontend && npm run build:dataplane            # → 浏览器打开 http://<host>:8081/
 
-# 3) 取数：起 gse-server + gse-agent，然后在「采集链路」页建采集项
-#    （metrics_host / log_file / log_k8s_stdout / apm_otlp / ebpf_*）
+# 3) 取数：起 gse-server + gse-agent，然后在 console 的「Agent 配置」页编辑该 Agent 的 spec
+#    （运行参数 + 采集项：metrics_host / log_file / log_k8s_stdout / apm_otlp / ebpf_*）
+#    保存只写期望，点「下发」才推送；采集链路页只做只读总览
 ```
 
 安装包部署（含 systemd 单元与前端 dist）：
