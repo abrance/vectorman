@@ -99,7 +99,7 @@ spec:
       terminationGracePeriodSeconds: 20
       containers:
         - name: gse-agent
-          image: vectorman-gse-agent:1.3.0
+          image: vectorman-gse-agent:1.3.2
           # 单机 k3s 无 registry：镜像由 build-image.sh --import 直接导入，故不强制拉取。
           imagePullPolicy: IfNotPresent
           securityContext:
