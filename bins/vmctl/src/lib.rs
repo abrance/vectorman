@@ -751,7 +751,13 @@ mod tests {
             let auth = text
                 .lines()
                 .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
-                .map(|l| l.split_once(':').map(|x| x.1).unwrap_or("").trim().to_string())
+                .map(|l| {
+                    l.split_once(':')
+                        .map(|x| x.1)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string()
+                })
                 .unwrap_or_default();
             let _ = tx.send(auth);
             let body = "{}";
