@@ -41,6 +41,12 @@ pub struct RuntimeConfig {
     applied: RwLock<AgentSpecWire>,
     /// 已应用的 revision；空字符串 = 本地文件基线。
     revision: RwLock<String>,
+    /// 最近一次应用的回执（含 `outcome` 与 `not_enforced`）。
+    ///
+    /// 心跳补报必须回放**这一份**，不能临时拼一个：临时拼会把 `outcome` 丢成空串、
+    /// 把 `not_enforced` 丢成空数组 —— 于是「Agent 自动拉取」（重连即收敛这条主路径）
+    /// 上报的状态里，「未实现字段」的标注就没了，正好违背「不许假装生效」。
+    last_ack: RwLock<Option<AgentSpecAck>>,
     /// 剩余补报次数；0 表示不必再报。
     pending_reports: AtomicU32,
     /// token 变更 → 通知心跳循环退出、由 `run` 重连重认证。
@@ -81,6 +87,7 @@ impl RuntimeConfig {
             collector,
             applied: RwLock::new(applied),
             revision: RwLock::new(String::new()),
+            last_ack: RwLock::new(None),
             pending_reports: AtomicU32::new(0),
             reauth: Notify::new(),
         })
@@ -127,6 +134,11 @@ impl RuntimeConfig {
         self.applied.read().await.clone()
     }
 
+    /// 记住本次回执，供心跳补报回放。
+    async fn remember(&self, ack: &AgentSpecAck) {
+        *self.last_ack.write().await = Some(ack.clone());
+    }
+
     /// 排一次心跳补报。下发回执只在「下发那一刻」到达；服务端落库前掉线、
     /// 或本次心跳丢失，都会让它永久停在旧 revision，所以要有兜底。
     pub fn schedule_report(&self) {
@@ -135,17 +147,14 @@ impl RuntimeConfig {
     }
 
     /// 待补报的生效快照（心跳携带）。剩余次数为 0 时返回 `None`。
+    ///
+    /// 回放最近一次应用的回执（`outcome` / `not_enforced` / `detail` 都在里面），
+    /// 而不是按当前状态临时拼一份 —— 见 `last_ack` 的注释。
     pub async fn pending_ack(&self) -> Option<AgentSpecAck> {
         if self.pending_reports.load(Ordering::Relaxed) == 0 {
             return None;
         }
-        Some(AgentSpecAck {
-            revision: self.applied_revision().await,
-            outcome: String::new(),
-            applied: self.applied_snapshot().await,
-            not_enforced: Vec::new(),
-            detail: String::new(),
-        })
+        self.last_ack.read().await.clone()
     }
 
     /// 服务端已确认落库：不再补报。
@@ -223,18 +232,22 @@ pub async fn apply_push(rt: &Arc<RuntimeConfig>, push: AgentSpecPush) -> AgentSp
     let Some(spec) = push.spec else {
         // 服务端说「没有期望 spec」：保持本地基线，顺带把现状报上去。
         rt.schedule_report();
-        return build_ack(
+        let ack = build_ack(
             rt,
             push.revision,
             spec_outcome::UNCHANGED,
             "无期望 spec，保持本地基线".to_string(),
         )
         .await;
+        rt.remember(&ack).await;
+        return ack;
     };
     let current = rt.applied_revision().await;
     if !current.is_empty() && current == push.revision {
         // 幂等：不重启任何采集器、不重建执行器、不断连。
-        return build_ack(rt, push.revision, spec_outcome::UNCHANGED, String::new()).await;
+        let ack = build_ack(rt, push.revision, spec_outcome::UNCHANGED, String::new()).await;
+        rt.remember(&ack).await;
+        return ack;
     }
     let not_enforced = not_enforced_fields(&spec.params);
     apply_spec(rt, &spec).await;
@@ -245,7 +258,9 @@ pub async fn apply_push(rt: &Arc<RuntimeConfig>, push: AgentSpecPush) -> AgentSp
     } else {
         spec_outcome::PARTIAL
     };
-    build_ack(rt, push.revision, outcome, String::new()).await
+    let ack = build_ack(rt, push.revision, outcome, String::new()).await;
+    rt.remember(&ack).await;
+    ack
 }
 
 /// 应用本地文件里的参数（`SIGHUP` 重读路径）。
@@ -265,7 +280,9 @@ pub async fn apply_local_file(rt: &Arc<RuntimeConfig>, params: SpecParams) -> Ag
     } else {
         spec_outcome::PARTIAL
     };
-    build_ack(rt, String::new(), outcome, "reloaded from file".to_string()).await
+    let ack = build_ack(rt, String::new(), outcome, "reloaded from file".to_string()).await;
+    rt.remember(&ack).await;
+    ack
 }
 
 async fn build_ack(
@@ -551,6 +568,56 @@ mod tests {
             rt.applied_snapshot().await.items.len(),
             1,
             "本地文件没有采集项，不该把已有的清掉"
+        );
+    }
+
+    /// 心跳补报必须回放最近一次回执（含 `outcome` 与 `not_enforced`）。
+    ///
+    /// 回归：此前 `pending_ack()` 临时拼一份回执，把 `outcome` 丢成空串、
+    /// `not_enforced` 丢成空数组 —— 而「Agent 认证后自动拉取」是主路径，
+    /// 于是页面上「未实现字段」的标注在真实部署里根本不出现（实测踩到）。
+    #[tokio::test]
+    async fn heartbeat_report_replays_outcome_and_not_enforced() {
+        let rt = runtime();
+        let p = SpecParams {
+            cpu_limit_percent: Some(80),
+            mem_limit_percent: Some(50),
+            ..params(15)
+        };
+        let pushed = apply_push(&rt, push("rev-9", p, vec![item("i1", "log_file")])).await;
+        assert_eq!(pushed.outcome, spec_outcome::PARTIAL);
+
+        let reported = rt.pending_ack().await.expect("应排了补报");
+        assert_eq!(
+            reported.outcome,
+            spec_outcome::PARTIAL,
+            "补报不得把 outcome 丢掉"
+        );
+        assert_eq!(
+            reported.not_enforced,
+            vec![
+                "cpu_limit_percent".to_string(),
+                "mem_limit_percent".to_string()
+            ],
+            "补报不得把 not_enforced 丢掉（否则「未实现」标注不显示）"
+        );
+        assert_eq!(reported.revision, "rev-9");
+        assert_eq!(reported.applied.items.len(), 1);
+
+        // 幂等路径（unchanged）也要能补报出正确 outcome。
+        let again = apply_push(&rt, push("rev-9", params(15), vec![])).await;
+        assert_eq!(again.outcome, spec_outcome::UNCHANGED);
+        assert_eq!(
+            rt.pending_ack().await.expect("应排了补报").outcome,
+            spec_outcome::UNCHANGED
+        );
+
+        // 本地重载路径同理。
+        let reloaded = apply_local_file(&rt, params(45)).await;
+        assert_eq!(reloaded.outcome, spec_outcome::APPLIED);
+        assert_eq!(
+            rt.pending_ack().await.expect("应排了补报").outcome,
+            spec_outcome::APPLIED
         );
     }
 
