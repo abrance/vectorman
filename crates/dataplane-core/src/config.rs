@@ -8,6 +8,7 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# vectorman dataserver 配置示例（�
 #   DP_DATA_PATH / DP_SQL_HTTP_LISTEN / DP_PROM_HTTP_LISTEN / DP_METRICS_HTTP_LISTEN
 #   DP_AUTH_ENABLED / DP_SELF_METRICS_INTERVAL
 #   DATASERVER_HTTP_WEB_DIR（前端 dist 目录）/ DATASERVER_GSE_ADMIN_URL（GSE 管理口）
+#   DATASERVER_GSE_ADMIN_PASSWORD（GSE 管理口密码；gse-server 开了 admin_password 时必须一致）
 
 # 数据目录：必须是目录（单文件仅支持 sqlite）。跨进程并发写同一目录不做文件锁。
 data_path = "./data"
@@ -62,6 +63,8 @@ enabled = false
 # GSE 管理口：配置后经 dataserver 反代 /v1/collect-items 到 GSE 台账，
 # 并且保存周期清理会从 GSE 读「live 采集项」（这是按采集项保留期清理的前提）。
 # gse_admin_url = "http://127.0.0.1:7101"
+# gse-server 开了管理口密码（GSE_SERVER_ADMIN_PASSWORD）时必须一起配上，否则转发与保留清理会 401：
+# gse_admin_password = "..."
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +95,11 @@ pub struct Config {
     pub auth: AuthConfig,
     pub http_web_dir: Option<String>,
     pub gse_admin_url: Option<String>,
+    /// gse-server 管理端口密码；空/None 表示对端未开认证。
+    ///
+    /// dataserver 需要它是因为有两处要读 gse-server 管理口：只读转发 `/v1/agent-specs`
+    /// 与保留清理拉 live 采集项。建议用环境变量 `DATASERVER_GSE_ADMIN_PASSWORD`。
+    pub gse_admin_password: Option<String>,
     #[serde(default = "default_metrics_http")]
     pub metrics_http: HttpListenConfig,
     #[serde(default = "default_self_metrics_interval")]
@@ -151,6 +159,7 @@ impl Default for Config {
             auth: AuthConfig { enabled: false },
             http_web_dir: None,
             gse_admin_url: None,
+            gse_admin_password: None,
             metrics_http: default_metrics_http(),
             self_metrics_interval_secs: default_self_metrics_interval(),
             ts_retention_days: default_ts_retention_days(),
@@ -199,6 +208,10 @@ impl Config {
         }
         if let Ok(v) = std::env::var("DATASERVER_GSE_ADMIN_URL") {
             self.gse_admin_url = nonempty_opt(v);
+        }
+        if let Ok(v) = std::env::var("DATASERVER_GSE_ADMIN_PASSWORD") {
+            // 空串显式表示「对端没开认证」。
+            self.gse_admin_password = if v.is_empty() { None } else { Some(v) };
         }
         if let Ok(v) = std::env::var("DP_METRICS_HTTP_LISTEN") {
             self.metrics_http.listen = v;

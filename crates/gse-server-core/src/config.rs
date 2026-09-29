@@ -23,6 +23,15 @@ pub struct ServerConfig {
     /// 目录不存在或未配置则不托管静态页面，管理端口仅暴露 API。
     #[serde(default)]
     pub http_web_dir: Option<String>,
+    /// 管理端口的访问密码；**空串 = 不认证**（保持历史行为）。
+    ///
+    /// 只保护 `/api/gse/*`：`/health` 与静态前端目录保持开放，否则浏览器连页面都加载不出来
+    /// （返回 401 时带 `WWW-Authenticate: Basic`，浏览器会自己弹登录框，前端无需改动）。
+    ///
+    /// 建议用环境变量 `GSE_SERVER_ADMIN_PASSWORD` 而不是写进配置文件 ——
+    /// 配置文件通常会进版本库/备份/`ps` 可见的命令行。
+    #[serde(default)]
+    pub admin_password: String,
     /// agent 期望心跳周期（秒）。
     #[serde(default = "default_interval")]
     pub heartbeat_interval_secs: u64,
@@ -85,6 +94,7 @@ impl Default for ServerConfig {
             http_listen: default_http_listen(),
             dataplane_probe_interval_secs: default_dataplane_probe_interval(),
             http_web_dir: None,
+            admin_password: String::new(),
             heartbeat_interval_secs: default_interval(),
             heartbeat_timeout_secs: default_timeout(),
             session_probe_interval_secs: default_probe_interval(),
@@ -227,6 +237,10 @@ pub fn load_config(path: &str) -> Result<ServerConfig, String> {
     if let Ok(v) = std::env::var("GSE_SERVER_HTTP_WEB_DIR") {
         // 显式设空串可关闭静态托管。
         cfg.http_web_dir = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Ok(v) = std::env::var("GSE_SERVER_ADMIN_PASSWORD") {
+        // 空串显式表示「关掉认证」。
+        cfg.admin_password = v;
     }
     if let Ok(v) = std::env::var("GSE_DATAPLANE_PROBE_INTERVAL") {
         if let Ok(secs) = v.parse() {

@@ -104,15 +104,23 @@ pub struct HttpResponse {
 
 pub struct UreqTransport {
     agent: ureq::Agent,
+    /// gse-server 管理口密码；`None` 表示对端未开认证。
+    password: Option<String>,
 }
 
 impl UreqTransport {
     pub fn new() -> Self {
+        Self::with_password(None)
+    }
+
+    /// 带管理口密码的客户端（`gse-server` 配了 `GSE_SERVER_ADMIN_PASSWORD` 时必填）。
+    pub fn with_password(password: Option<String>) -> Self {
         Self {
             agent: ureq::AgentBuilder::new()
                 .timeout_connect(CONNECT_TIMEOUT)
                 .timeout_read(READ_TIMEOUT)
                 .build(),
+            password: password.filter(|p| !p.is_empty()),
         }
     }
 }
@@ -130,7 +138,10 @@ impl Transport for UreqTransport {
         url: &str,
         body: RequestBody<'_>,
     ) -> Result<HttpResponse, String> {
-        let req = self.agent.request(method, url);
+        let mut req = self.agent.request(method, url);
+        if let Some(pw) = self.password.as_deref() {
+            req = req.set("Authorization", &format!("Bearer {pw}"));
+        }
         let result = match body {
             RequestBody::Empty => req.call(),
             RequestBody::Json(payload) => req
@@ -723,6 +734,65 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::Mutex;
+
+    /// 起一个只回显请求头的极简 HTTP 服务（避免为一条断言引入依赖）。
+    fn echo_auth_server() -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let text = String::from_utf8_lossy(&buf[..n]).to_string();
+            let auth = text
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                .map(|l| {
+                    l.split_once(':')
+                        .map(|x| x.1)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string()
+                })
+                .unwrap_or_default();
+            let _ = tx.send(auth);
+            let body = "{}";
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = stream.flush();
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    /// gse-server 开了管理口密码后，客户端必须把密码带上 —— 否则 CLI 全线 401。
+    #[test]
+    fn transport_sends_bearer_password_only_when_configured() {
+        for (password, expected) in [
+            (Some("s3cret".to_string()), "Bearer s3cret".to_string()),
+            (None, String::new()),
+            (Some(String::new()), String::new()),
+        ] {
+            let (url, rx) = echo_auth_server();
+            let transport = UreqTransport::with_password(password);
+            let resp = transport
+                .exchange("GET", &format!("{url}/api/gse/agents"), RequestBody::Empty)
+                .expect("exchange");
+            assert_eq!(resp.status, 200);
+            assert_eq!(
+                rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+                expected
+            );
+        }
+    }
 
     struct Mock {
         inner: Mutex<MockInner>,

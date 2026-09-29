@@ -699,6 +699,7 @@ async fn e2e_http_delete_agent_clears_ledger_and_session() {
             registry: Some(server.registry.clone()),
             cfg: Some(server.cfg.clone()),
             file_store: Some(server.file_store.clone()),
+            admin_password: String::new(),
         },
         None,
     )
@@ -998,6 +999,7 @@ async fn e2e_template_submit_and_save_as_template() {
             registry: Some(server.registry.clone()),
             cfg: Some(server.cfg.clone()),
             file_store: Some(server.file_store.clone()),
+            admin_password: String::new(),
         },
         None,
     );
@@ -1065,6 +1067,7 @@ async fn e2e_rerun_history_job() {
             registry: Some(server.registry.clone()),
             cfg: Some(server.cfg.clone()),
             file_store: Some(server.file_store.clone()),
+            admin_password: String::new(),
         },
         None,
     );
@@ -1286,6 +1289,7 @@ async fn e2e_file_missing_file_id_is_404() {
             registry: Some(server.registry.clone()),
             cfg: Some(server.cfg.clone()),
             file_store: Some(server.file_store.clone()),
+            admin_password: String::new(),
         },
         None,
     );

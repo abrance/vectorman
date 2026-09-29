@@ -36,6 +36,8 @@ pub struct AppState {
     pub log: Arc<dyn LogStore>,
     pub auth: Arc<dyn AuthN>,
     pub gse_admin_url: Option<String>,
+    /// gse-server 管理端口密码；对端未开认证时为 `None`。
+    pub gse_admin_password: Option<String>,
     pub metrics: Option<Arc<vectorman_metrics::SelfMetrics>>,
     /// APM 派生数据（trace 摘要、服务端点半）；`apm_enabled=false` 时为 `None`。
     pub apm: Option<Arc<ApmSink>>,
@@ -547,7 +549,7 @@ async fn forward_gse(
         Err(e) => return map_err(e),
     };
     let url = join_gse_url(base, gse_path, query);
-    match gse_call(method, &url, body).await {
+    match gse_call(method, &url, body, state.gse_admin_password.as_deref()).await {
         Ok((status, text)) => {
             let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
             (code, [("content-type", "application/json")], text).into_response()
@@ -935,6 +937,7 @@ mod tests {
                 log,
                 auth: Arc::new(NoopAuth),
                 gse_admin_url,
+                gse_admin_password: None,
                 metrics: None,
                 apm: Some(Arc::new(ApmSink::new(
                     sql_for_apm,
@@ -1096,6 +1099,31 @@ mod tests {
         let (st, body) = send(&app, req("GET", "/v1/agent-specs", None)).await;
         assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{body}");
         assert!(body.contains("unavailable"), "{body}");
+    }
+
+    /// dataserver 转发必须带上 gse-server 管理口密码，否则开了认证就全线 401
+    /// （只读总览与保留清理都会静默降级）。
+    #[tokio::test]
+    async fn forwards_gse_admin_password_when_configured() {
+        let (gse_url, handle) = spawn_mock_gse().await;
+        let mut env = test_env(Some(gse_url)).await;
+        env.state.gse_admin_password = Some("s3cret".to_string());
+        let app = sql_router(env.state.clone(), None);
+
+        let (st, body) = send(&app, req("GET", "/v1/agent-specs", None)).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let echoed: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(echoed["authorization"], "Bearer s3cret", "{body}");
+
+        // 未配置密码时不该凭空造一个 Authorization 头。
+        env.state.gse_admin_password = None;
+        let app = sql_router(env.state.clone(), None);
+        let (st, body) = send(&app, req("GET", "/v1/agent-specs", None)).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let echoed: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(echoed["authorization"], "", "{body}");
+
+        handle.abort();
     }
 
     #[tokio::test]
@@ -1282,13 +1310,22 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
-    async fn mock_gse_echo(method: Method, uri: Uri, body: Bytes) -> Response {
+    async fn mock_gse_echo(
+        method: Method,
+        uri: Uri,
+        headers: axum::http::HeaderMap,
+        body: Bytes,
+    ) -> Response {
         Json(json!({
             "ok": true,
             "method": method.as_str(),
             "path": uri.path(),
             "query": uri.query(),
             "body": String::from_utf8_lossy(&body),
+            "authorization": headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(""),
             "item_id": "item-del",
             "storage": {"retention_days": 2}
         }))

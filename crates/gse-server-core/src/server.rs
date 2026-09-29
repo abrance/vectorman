@@ -164,6 +164,7 @@ impl Server {
                 registry: Some(self.registry.clone()),
                 cfg: Some(self.cfg.clone()),
                 file_store: Some(self.file_store.clone()),
+                admin_password: self.cfg.admin_password.clone(),
             };
             let listen = self.cfg.http_listen.clone();
             let web_dir = self.cfg.http_web_dir.clone();

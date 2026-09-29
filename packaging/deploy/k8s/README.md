@@ -127,6 +127,8 @@ kubectl -n vectorman get pods -o wide                     # 每节点 1 个 Read
 kubectl -n vectorman logs ds/gse-agent --tail=50          # 看挂载/降级日志
 
 # 集群侧：纳管与能力
+# 若 gse-server 开了管理口密码（GSE_SERVER_ADMIN_PASSWORD），下面每条都要加：
+#   -H "Authorization: Bearer $GSE_ADMIN_PASSWORD"
 curl -sS https://vectorman.xiaoyxq.top/api/gse/agents | head -c 400  # 状态 online、心跳推进
 curl -sS https://vectorman.xiaoyxq.top/api/gse/agents/<node>/spec  # 该节点下发了什么（参数 + 采集项）
 

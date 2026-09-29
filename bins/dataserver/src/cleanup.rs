@@ -101,11 +101,18 @@ pub fn gse_http_sync(
     method: &str,
     url: &str,
     body: &[u8],
+    password: Option<&str>,
 ) -> Result<(u16, String), DataplaneError> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(10))
         .build();
-    let req = agent.request(method, url);
+    let mut req = agent.request(method, url);
+    // gse-server 开了管理口密码（`GSE_SERVER_ADMIN_PASSWORD`）时必须带凭据，
+    // 否则只读转发与保留清理都会 401 —— 后者会退化成「取不到 live 列表」，
+    // 而那条路径是**不清理**（保守方向），不是删数据。
+    if let Some(pw) = password.filter(|p| !p.is_empty()) {
+        req = req.set("Authorization", &format!("Bearer {pw}"));
+    }
     let result = if matches!(method, "GET" | "HEAD") || (method == "DELETE" && body.is_empty()) {
         req.call()
     } else {
@@ -130,11 +137,13 @@ pub async fn gse_call(
     method: &str,
     url: &str,
     body: &[u8],
+    password: Option<&str>,
 ) -> Result<(u16, String), DataplaneError> {
     let method = method.to_string();
     let url = url.to_string();
     let body = body.to_vec();
-    tokio::task::spawn_blocking(move || gse_http_sync(&method, &url, &body))
+    let password = password.map(|p| p.to_string());
+    tokio::task::spawn_blocking(move || gse_http_sync(&method, &url, &body, password.as_deref()))
         .await
         .map_err(|e| DataplaneError::new(ErrorCode::Unavailable, e.to_string()))?
 }
@@ -222,9 +231,12 @@ pub fn parse_agent_specs(body: &str) -> Vec<LiveItem> {
 }
 
 /// 拉取 live 采集项；GSE 不可达返回错误，调用方继续处理 retain/。
-pub async fn fetch_live_items(gse_admin_url: &str) -> Result<Vec<LiveItem>, DataplaneError> {
+pub async fn fetch_live_items(
+    gse_admin_url: &str,
+    password: Option<&str>,
+) -> Result<Vec<LiveItem>, DataplaneError> {
     let url = join_gse_url(gse_admin_url, "/api/gse/agent-specs", None);
-    let (status, body) = gse_call("GET", &url, b"").await?;
+    let (status, body) = gse_call("GET", &url, b"", password).await?;
     if status != 200 {
         return Err(DataplaneError::new(
             ErrorCode::Unavailable,
@@ -513,6 +525,7 @@ pub async fn run_cleanup(
     ts: &dyn TimeSeriesStore,
     kv: &dyn KvStore,
     gse_admin_url: Option<&str>,
+    gse_admin_password: Option<&str>,
     global_ts_days: u32,
     now_micros: i64,
     tracker: &mut TsCleanTracker,
@@ -521,7 +534,7 @@ pub async fn run_cleanup(
     // 把前者当成空列表会让 `mark_removed_items` 把**所有**采集项误判成已删除、
     // 进而删掉全部历史数据。
     let live = match gse_admin_url {
-        Some(url) => match fetch_live_items(url).await {
+        Some(url) => match fetch_live_items(url, gse_admin_password).await {
             Ok(items) => Some(items),
             Err(e) => {
                 eprintln!(

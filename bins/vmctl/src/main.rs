@@ -14,6 +14,10 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_BASE_URL)]
     url: String,
 
+    /// gse-server 管理口密码（配了 GSE_SERVER_ADMIN_PASSWORD 时必填）
+    #[arg(long)]
+    password: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -147,7 +151,11 @@ enum JobFilesCmd {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let transport = UreqTransport::new();
+    // 环境变量兜底：密码不该出现在命令行（`ps` 可见）与 shell 历史里。
+    let password = cli
+        .password
+        .or_else(|| std::env::var("VECTORMAN_PASSWORD").ok());
+    let transport = UreqTransport::with_password(password);
     let client = Client {
         base_url: cli.url,
         transport: &transport,

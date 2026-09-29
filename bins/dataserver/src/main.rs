@@ -132,6 +132,7 @@ async fn main() -> ExitCode {
         log: Arc::clone(&log),
         auth: Arc::new(NoopAuth),
         gse_admin_url: cfg.gse_admin_url.clone(),
+        gse_admin_password: cfg.gse_admin_password.clone(),
         metrics: Some(metrics.clone()),
         apm: apm.clone(),
         apm_limiter: Some(Arc::new(dataserver::limits::BatchLimiter::new(
@@ -168,6 +169,7 @@ async fn main() -> ExitCode {
                 cleanup_state.ts.as_ref(),
                 cleanup_state.kv.as_ref(),
                 cleanup_state.gse_admin_url.as_deref(),
+                cleanup_state.gse_admin_password.as_deref(),
                 global_ts_days,
                 now_micros(),
                 &mut ts_tracker,

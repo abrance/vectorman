@@ -206,8 +206,9 @@ Server 只提供三个动作 —— **取 spec / 存 spec / 下发 spec**。采�
 - 前置依赖：`token` 轮换正确性依赖 Requirement 7 的双凭据宽限；`sync_status` 依赖 Agent 心跳补报；
   前端依赖 `frontend/apps/node` 分层与 `@vectorman/adapters`（均已具备）。
 - 已知风险（须在本 feature 内收口或明确接受）：
-  1. **gse-server 管理口无鉴权**（`[auth] enabled=false`，observability-hardening 待办 1.19）：
-     配置下发是能改所有 Agent 行为的敏感写操作，本 feature 显著放大该风险面；
+  1. **gse-server 管理口鉴权**（observability-hardening 待办 1.19）：配置下发是能改所有 Agent 行为的
+     敏感写操作。现已提供密码开关 `GSE_SERVER_ADMIN_PASSWORD`（空 = 不认证，只罩 `/api/gse/*`），
+     但**默认仍是关闭的**，需要在部署里显式启用；
   2. 一律「下发赢 + 重连自动收敛」意味着**本地手改只在下次下发/重连前有效**，这是刻意的取舍；
   3. 一旦某台 Agent 有过期望 spec，就**没有回到「纯本地 TOML 基线」的路径**（本 feature 不提供删除）。
 

@@ -5,16 +5,19 @@
 //! `web_dir` 使同一端口同时托管前端 dist：`ServeDir` 找不到文件时回退
 //! `index.html`，满足 SPA 客户端路由。
 //!
-//! 该模块仅操作 `Ledger` 与可选的会话注册表；v1 管理接口不鉴权，
-//! 默认仅监听回环地址。
+//! 该模块仅操作 `Ledger` 与可选的会话注册表。
+//!
+//! 管理接口默认不鉴权、仅监听回环地址；配置 `admin_password`（建议用环境变量
+//! `GSE_SERVER_ADMIN_PASSWORD`）后 `/api/gse/*` 需要密码，`/health` 与静态前端目录保持开放。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::DefaultBodyLimit;
 use axum::extract::Multipart;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -44,6 +47,8 @@ pub struct AdminState {
     pub cfg: Option<Arc<ServerConfig>>,
     /// 作业临时文件；独立部署管理端口时为 None，文件接口不可用。
     pub file_store: Option<Arc<JobFileStore>>,
+    /// 管理端口密码；**空串 = 不认证**。
+    pub admin_password: String,
 }
 
 pub(crate) struct GseScrapeHook {
@@ -159,7 +164,76 @@ fn ledger_routes(admin: AdminState) -> Router {
             "/job-files/{file_id}",
             get(download_job_file).delete(delete_job_file),
         )
+        // 认证只罩住 `/api/gse/*`（即这个嵌套 router）：`/health` 与静态前端目录不经过这里，
+        // 否则「要登录才能加载登录页」。
+        .layer(middleware::from_fn_with_state(
+            admin.clone(),
+            require_admin_password,
+        ))
         .with_state(admin)
+}
+
+/// 管理端口密码认证。
+///
+/// - 密码为空 → 直接放行（默认行为，向后兼容）；
+/// - 否则接受 `Authorization: Bearer <密码>`（CLI/脚本）或 HTTP Basic（浏览器原生弹窗，
+///   密码部分匹配即可，用户名忽略 —— 这里只有一个共享密码，没有用户体系）；
+/// - 拒绝时带 `WWW-Authenticate: Basic`，浏览器会自己弹登录框，前端无需任何改动。
+async fn require_admin_password(
+    State(admin): State<AdminState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if admin.admin_password.is_empty() || password_matches(req.headers(), &admin.admin_password) {
+        return next.run(req).await;
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        [("WWW-Authenticate", "Basic realm=\"vectorman\"")],
+        Json(json!({"error": "admin password required", "code": "unauthorized"})),
+    )
+        .into_response()
+}
+
+/// 从 `Authorization` 头里取出候选密码。
+fn candidate_password(headers: &axum::http::HeaderMap) -> Option<String> {
+    let raw = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    if let Some(token) = raw
+        .strip_prefix("Bearer ")
+        .or_else(|| raw.strip_prefix("bearer "))
+    {
+        return Some(token.to_string());
+    }
+    let b64 = raw
+        .strip_prefix("Basic ")
+        .or_else(|| raw.strip_prefix("basic "))?;
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let text = String::from_utf8(decoded).ok()?;
+    // Basic 是 `user:password`；用户名忽略（没有用户体系，只有一个共享密码）。
+    let (_, password) = text.split_once(':')?;
+    Some(password.to_string())
+}
+
+fn password_matches(headers: &axum::http::HeaderMap, expected: &str) -> bool {
+    candidate_password(headers)
+        .map(|candidate| constant_time_eq(candidate.as_bytes(), expected.as_bytes()))
+        .unwrap_or(false)
+}
+
+/// 定长比较，避免按字节提前返回泄漏前缀信息（长度不等直接返回 False —— 长度不属于秘密）。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// 作业文件上传的 body 上限：取 `job_max_file_bytes`，再留出 multipart 边框余量。
@@ -1837,6 +1911,132 @@ mod tests {
             .into_owned()
     }
 
+    /// 带密码的管理端口（其余字段与 `app_ledger` 一致）。
+    async fn app_with_password(name: &str, password: &str) -> (Router, Arc<Ledger>) {
+        let db = test_db(name);
+        let ledger = Arc::new(Ledger::new(&db).expect("open"));
+        ledger.init().await.expect("init");
+        let app = router(
+            AdminState {
+                ledger: ledger.clone(),
+                registry: None,
+                cfg: None,
+                file_store: None,
+                admin_password: password.to_string(),
+            },
+            None,
+        );
+        (app, ledger)
+    }
+
+    fn req_with_auth(method: &str, uri: &str, auth: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", auth)
+            .body(Body::empty())
+            .expect("request")
+    }
+
+    /// 管理端口的密码认证（`/api/gse/*` 需要密码，`/health` 不需要）。
+    #[tokio::test]
+    async fn admin_password_protects_api_but_not_health() {
+        let (mut app, _ledger) = app_with_password("admin-pw", "s3cret").await;
+
+        // 无凭据 → 401，且必须带 WWW-Authenticate（浏览器据此弹登录框）。
+        let resp = app
+            .clone()
+            .oneshot(req("GET", "/api/gse/agents", None))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            resp.headers().contains_key("www-authenticate"),
+            "缺 WWW-Authenticate 时浏览器不会弹登录框"
+        );
+
+        // 错密码 → 401。
+        let (status, _) = send(
+            &mut app,
+            req_with_auth("GET", "/api/gse/agents", "Bearer wrong"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Bearer（CLI / 脚本）。
+        let (status, body) = send(
+            &mut app,
+            req_with_auth("GET", "/api/gse/agents", "Bearer s3cret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // HTTP Basic（浏览器）：用户名忽略，只看密码。
+        use base64::Engine;
+        let basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("any:s3cret")
+        );
+        let (status, body) = send(&mut app, req_with_auth("GET", "/api/gse/agents", &basic)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // /health 不认证：存活探测与反代不该被密码挡住。
+        let (status, body) = send(&mut app, req("GET", "/health", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // 写接口同样受保护（配置下发是敏感操作）。
+        let (status, _) = send(
+            &mut app,
+            req(
+                "PUT",
+                "/api/gse/agents/a-1/spec",
+                Some(r#"{"params":{"heartbeat_interval_secs":30},"items":[]}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn empty_password_keeps_api_open() {
+        let (mut app, _ledger) = app_ledger("admin-pw-empty").await;
+        let (status, body) = send(&mut app, req("GET", "/api/gse/agents", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn static_web_dir_stays_open_so_the_spa_can_load() {
+        let dir = std::env::temp_dir().join(format!("gse-http-pw-web-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.html"), "<html>spa-root</html>").unwrap();
+        let db = test_db("admin-pw-web");
+        let ledger = Arc::new(Ledger::new(&db).expect("open"));
+        ledger.init().await.expect("init");
+        let mut app = router(
+            AdminState {
+                ledger: ledger.clone(),
+                registry: None,
+                cfg: None,
+                file_store: None,
+                admin_password: "s3cret".to_string(),
+            },
+            Some(&dir),
+        );
+        // 静态页面不认证：否则「要登录才能看到登录页」。
+        let (status, body) = send(&mut app, req("GET", "/", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("spa-root"), "{body}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_identical() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
     async fn app_ledger(name: &str) -> (Router, Arc<Ledger>) {
         let db = test_db(name);
         let ledger = Arc::new(Ledger::new(&db).expect("open"));
@@ -1847,6 +2047,7 @@ mod tests {
                 registry: None,
                 cfg: None,
                 file_store: None,
+                admin_password: String::new(),
             },
             None,
         );
@@ -2399,6 +2600,7 @@ mod tests {
                 registry: None,
                 cfg: None,
                 file_store: None,
+                admin_password: String::new(),
             },
             Some(&dir),
         );
@@ -2451,6 +2653,7 @@ mod tests {
                 registry: Some(Arc::new(SessionRegistry::new())),
                 cfg: None,
                 file_store: None,
+                admin_password: String::new(),
             },
             None,
         );
@@ -2482,6 +2685,7 @@ mod tests {
                 registry: Some(Arc::new(SessionRegistry::new())),
                 cfg: Some(Arc::new(ServerConfig::default())),
                 file_store: Some(store),
+                admin_password: String::new(),
             },
             None,
         );
@@ -3125,6 +3329,7 @@ mod tests {
                 registry: Some(Arc::new(SessionRegistry::new())),
                 cfg: Some(Arc::new(cfg)),
                 file_store: Some(store),
+                admin_password: String::new(),
             },
             None,
         );

@@ -5,6 +5,7 @@
 #   DP_DATA_PATH / DP_SQL_HTTP_LISTEN / DP_PROM_HTTP_LISTEN / DP_METRICS_HTTP_LISTEN
 #   DP_AUTH_ENABLED / DP_SELF_METRICS_INTERVAL
 #   DATASERVER_HTTP_WEB_DIR（前端 dist 目录）/ DATASERVER_GSE_ADMIN_URL（GSE 管理口）
+#   DATASERVER_GSE_ADMIN_PASSWORD（GSE 管理口密码；gse-server 开了 admin_password 时必须一致）
 
 # 数据目录：必须是目录（单文件仅支持 sqlite）。跨进程并发写同一目录不做文件锁。
 data_path = "./data"
@@ -59,3 +60,5 @@ enabled = false
 # GSE 管理口：配置后经 dataserver 反代 /v1/collect-items 到 GSE 台账，
 # 并且保存周期清理会从 GSE 读「live 采集项」（这是按采集项保留期清理的前提）。
 # gse_admin_url = "http://127.0.0.1:7101"
+# gse-server 开了管理口密码（GSE_SERVER_ADMIN_PASSWORD）时必须一起配上，否则转发与保留清理会 401：
+# gse_admin_password = "..."

@@ -134,10 +134,12 @@
       加固动作：`dataserver` 开 `[auth] enabled = true` + 客户端带 token（与 gse-server 的
       台账鉴权口径对齐）；同步更新 `k8s.yaml` 的 ConfigMap 与 Agent 侧配置。
       ⚠️ 与 1.18 的扫描事件是同一根因，优先级不低。
-      ⚠️ **2026-09-29 升级为前置风险**：`gse-agent-config-center` 新增的配置下发是「能改所有 Agent 行为」
-      的敏感写操作，而 gse-server 的 HTTP 管理口（默认 `127.0.0.1:7101`）同样无鉴权。
-      若管理口被暴露，任何可达的人都能改任意 Agent 的配置（含 token）。上线前必须收口鉴权，
-      或明确接受风险并保证 7101 不可达。
+      ✅ **2026-09-29 已提供开关**：gse-server 管理口支持密码认证 ——
+      环境变量 `GSE_SERVER_ADMIN_PASSWORD`（空/未设 = 不认证，保持历史行为），
+      只罩 `/api/gse/*`，`/health` 与静态前端目录保持开放。浏览器走 HTTP Basic 原生弹窗，
+      脚本/CLI 走 `Authorization: Bearer`（`vmctl --password` / `VECTORMAN_PASSWORD`）；
+      dataserver 需配 `gse_admin_password`（`DATASERVER_GSE_ADMIN_PASSWORD`）。
+      **剩余动作**：在 k8s/systemd 部署里把这个环境变量配上（默认仍是不认证）。
 
 ## 2. 单机回归清单（对应需求 5、9）
 
