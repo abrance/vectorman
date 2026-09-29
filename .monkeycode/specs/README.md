@@ -36,6 +36,7 @@
 | [observability-data-model](observability-data-model/) | ✅ 已实现（本目录仅 design） | 2026-09-24 | 可观测共享数据模型：span/边/服务标识/指标命名 + LogStore v2/sqlite 观测表 |
 | [server-self-monitoring](server-self-monitoring/) | ✅ 已实现 | 2026-09-21 | 组件自监控指标（vectorman-* metrics 口） |
 | [vmctl-file-transfer](vmctl-file-transfer/) | ✅ 已实现 | 2026-09-21 | vmctl 文件传输子命令 |
+| [vmctl-collect-chain](vmctl-collect-chain/) | 🟡 ACTIVE（规格完成，待实施） | 2026-09-29 | vmctl 全链路采集 CLI：`collect` 下发配置与核验生效、`data` 查询数据面 |
 
 ## 相关测试用例
 
