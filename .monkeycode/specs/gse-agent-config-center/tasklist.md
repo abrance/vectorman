@@ -329,3 +329,31 @@ Agent `e2e-agent` 预登记 token `tok-1`。真机（cloud3 的 debian12 / cloud
    整个工作区、因找不到 `Cargo.toml` 失败（本次部署踩到，改用 `ctr pull/tag` 绕过）。
    修：改为内联四行 Dockerfile（`FROM scratch` + `COPY gse-agent/bin/gse-agent`），并补上 `ctr pull/tag` 这条更省事的路径；
    `gse-agent-daemonset.yaml` 的镜像标签对齐到 `1.3.0`。
+
+### 11. v1.3.1 补丁发布与验收（2026-09-29 晚）
+
+**tag**：`server/v1.3.1` + `agent/v1.3.1` + `v1.3.1`（提交 `1b5110f`）→ 镜像 `v1.3.1-1b5110f`；
+**cops**：PR #70 → CD 成功。
+
+**四个 Agent 全部升到 1.3.1**：
+
+| 目标 | 方式 |
+| --- | --- |
+| k8s daemonset | `k3s ctr images pull` + `ctr images tag` + `set image`（1.3.0 → 1.3.1） |
+| cloud2-agent / testbkee | 它们已是 1.3.0 → **内置 `agent_upgrade` 作业可用**：`file_transfer` 送二进制到 `/tmp` + `jobs submit --kind agent_upgrade --binary-path --sha256`（自动 停→备份→替换→chmod→起→判活→失败回滚，结果落文件由心跳补报） |
+| 本机 debian12-agent | 本地 `mv` 替换 + `systemctl restart` |
+
+**验收（这次补丁的关键路径）**：
+
+| 步骤 | 结果 |
+| --- | --- |
+| 下发 `cpu_limit_percent=80`（未实现字段） | `ack.outcome=partial`、`ack.not_enforced=['cpu_limit_percent']` |
+| **重启 k8s agent pod → 走「重连自动拉取 + 心跳补报」** | 服务端状态仍为 `partial` + `not_enforced=['cpu_limit_percent']` —— **v1.3.0 此处为空**，补丁生效 |
+| 清掉该字段再下发 | `outcome=applied`、`not_enforced=[]`，revision 回到 `638b7d2a`（内容哈希幂等） |
+| 未匹配 API 路径 | `/api/gse/collect-items`、`/v1/collect-items` → `404 + application/json`（正文含路径）；`/hosts`、`/settings` 仍 `200 + text/html` |
+| 全队状态 | 4 台全 online；`ser539375215934` `sync_status=synced`、diff 三项全空 |
+
+**遗留待办**（与本次部署无关，另开）：
+- `POST /api/gse/jobs` 落库的 `kind` 恒为 `script`（`insert_job` 用 `..Default::default()`），
+  派发用的是真实 kind —— 只是记录字段不准，排查 `agent_upgrade` 作业时容易被误导。
+- 管理口密码开关（`GSE_SERVER_ADMIN_PASSWORD`）仍未在部署里启用（默认空 = 不认证）。
