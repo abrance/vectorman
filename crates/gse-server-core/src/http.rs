@@ -164,6 +164,10 @@ fn ledger_routes(admin: AdminState) -> Router {
             "/job-files/{file_id}",
             get(download_job_file).delete(delete_job_file),
         )
+        // **未匹配的 `/api/gse/*` 必须 404**：不挂这条 fallback，请求会落到
+        // `web_dir` 的静态回退上，拿到 `200 + text/html` —— API 路径打错一个字、
+        // 或者删掉旧路由后，调用方（脚本/CLI）都会把它当成功。
+        .fallback(api_not_found)
         // 认证只罩住 `/api/gse/*`（即这个嵌套 router）：`/health` 与静态前端目录不经过这里，
         // 否则「要登录才能加载登录页」。
         .layer(middleware::from_fn_with_state(
@@ -171,6 +175,17 @@ fn ledger_routes(admin: AdminState) -> Router {
             require_admin_password,
         ))
         .with_state(admin)
+}
+
+/// 未匹配的 API 路径：JSON 404（而不是静态回退的 `200 + HTML`）。
+async fn api_not_found(req: Request) -> Response {
+    err_json(
+        StatusCode::NOT_FOUND,
+        GseError::new(
+            "not_found",
+            format!("no such API route: {}", req.uri().path()),
+        ),
+    )
 }
 
 /// 管理端口密码认证。
@@ -2024,6 +2039,56 @@ mod tests {
         );
         // 静态页面不认证：否则「要登录才能看到登录页」。
         let (status, body) = send(&mut app, req("GET", "/", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("spa-root"), "{body}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 未匹配的 API 路径必须 JSON 404 —— 不能落到静态回退上变成 `200 + HTML`。
+    ///
+    /// 这条是实测踩出来的：删掉旧路由后，`curl /api/gse/collect-items` 返回 200
+    /// 且正文是 index.html，用状态码根本判断不出「路由没了」，脚本还会当成功。
+    #[tokio::test]
+    async fn unknown_api_path_returns_json_404_even_with_spa_enabled() {
+        let dir = std::env::temp_dir().join(format!("gse-http-api404-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.html"), "<html>spa-root</html>").unwrap();
+        let db = test_db("api-404");
+        let ledger = Arc::new(Ledger::new(&db).expect("open"));
+        ledger.init().await.expect("init");
+        let mut app = router(
+            AdminState {
+                ledger: ledger.clone(),
+                registry: None,
+                cfg: None,
+                file_store: None,
+                admin_password: String::new(),
+            },
+            Some(&dir),
+        );
+
+        for path in [
+            "/api/gse/collect-items",
+            "/api/gse/agent-configs",
+            "/api/gse/nope",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(req("GET", path, None))
+                .await
+                .expect("oneshot");
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+            let ct = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            assert!(ct.starts_with("application/json"), "{path}: {ct}");
+        }
+
+        // SPA 客户端路由仍回退 index.html。
+        let (status, body) = send(&mut app, req("GET", "/hosts", None)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body.contains("spa-root"), "{body}");
         std::fs::remove_dir_all(&dir).ok();

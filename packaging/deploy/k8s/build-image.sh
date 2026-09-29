@@ -10,6 +10,12 @@
 #
 # 说明：单机 k3s（如 cloud3）通常没有 registry，用 `docker save | ssh <host> k3s ctr images import -`
 # 是 k3s 官方支持的导入方式；集群里若有 registry，请自行 tag/push 并改清单里的 image。
+#
+# 更省事的一条路（不需要本地 docker build，用的就是 CI 产出的那个制品）：
+#   ssh <host> 'sudo k3s ctr images pull ghcr.io/abrance/vectorman-gse-agent:<tag>' \
+#     && ssh <host> 'sudo k3s ctr images tag ghcr.io/abrance/vectorman-gse-agent:<tag> docker.io/library/vectorman-gse-agent:<version>' \
+#     && kubectl -n vectorman set image ds/gse-agent gse-agent=vectorman-gse-agent:<version>
+# 本仓库 2026-09-29 升级到 1.3.0 用的就是这条。
 set -euo pipefail
 
 USAGE="usage: build-image.sh --pkg <解压后的发布包目录> [--version <tag>] [--import <ssh-host>] [--dry-run]"
@@ -56,11 +62,18 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
+# 用内联 Dockerfile：仓库主 Dockerfile 只有「从源码构建」的 stage（rust → scratch），
+# 拿发布包当上下文会因找不到 Cargo.toml 失败。这里只需要把静态二进制塞进 scratch 镜像，
+# 四行就够，也不必为此再编译一遍整个工作区。
 echo "==> 构建 $IMAGE（上下文 $PKG）"
+INLINE_DOCKERFILE="FROM scratch
+COPY gse-agent/bin/gse-agent /usr/local/bin/gse-agent
+ENTRYPOINT [\"/usr/local/bin/gse-agent\"]"
 if [[ "$DRY_RUN" -eq 1 ]]; then
-  echo "dry-run: docker build -f $DOCKERFILE -t $IMAGE $PKG"
+  echo "dry-run: docker build -t $IMAGE $PKG  <<'DOCKER'"
+  printf '%s\n' "$INLINE_DOCKERFILE"
 else
-  docker build -f "$DOCKERFILE" -t "$IMAGE" "$PKG"
+  printf '%s\n' "$INLINE_DOCKERFILE" | docker build -t "$IMAGE" -f - "$PKG"
 fi
 
 if [[ -n "$IMPORT_HOST" ]]; then

@@ -47,6 +47,17 @@ pub struct AppState {
     pub apm_detail_min_duration_micros: i64,
 }
 
+/// 未匹配的 API 路径：JSON 404（而不是静态回退的 `200 + HTML`）。
+async fn api_not_found(req: axum::extract::Request) -> Response {
+    json_err(
+        StatusCode::NOT_FOUND,
+        DataplaneError::new(
+            ErrorCode::NotFound,
+            format!("no such API route: {}", req.uri().path()),
+        ),
+    )
+}
+
 fn json_err(status: StatusCode, e: DataplaneError) -> Response {
     (
         status,
@@ -779,6 +790,14 @@ async fn ts_stats(State(state): State<AppState>) -> Response {
 
 fn api_routes(state: AppState) -> Router {
     Router::new()
+        // 未匹配的 API 路径返回 JSON 404：否则会落到 SQL 口的静态回退上，
+        // 拿到 `200 + text/html`，调用方无法区分「路由没了」与「调用成功」。
+        //
+        // 为什么用 catch-all 路由而不是 `.fallback()`：同层的 `.fallback_service()`
+        // （静态 SPA）会**覆盖** `.fallback()`；catch-all 属于真实路由，
+        // 静态路径优先级更高（`/v1/sql` 仍命中自己的 handler）。
+        .route("/v1/{*rest}", axum::routing::any(api_not_found))
+        .route("/api/v1/{*rest}", axum::routing::any(api_not_found))
         .route("/health", get(health))
         .route("/v1/sql", post(sql_exec))
         .route("/v1/ingest", post(ingest))
@@ -1266,6 +1285,24 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK, "{body}");
         assert!(!body.contains("ancient"), "{body}");
+    }
+
+    /// 未匹配的 `/v1/*` 也必须 JSON 404，而不是静态回退的 `200 + HTML`。
+    #[tokio::test]
+    async fn unknown_api_path_returns_json_404_with_spa_enabled() {
+        let env = test_env(None).await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<html>spa</html>").unwrap();
+        let app = sql_router(env.state.clone(), Some(dir.path()));
+
+        let (st, body) = send(&app, req("GET", "/v1/collect-items", None)).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains("no such API route"), "{body}");
+
+        // SPA 路由照旧。
+        let (st, body) = send(&app, req("GET", "/settings", None)).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert!(body.contains("spa"), "{body}");
     }
 
     #[tokio::test]

@@ -281,3 +281,51 @@ Agent `e2e-agent` 预登记 token `tok-1`。真机（cloud3 的 debian12 / cloud
    （台账 token 若已在配置中心轮换过，本地文件是旧值）。
 4. `cloud3` 那台是 systemd 部署，`SIGHUP` 用 `systemctl reload vectorman-gse-agent`；
    testbkee 是 `ctl.sh` direct 模式，用 `kill -HUP <pid>`。
+
+## 9. 部署记录（2026-09-29，cloud3 生产）
+
+**版本**：`v1.3.0`（`server/v1.3.0` + `agent/v1.3.0` + `v1.3.0`），镜像 tag `v1.3.0-a216b93`。
+**备份**：cloud3 `/opt/vectorman-k8s-backup-20260929-192641.tgz`（7 MB，含 gse-server/dataserver/console/web）；
+本机另存了一份台账库副本供比对。回滚 = 把 cops 的 `VECTORMAN_IMAGE_TAG` 改回 `v1.2.4-6b5b5f8`。
+
+| 步骤 | 结果 |
+| --- | --- |
+| cops `apps/vectorman/.env` bump（PR #69） | 3 个 Deployment Recreate 成功（gse-server / dataserver / console） |
+| 一次性迁移 | `agent_specs` 0 → 1：`ser539375215934` 拿到 4 条 eBPF 采集项（retention 1 天、enabled=true） |
+| k8s daemonset agent | `1.2.0-rc2` → `1.3.0`（本地标签：`k3s ctr images pull` + `ctr images tag`） |
+| cloud2-agent | `1.1.0` → `1.3.0` |
+| testbkee | `1.2.3-test` → `1.3.0` |
+| 本机 debian12-agent | `1.2.3-test` → `1.3.0`（原先 unit inactive ≈ 台账 offline 的原因，顺手拉起） |
+| 验收 | 4 台全 online；`ser539375215934` `sync_status=synced`、`applied.revision` 与期望一致、diff 三项全空、4 项生效 |
+
+**升级路径上的实测坑（写进 runbook）**：
+
+1. `--kind agent_upgrade` 对 **1.1.0 的 agent 无效** —— 它早于自更新功能（PR #96），会把升级载荷当普通脚本执行
+   （`exit 127: binary_path: No such file or directory`）。低版本必须先手动换二进制。
+2. **运行中的二进制不能 `cp` 覆盖**（`Text file busy`）→ 用 `mv`（rename 换目录项）。
+3. **cloud2 无免密 sudo** → 二进制文件属主是部署用户（可直接替换），但重启走**作业**（agent 以 root 跑）
+   `systemctl restart vectorman-gse-agent`。
+4. **testbkee 是 direct 模式** 且 agent ppid=1（nohup 起的）→ 重启必须 `setsid nohup sh -c 'sleep 3; ctl.sh gse-agent restart'`
+   脱离作业进程组，否则 agent 自杀会把重启动作一起带走。
+5. **GHCR 镜像是匿名可拉的**；agent 镜像的「本地导入」不必自己 build：
+   `k3s ctr images pull ghcr.io/abrance/vectorman-gse-agent:<tag>` + `ctr images tag ... docker.io/library/vectorman-gse-agent:<version>`。
+6. 三个 Deployment 是 `strategy: Recreate` → rollout 期间有短暂中断（本次未观测到报错）。
+
+## 10. 部署中发现并修复的缺陷（v1.3.1 补丁）
+
+1. **心跳补报丢了 `outcome` 与 `not_enforced`（功能级，最严重）**
+   `RuntimeConfig::pending_ack()` 临时拼了一份回执，把 `outcome` 丢成空串、`not_enforced` 丢成空数组。
+   而「Agent 认证后自动拉取」是**主路径**（手动下发只是「不必等重连」），于是真实部署里
+   `applied.outcome` 为空、页面上「未实现字段」的标注根本不出现 —— 正好违背 R10/R11「不许假装生效」。
+   **实测证据**：v1.3.0 上 `ser539375215934` 的 `applied.outcome = ""`。
+   修：`last_ack` 回放最近一次回执 + 回归用例 `heartbeat_report_replays_outcome_and_not_enforced`。
+2. **未匹配的 `/api/*` 返回 `200 + text/html`（隐蔽）**
+   `web_dir` 的静态回退吞掉了 API 的 404。实测：删掉旧路由后 `curl /api/gse/collect-items` 返回 200 且正文是
+   `index.html` —— 用状态码判断不出「路由没了」，脚本还会当成功。
+   修：gse-server 在 `nest("/api/gse")` 上挂 JSON 404 fallback；dataserver 用 catch-all 路由
+   （同层的 `.fallback()` 会被 `.fallback_service()` 覆盖）。两侧各加一条用例。
+3. **`build-image.sh` 已损坏 + daemonset 清单标签漂移**
+   仓库主 Dockerfile 只有「从源码构建」的 stage（rust → scratch），脚本原来的默认 target 会把发布包当上下文去编
+   整个工作区、因找不到 `Cargo.toml` 失败（本次部署踩到，改用 `ctr pull/tag` 绕过）。
+   修：改为内联四行 Dockerfile（`FROM scratch` + `COPY gse-agent/bin/gse-agent`），并补上 `ctr pull/tag` 这条更省事的路径；
+   `gse-agent-daemonset.yaml` 的镜像标签对齐到 `1.3.0`。
