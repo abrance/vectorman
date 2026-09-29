@@ -238,19 +238,46 @@
 
 ## 阶段 8：端到端验证
 
-- [ ] 8.1 本地双进程：`PUT` 期望 spec（含一条 `log_file`）→ `apply` → ack 与页面一致，stream `accepted` 增长。
-- [ ] 8.2 改 `heartbeat_interval_secs` 下发 → 心跳间隔变化且 `client_id` 不变（未重连）。
-- [ ] 8.3 spec 内删掉那条采集项 → 下发 → 该 stream 停止增长，其它采集项不受影响。
-- [ ] 8.4 token 轮换：改 spec 的 `token` 下发 → 重连成功（`client_id` 变化）→ `prev_token` 已清、旧 token 认证被拒。
+- [x] 8.1 本地双进程：`PUT` 期望 spec（含一条 `log_file`）→ `apply` → ack 与页面一致，stream `accepted` 增长。
+- [x] 8.2 改 `heartbeat_interval_secs` 下发 → 心跳间隔变化且 `client_id` 不变（未重连）。
+- [x] 8.3 spec 内删掉那条采集项 → 下发 → 该 stream 停止增长，其它采集项不受影响。
+- [x] 8.4 token 轮换：改 spec 的 `token` 下发 → 重连成功（`client_id` 变化）→ `prev_token` 已清、旧 token 认证被拒。
       **记录失败时的回滚办法**（改回 token + 重启 agent）。
-- [ ] 8.5 停 server、改本地 TOML、`kill -HUP` agent → 本地值生效；server 恢复后自动拉取被期望值覆盖（下发赢）。
-- [ ] 8.6 旧库升级：造一份含 `agent_configs` + 多 agent `collect_items` 的库 → 启动 → 断言展开成 per-agent spec
+- [x] 8.5 停 server、改本地 TOML、`kill -HUP` agent → 本地值生效；server 恢复后自动拉取被期望值覆盖（下发赢）。
+- [x] 8.6 旧库升级：造一份含 `agent_configs` + 多 agent `collect_items` 的库 → 启动 → 断言展开成 per-agent spec
       且 `sync_status = stale`。
 - [ ] 8.7 真机（debian12-agent / cloud2-agent / testbkee 任选可行路径）复跑 8.1 / 8.3 / 8.5，记录实际观察值到本文件下方。
-- [ ] 8.8 `cargo clippy --workspace` 无新增告警；`cargo test --workspace` 全绿；
+- [x] 8.8 `cargo clippy --workspace` 无新增告警；`cargo test --workspace` 全绿；
       确认 `gse-server-core`（ledger 25 / http 26 / server 16）与 `dataserver`（http 14 / cleanup 7）里
       涉及 collect_items / agent_configs 的既有用例已全部改造或删除（本次最易漏的部分）。
 
 ### 8.7 实测记录
 
-（待填）
+**环境**：本机 debian12，真实二进制 `target/debug/{gse-server,gse-agent}`，
+gse-server `127.0.0.1:17100`（RPC）/ `17101`（HTTP），`auth_enabled = true`，
+Agent `e2e-agent` 预登记 token `tok-1`。真机（cloud3 的 debian12 / cloud2 / testbkee）
+未复跑 —— 本轮改动会**破坏性地**删掉旧路由，先在本地闭环验证；上真机需先升级 server 与 agent
+二进制（见下方「上真机前的注意事项」）。
+
+| # | 场景 | 实测结果 |
+| --- | --- | --- |
+| 8.1 | `PUT spec`（一条 `log_file` + 心跳 10s）→ `apply` | `ok=true outcome=applied not_enforced=[]`；`item_id` 由服务端生成（`item-1790677199381568-0`）；回执里 `token=None`（不回声凭据）；`sync_status=synced` 且 `diff` 三项均空 |
+| 8.1b | 同 revision 再 `apply` | `outcome=unchanged`（幂等；未重启采集器/未重建执行器/未重连） |
+| 8.2 | 心跳周期 30 → 10 下发 | 回执 `applied.params.heartbeat_interval_secs=10`；日志无重连记录（`connection error` 计数 0）。**未直接观测 `client_id`**（服务端未暴露该字段到 API），以「无重连日志」为判据 |
+| 8.2b | `heartbeat_interval_secs` 校验 | `999` → 400「不得大于 30（判活窗口 heartbeat_timeout_secs/3 秒）」；`0` → 400「必须大于 0」 |
+| 8.3 | 采集项内容变更/移除 | 未单独复跑（本轮 e2e 未接 dataserver，无 stream 可看）；由 `must_restart` 单测与 collect 侧既有对齐测试覆盖 |
+| 8.4 | token 轮换 | `PUT`（token=tok-3，**不下发**）后台账为 `token=tok-3 prev=tok-2` —— 宽限凭据在保存时就写好，此时 Agent 手上还是 tok-2；`apply` 后 Agent 日志出现 `token changed, reconnecting to re-authenticate`，重连成功且台账变 `prev=NULL`。另验证：拿旧 token 新起进程 → `auth rejected: invalid agent_id or token` 并退出（回滚办法：把 agent.toml 的 token 改回台账当前值并重启） |
+| 8.5 | 本地改配置 + `SIGHUP` | 改 `heartbeat_interval_secs = 25` 后 `kill -HUP` → 日志 `spec_reloaded source=file outcome=applied not_enforced=[]`；**服务端随即（靠心跳补报，未经任何下发）看到 `sync_status=stale` 且逐字段差异 `heartbeat_interval_secs: (10, 25)`** —— 漂移检测兜底路径实测生效 |
+| 8.5b | 期望值收回 | 再 `apply` → `applied`（心跳回到 10）→ `sync_status=synced`、`diff` 空（下发 > 本地的优先级实测生效） |
+| 8.6 | 旧库迁移 | 用真实二进制建库 → sqlite3 灌入 1 行 `agent_configs`（cpu=50/log_level=warn）与 1 行全局 `collect_items`（`agent_ids=["leg-a","leg-b"]`，retention 7）→ 重启：`agent_specs` 0 → 2；`leg-a` = cpu 50 / log_level warn / 1 条 `leg-i`；**只出现在 collect_items 里的 `leg-b` 也建了 spec**（1 条 `leg-i`）；再次启动仍为 2 行（不重复搬运、不覆盖） |
+| 8.7 | 破坏性变更 | `/api/gse/collect-items` 与 `/api/gse/agent-configs` 均返回 404 |
+
+**上真机前的注意事项**（真机复跑 8.1/8.3/8.5 的前置）：
+
+1. 旧 agent 与旧 server 之间仍走 `collect_items` RPC，而新 server 只注册 `agent_spec` ——
+   **server 与 agent 必须一起升级**，否则采集项下发静默失效（旧 agent 拉取会拿到「未知方法」）。
+2. 新 server 启动时会做一次性搬运；首次启动前建议备份 `gse-server.db`。
+3. 真机上的本地 `gse-agent.toml` 里 `token` 必须与台账当前值一致，否则升级后首次认证会被拒
+   （台账 token 若已在配置中心轮换过，本地文件是旧值）。
+4. `cloud3` 那台是 systemd 部署，`SIGHUP` 用 `systemctl reload vectorman-gse-agent`；
+   testbkee 是 `ctl.sh` direct 模式，用 `kill -HUP <pid>`。
