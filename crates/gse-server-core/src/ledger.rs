@@ -80,6 +80,17 @@ pub struct AgentConfig {
     pub updated_at: String,
 }
 
+/// 凭据校验结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthOutcome {
+    /// 凭据不匹配（或 Agent 不存在）。
+    Rejected,
+    /// 命中当前 token：轮换已完成，可清宽限凭据。
+    Current,
+    /// 命中轮换前的 token：宽限期内，接受但不清理。
+    Previous,
+}
+
 /// 某台 Agent 的期望 spec（下发源）。
 ///
 /// 一台 Agent 一行：`spec` 是整份 `AgentSpecWire` 的 JSON（含敏感字段明文，读出时脱敏）。
@@ -797,13 +808,32 @@ impl Ledger {
 
     /// 仅从 agents 表校验 agent-id 与 token 一致性。
     pub async fn check_auth(&self, agent_id: &str, token: &str) -> Result<bool, GseError> {
-        let res = self
-            .execute(
-                "SELECT 1 FROM agents WHERE agent_id = ? AND token = ?",
-                &[text(agent_id), text(token)],
-            )
-            .await?;
-        Ok(!res.rows.is_empty())
+        Ok(!matches!(
+            self.verify_agent_token(agent_id, token).await?,
+            AuthOutcome::Rejected
+        ))
+    }
+
+    /// 凭据校验，区分「命中当前 token」与「命中轮换前的 token」。
+    ///
+    /// 为什么要宽限：下发是手动的，`agents.token` 与期望 spec 在同一次写里更新，
+    /// 但 agent 可能在下发之前就因网络抖动重连 —— 那一瞬它手上还是旧 token。
+    /// 只认新值 → 认证被拒 → 会话建立不起来 → 永远收不到下发（死锁）。
+    pub async fn verify_agent_token(
+        &self,
+        agent_id: &str,
+        token: &str,
+    ) -> Result<AuthOutcome, GseError> {
+        let Some((current, prev)) = self.agent_tokens(agent_id).await? else {
+            return Ok(AuthOutcome::Rejected);
+        };
+        if token == current {
+            return Ok(AuthOutcome::Current);
+        }
+        if prev.as_deref() == Some(token) {
+            return Ok(AuthOutcome::Previous);
+        }
+        Ok(AuthOutcome::Rejected)
     }
 
     /// 认证成功后置在线并记录最后心跳。
@@ -2235,6 +2265,65 @@ mod tests {
             .expect("exists");
         assert_eq!(prev, None);
         assert!(ledger.agent_tokens("nope").await.expect("tokens").is_none());
+    }
+
+    /// 双凭据宽限的状态机：新值 → `Current`（可清宽限）、旧值 → `Previous`（放行）、其余 → `Rejected`。
+    #[tokio::test]
+    async fn verify_agent_token_accepts_previous_and_flags_current() {
+        let ledger = fresh_ledger("token-verify").await;
+        ledger
+            .upsert_agent(&Agent {
+                agent_id: "a-1".to_string(),
+                host_id: "h-1".to_string(),
+                access_point_id: None,
+                token: "old".to_string(),
+                version: String::new(),
+                install_path: String::new(),
+                status: "unknown".to_string(),
+                last_heartbeat_at: None,
+                registered_at: ledger_stamp(),
+            })
+            .await
+            .expect("upsert agent");
+
+        assert_eq!(
+            ledger.verify_agent_token("a-1", "old").await.expect("verify"),
+            AuthOutcome::Current,
+            "没有轮换时旧值就是当前值"
+        );
+        assert_eq!(
+            ledger.verify_agent_token("a-1", "nope").await.expect("verify"),
+            AuthOutcome::Rejected
+        );
+        assert_eq!(
+            ledger.verify_agent_token("ghost", "old").await.expect("verify"),
+            AuthOutcome::Rejected,
+            "不存在的 agent 不能认证"
+        );
+
+        ledger
+            .rotate_agent_token("a-1", "new")
+            .await
+            .expect("rotate");
+        // 这就是「下发是手动的」带来的窗口：agent 手上可能还是旧 token，
+        // 必须放行，否则它会永久失联、也就永远收不到新 token。
+        assert_eq!(
+            ledger.verify_agent_token("a-1", "old").await.expect("verify"),
+            AuthOutcome::Previous
+        );
+        assert_eq!(
+            ledger.verify_agent_token("a-1", "new").await.expect("verify"),
+            AuthOutcome::Current
+        );
+        // check_auth 也必须跟着放行旧值（它是同一份逻辑的布尔投影）。
+        assert!(ledger.check_auth("a-1", "old").await.expect("check_auth"));
+
+        ledger.clear_agent_prev_token("a-1").await.expect("clear");
+        assert_eq!(
+            ledger.verify_agent_token("a-1", "old").await.expect("verify"),
+            AuthOutcome::Rejected,
+            "宽限已结束，旧 token 必须被拒"
+        );
     }
 
     fn dataplane(id: &str, ingest_url: &str, status: &str) -> DataplaneService {

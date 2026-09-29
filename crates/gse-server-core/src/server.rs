@@ -7,15 +7,16 @@ use std::time::Duration;
 use geminio::app::Error;
 use geminio::{Bytes, End, EndDrivers, EndListener, ListenOptions};
 use gse_proto::{
-    AuthReply, AuthRequest, CollectItemsReply, Command, DataplaneAddrReply, DataplaneAddrRequest,
-    GseError, Heartbeat, JobAck, JobExec, JobResult, Receipt,
+    AuthReply, AuthRequest, AgentSpecAck, AgentSpecPush, CollectItemsReply, Command,
+    DataplaneAddrReply, DataplaneAddrRequest, GseError, Heartbeat, HeartbeatReply, JobAck, JobExec,
+    JobResult, Receipt,
 };
 
 use crate::config::ServerConfig;
 use crate::dataplane::probe_dataplanes;
 use crate::http;
 use crate::job_file_store::JobFileStore;
-use crate::ledger::{ledger_stamp, AccessPoint, JobRecord, Ledger, NewJob};
+use crate::ledger::{ledger_stamp, AccessPoint, AuthOutcome, JobRecord, Ledger, NewJob};
 use crate::rerun::{build_rerun_submit, RerunRequest};
 use crate::session::{now_micros, Session, SessionRegistry, SessionState};
 
@@ -595,8 +596,11 @@ async fn handle_conn(
             let end = end_heartbeat.clone();
             let authed = authed_heartbeat.clone();
             async move {
-                handle_heartbeat(&req, &end, conn_client_id, &authed, &registry, &ledger).await;
-                Ok(Bytes::new())
+                let reply =
+                    handle_heartbeat(&req, &end, conn_client_id, &authed, &registry, &ledger).await;
+                serde_json::to_vec(&reply)
+                    .map(Bytes::from)
+                    .map_err(|e| Error::Remote(e.to_string()))
             }
         })
         .await
@@ -623,15 +627,15 @@ async fn handle_conn(
         eprintln!("gse-server: register dataplane_addr failed: {e}");
     }
 
-    let ledger_items = ledger.clone();
-    let authed_items = authed.clone();
+    let ledger_spec = ledger.clone();
+    let authed_spec = authed.clone();
     if let Err(e) = end
-        .register("collect_items", move |_req: Bytes| {
-            let ledger = ledger_items.clone();
-            let authed = authed_items.clone();
+        .register("agent_spec", move |_req: Bytes| {
+            let ledger = ledger_spec.clone();
+            let authed = authed_spec.clone();
             async move {
                 let conn_agent_id = authed.lock().ok().and_then(|g| g.clone());
-                let reply = handle_collect_items(conn_agent_id.as_deref(), &ledger).await;
+                let reply = handle_agent_spec(conn_agent_id.as_deref(), &ledger).await;
                 serde_json::to_vec(&reply)
                     .map(Bytes::from)
                     .map_err(|e| Error::Remote(e.to_string()))
@@ -639,7 +643,7 @@ async fn handle_conn(
         })
         .await
     {
-        eprintln!("gse-server: register collect_items failed: {e}");
+        eprintln!("gse-server: register agent_spec failed: {e}");
     }
 
     // ——— 连接生命周期：主动探测连接活性，失活即清理本连接建立的会话 ———
@@ -737,6 +741,133 @@ async fn cleanup_connection(
 /// 连接活性探测使用的方法名。agent 不会注册它，对端会回「未知方法」——
 /// 拿到任何回应都说明连接活着；超时或传输层错误才判定失活。
 const SESSION_PROBE_METHOD: &str = "__vectorman_probe__";
+
+/// Agent → Server：拉取本 Agent 的期望 spec；未认证或台账读失败返回空 revision。
+///
+/// 读失败时返回「无期望 spec」是**保守方向**：agent 会保持当前配置（不回退、不清空），
+/// 而反过来（拿坏数据覆盖）会直接洗掉一台机器的配置。
+async fn handle_agent_spec(conn_agent_id: Option<&str>, ledger: &Ledger) -> AgentSpecPush {
+    let Some(agent_id) = conn_agent_id else {
+        return AgentSpecPush::default();
+    };
+    match ledger.get_agent_spec(agent_id).await {
+        Ok(Some(s)) => AgentSpecPush {
+            revision: s.revision,
+            spec: Some(s.spec),
+        },
+        Ok(None) => AgentSpecPush::default(),
+        Err(e) => {
+            eprintln!(
+                "gse-server: load agent_specs for {agent_id} failed: {}",
+                e.message
+            );
+            AgentSpecPush::default()
+        }
+    }
+}
+
+/// 把 Agent 上报的生效快照落库（含逐字段 diff）。
+///
+/// - `force = false`（心跳补报）：与已存 state 的 revision 相同时**跳过**，
+///   否则每 30 秒都会写一次库；
+/// - `force = true`（显式下发）：无论 revision 是否相同都刷新，让 `reported_at` 反映本次下发。
+///
+/// 无期望 spec 时 diff 取空（没期望就没有漂移）。
+async fn record_spec_report(
+    ledger: &Ledger,
+    agent_id: &str,
+    ack: &AgentSpecAck,
+    force: bool,
+) -> Result<(), GseError> {
+    if agent_id.is_empty() {
+        return Err(GseError::new("invalid_argument", "missing agent_id"));
+    }
+    if !force {
+        let stored = ledger.get_agent_spec_state(agent_id).await?;
+        if let Some(s) = stored {
+            if s.revision == ack.revision && s.applied == ack.applied {
+                return Ok(());
+            }
+        }
+    }
+    let desired = ledger.get_agent_spec(agent_id).await?;
+    let diff = match desired.as_ref() {
+        Some(d) => crate::spec::diff(&d.spec, &ack.applied).map_err(|e| GseError::new("internal", e))?,
+        None => crate::spec::SpecDiff::default(),
+    };
+    ledger
+        .upsert_agent_spec_state(&crate::ledger::AgentSpecState {
+            agent_id: agent_id.to_string(),
+            revision: ack.revision.clone(),
+            applied: ack.applied.clone(),
+            diff,
+            not_enforced: ack.not_enforced.clone(),
+            outcome: ack.outcome.clone(),
+            detail: ack.detail.clone(),
+            reported_at: ledger_stamp(),
+        })
+        .await
+}
+
+/// Server → Agent：推送该 Agent 的期望 spec 并等待回执；离线会话返回 `agent_offline`。
+///
+/// 同步返回回执（而非异步 fire-and-forget）：下发的结果就是回执，没有回执的下发
+/// 无法回答「到底生效了没」。
+pub async fn push_agent_spec(
+    ledger: &Ledger,
+    registry: &SessionRegistry,
+    agent_id: &str,
+) -> Result<AgentSpecAck, GseError> {
+    let desired = ledger.get_agent_spec(agent_id).await?.ok_or_else(|| {
+        GseError::new(
+            "not_found",
+            format!("agent {agent_id} 没有期望 spec，请先保存"),
+        )
+    })?;
+    let Some(session) = registry.get(agent_id).await else {
+        return Err(GseError::new(
+            "agent_offline",
+            format!("agent {agent_id} 无会话"),
+        ));
+    };
+    if session.state != SessionState::Online {
+        return Err(GseError::new(
+            "agent_offline",
+            format!("agent {agent_id} 会话状态为 {:?}", session.state),
+        ));
+    }
+    let push = AgentSpecPush {
+        revision: desired.revision.clone(),
+        spec: Some(desired.spec.clone()),
+    };
+    let body = serde_json::to_vec(&push)
+        .map_err(|e| GseError::new("internal", format!("encode spec: {e}")))?;
+    let resp = session
+        .end
+        .call("agent_spec", Bytes::from(body))
+        .await
+        .map_err(|e| {
+            GseError::new(
+                "agent_offline",
+                format!("push agent_spec to {agent_id} failed: {e}"),
+            )
+        })?;
+    let ack: AgentSpecAck = serde_json::from_slice(&resp).map_err(|e| {
+        GseError::new(
+            "internal",
+            format!("bad agent_spec ack from {agent_id}: {e}"),
+        )
+    })?;
+    // 落库失败不影响回执：回执已经拿到了，页面确实应该看到 outcome；
+    // 只是 sync_status 会晚一拍（下次心跳补报会补上）。
+    if let Err(e) = record_spec_report(ledger, agent_id, &ack, true).await {
+        eprintln!(
+            "gse-server: record spec report from {agent_id} failed: {}",
+            e.message
+        );
+    }
+    Ok(ack)
+}
 
 /// Agent → Server 拉取本 Agent 应执行的采集项；未认证返回空表。
 async fn handle_collect_items(conn_agent_id: Option<&str>, ledger: &Ledger) -> CollectItemsReply {
@@ -860,7 +991,7 @@ async fn handle_heartbeat(
     authed: &Arc<Mutex<Option<String>>>,
     registry: &SessionRegistry,
     ledger: &Ledger,
-) {
+) -> HeartbeatReply {
     if let Ok(hb) = serde_json::from_slice::<Heartbeat>(req) {
         // 心跳到达即证明**这条连接是活的** —— 若注册表里没有该会话
         // （例如上一次活性探测误判、会话已被清理），据此重建，
@@ -923,7 +1054,26 @@ async fn handle_heartbeat(
                 Err(e) => eprintln!("gse-server: encode upgrade result failed: {e}"),
             }
         }
+        // 生效 spec 的一次性补报：下发回执只在「下发那一刻」到达，agent 与服务端之间
+        // 任何一次丢失都会让页面永久停在旧 revision。心跳补报是唯一的兜底路径。
+        //
+        // 只有真的落库（或确认无需落库）才回 `spec_synced = true`，
+        // 否则 agent 会带着同一份快照无限重发。
+        return match hb.spec.as_ref() {
+            None => HeartbeatReply { spec_synced: true },
+            Some(ack) => match record_spec_report(ledger, &hb.agent_id, ack, false).await {
+                Ok(()) => HeartbeatReply { spec_synced: true },
+                Err(e) => {
+                    eprintln!(
+                        "gse-server: record spec report from {} failed: {}",
+                        hb.agent_id, e.message
+                    );
+                    HeartbeatReply { spec_synced: false }
+                }
+            },
+        };
     }
+    HeartbeatReply { spec_synced: true }
 }
 
 async fn handle_auth(
@@ -946,8 +1096,20 @@ async fn handle_auth(
     let authenticated = if !cfg.auth_enabled {
         true
     } else {
-        match ledger.check_auth(&req.agent_id, &req.token).await {
-            Ok(ok) => ok,
+        match ledger.verify_agent_token(&req.agent_id, &req.token).await {
+            // 命中当前 token：轮换已完成，把宽限凭据清掉，不再接受旧值。
+            Ok(AuthOutcome::Current) => {
+                if let Err(e) = ledger.clear_agent_prev_token(&req.agent_id).await {
+                    eprintln!(
+                        "gse-server: clear prev_token for {} failed: {}",
+                        req.agent_id, e.message
+                    );
+                }
+                true
+            }
+            // 命中轮换前的 token：agent 还没拿到新值（可能还没收到下发），必须放行。
+            Ok(AuthOutcome::Previous) => true,
+            Ok(AuthOutcome::Rejected) => false,
             Err(e) => {
                 eprintln!("gse-server: auth lookup failed: {:?}", e);
                 return AuthReply {
@@ -1238,6 +1400,239 @@ mod tests {
         // 未知/离线会话静默跳过。
         push_collect_items(&ledger, &registry, "a-3").await;
         let _ = client_end;
+    }
+
+    // ---- per-Agent spec ----
+
+    fn wire(item_ids: &[&str]) -> gse_proto::AgentSpecWire {
+        gse_proto::AgentSpecWire {
+            items: item_ids
+                .iter()
+                .map(|id| gse_proto::SpecItem {
+                    item_id: id.to_string(),
+                    name: format!("item-{id}"),
+                    kind: "log_file".to_string(),
+                    enabled: true,
+                    collector: serde_json::json!({"path_patterns": ["/var/log/*.log"]}),
+                    storage: serde_json::json!({"retention_days": 1}),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    async fn desired(ledger: &Ledger, agent_id: &str, items: &[&str]) {
+        let spec = wire(items);
+        let revision = crate::spec::revision(&spec).expect("revision");
+        ledger
+            .upsert_agent_spec(&crate::ledger::AgentSpec {
+                agent_id: agent_id.to_string(),
+                revision,
+                spec,
+                updated_at: ledger_stamp(),
+            })
+            .await
+            .expect("upsert spec");
+    }
+
+    fn ack_of(push: &AgentSpecPush, outcome: &str) -> AgentSpecAck {
+        AgentSpecAck {
+            revision: push.revision.clone(),
+            outcome: outcome.to_string(),
+            applied: push.spec.clone().unwrap_or_default(),
+            not_enforced: vec![],
+            detail: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_agent_spec_returns_empty_revision_when_nothing_desired() {
+        let l = ledger("spec-pull-none").await;
+        // 未认证
+        let push = handle_agent_spec(None, &l).await;
+        assert!(push.revision.is_empty());
+        assert!(push.spec.is_none());
+        // 已认证但没存过期望 spec：必须是「空」而不是「一份默认值」——
+        // 返回默认值会把 agent 的本地配置洗掉。
+        let push = handle_agent_spec(Some("a-1"), &l).await;
+        assert!(push.revision.is_empty(), "空 revision 才代表「无期望」");
+        assert!(push.spec.is_none());
+        // 存过之后就能拉到。
+        desired(&l, "a-1", &["i-1"]).await;
+        let push = handle_agent_spec(Some("a-1"), &l).await;
+        assert!(!push.revision.is_empty());
+        assert_eq!(push.spec.expect("spec").items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn push_agent_spec_reaches_online_agent_and_records_state() {
+        use geminio::{dial, DialOptions};
+
+        let l = ledger("spec-push").await;
+        desired(&l, "a-1", &["i-1"]).await;
+
+        let listener = EndListener::bind("127.0.0.1:0", ListenOptions::default())
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let client_task = tokio::spawn(async move {
+            let (client, _drivers) = dial(addr, DialOptions::default()).await.expect("dial");
+            client
+                .register("agent_spec", move |req: Bytes| {
+                    let push: AgentSpecPush = serde_json::from_slice(&req).expect("decode push");
+                    let ack = ack_of(&push, gse_proto::spec_outcome::APPLIED);
+                    let _ = tx.send(push);
+                    async move {
+                        Ok(Bytes::from(serde_json::to_vec(&ack).expect("encode ack")))
+                    }
+                })
+                .await
+                .expect("register");
+            client
+        });
+        let (server_end, _drivers) = listener.accept().await.expect("accept");
+        let client_end = client_task.await.expect("client");
+
+        let registry = SessionRegistry::new();
+        registry
+            .insert(Session::new("a-1", server_end, now_micros()))
+            .await;
+
+        let ack = push_agent_spec(&l, &registry, "a-1")
+            .await
+            .expect("push ok");
+        assert_eq!(ack.outcome, "applied");
+        let pushed = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("push timed out")
+            .expect("push received");
+        assert_eq!(pushed.spec.expect("spec").items.len(), 1);
+        assert_eq!(pushed.revision, ack.revision);
+
+        // 回执必须落库，且 diff 为空（agent 回声了同一份 spec）。
+        let state = l
+            .get_agent_spec_state("a-1")
+            .await
+            .expect("get state")
+            .expect("state exists");
+        assert_eq!(state.revision, ack.revision);
+        assert!(state.diff.is_empty(), "{:?}", state.diff);
+        assert_eq!(state.outcome, "applied");
+        let _ = client_end;
+    }
+
+    #[tokio::test]
+    async fn push_agent_spec_reports_offline_and_writes_no_state() {
+        let l = ledger("spec-push-offline").await;
+        desired(&l, "a-1", &["i-1"]).await;
+        let registry = SessionRegistry::new();
+
+        let err = push_agent_spec(&l, &registry, "a-1")
+            .await
+            .expect_err("no session");
+        assert_eq!(err.code, "agent_offline");
+        assert!(
+            l.get_agent_spec_state("a-1").await.expect("get").is_none(),
+            "离线不得写生效状态"
+        );
+
+        // 没有期望 spec 时先报 not_found：提示运维「要先保存」而不是「agent 离线」。
+        let err = push_agent_spec(&l, &registry, "a-9")
+            .await
+            .expect_err("no desired spec");
+        assert_eq!(err.code, "not_found");
+    }
+
+    #[tokio::test]
+    async fn record_spec_report_skips_identical_and_force_refreshes() {
+        let l = ledger("spec-report").await;
+        desired(&l, "a-1", &["i-1", "i-2"]).await;
+        let mut push = AgentSpecPush {
+            revision: crate::spec::revision(&wire(&["i-1"])).expect("rev"),
+            spec: Some(wire(&["i-1"])),
+        };
+        let ack = ack_of(&push, gse_proto::spec_outcome::PARTIAL);
+
+        record_spec_report(&l, "a-1", &ack, false)
+            .await
+            .expect("record");
+        let s1 = l
+            .get_agent_spec_state("a-1")
+            .await
+            .expect("get")
+            .expect("state");
+        // 期望有 i-2、生效没有 → added；这是页面「哪些采集项没生效」的唯一来源。
+        assert_eq!(s1.diff.items.added, vec!["i-2".to_string()]);
+        assert_eq!(s1.diff.items.removed, Vec::<String>::new());
+        assert_eq!(s1.outcome, "partial");
+
+        // 内容相同的心跳补报不重复写库（否则每 30 秒一次写）。
+        record_spec_report(&l, "a-1", &ack, false)
+            .await
+            .expect("record again");
+        let s2 = l
+            .get_agent_spec_state("a-1")
+            .await
+            .expect("get")
+            .expect("state");
+        assert_eq!(s2.reported_at, s1.reported_at);
+
+        // 显式下发强制刷新，让 reported_at 反映本次下发。
+        record_spec_report(&l, "a-1", &ack, true)
+            .await
+            .expect("force");
+        let s3 = l
+            .get_agent_spec_state("a-1")
+            .await
+            .expect("get")
+            .expect("state");
+        assert_ne!(s3.reported_at, s1.reported_at);
+
+        // revision 变了但内容相同（agent 侧改了本地配置又报回来）也要刷新并重算 diff。
+        push.revision = "other-rev".to_string();
+        let ack2 = ack_of(&push, gse_proto::spec_outcome::APPLIED);
+        record_spec_report(&l, "a-1", &ack2, false)
+            .await
+            .expect("record changed revision");
+        let s4 = l
+            .get_agent_spec_state("a-1")
+            .await
+            .expect("get")
+            .expect("state");
+        assert_eq!(s4.revision, "other-rev");
+        assert_eq!(s4.outcome, "applied");
+    }
+
+    #[tokio::test]
+    async fn record_spec_report_without_desired_has_empty_diff() {
+        // 没期望就没有漂移：agent 报的是本地基线，不该在页面上显示成一堆差异。
+        let l = ledger("spec-report-nodesired").await;
+        let push = AgentSpecPush {
+            revision: String::new(),
+            spec: Some(wire(&["i-1"])),
+        };
+        let ack = ack_of(&push, gse_proto::spec_outcome::APPLIED);
+        record_spec_report(&l, "a-1", &ack, false)
+            .await
+            .expect("record");
+        let s = l
+            .get_agent_spec_state("a-1")
+            .await
+            .expect("get")
+            .expect("state");
+        assert!(s.diff.is_empty(), "{:?}", s.diff);
+        assert_eq!(s.revision, "", "空 revision 表示本地基线");
+    }
+
+    #[tokio::test]
+    async fn record_spec_report_rejects_missing_agent_id() {
+        let l = ledger("spec-report-noid").await;
+        let ack = ack_of(&AgentSpecPush::default(), gse_proto::spec_outcome::APPLIED);
+        let err = record_spec_report(&l, "", &ack, false)
+            .await
+            .expect_err("must reject");
+        assert_eq!(err.code, "invalid_argument");
     }
 
     /// 测试用：登记一个 agent 并置为 online。

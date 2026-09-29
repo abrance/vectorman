@@ -51,21 +51,25 @@
 
 ## 阶段 3：服务端下发通道
 
-- [ ] 3.1 `server.rs`：`handle_collect_items` → `handle_agent_spec`（未认证 / 无期望 spec → 空 revision）。
+- [x] 3.1 `server.rs` 新增 `handle_agent_spec`（未认证 / 无期望 spec → 空 revision；台账读失败也返回空，
+      保守方向是「让 agent 保持现状」而不是「拿坏数据覆盖」）。
       —— 对应 需求 R4、设计「服务端函数」。
-- [ ] 3.2 `push_collect_items` / `push_collect_items_to` → `push_agent_spec`：会话非 `Online` →
-      `agent_offline` 且不写 state；成功 → ack 落 state（含 diff）。**不再保留批量 `_to` 变体**
-      （单台即可，列表页逐台调用）。—— 对应 需求 R1/R4/R8。
-- [ ] 3.3 `handle_conn` 里把 `collect_items` handler 换成 `agent_spec` 同名 handler（形状不变）。
+- [x] 3.2 新增 `push_agent_spec`：无期望 spec → `not_found`（提示先保存）；无会话 / 非 `Online` →
+      `agent_offline`；调用失败也归 `agent_offline`；成功 → ack 落 state（含 diff）。**不提供批量变体**。
+      另抽 `record_spec_report(force)` 共用落库：显式下发强制刷新 `reported_at`，心跳补报在
+      revision+applied 都相同时跳过（否则每 30 秒写一次库）。—— 对应 需求 R1/R4/R8。
+- [x] 3.3 `handle_conn` 里 `collect_items` handler 换成 `agent_spec`（形状不变，双侧同名注册）。
       —— 对应 需求 R4、设计 Pitfall 2。
-- [ ] 3.4 `auth` 支持双凭据：`token` 或 `prev_token` 匹配即通过；命中 `prev_token` 的认证 SHALL 不清理，
-      命中**新** `token` 时清理 `prev_token`。
+- [x] 3.4 认证逻辑下沉到台账：`verify_agent_token` 返回 `AuthOutcome::{Current,Previous,Rejected}`，
+      `check_auth` 改为它的布尔投影（同一份逻辑，不分叉）；`handle_auth` 命中 `Current` 时清 `prev_token`。
       —— 对应 需求 R7、设计「token 轮换」。
-- [ ] 3.5 `heartbeat` handler 接收一次性补报：与已存 state 的 revision 比对，不同则刷新 state + diff；
-      返回 `HeartbeatReply { spec_synced }`。—— 对应 需求 R8、设计 Pitfall 7。
-- [ ] 3.6 单测：`push_agent_spec_reaches_online_agent`（镜像 `collect_items_reaches_online_agent` 的
-      假 agent 注册法）；离线不写 state；`handle_agent_spec` 空 revision；auth 双凭据三分支;
-      心跳补报落 state。—— 对应 需求 R4/R7/R8。
+- [x] 3.5 `heartbeat` handler 改为返回 `HeartbeatReply { spec_synced }`；接收 `hb.spec` 一次性补报并落库，
+      **只有真的落库（或确认无需落库）才回 `true`**，否则 agent 会无限重发。
+      —— 对应 需求 R8、设计 Pitfall 7。
+- [x] 3.6 单测（7 条新用例）：`handle_agent_spec` 空 revision 三分支；假 agent 注册 `agent_spec` 的
+      推送 + 回执落库；离线 / 无期望 spec 两个错误码 + 不写 state；`record_spec_report` 的跳过与强制刷新；
+      无期望时 diff 为空；缺 agent_id 报错；台账侧 `verify_agent_token` 三分支 + `check_auth` 放行旧值。
+      —— 对应 需求 R4/R7/R8。实测 `cargo test --workspace` 全绿、`cargo clippy --all-targets` 0 告警。
 
 **检查点 - 确保所有测试通过**：`cargo test -p gse-server-core`。
 
