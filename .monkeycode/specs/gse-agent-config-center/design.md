@@ -328,9 +328,30 @@ pub struct ItemDiff {
 | `http.rs`（5 条路由） | 读写转发 `/v1/collect-items*` → `/api/gse/collect-items*` | 只读转发 `GET /v1/agent-specs` → `/api/gse/agent-specs`；其余删除 |
 | `cleanup.rs::fetch_live_items` | `GET /api/gse/collect-items` 取 live 项算保留窗口 | `GET /api/gse/agent-specs`，遍历各 Agent `desired.spec.items` 展平 |
 
-保留窗口的去重口径（`parse_live_items`）：按 `item_id` 归并，`kind` 取首个非空值，
-`retention_days` **取所有 Agent 中的最大值** —— 同一条采集项现在可能在不同 Agent 的 spec 里被改成不同的
-保留天数，取最大值是保守方向（宁可不提早删数据）；eBPF 类仍走 `ebpf_retention::retention_days`。
+**保留窗口的去重口径**（`parse_agent_specs`）：遍历各 Agent 的 `desired.spec.items`，按 `item_id` 归并，
+`kind` 取首个非空值，`retention_days` **取所有 Agent 中的最大值** —— 同一条采集项现在可能在不同 Agent 的 spec
+里被改成不同的保留天数，取最大值是保守方向（宁可不提早删数据）；eBPF 类仍走
+`ebpf_retention::retention_days`。`enabled = false` 的项**不算 live**（已停止采集，数据按保留期清理）。
+
+**已删采集项的数据谁清理（本 feature 补上的缺口）**：新模型里采集项是 spec 的一段，
+**没有 per-item 删除事件** —— 运维把它从 spec 里去掉、或 `enabled=false`，服务端只是少返回一条。
+原先由 `DELETE /v1/collect-items/{id}` 顺手写 `retain/{item_id}` 的那条路径随之消失。
+替代机制完全落在 `cleanup.rs` 自身上：
+
+| 键 | 含义 |
+| --- | --- |
+| `spec-live/{item_id}` → `{"retention_days":N}` | 上一轮 live 集合（记得住才能发现「消失」） |
+| `retain/{item_id}` → `{"until_micros":T}` | 已删项的数据清理计划（沿用既有语义） |
+
+`mark_removed_items(kv, live, now)` 每轮在 `apply_retention` **之前**跑：
+消失的项 → 按它上次记录的保留天数写 `retain/`；回来的项（重新加回或重新启用）→ **删掉 `retain/`**
+（否则一次临时停用就会在保留期到点时把数据删掉）。
+
+比原来更强的一点：原先只有「显式删除」才会排清理，现在是「任何消失」都会。
+
+**`fetch_live_items` 的失败必须在语义上与「空列表」分开**（`Option<Vec<LiveItem>>`）：
+把 GSE 不可达当成空列表，`mark_removed_items` 会把**所有**采集项误判成已删除、进而删掉全部历史数据。
+测试 `...` 锁的就是这条。
 
 服务端函数（`server.rs`）：
 
@@ -513,7 +534,10 @@ specs: BTreeMap<agent_id, AgentSpecWire> = {}
    写入路径显式拒绝该值。
 10. **破坏性变更的静默失败面**：删掉 `/collect-items*` 与 `/agent-configs*` 后，dataplane 采集链路页与
     任何既有脚本会直接 404。前端改动与 README 标注是本 feature 的必做项，不是可选项。
-11. **整份 JSON 存储的检索代价**：「哪些 Agent 采了 X」是内存聚合，无索引。规模上来要么加
+11. **GSE 不可达 ≠ 没有采集项**：`run_cleanup` 必须把「取不到 live 列表」与「列表为空」分开传下去
+    （`Option<Vec<LiveItem>>`）。混为一谈会让 `mark_removed_items` 把全部采集项标记成已删除，
+    下一轮保留清理就把历史数据删干净 —— 这是本 feature 里后果最重的坑。
+12. **整份 JSON 存储的检索代价**：「哪些 Agent 采了 X」是内存聚合，无索引。规模上来要么加
     `agent_spec_items` 表，要么把聚合下推到 dataserver；本期接受。
 12. **迁移的语义不可逆**：全局采集项展开成 N 份拷贝后再也不联动 —— 这是刻意的（用户要求 per-agent 独立），
     但必须写进发布说明，否则会被当成 bug。

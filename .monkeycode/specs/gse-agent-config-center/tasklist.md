@@ -75,24 +75,29 @@
 
 ## 阶段 4：服务端 HTTP
 
-- [ ] 4.1 新增路由 `GET /api/gse/agent-specs`、`GET|PUT /api/gse/agents/{agent_id}/spec`、
+- [x] 4.1 新增路由 `GET /api/gse/agent-specs`、`GET|PUT /api/gse/agents/{agent_id}/spec`、
       `POST /api/gse/agents/{agent_id}/spec/apply`。
       —— 对应 需求 R2/R4/R10、设计「服务端接口」。
-- [ ] 4.2 删除 `/api/gse/collect-items*` 与 `/api/gse/agent-configs*` 整组路由与其 handler。
+- [x] 4.2 删除 `/api/gse/collect-items*` 与 `/api/gse/agent-configs*` 整组路由与其 handler。
       —— 对应 需求 R12 破坏性变更 1。
-- [ ] 4.3 脱敏：响应里 `token` / `otlp_token` 输出 `"***"`（原值为空输出 `""`）；
+- [x] 4.3 脱敏：响应里 `token` / `otlp_token` 输出 `"***"`（原值为空输出 `""`）；
       写请求哨兵或空串表示「保留原值」，`null` 表示清空；哨兵但无既有值 → 400 `invalid_argument`。
       —— 对应 需求 R9。
-- [ ] 4.4 结构性校验（六条，全部拦在写库前）：心跳周期缺失/≤0、心跳周期 > `heartbeat_timeout_secs / 3`、
+- [x] 4.4 结构性校验（六条，全部拦在写库前）：心跳周期缺失/≤0、心跳周期 > `heartbeat_timeout_secs / 3`、
       `item_id` 重复或为空、`kind` 不在白名单、目标 `agent_id` 不在 `agents` 台账、`agent_id == "apply"`。
       —— 对应 需求 R2、设计 Pitfall 9。
-- [ ] 4.5 `PUT spec` 时若 `token` 实际变更 → 同一次写里 `agents.prev_token = 旧值` + `agents.token = 新值`。
+- [x] 4.5 `PUT spec` 时若 `token` 实际变更 → 同一次写里 `agents.prev_token = 旧值` + `agents.token = 新值`。
       —— 对应 需求 R7、设计 Pitfall 4。
-- [ ] 4.6 `sync_status` 派生（`unknown` / `rejected` / `synced` / `stale`）与列表合并返回
+- [x] 4.6 `sync_status` 派生（`unknown` / `rejected` / `synced` / `stale`）与列表合并返回
       （desired + state + diff + `session_state`），供列表页与采集链路总览共用。
       —— 对应 需求 R8/R10/R13。
-- [ ] 4.7 路由测试：三条新路由 + 列表；六条校验各一例（含 `apply` 保留字）；**响应体不含 token 明文**；
-      旧路由 404。—— 对应 需求 R2/R9/R12。
+- [x] 4.7 路由测试：三条新路由 + 列表；六条校验各一例（含 `apply` 保留字、心跳上限两条）；脱敏写回与
+      哨兵误用 400；`s3cret` 不出现在响应里且必须落进 `agents.token`（旧值进 `prev_token`）；
+      管理端口独立部署时 apply 返回 503；四条旧路由 404。
+      **实现补充**：PUT 的非敏感字段是整体覆盖（缺省回落内置默认值），`token`/`otlp_token` 用
+      `double_option` 区分「缺失/空串=保持」与「null=清空」；PUT 时若 token 实际变更则同一次写里轮换
+      `agents.token`（旧值进 `prev_token`）；`delete_agent` 级联改为清 `agent_specs` + `agent_spec_states`。
+      —— 对应 需求 R2/R7/R9/R12。
 
 **检查点 - 确保所有测试通过**：`cargo test -p gse-server-core`。
 
@@ -135,13 +140,17 @@
       `getAgentConfig` 与 collect-items 方法；新增 `listAgentSpecs` / `getAgentSpec` / `putAgentSpec` /
       `applyAgentSpec`，类型按 `AgentSpecWire` / `SpecParams` / `SpecItem` / `SpecDiff` 定义。
       —— 对应 需求 R2/R10。
-- [ ] 6.1b `frontend/packages/adapters/src/dataplane/ingest.ts`：删除 `CollectItem` 的 5 个 CRUD 方法，
+- [x] 6.1b `frontend/packages/adapters/src/dataplane/ingest.ts`：删除 `CollectItem` 的 5 个 CRUD 方法，
       新增只读 `listAgentSpecs`（`GET /v1/agent-specs`）；同步改 `dataplane/ingest.test.ts`。
       —— 对应 需求 R10、设计 Pitfall 16。
-- [ ] 6.1c `bins/dataserver`：删除 `http.rs` 的 5 条 `/v1/collect-items*` 路由，新增只读
+- [x] 6.1c `bins/dataserver`：删除 `http.rs` 的 5 条 `/v1/collect-items*` 路由，新增只读
       `GET /v1/agent-specs` 转发；`cleanup.rs::fetch_live_items` 改读 `/api/gse/agent-specs`，
       `parse_collect_items` → `parse_live_items`（按 `item_id` 去重、`retention_days` 取最大值）。
       —— 对应 需求 R10/R12 破坏性变更 5、设计「dataserver 侧口径」。
+      **实现补充（本 feature 补的缺口）**：原先由 `DELETE /v1/collect-items/{id}` 写 `retain/{item_id}`
+      的清理入口没了 —— 新增 `mark_removed_items`（`spec-live/{item_id}` 记住上一轮 live 集合，
+      消失即排清理、回来即撤销删除计划），并把 `run_cleanup` 的 live 改为 `Option<Vec<LiveItem>>`，
+      保证「GSE 不可达」不会被当成「列表为空」（后者会删掉全部历史数据）。
 - [ ] 6.1d **迁移** `frontend/apps/dataplane/src/features/collect-form.ts` + `collect-form.test.ts` →
       `frontend/packages/adapters/src/dataplane/`：新的采集项编辑在 `apps/node`，分层规则禁止 app 之间互相
       import；迁后改两侧 import。—— 对应 需求 R10、设计「改动范围」。

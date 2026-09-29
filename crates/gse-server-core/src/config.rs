@@ -139,6 +139,21 @@ fn default_interval() -> u64 {
     30
 }
 
+/// 管理端口独立部署（拿不到 `ServerConfig`）时用的心跳周期上限兜底。
+/// 与默认配置一致：判活窗口 90s 的三分之一。
+pub const DEFAULT_MAX_AGENT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
+
+impl ServerConfig {
+    /// 允许下发给 Agent 的心跳周期上限。
+    ///
+    /// 判活是全局的 `heartbeat_timeout_secs`（会话超时即摘掉），而下发的心跳周期是
+    /// per-Agent 的。周期大于窗口时，Agent 会在两次心跳之间就被判离线，表现成周期性
+    /// 「离线→上线」闪断、采集器反复重对齐 —— 所以取窗口的 1/3 作为上限。
+    pub fn max_agent_heartbeat_interval_secs(&self) -> u64 {
+        (self.heartbeat_timeout_secs / 3).max(1)
+    }
+}
+
 fn default_timeout() -> u64 {
     90
 }

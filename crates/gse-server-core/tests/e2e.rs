@@ -7,7 +7,7 @@ use gse_agent_core::{run as run_agent, AgentConfig};
 use gse_proto::{FileEndpoint, JobStatus};
 use gse_server_core::file_transfer::{submit_file_job, FileJobSubmit};
 use gse_server_core::{
-    http_router, AdminState, Agent, AgentConfig as LedgerAgentConfig, JobRecord, JobSubmit, Ledger,
+    http_router, AdminState, Agent, JobRecord, JobSubmit, Ledger,
     NewJob, Server, ServerConfig, SessionState,
 };
 use http_body_util::BodyExt;
@@ -661,18 +661,17 @@ async fn e2e_http_delete_agent_clears_ledger_and_session() {
         .await
         .expect("bind");
     register(&server, "web-01", "tok-1").await;
+    let spec = gse_proto::AgentSpecWire::default();
     server
         .ledger
-        .upsert_agent_config(&LedgerAgentConfig {
+        .upsert_agent_spec(&gse_server_core::AgentSpec {
             agent_id: "web-01".to_string(),
-            host_id: "h-1".to_string(),
-            cpu_limit_percent: None,
-            mem_limit_percent: None,
-            log_level: "info".to_string(),
+            revision: gse_server_core::spec_revision(&spec).expect("revision"),
+            spec,
             updated_at: String::new(),
         })
         .await
-        .expect("write agent config");
+        .expect("write agent spec");
     let server_ref = server.clone();
     tokio::spawn(async move {
         let _ = server_ref.run().await;
@@ -711,7 +710,7 @@ async fn e2e_http_delete_agent_clears_ledger_and_session() {
         .expect("delete response");
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // 台账级联清空：agents + agent_configs。
+    // 台账级联清空：agents + agent_specs。
     assert!(server
         .ledger
         .get_agent("web-01")
@@ -721,11 +720,11 @@ async fn e2e_http_delete_agent_clears_ledger_and_session() {
     assert!(
         server
             .ledger
-            .get_agent_config("web-01")
+            .get_agent_spec("web-01")
             .await
             .expect("get")
             .is_none(),
-        "agent config should be cascaded away"
+        "agent spec should be cascaded away"
     );
     // 活跃会话被移除 -> 指令不可达。
     let err = server

@@ -11,7 +11,7 @@ use dataplane_log::{LogStore, TantivyLogStore};
 use dataplane_sql::{RelationalStore, SqliteRelationalStore};
 use dataplane_ts::{TimeSeriesStore, TsRetentionConfig, TsinkTimeSeriesStore};
 use dataserver::{prom_router, sql_router, AppState};
-use gse_server_core::{http_router, probe_once, AdminState, DataplaneService, Ledger};
+use gse_server_core::{http_router, probe_once, AdminState, Agent, DataplaneService, Ledger};
 
 /// 与测试内上报一致的时间戳（微秒），保证 Prom 即时查询能命中。
 const TS: i64 = 1_710_000_000_000_000;
@@ -149,28 +149,48 @@ async fn register_probe_collect_ingest_and_query() {
         Some(ds_url.as_str())
     );
 
-    // 5. 经 dataserver 反代在 GSE 新建 metrics 采集项。
+    // 5. 采集项现在是 per-Agent spec 的一段：在 GSE 控制面写 spec，数据面只读透传。
+    ledger
+        .upsert_agent(&Agent {
+            agent_id: "agent-1".to_string(),
+            host_id: "host-1".to_string(),
+            access_point_id: None,
+            token: "tok".to_string(),
+            version: String::new(),
+            install_path: String::new(),
+            status: "unknown".to_string(),
+            last_heartbeat_at: None,
+            registered_at: "t".to_string(),
+        })
+        .await
+        .expect("agent");
     let create = serde_json::json!({
-        "name": "cpu metrics",
-        "agent_ids": ["agent-1"],
-        "kind": "metrics_host",
-        "enabled": true,
-        "collector": {"interval_secs": 15},
-        "storage": {"retention_days": 1},
+        "params": {"heartbeat_interval_secs": 15},
+        "items": [{
+            "name": "cpu metrics",
+            "kind": "metrics_host",
+            "enabled": true,
+            "collector": {"interval_secs": 15},
+            "storage": {"retention_days": 1},
+        }],
     })
     .to_string();
-    let (status, body) = http("POST", &format!("{ds_url}/v1/collect-items"), Some(create)).await;
-    assert_eq!(status, 201, "{body}");
-    let item: serde_json::Value = serde_json::from_str(&body).expect("item json");
-    let item_id = item["item_id"].as_str().expect("item_id").to_string();
-    assert_eq!(item["agent_ids"], serde_json::json!(["agent-1"]));
-
     let (status, body) = http(
-        "GET",
-        &format!("{ds_url}/v1/collect-items?agent_id=agent-1"),
-        None,
+        "PUT",
+        &format!("{gse_url}/api/gse/agents/agent-1/spec"),
+        Some(create),
     )
     .await;
+    assert_eq!(status, 200, "{body}");
+    let view: serde_json::Value = serde_json::from_str(&body).expect("spec view json");
+    let item_id = view["desired"]["spec"]["items"][0]["item_id"]
+        .as_str()
+        .expect("item_id")
+        .to_string();
+    assert!(view["desired"]["spec"]["items"][0]["storage"]["retention_days"].is_number());
+
+    // 数据面只读透传：能看到该 Agent 的期望 spec。
+    let (status, body) = http("GET", &format!("{ds_url}/v1/agent-specs"), None).await;
     assert_eq!(status, 200, "{body}");
     assert!(body.contains(&item_id), "{body}");
 

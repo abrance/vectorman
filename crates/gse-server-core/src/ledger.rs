@@ -1255,6 +1255,29 @@ impl Ledger {
             .collect()
     }
 
+    /// 删除期望 spec（删除 Agent 时级联清理）。返回是否存在并删除。
+    pub async fn remove_agent_spec(&self, agent_id: &str) -> Result<bool, GseError> {
+        if self.get_agent_spec(agent_id).await?.is_none() {
+            return Ok(false);
+        }
+        self.execute(
+            "DELETE FROM agent_specs WHERE agent_id = ?",
+            &[text(agent_id)],
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// 删除生效状态（删除 Agent 时级联清理）。
+    pub async fn remove_agent_spec_state(&self, agent_id: &str) -> Result<(), GseError> {
+        self.execute(
+            "DELETE FROM agent_spec_states WHERE agent_id = ?",
+            &[text(agent_id)],
+        )
+        .await?;
+        Ok(())
+    }
+
     // ---- jobs ----
 
     /// 插入一条 `pending` 作业。

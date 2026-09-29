@@ -198,8 +198,11 @@ Server 只提供三个动作 —— **取 spec / 存 spec / 下发 spec**。采�
   4. dataplane「采集链路」页由可编辑改为只读总览；
   5. dataserver 的 `/v1/collect-items*` 读写转发删除，改为只读 `/v1/agent-specs`；
      `bins/dataserver/src/cleanup.rs` 的保留清理改为从 `/api/gse/agent-specs` 取 live 采集项
-     （口径按 `item_id` 去重，同一 `item_id` 在多台 Agent 的 spec 里 `retention_days` 不一致时**取最大值**，
-     宁可不提早删数据）。
+     （口径按 `item_id` 去重，`enabled = false` 不算 live，同一 `item_id` 在多台 Agent 的 spec 里
+     `retention_days` 不一致时**取最大值**，宁可不提早删数据）；
+     原先由 `DELETE /v1/collect-items/{id}` 写 `retain/{item_id}` 的清理入口改为在 cleanup 内自行发现：
+     记 `spec-live/{item_id}` 保存上一轮 live 集合，消失即排清理、回来即撤销删除计划。
+     **GSE 不可达必须与「空列表」区分**，否则会把全部采集项误判为已删除。
 - 前置依赖：`token` 轮换正确性依赖 Requirement 7 的双凭据宽限；`sync_status` 依赖 Agent 心跳补报；
   前端依赖 `frontend/apps/node` 分层与 `@vectorman/adapters`（均已具备）。
 - 已知风险（须在本 feature 内收口或明确接受）：
