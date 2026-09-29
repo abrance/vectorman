@@ -14,6 +14,7 @@
 
 | Feature | 状态 | 截至日期 | 一句话 |
 | --- | --- | --- | --- |
+| [gse-agent-config-center](gse-agent-config-center/) | 🟡 ACTIVE（规格完成，待实施） | 2026-09-29 | Agent 配置中心：一台 Agent 一份 spec（参数 + 采集项），手动下发 + 热加载 + 逐字段生效核验与可视化 |
 | [gse-session-liveness](gse-session-liveness/) | 🟡 ACTIVE（规格完成，待实施） | 2026-09-26 | 会话生命周期修复：断连后台账/会话状态一致的关闭路径 |
 | [ebpf-observability](ebpf-observability/) | 🟡 ACTIVE（主体已实现，P2/P3 遗留见 `todo.md`） | 2026-09-25 | eBPF 四类采集（network/tcp/process/syscall）：内核态程序 + 用户态聚合 |
 | [observability-hardening](observability-hardening/) | 🟡 ACTIVE（余 cron 幂等验收、鉴权加固 1.19） | 2026-09-26 | 可观测加固与真集群（k3s）验证：清单 + 验证执行 + 文档对齐 |

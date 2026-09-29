@@ -90,6 +90,11 @@ v1 可运行范围：以「采集项」为配置单元打通指标与日志（�
 
 - AS 运维人员, I want 在 dataserver 以采集项为单位配置采集和入库并由 GSE 下发, so that 每条采集链路可独立维护。
 - 验收：THE 采集项 SHALL 包含：`item_id`、目标 `agent_id` 列表（至少一个）、名称、类型、启用开关、采集端配置、入库配置；THE 采集项类型 SHALL 为 `metrics_host`、`log_file`、`log_k8s_stdout` 三者之一。
+  **2026-09-29 修订**：`gse-agent-config-center` 把采集项从**全局共享**改为 **per-Agent spec 的 `items`**：
+  `agent_ids` 字段删除，「一条采集项给多台 Agent 用」的复用能力取消（同一份配置会展开成 N 份独立拷贝）；
+  下发通道由 `collect_items` RPC 改为随 `agent_spec` 整份下发；`/api/gse/collect-items*` 路由整组删除，
+  改为 `/api/gse/agents/{agent_id}/spec`。本文件 Requirement 13 的「目标 agent_id 列表」口径失效，详见
+  [`gse-agent-config-center`](../gse-agent-config-center/requirements.md) R1/R3/R12。
 ### Requirement 14: 错误与可观测性
 
 - AS 运维人员, I want 接入失败和查询失败有明确输出, so that 可以区分采集、选路与存储问题。

@@ -83,6 +83,9 @@ impl Ledger {
     pub async fn upsert_agent_config(&self, c: &AgentConfig) -> Result<(), GseError>;
     pub async fn get_agent_config(&self, agent_id: &str) -> Result<Option<AgentConfig>, GseError>;
     pub async fn list_agent_configs(&self) -> Result<Vec<AgentConfig>, GseError>;
+    // 2026-09-29 修订：`agent_configs` 台账已由 `gse-agent-config-center` 的 per-Agent
+    // spec（表 `agent_specs`）取代，上述三个方法与 `AgentConfig` 类型均删除；
+    // 旧表只保留建表语句作一次性搬运来源。详见 `.monkeycode/specs/gse-agent-config-center/design.md`。
 }
 ```
 
