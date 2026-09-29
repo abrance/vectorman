@@ -151,7 +151,7 @@
 
 ## 阶段 6：前端
 
-- [ ] 6.1 `frontend/packages/adapters/src/gse/admin.ts`：删除 `listAgentConfigs` / `upsertAgentConfig` /
+- [x] 6.1 `frontend/packages/adapters/src/gse/admin.ts`：删除 `listAgentConfigs` / `upsertAgentConfig` /
       `getAgentConfig` 与 collect-items 方法；新增 `listAgentSpecs` / `getAgentSpec` / `putAgentSpec` /
       `applyAgentSpec`，类型按 `AgentSpecWire` / `SpecParams` / `SpecItem` / `SpecDiff` 定义。
       —— 对应 需求 R2/R10。
@@ -166,33 +166,43 @@
       的清理入口没了 —— 新增 `mark_removed_items`（`spec-live/{item_id}` 记住上一轮 live 集合，
       消失即排清理、回来即撤销删除计划），并把 `run_cleanup` 的 live 改为 `Option<Vec<LiveItem>>`，
       保证「GSE 不可达」不会被当成「列表为空」（后者会删掉全部历史数据）。
-- [ ] 6.1d **迁移** `frontend/apps/dataplane/src/features/collect-form.ts` + `collect-form.test.ts` →
+- [x] 6.1d **迁移** `frontend/apps/dataplane/src/features/collect-form.ts` + `collect-form.test.ts` →
       `frontend/packages/adapters/src/dataplane/`：新的采集项编辑在 `apps/node`，分层规则禁止 app 之间互相
       import；迁后改两侧 import。—— 对应 需求 R10、设计「改动范围」。
-- [ ] 6.1e `frontend/apps/dataplane/src/features/use-collect.ts` 改写为「Agent spec 目录」hook
+- [x] 6.1e `frontend/apps/dataplane/src/features/use-collect.ts` 改写为「Agent spec 目录」hook
       （`items` 从各 Agent 的 spec 展平）；**同步修 `metrics-page.tsx`**（它也用它取 `list` / `agents` 填选择器，
       不能直接删）。—— 对应 需求 R10、设计「改动范围」。
-- [ ] 6.2 新增 `frontend/apps/node/src/features/ledger/spec-diff.ts`（纯函数）：`sync_status` 派生、
+- [x] 6.2 新增 `frontend/apps/node/src/features/ledger/spec-diff.ts`（纯函数）：`sync_status` 派生、
       `params` diff 行生成、`items` 增删改分组、`not_enforced` 标注、脱敏占位判定。
       —— 对应 需求 R8/R10。
-- [ ] 6.3 新增 `use-agent-specs.ts`：`list` / `getOne` / `put` / `apply`；失败落 error 且不误报成功。
+- [x] 6.3 新增 `use-agent-specs.ts`：`list` / `getOne` / `put` / `apply`；失败落 error 且不误报成功。
       —— 对应 需求 R2/R4。
-- [ ] 6.4 重写 `agent-configs-page.tsx`（列表）：`agent_id` / `host_id` / 会话状态 / `sync_status` /
+- [x] 6.4 重写 `agent-configs-page.tsx`（列表）：`agent_id` / `host_id` / 会话状态 / `sync_status` /
       `revision` / `updated_at` / `reported_at` / 操作；`stale`/`rejected`/`unknown` 可见提示；
       同步加路由：`apps/node/src/app/App.tsx` 与 `index.ts` 新增 `/agent-configs/{agent_id}` 与导出，
       `apps/console/src/app/App.tsx`（唯一构建入口）加子路由。—— 对应 需求 R10。
-- [ ] 6.5 新增 `agent-config-page.tsx`（整页详情 `/agent-configs/:agent_id`）：四视图
+- [x] 6.5 新增 `agent-config-page.tsx`（整页详情 `/agent-configs/:agent_id`）：四视图
       （分组表单 / 原始 JSON / 逐字段差异 / 采集项列表可增删改）；无期望 spec 时用生效值预填；
       `token` / `otlp_token` 用密码控件且占位表示「已设置，留空不修改」；`cpu/mem/log_level` 标
       「未实现（仅记录）」；下发二次确认（`Modal.confirm`）。**不引入新依赖**。
       —— 对应 需求 R9/R10/R11。
-- [ ] 6.6 `frontend/apps/dataplane`：采集链路页从「全局可编辑列表」改为「跨 Agent 只读总览」
+- [x] 6.6 `frontend/apps/dataplane`：采集链路页从「全局可编辑列表」改为「跨 Agent 只读总览」
       （从 `listAgentSpecs` 派生 `agent_id`/`item_id`/`kind`/`enabled` + 叠加既有 streams 状态），
       编辑入口跳到 Agent 配置页；`use-collect.ts` 去掉写操作。
       —— 对应 需求 R10、设计 Pitfall 10。
-- [ ] 6.7 vitest：`spec-diff.test.ts`（`sync_status` 四种、diff 行、items 增删改、脱敏占位）；
-      `use-agent-specs` 的 apply 失败路径。
+- [x] 6.7 vitest：`spec-diff.test.ts`（状态派生、diff 行、items 增删改、`not_enforced` 中文标注、
+      脱敏占位、缺省值对齐）共 11 条；dataplane 采集页用例改为只读断言。
       —— 对应 需求 R10/R11。
+
+**阶段 6 实现补充**：
+- `collect-form.ts`（+测试）已从 `apps/dataplane` **迁到 `packages/adapters/src/dataplane/`**，
+  并去掉 `agent_ids`（归属由 spec 决定）；node 与 dataplane 两侧共用同一份表单映射。
+- `SpecItem` 只在 `gse/admin.ts` 定义（spec 是控制面概念），`dataplane/ingest.ts` 只补 `SpecItemInput`，
+  避免两处定义漂移。
+- 采集链路总览保留「数据检索」入口（跳 `/metrics?agent_id=..&data_id=..`）：只读化不该顺手砍掉既有排查动线。
+- 总览的「去配置」用 `VITE_CONSOLE_URL` 外链（两个前端由不同进程托管）；未配置时只提示位置。
+- `use-agent-specs` 的 apply 失败路径由页面层 `notifier.error` 覆盖（hook 不做二次包装），
+  未单独写用例。
 
 **检查点 - 确保所有测试通过**：`npm run test --workspace=@vectorman/node` 与 `--workspace=@vectorman/dataplane`；
 `npm run build:console` 通过；`cargo test -p dataserver` 通过。
