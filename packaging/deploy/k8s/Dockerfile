@@ -54,6 +54,12 @@ COPY --from=web /src/frontend/apps/desktop/dist/   /app/web/console/
 ENTRYPOINT ["/usr/local/bin/gse-server"]
 
 # ── 3b) agent 运行镜像：scratch + 静态二进制 ─────────────────────────────
-FROM scratch AS agent
+# 用 alpine 而不是 scratch：**作业执行器要 spawn 解释器**，scratch 里连 `/bin/sh` 都没有，
+# 于是 k8s 节点上的 Agent 提交任何脚本作业都是 `spawn failed: No such file or directory`
+# （实测：1.2.0-rc2 与 1.3.1 两个镜像都没有 shell）。
+# 这里只用 busybox 自带的 `sh`：该 Agent 的 spec/ConfigMap 要把解释器配置成 `["sh"]`
+# 且 `job_default_interpreter = "sh"`（默认的 bash 在 alpine 里不存在）。
+# 需要 bash / python3 时再 `RUN apk add --no-cache bash python3`（镜像会明显变大）。
+FROM alpine AS agent
 COPY --from=rust /src/target/x86_64-unknown-linux-musl/release/gse-agent /usr/local/bin/gse-agent
 ENTRYPOINT ["/usr/local/bin/gse-agent"]
