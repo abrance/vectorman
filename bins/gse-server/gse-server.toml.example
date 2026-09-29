@@ -5,7 +5,8 @@
 # 配置缺失或 TOML 非法时进程退出码 1，stderr 含 config_invalid 与路径。
 # 环境变量覆盖（GSE_ 前缀）：
 #   GSE_SERVER_CONFIG / GSE_SERVER_LISTEN / GSE_SERVER_AUTH / GSE_SERVER_DB
-#   GSE_SERVER_HTTP_LISTEN / GSE_SERVER_HTTP_WEB_DIR / GSE_SERVER_HEARTBEAT_TIMEOUT
+#   GSE_SERVER_HTTP_LISTEN / GSE_SERVER_HTTP_WEB_DIR / GSE_SERVER_ADMIN_PASSWORD
+#   GSE_SERVER_HEARTBEAT_TIMEOUT
 #   GSE_SERVER_METRICS_LISTEN / GSE_DATAPLANE_PROBE_INTERVAL
 
 listen = "0.0.0.0:7100"
@@ -15,6 +16,14 @@ heartbeat_timeout_secs = 90
 
 # 台账 sqlite 数据库路径（默认 gse-server.db，可被 GSE_SERVER_DB 覆盖）。
 # db = "gse-server.db"
+
+# 管理端口密码：**留空/不设 = 不认证**（默认）。设了以后 `/api/gse/*` 需要密码，
+# `/health` 与静态前端目录保持开放（否则「要登录才能加载登录页」）。
+# 建议用环境变量 `GSE_SERVER_ADMIN_PASSWORD` 而不是写在这里 —— 配置文件会进备份/版本库。
+# 客户端：浏览器访问 console 会弹原生登录框（HTTP Basic，用户名随便填、密码即此值）；
+#         脚本/CLI 用 `Authorization: Bearer <密码>`（`vmctl --password` 或 `VECTORMAN_PASSWORD`）；
+#         dataserver 反代与保留清理需要配 `gse_admin_password`（或 DATASERVER_GSE_ADMIN_PASSWORD）。
+# admin_password = ""
 
 # HTTP 端口：默认为本机回环 127.0.0.1:7101，仅内网/受控环境使用。
 # 台账 API 统一挂在 /api/gse 前缀下；根路径仅保留 /health。

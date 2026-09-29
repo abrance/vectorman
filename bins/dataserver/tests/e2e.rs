@@ -98,6 +98,7 @@ async fn register_probe_collect_ingest_and_query() {
             registry: None,
             cfg: None,
             file_store: None,
+            admin_password: String::new(),
         },
         None,
     ))
@@ -115,6 +116,7 @@ async fn register_probe_collect_ingest_and_query() {
         log,
         auth: Arc::new(NoopAuth),
         gse_admin_url: Some(gse_url.clone()),
+        gse_admin_password: None,
         metrics: None,
         apm: Some(Arc::new(dataplane_apm::ApmSink::new(
             sql.clone(),
@@ -277,6 +279,7 @@ async fn ebpf_edge_ingest_validates_and_lands() {
         log,
         auth: Arc::new(NoopAuth),
         gse_admin_url: None,
+        gse_admin_password: None,
         metrics: None,
         apm: Some(Arc::new(dataplane_apm::ApmSink::new(
             sql.clone(),

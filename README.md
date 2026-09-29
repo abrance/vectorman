@@ -62,6 +62,15 @@ cd frontend && npm run build:dataplane            # → 浏览器打开 http://<
 #    保存只写期望，点「下发」才推送；采集链路页只做只读总览
 ```
 
+管理端口默认只监听回环、不认证；对外暴露时用环境变量加密码（空 = 不认证）：
+
+```bash
+GSE_SERVER_ADMIN_PASSWORD='<密码>' /opt/vectorman/deploy/ctl.sh gse-server start
+# 浏览器访问 console 会弹原生登录框；脚本用 Authorization: Bearer <密码>
+# （vmctl --password 或 VECTORMAN_PASSWORD）；dataserver 若配了 gse_admin_url 也要同时配
+# gse_admin_password，否则它的只读总览与保留清理会 401。
+```
+
 安装包部署（含 systemd 单元与前端 dist）：
 
 ```bash
