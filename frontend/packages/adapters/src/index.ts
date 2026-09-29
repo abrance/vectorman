@@ -3,8 +3,17 @@ export {
   GseAdminAdapter,
   type AccessPoint,
   type Agent,
-  type AgentConfig,
+  type AgentSpecAck,
+  type AgentSpecPutBody,
+  type AgentSpecView,
+  type AgentSpecWire,
+  type FieldPair,
   type Host,
+  type ItemDiff,
+  type SpecDiff,
+  type SpecItem,
+  type SpecParams,
+  type SyncStatus,
 } from "./gse/admin";
 export {
   GseJobAdapter,
@@ -47,11 +56,18 @@ export { EbpfAdapter, type CapabilityEntry, type CapabilityReport, type EbpfEven
 export { PromQueryAdapter, type PromEnvelope } from "./dataplane/prom";
 export {
   DataplaneAdapter,
-  type CollectItem,
-  type CollectItemInput,
   type CollectItemKind,
   type ExtractRule,
   type LogRecord,
   type LogSearchRequest,
+  type SpecItemInput,
   type StreamEntry,
 } from "./dataplane/ingest";
+export {
+  COLLECT_KINDS,
+  isEbpfKind,
+  splitList,
+  toCollectFormValues,
+  toCollectItemInput,
+  type CollectFormValues,
+} from "./dataplane/collect-form";

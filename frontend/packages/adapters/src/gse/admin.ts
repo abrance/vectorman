@@ -38,13 +38,81 @@ export type Agent = {
   job_channel_available?: boolean;
 };
 
-export type AgentConfig = {
-  agent_id: string;
-  host_id: string;
+/// Agent 运行参数（spec 的一半）。敏感字段读出是 `"***"`，写回该值表示「保持不变」。
+export type SpecParams = {
+  heartbeat_interval_secs: number;
+  allowed_interpreters: string[];
+  job_default_interpreter: string;
+  max_concurrent_jobs: number;
+  job_work_dir?: string | null;
+  otlp_enabled: boolean;
+  otlp_listen: string;
+  otlp_max_body_bytes: number;
+  otlp_token?: string | null;
+  otlp_allowed_cidrs: string[];
+  token?: string | null;
   cpu_limit_percent?: number | null;
   mem_limit_percent?: number | null;
-  log_level?: string;
-  updated_at?: string;
+  log_level: string;
+};
+
+/// 一台 Agent 的完整期望状态：`params` + 这台的采集项数组。
+export type AgentSpecWire = {
+  params: SpecParams;
+  items: SpecItem[];
+};
+
+/// 采集项（收口到 spec 之后不再带 `agent_ids`）。
+export type SpecItem = {
+  item_id: string;
+  name: string;
+  kind: string;
+  enabled: boolean;
+  collector: Record<string, unknown>;
+  /// 至少含 `retention_days`（dataserver 的保留清理按它算清理窗口）。
+  storage: { retention_days?: number } & Record<string, unknown>;
+};
+
+export type FieldPair = { desired: unknown; applied: unknown };
+export type ItemDiff = { added: string[]; removed: string[]; changed: string[] };
+export type SpecDiff = { params: Record<string, FieldPair>; items: ItemDiff };
+
+/// 期望值与生效值是否一致。
+///
+/// `unspecified` = 没有期望 spec（Agent 跑本地文件基线）；`unknown` = 从未上报。
+export type SyncStatus = "synced" | "stale" | "rejected" | "unspecified" | "unknown";
+
+export type AgentSpecView = {
+  agent_id: string;
+  host_id: string;
+  /// 会话口径（内存会话注册表），与台账 `status` 可能不一致。
+  session_state: string;
+  sync_status: SyncStatus;
+  updated_at?: string | null;
+  reported_at?: string | null;
+  desired?: { revision: string; spec: AgentSpecWire } | null;
+  applied?: {
+    revision: string;
+    outcome: string;
+    spec: AgentSpecWire;
+    not_enforced: string[];
+    detail: string;
+  } | null;
+  diff?: SpecDiff | null;
+};
+
+/// PUT spec 的请求体。非敏感字段整体覆盖，`token`/`otlp_token` 缺省或空串表示保持原值。
+export type AgentSpecPutBody = {
+  params?: Partial<SpecParams>;
+  items?: (Partial<SpecItem> & { item_id?: string })[];
+};
+
+export type AgentSpecAck = {
+  revision: string;
+  outcome: string;
+  applied: AgentSpecWire;
+  not_enforced: string[];
+  detail: string;
 };
 
 const PREFIX = "/api/gse";
@@ -108,19 +176,36 @@ export class GseAdminAdapter {
     return this.http.request({ method: "DELETE", url: `${PREFIX}/agents/${enc(agentId)}` }).then(() => undefined);
   }
 
-  listAgentConfigs(): Promise<AgentConfig[]> {
-    return this.http.request<AgentConfig[]>({ method: "GET", url: `${PREFIX}/agent-configs` }).then((r) => r.body);
-  }
-
-  upsertAgentConfig(cfg: AgentConfig): Promise<AgentConfig> {
+  listAgentSpecs(): Promise<AgentSpecView[]> {
     return this.http
-      .request<AgentConfig>({ method: "POST", url: `${PREFIX}/agent-configs`, body: cfg })
+      .request<AgentSpecView[]>({ method: "GET", url: `${PREFIX}/agent-specs` })
       .then((r) => r.body);
   }
 
-  getAgentConfig(agentId: string): Promise<AgentConfig> {
+  getAgentSpec(agentId: string): Promise<AgentSpecView> {
     return this.http
-      .request<AgentConfig>({ method: "GET", url: `${PREFIX}/agent-configs/${enc(agentId)}` })
+      .request<AgentSpecView>({ method: "GET", url: `${PREFIX}/agents/${enc(agentId)}/spec` })
+      .then((r) => r.body);
+  }
+
+  /// 只写期望，**不触发下发**（下发是独立的 apply）。
+  putAgentSpec(agentId: string, body: AgentSpecPutBody): Promise<AgentSpecView> {
+    return this.http
+      .request<AgentSpecView>({
+        method: "PUT",
+        url: `${PREFIX}/agents/${enc(agentId)}/spec`,
+        body,
+      })
+      .then((r) => r.body);
+  }
+
+  /// 下发该 Agent 的期望 spec（单台，不批量）。
+  applyAgentSpec(agentId: string): Promise<{ ok: boolean; ack: AgentSpecAck }> {
+    return this.http
+      .request<{ ok: boolean; ack: AgentSpecAck }>({
+        method: "POST",
+        url: `${PREFIX}/agents/${enc(agentId)}/spec/apply`,
+      })
       .then((r) => r.body);
   }
 }

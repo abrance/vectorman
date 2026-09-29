@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { CollectItem } from "@vectorman/adapters";
+import type { SpecItem } from "@vectorman/adapters";
 import {
   COLLECT_KINDS,
   splitList,
@@ -10,18 +10,16 @@ import {
 
 const base: CollectFormValues = {
   name: "  cpu  ",
-  agent_ids: ["a-1", "a-2"],
   kind: "metrics_host",
   enabled: true,
   retention_days: 0,
   interval_secs: 0,
 };
 
-describe("toCollectItemInput", () => {
+describe("toSpecItemInput", () => {
   it("trims name and falls back to defaults", () => {
     const input = toCollectItemInput(base);
     expect(input.name).toBe("cpu");
-    expect(input.agent_ids).toEqual(["a-1", "a-2"]);
     expect(input.collector).toEqual({ interval_secs: 15 });
     expect(input.storage).toEqual({ retention_days: 1 });
   });
@@ -56,9 +54,8 @@ describe("toCollectItemInput", () => {
   });
 
   it("round-trips a log_k8s_stdout item", () => {
-    const item: CollectItem = {
+    const item: SpecItem = {
       item_id: "item-9",
-      agent_ids: ["a-1"],
       name: "pods",
       kind: "log_k8s_stdout",
       enabled: false,
@@ -78,7 +75,6 @@ describe("toCollectItemInput", () => {
     const input = toCollectItemInput(toCollectFormValues(item));
     expect(input).toEqual({
       name: "pods",
-      agent_ids: ["a-1"],
       kind: "log_k8s_stdout",
       enabled: false,
       collector: item.collector,
@@ -94,7 +90,6 @@ describe("apm_otlp", () => {
 
     const input = toCollectItemInput({
       name: "apm",
-      agent_ids: ["a-1"],
       kind: "apm_otlp",
       enabled: true,
       retention_days: 3,
@@ -117,7 +112,6 @@ describe("apm_otlp", () => {
     const values = toCollectFormValues({
       item_id: "item-apm",
       name: "apm",
-      agent_ids: ["a-1"],
       kind: "apm_otlp",
       enabled: true,
       collector: {
@@ -196,9 +190,8 @@ describe("ebpf", () => {
   });
 
   it("编辑回填：eBPF 参数能读回表单", () => {
-    const item: CollectItem = {
+    const item: SpecItem = {
       item_id: "item-1",
-      agent_ids: ["a-1"],
       name: "ebpf net",
       kind: "ebpf_network",
       enabled: true,

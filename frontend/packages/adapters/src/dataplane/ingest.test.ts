@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { HttpClient, HttpRequest, HttpResponse } from "@vectorman/primitives";
-import { DataplaneAdapter, type CollectItemInput } from "./ingest";
+import { DataplaneAdapter } from "./ingest";
 
 class FakeHttp implements HttpClient {
   readonly calls: HttpRequest[] = [];
@@ -17,41 +17,21 @@ class FakeHttp implements HttpClient {
   }
 }
 
-const input: CollectItemInput = {
-  agent_ids: ["a-1"],
-  name: "cpu",
-  kind: "metrics_host",
-  enabled: true,
-  collector: { interval_secs: 15 },
-  storage: { retention_days: 1 },
-};
-
 describe("DataplaneAdapter", () => {
-  it("reads collect items with optional agent filter", async () => {
-    const http = new FakeHttp([]);
+  it("reads per-Agent specs (read-only passthrough)", async () => {
+    const views = [{ agent_id: "a-1", host_id: "h-1", session_state: "online", sync_status: "synced" }];
+    const http = new FakeHttp(views);
     const a = new DataplaneAdapter(http);
-    await a.listCollectItems();
-    await a.listCollectItems("a 1");
-    expect(http.calls[0]).toMatchObject({ method: "GET", url: "/v1/collect-items" });
-    expect(http.calls[1]).toMatchObject({ method: "GET", url: "/v1/collect-items?agent_id=a%201" });
+    const got = await a.listAgentSpecs();
+    expect(http.calls[0]).toMatchObject({ method: "GET", url: "/v1/agent-specs" });
+    expect(got).toEqual(views);
   });
 
-  it("creates, updates and deletes collect items", async () => {
-    const http = new FakeHttp({}, {}, null);
-    const a = new DataplaneAdapter(http);
-    await a.createCollectItem(input);
-    await a.updateCollectItem("item a", { ...input, enabled: false });
-    await a.deleteCollectItem("item a");
-    expect(http.calls[0]).toMatchObject({ method: "POST", url: "/v1/collect-items", body: input });
-    expect(http.calls[1]).toMatchObject({
-      method: "PUT",
-      url: "/v1/collect-items/item%20a",
-      body: { ...input, enabled: false },
-    });
-    expect(http.calls[2]).toMatchObject({
-      method: "DELETE",
-      url: "/v1/collect-items/item%20a",
-    });
+  it("不再提供采集项写入口（配置编辑走 console 直连 gse-server）", () => {
+    const a = new DataplaneAdapter(new FakeHttp([]));
+    for (const gone of ["createCollectItem", "updateCollectItem", "deleteCollectItem"]) {
+      expect(a).not.toHaveProperty(gone);
+    }
   });
 
   it("unwraps streams, agents and log records", async () => {
