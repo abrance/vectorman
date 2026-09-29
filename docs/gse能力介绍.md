@@ -23,7 +23,8 @@ v0.1 实现了最小闭环：连接建立 → 身份认证 → 心跳保活 → 
 
 - **Agent 主动外连与自动重连**：Agent 启动即 dial Server；断线后按指数退避 1s→60s 自动重连，重连成功后重新认证并恢复心跳。
 - **身份认证（查库）**：agent-id + token；认证数据源为预登记的 `agents` 台账表（配置 `[agents]` 静态表已废弃），未登记或 token 不匹配即拒绝，认证失败 Agent 停止重连并以非零退出码结束。
-- **资产台账（CMDB）**：sqlite 持久化 hosts / access_points / agents / agent_configs 四张表，以自然键幂等 upsert；支持通过 HTTP 管理端口或同进程 `Ledger` API 预登记与查询。
+- **资产台账（CMDB）**：sqlite 持久化 hosts / access_points / agents / agent_specs 等表，以自然键幂等 upsert；支持通过 HTTP 管理端口或同进程 `Ledger` API 预登记与查询。
+- **Agent 配置中心**：一台 Agent 一份 **spec**（运行参数 + 该 Agent 的采集项）。保存只写期望，点「下发」才推送并把生效值报文回来做逐字段核验；Agent 侧热加载（含 `SIGHUP` 重读本地配置）。`server_addr`/`agent_id` 不可下发；`cpu/mem_limit_percent` 与 `log_level` 目前只记录并标注「未实现」。
 - **运行状态回写**：认证成功将 agents 表置 `online` 并记录最后心跳；心跳持续推进 `last_heartbeat_at`；liveness 超时将会话与台账同步置 `offline`。
 - **心跳保活与存活检测**：Agent 每 30s 一次 `heartbeat`（可配置）；Server 在超时窗口（默认 90s）内无任何消息则将会话按 Online→Checking→Offline 推进。
 - **会话管理**：内存注册表，key 为 agent-id，保证同一 agent-id 至多一个活跃会话；支持列表、按 id 查询、在线状态查询。

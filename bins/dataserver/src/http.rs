@@ -1,7 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use axum::body::Bytes;
 use axum::extract::{Path as PathParam, Query, State};
 use axum::http::{Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
@@ -25,10 +24,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tower_http::services::{ServeDir, ServeFile};
 
-use crate::cleanup::{
-    clamp_retention_days, gse_call, join_gse_url, now_micros, retain_key, retention_days_from_item,
-    MICROS_PER_DAY,
-};
+use crate::cleanup::{gse_call, join_gse_url, now_micros};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -560,69 +556,11 @@ async fn forward_gse(
     }
 }
 
-async fn collect_list(State(state): State<AppState>, uri: Uri) -> Response {
-    forward_gse(&state, "GET", "/api/gse/collect-items", uri.query(), b"").await
-}
-
-async fn collect_create(State(state): State<AppState>, uri: Uri, body: Bytes) -> Response {
-    forward_gse(&state, "POST", "/api/gse/collect-items", uri.query(), &body).await
-}
-
-async fn collect_get(
-    State(state): State<AppState>,
-    PathParam(item_id): PathParam<String>,
-    uri: Uri,
-) -> Response {
-    let path = format!("/api/gse/collect-items/{item_id}");
-    forward_gse(&state, "GET", &path, uri.query(), b"").await
-}
-
-async fn collect_put(
-    State(state): State<AppState>,
-    PathParam(item_id): PathParam<String>,
-    uri: Uri,
-    body: Bytes,
-) -> Response {
-    let path = format!("/api/gse/collect-items/{item_id}");
-    forward_gse(&state, "PUT", &path, uri.query(), &body).await
-}
-
-async fn collect_delete(
-    State(state): State<AppState>,
-    PathParam(item_id): PathParam<String>,
-) -> Response {
-    let base = match require_gse(&state) {
-        Ok(u) => u.to_string(),
-        Err(e) => return map_err(e),
-    };
-    let get_url = join_gse_url(&base, &format!("/api/gse/collect-items/{item_id}"), None);
-    let days = match gse_call("GET", &get_url, b"").await {
-        Ok((200, body)) => serde_json::from_str::<Value>(&body)
-            .map(|v| retention_days_from_item(&v))
-            .unwrap_or(1),
-        _ => 1,
-    };
-    let days = clamp_retention_days(days);
-    let until = now_micros() + days as i64 * MICROS_PER_DAY;
-    let payload = json!({"until_micros": until});
-    if let Err(e) = state
-        .kv
-        .set(
-            retain_key(&item_id).as_bytes(),
-            payload.to_string().as_bytes(),
-        )
-        .await
-    {
-        return map_err(e);
-    }
-    forward_gse(
-        &state,
-        "DELETE",
-        &format!("/api/gse/collect-items/{item_id}"),
-        None,
-        b"",
-    )
-    .await
+/// 透传 gse-server 的 per-Agent spec 列表（含期望项与生效状态）。
+///
+/// 只读：数据面不写控制面。保留清理（`cleanup.rs`）不经这里，它直连 gse-server。
+async fn agent_specs_list(State(state): State<AppState>, uri: Uri) -> Response {
+    forward_gse(&state, "GET", "/api/gse/agent-specs", uri.query(), b"").await
 }
 
 async fn agents_list(State(state): State<AppState>, uri: Uri) -> Response {
@@ -862,11 +800,9 @@ fn api_routes(state: AppState) -> Router {
         .route("/v1/ts/stats", get(ts_stats))
         .route("/api/v1/query", get(prom_query))
         .route("/api/v1/query_range", get(prom_query_range))
-        .route("/v1/collect-items", get(collect_list).post(collect_create))
-        .route(
-            "/v1/collect-items/{item_id}",
-            get(collect_get).put(collect_put).delete(collect_delete),
-        )
+        // 采集项现在属于 per-Agent spec：这里只提供**只读**透传给数据面总览用。
+        // 配置编辑走 console 直连 gse-server（`PUT /api/gse/agents/{id}/spec`），不经数据面。
+        .route("/v1/agent-specs", get(agent_specs_list))
         .route("/v1/agents", get(agents_list))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -934,7 +870,8 @@ impl vectorman_metrics::MetricsSink for LocalTsSink {
 
 #[cfg(test)]
 mod tests {
-    use axum::body::Body;
+    use crate::cleanup::{mark_removed_items, LiveItem, MICROS_PER_DAY};
+    use axum::body::{Body, Bytes};
     use axum::http::{Method, Request, StatusCode};
     use dataplane_core::{resolve_data_paths, NoopAuth};
     use dataplane_file::DirFileStore;
@@ -947,7 +884,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::cleanup::{apply_retention, LiveItem};
+    use crate::cleanup::apply_retention;
     use vectorman_metrics::MetricsSink;
 
     struct TestEnv {
@@ -1153,28 +1090,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_items_unavailable_without_gse_url() {
+    async fn agent_specs_unavailable_without_gse_url() {
         let env = test_env(None).await;
         let app = sql_router(env.state.clone(), None);
-        let (st, body) = send(&app, req("GET", "/v1/collect-items", None)).await;
+        let (st, body) = send(&app, req("GET", "/v1/agent-specs", None)).await;
         assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{body}");
         assert!(body.contains("unavailable"), "{body}");
     }
 
     #[tokio::test]
-    async fn proxy_collect_items_and_agents() {
+    async fn proxy_agent_specs_and_agents() {
         let (gse_url, handle) = spawn_mock_gse().await;
         let env = test_env(Some(gse_url)).await;
         let app = sql_router(env.state.clone(), None);
 
-        let (st, body) = send(
-            &app,
-            req("POST", "/v1/collect-items", Some(r#"{"name":"cpu"}"#)),
-        )
-        .await;
+        // 采集项现在只在 gse-server 的 per-Agent spec 里；数据面只做只读透传。
+        let (st, body) = send(&app, req("GET", "/v1/agent-specs", None)).await;
         assert_eq!(st, StatusCode::OK, "{body}");
-        assert!(body.contains("/api/gse/collect-items"), "{body}");
-        assert!(body.contains("POST"), "{body}");
+        assert!(body.contains("/api/gse/agent-specs"), "{body}");
+        assert!(body.contains("GET"), "{body}");
+        // 写路由必须已经消失（配置编辑走 console 直连 gse-server）。
+        for (method, path) in [
+            ("POST", "/v1/collect-items"),
+            ("GET", "/v1/collect-items"),
+            ("DELETE", "/v1/collect-items/i-1"),
+        ] {
+            let (st, _) = send(&app, req(method, path, None)).await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{method} {path} 应当已删除");
+        }
 
         let (st, body) = send(&app, req("GET", "/v1/agents?online=1", None)).await;
         assert_eq!(st, StatusCode::OK, "{body}");
@@ -1184,10 +1127,13 @@ mod tests {
         handle.abort();
     }
 
+    /// 采集项从 spec 里消失 → 数据按它原来的保留期清理掉。
+    ///
+    /// 这条路径替换了原先的 `DELETE /v1/collect-items/{id}`：新模型没有 per-item 删除事件，
+    /// 由 `mark_removed_items` 比对上一轮 live 集合来发现。
     #[tokio::test]
-    async fn delete_writes_retain_and_cleanup_drops_logs() {
-        let (gse_url, handle) = spawn_mock_gse().await;
-        let env = test_env(Some(gse_url)).await;
+    async fn removed_item_retain_then_cleanup_drops_logs() {
+        let env = test_env(None).await;
         let app = sql_router(env.state.clone(), None);
 
         let (st, body) = send(
@@ -1201,13 +1147,29 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK, "{body}");
 
-        let (st, body) = send(&app, req("DELETE", "/v1/collect-items/item-del", None)).await;
-        assert_eq!(st, StatusCode::OK, "{body}");
+        // 第一轮：这一项还是 live 的（记进 spec-live/）。
+        mark_removed_items(
+            env.state.kv.as_ref(),
+            &[LiveItem {
+                item_id: "item-del".into(),
+                retention_days: 1,
+                kind: "log_file".into(),
+            }],
+            now_micros(),
+        )
+        .await
+        .expect("mark live");
 
+        // 第二轮：它从 spec 里消失了 → 写 retain 计划。
+        let marked = mark_removed_items(env.state.kv.as_ref(), &[], now_micros())
+            .await
+            .expect("mark removed");
+        assert_eq!(marked, 1);
         let retain = env.state.kv.get(b"retain/item-del").await.unwrap();
         let meta: Value = serde_json::from_slice(&retain).unwrap();
         assert!(meta["until_micros"].as_i64().unwrap() > now_micros());
 
+        // 到期后清理掉。
         env.state
             .kv
             .set(b"retain/item-del", br#"{"until_micros":1}"#)
@@ -1234,8 +1196,6 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK, "{body}");
         assert!(!body.contains("stale line"), "{body}");
-
-        handle.abort();
     }
 
     #[tokio::test]

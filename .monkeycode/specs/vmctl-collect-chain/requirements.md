@@ -47,7 +47,7 @@ v1 交付两个新子命名空间（既有 `hosts` / `agents` / `jobs` 保留原
 - AS 运维人员, I want 用 `collect` 与 `data` 两个命名空间区分「配」与「查」, so that 不必记忆散落的子命令。
 - 验收：WHEN 用户执行 `vmctl --help`，THE vmctl SHALL 在顶层列出 `health`、`hosts`、`agents`、`jobs`、
   `collect`、`data` 六个子命令；WHEN 用户执行 `vmctl collect --help`，THE vmctl SHALL 列出 `kinds`、`list`、
-  `get`、`create`、`update`、`delete`、`apply`、`status`、`doctor`；WHEN 用户执行 `vmctl data --help`，
+  `get`、`create`、`update`、`delete`、`apply`、`push`、`status`、`doctor`；WHEN 用户执行 `vmctl data --help`，
   THE vmctl SHALL 列出 `health`、`sql`、`query`、`query-range`、`logs`、`ebpf-events`、`ebpf-capability`、
   `streams`、`traces`、`trace`、`edges`、`apm`、`aliases`、`ts`。
 - 验收：WHEN 用户执行任一 Legacy 子命令，THE vmctl SHALL 保持本 feature 之前的请求路径、请求体与输出格式不变。
@@ -198,6 +198,11 @@ v1 交付两个新子命名空间（既有 `hosts` / `agents` / `jobs` 保留原
   `vmctl collect set-agent-config --json '<json>'`（或 `-f <path>`），THE vmctl SHALL 请求
   `POST /api/gse/agent-configs`。THE vmctl SHALL NOT 提供 agent-config 的更新或删除子命令——服务端只有
   `GET` 与 `POST` 两条路由。
+- 验收：WHEN 用户执行 `vmctl collect push-agent-config <agent_id>`，THE vmctl SHALL 请求
+  `POST /api/gse/agent-configs/<agent_id>/apply` 并透传回执（含 `outcome` 与 `not_enforced`）。
+  ⚠️ **2026-09-29 二次修订后已失效**：该路由不存在，应为 `POST /api/gse/agents/<agent_id>/spec/apply`，
+  且命令形态改为 `vmctl agent spec apply <agent_id>`；详见文末「二次修订」。
+  —— 2026-09-29 增补，见文末「修订记录」与 `.monkeycode/specs/gse-agent-config-center/`。
 - 验收：WHEN 用户执行 `vmctl collect access-points list|get <id>|create --json '<json>'|delete <id>`，
   THE vmctl SHALL 分别请求 `GET /api/gse/access-points`、`GET /api/gse/access-points/<id>`、
   `POST /api/gse/access-points`、`DELETE /api/gse/access-points/<id>`。
@@ -225,7 +230,41 @@ v1 交付两个新子命名空间（既有 `hosts` / `agents` / `jobs` 保留原
   SHALL NOT 改动 `dpc`（保留但冻结，新能力只进 `vmctl data`）；SHALL NOT 改动前端与台账数据模型。
 - 前置依赖：`collect status` / `doctor` 依赖 dataserver 的 `GET /v1/streams` 与 `GET /v1/ebpf/capability`
   （已存在）；`collect` 的采集项与 Agent 侧写入依赖 gse-server 的 `/api/gse/collect-items*` 与
-  `/api/gse/agent-configs`（已存在）。本 feature 不需要服务端新增任何路由。
+  `/api/gse/agent-configs`（已存在）。
+  —— **2026-09-29 修订**：本 feature 假设「不需要服务端新增任何路由」已不成立，见文末「修订记录」。
 - 已知限制（需在使用文档中写明）：gse-server 管理面当前无鉴权（`--token` 只对已启用鉴权的部署生效）；
   dataserver 默认 `NoopAuth`；`agent-configs` 无法更新或删除，改配置只能重新 `POST`；采集项的删除清理窗口取决于
   `storage.retention_days`，删除后历史数据的实际回收由 dataserver 的保留机制决定。
+  —— **2026-09-29 修订**：`agent-configs` 将新增 `PUT` / `DELETE` / `apply` 路由并支持脱敏，
+  「无法更新或删除」口径失效，见文末「修订记录」。
+
+## 修订记录
+
+### 2026-09-29：与 `gse-agent-config-center` 对齐
+
+本 feature 尚未实施（规格完成后待实施）。同期立项的
+[`gse-agent-config-center`](../gse-agent-config-center/requirements.md) 会改动本 feature 依赖的服务端语义，
+实施本 feature 时必须按下表调整：
+
+| 本文件条款 | 原口径 | 修订后 |
+| --- | --- | --- |
+| R1 `collect --help` 子命令表 | 无 `push` | 增 `push`（下发采集项到目标 Agent） |
+| R5 `create` / `update` | 保存即生效（服务端保存后自动推送） | **保存不推送**；需显式下发 |
+| R6 `apply` | `POST`/`PUT` 后由服务端自动推送 | 写完逐条目后再调 `POST /api/gse/collect-items/apply`；`--dry-run` 语义不变 |
+| R7 `status` / R8 `doctor` | 直接读 stream 判生效 | 判据增加一步：未下发（dirty）时 stream 不可能更新，输出 SHALL 区分「未下发」与「已下发未上报」 |
+| R13 agent-configs | 仅 `GET` / `POST` | ~~增 `PUT /agent-configs/{id}`、`DELETE`、`POST /{id}/apply`、`POST /apply`（批量）~~ **已被二次修订取代**：改为 `/api/gse/agents/{id}/spec` 三动作（GET/PUT/apply），无批量；响应脱敏口径不变 |
+| R15 前置依赖 | 不需要服务端新增路由 | 依赖新路由（见上）；同时采集项 `DELETE` 仍自动推送（避免继续采数据） |
+
+口径以 `gse-agent-config-center` 的 requirements 为准；本文件不改写编号。
+
+### 2026-09-29（二次修订）：collect 部分整体重新定范围
+
+`gse-agent-config-center` 在第二次设计采访后把模型收敛为 **per-Agent spec**：一台 Agent 一份 spec
+（`params` + `items`），Server 只有「取 spec / 存 spec / 下发 spec」三个动作，采集项**不再是一等资源**
+（没有增删改查、没有 `agent_ids`、没有 `/api/gse/collect-items*`）。
+因此本文件 R1/R4/R5/R6/R7/R8/R13/R15 中的 collect 部分**不能按原文实施**，需重新定范围，
+新的 CLI 形态应为 `vmctl agent spec get|put|apply <agent_id>`（单台 Agent，不批量）。
+本期不做 CLI（用户决定）；本 feature 的 `data` 子命令（dataserver 查询，R9-R12）与新模型无关，
+仍可按原文实施。详见 [`gse-agent-config-center`](../gse-agent-config-center/requirements.md) R12 与
+[`design.md`](../gse-agent-config-center/design.md) 的「服务端接口」节。
+

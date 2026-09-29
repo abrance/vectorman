@@ -65,19 +65,42 @@ pub struct Agent {
     pub registered_at: String,
 }
 
-/// Agent 运行时配置（本期仅存储与查询）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentConfig {
+/// 凭据校验结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthOutcome {
+    /// 凭据不匹配（或 Agent 不存在）。
+    Rejected,
+    /// 命中当前 token：轮换已完成，可清宽限凭据。
+    Current,
+    /// 命中轮换前的 token：宽限期内，接受但不清理。
+    Previous,
+}
+
+/// 某台 Agent 的期望 spec（下发源）。
+///
+/// 一台 Agent 一行：`spec` 是整份 `AgentSpecWire` 的 JSON（含敏感字段明文，读出时脱敏）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentSpec {
     pub agent_id: String,
-    pub host_id: String,
-    #[serde(default)]
-    pub cpu_limit_percent: Option<i64>,
-    #[serde(default)]
-    pub mem_limit_percent: Option<i64>,
-    #[serde(default)]
-    pub log_level: String,
-    #[serde(default)]
+    pub revision: String,
+    pub spec: gse_proto::AgentSpecWire,
     pub updated_at: String,
+}
+
+/// 某台 Agent 的生效状态（Agent 上报 + diff 派生）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentSpecState {
+    pub agent_id: String,
+    /// Agent 声称已应用的 revision；空字符串 = 报的是本地文件基线。
+    pub revision: String,
+    pub applied: gse_proto::AgentSpecWire,
+    pub diff: crate::spec::SpecDiff,
+    pub not_enforced: Vec<String>,
+    /// applied | unchanged | partial | rejected。
+    pub outcome: String,
+    #[serde(default)]
+    pub detail: String,
+    pub reported_at: String,
 }
 
 /// 数据面服务登记（运维手工 upsert，探活维护 status）。
@@ -93,36 +116,6 @@ pub struct DataplaneService {
     pub last_seen_at: Option<String>,
     #[serde(default)]
     pub registered_at: String,
-}
-
-/// 采集项：以 `item_id` 为主键，`agent_ids` 为目标 Agent 列表。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CollectItem {
-    pub item_id: String,
-    pub agent_ids: Vec<String>,
-    pub name: String,
-    /// metrics_host | log_file | log_k8s_stdout | apm_otlp | ebpf_network | ebpf_tcp | ebpf_process。
-    pub kind: String,
-    pub enabled: bool,
-    pub collector: serde_json::Value,
-    pub storage: serde_json::Value,
-    #[serde(default)]
-    pub updated_at: String,
-}
-
-impl CollectItem {
-    /// 转为跨 RPC 下发的 DTO（不含本地 `updated_at`）。
-    pub fn to_proto(&self) -> gse_proto::CollectItem {
-        gse_proto::CollectItem {
-            item_id: self.item_id.clone(),
-            agent_ids: self.agent_ids.clone(),
-            name: self.name.clone(),
-            kind: self.kind.clone(),
-            enabled: self.enabled,
-            collector: self.collector.clone(),
-            storage: self.storage.clone(),
-        }
-    }
 }
 
 /// 作业持久化记录；字段与前端 `Job` 类型对齐。
@@ -373,6 +366,24 @@ impl Ledger {
                 storage_json   TEXT NOT NULL,
                 updated_at     TEXT NOT NULL
             )",
+            // per-Agent spec：一台 Agent 一行 JSON。
+            // 为什么独立新表：sqlite 侧只有 `CREATE TABLE IF NOT EXISTS`，给旧表加列对既有库不生效。
+            "CREATE TABLE IF NOT EXISTS agent_specs (
+                agent_id   TEXT PRIMARY KEY,
+                revision   TEXT NOT NULL,
+                spec       TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+            "CREATE TABLE IF NOT EXISTS agent_spec_states (
+                agent_id     TEXT PRIMARY KEY,
+                revision     TEXT NOT NULL,
+                applied      TEXT NOT NULL,
+                diff         TEXT NOT NULL,
+                not_enforced TEXT NOT NULL,
+                outcome      TEXT NOT NULL,
+                detail       TEXT NOT NULL DEFAULT '',
+                reported_at  TEXT NOT NULL
+            )",
         ];
         for sql in ddl {
             self.store
@@ -384,6 +395,123 @@ impl Ledger {
         self.migrate_jobs_rerun_of().await?;
         self.migrate_jobs_file_transfer().await?;
         self.migrate_agents_upgrade_result().await?;
+        self.migrate_agents_prev_token().await?;
+        self.migrate_legacy_specs().await?;
+        Ok(())
+    }
+
+    /// 给 `agents` 加 `prev_token`（token 轮换宽限用）。幂等。
+    async fn migrate_agents_prev_token(&self) -> Result<(), String> {
+        let info = self
+            .store
+            .execute("PRAGMA table_info(agents)", &[])
+            .await
+            .map_err(|e| format!("init ledger: {}", e.message))?;
+        let present = info
+            .rows
+            .iter()
+            .any(|row| field_text(&info.columns, row, "name") == "prev_token");
+        if !present {
+            self.store
+                .execute("ALTER TABLE agents ADD COLUMN prev_token TEXT", &[])
+                .await
+                .map_err(|e| format!("init ledger: {}", e.message))?;
+        }
+        Ok(())
+    }
+
+    /// 一次性搬运旧模型到 per-Agent spec。
+    ///
+    /// - 旧 `agent_configs` 每行 → 该 Agent spec 的 `params` 三个字段；
+    /// - 旧全局 `collect_items` 每行 → 按 `agent_ids` **展开**成各 Agent 的 `items`（去掉 `agent_ids`）。
+    ///
+    /// 幂等：`agent_specs` 非空就跳过（不覆盖已有 spec）。展开后同一 `item_id` 会变成多台 Agent
+    /// 各一份独立拷贝，此后互不影响 —— 这是刻意的语义变更。
+    async fn migrate_legacy_specs(&self) -> Result<(), String> {
+        let existing = self
+            .store
+            .execute("SELECT agent_id FROM agent_specs LIMIT 1", &[])
+            .await
+            .map_err(|e| format!("init ledger: {}", e.message))?;
+        if !existing.rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut specs: BTreeMap<String, gse_proto::AgentSpecWire> = BTreeMap::new();
+
+        let cfg = self
+            .store
+            .execute("SELECT * FROM agent_configs", &[])
+            .await
+            .map_err(|e| format!("init ledger: {}", e.message))?;
+        for row in &cfg.rows {
+            let agent_id = field_text(&cfg.columns, row, "agent_id");
+            if agent_id.is_empty() {
+                continue;
+            }
+            let entry = specs.entry(agent_id).or_default();
+            entry.params.cpu_limit_percent = field_opt_i64(&cfg.columns, row, "cpu_limit_percent");
+            entry.params.mem_limit_percent = field_opt_i64(&cfg.columns, row, "mem_limit_percent");
+            let level = field_text(&cfg.columns, row, "log_level");
+            if !level.is_empty() {
+                entry.params.log_level = level;
+            }
+        }
+
+        let items = self
+            .store
+            .execute("SELECT * FROM collect_items", &[])
+            .await
+            .map_err(|e| format!("init ledger: {}", e.message))?;
+        for row in &items.rows {
+            let item_id = field_text(&items.columns, row, "item_id");
+            if item_id.is_empty() {
+                continue;
+            }
+            let agent_ids: Vec<String> =
+                serde_json::from_str(&field_text(&items.columns, row, "agent_ids"))
+                    .unwrap_or_default();
+            if agent_ids.is_empty() {
+                continue;
+            }
+            let collector: serde_json::Value =
+                serde_json::from_str(&field_text(&items.columns, row, "collector_json"))
+                    .unwrap_or(serde_json::Value::Null);
+            let storage: serde_json::Value =
+                serde_json::from_str(&field_text(&items.columns, row, "storage_json"))
+                    .unwrap_or(serde_json::Value::Null);
+            for agent_id in agent_ids {
+                if agent_id.is_empty() {
+                    continue;
+                }
+                specs
+                    .entry(agent_id)
+                    .or_default()
+                    .items
+                    .push(gse_proto::SpecItem {
+                        item_id: item_id.clone(),
+                        name: field_text(&items.columns, row, "name"),
+                        kind: field_text(&items.columns, row, "kind"),
+                        enabled: field_i64(&items.columns, row, "enabled") != 0,
+                        collector: collector.clone(),
+                        storage: storage.clone(),
+                    });
+            }
+        }
+
+        let stamp = ledger_stamp();
+        for (agent_id, spec) in specs {
+            let revision = crate::spec::revision(&spec)?;
+            let row = AgentSpec {
+                agent_id,
+                revision,
+                spec,
+                updated_at: stamp.clone(),
+            };
+            self.upsert_agent_spec(&row)
+                .await
+                .map_err(|e| format!("init ledger: {}", e.message))?;
+        }
         Ok(())
     }
 
@@ -635,13 +763,32 @@ impl Ledger {
 
     /// 仅从 agents 表校验 agent-id 与 token 一致性。
     pub async fn check_auth(&self, agent_id: &str, token: &str) -> Result<bool, GseError> {
-        let res = self
-            .execute(
-                "SELECT 1 FROM agents WHERE agent_id = ? AND token = ?",
-                &[text(agent_id), text(token)],
-            )
-            .await?;
-        Ok(!res.rows.is_empty())
+        Ok(!matches!(
+            self.verify_agent_token(agent_id, token).await?,
+            AuthOutcome::Rejected
+        ))
+    }
+
+    /// 凭据校验，区分「命中当前 token」与「命中轮换前的 token」。
+    ///
+    /// 为什么要宽限：下发是手动的，`agents.token` 与期望 spec 在同一次写里更新，
+    /// 但 agent 可能在下发之前就因网络抖动重连 —— 那一瞬它手上还是旧 token。
+    /// 只认新值 → 认证被拒 → 会话建立不起来 → 永远收不到下发（死锁）。
+    pub async fn verify_agent_token(
+        &self,
+        agent_id: &str,
+        token: &str,
+    ) -> Result<AuthOutcome, GseError> {
+        let Some((current, prev)) = self.agent_tokens(agent_id).await? else {
+            return Ok(AuthOutcome::Rejected);
+        };
+        if token == current {
+            return Ok(AuthOutcome::Current);
+        }
+        if prev.as_deref() == Some(token) {
+            return Ok(AuthOutcome::Previous);
+        }
+        Ok(AuthOutcome::Rejected)
     }
 
     /// 认证成功后置在线并记录最后心跳。
@@ -770,140 +917,180 @@ impl Ledger {
         Ok(Some(online[idx].ingest_url.clone()))
     }
 
-    // ---- collect_items ----
+    // ---- agents 的认证凭据（token 轮换宽限）----
 
-    /// 以 `item_id` 为主键幂等保存采集项。
-    pub async fn upsert_collect_item(&self, item: &CollectItem) -> Result<(), GseError> {
-        let agent_ids = serde_json::to_string(&item.agent_ids)
+    /// 取 Agent 的认证凭据：`(当前 token, 轮换前的 token)`；Agent 不存在返回 `None`。
+    pub async fn agent_tokens(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<(String, Option<String>)>, GseError> {
+        let res = self
+            .execute(
+                "SELECT token, prev_token FROM agents WHERE agent_id = ?",
+                &[text(agent_id)],
+            )
+            .await?;
+        Ok(res.rows.first().map(|row| {
+            (
+                field_text(&res.columns, row, "token"),
+                field_opt_text(&res.columns, row, "prev_token"),
+            )
+        }))
+    }
+
+    /// 轮换 token：**同一条语句**把旧值挪到 `prev_token` 并写入新值。
+    ///
+    /// 不能分两步：中间失败会让 Agent 用新 token 重连被拒、也回不到旧 token（永久失联）。
+    pub async fn rotate_agent_token(
+        &self,
+        agent_id: &str,
+        new_token: &str,
+    ) -> Result<(), GseError> {
+        self.execute(
+            "UPDATE agents SET prev_token = token, token = ? WHERE agent_id = ?",
+            &[text(new_token), text(agent_id)],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// 清除轮换前的 token（Agent 已用新 token 认证成功）。
+    pub async fn clear_agent_prev_token(&self, agent_id: &str) -> Result<(), GseError> {
+        self.execute(
+            "UPDATE agents SET prev_token = NULL WHERE agent_id = ?",
+            &[text(agent_id)],
+        )
+        .await?;
+        Ok(())
+    }
+
+    // ---- agent_specs ----
+
+    /// 以 `agent_id` 为主键幂等保存期望 spec。
+    pub async fn upsert_agent_spec(&self, s: &AgentSpec) -> Result<(), GseError> {
+        let spec = serde_json::to_string(&s.spec)
             .map_err(|e| GseError::new("invalid_argument", e.to_string()))?;
-        let collector = serde_json::to_string(&item.collector)
-            .map_err(|e| GseError::new("invalid_argument", e.to_string()))?;
-        let storage = serde_json::to_string(&item.storage)
-            .map_err(|e| GseError::new("invalid_argument", e.to_string()))?;
-        let sql = "INSERT INTO collect_items (item_id, agent_ids, name, kind, enabled, collector_json, storage_json, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(item_id) DO UPDATE SET
-                     agent_ids = excluded.agent_ids,
-                     name = excluded.name,
-                     kind = excluded.kind,
-                     enabled = excluded.enabled,
-                     collector_json = excluded.collector_json,
-                     storage_json = excluded.storage_json,
+        let sql = "INSERT INTO agent_specs (agent_id, revision, spec, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(agent_id) DO UPDATE SET
+                     revision = excluded.revision,
+                     spec = excluded.spec,
                      updated_at = excluded.updated_at";
         self.execute(
             sql,
             &[
-                text(&item.item_id),
-                SqlValue::Text(agent_ids),
-                text(&item.name),
-                text(&item.kind),
-                bool_int(item.enabled),
-                SqlValue::Text(collector),
-                SqlValue::Text(storage),
-                text(&item.updated_at),
+                text(&s.agent_id),
+                text(&s.revision),
+                SqlValue::Text(spec),
+                text(&s.updated_at),
             ],
         )
         .await?;
         Ok(())
     }
 
-    pub async fn get_collect_item(&self, item_id: &str) -> Result<Option<CollectItem>, GseError> {
+    pub async fn get_agent_spec(&self, agent_id: &str) -> Result<Option<AgentSpec>, GseError> {
         let res = self
             .execute(
-                "SELECT * FROM collect_items WHERE item_id = ?",
-                &[text(item_id)],
+                "SELECT * FROM agent_specs WHERE agent_id = ?",
+                &[text(agent_id)],
             )
             .await?;
-        Ok(res
-            .rows
-            .first()
-            .map(|row| row_to_collect_item(&res.columns, row)))
+        match res.rows.first() {
+            Some(row) => Ok(Some(row_to_agent_spec(&res.columns, row)?)),
+            None => Ok(None),
+        }
     }
 
-    /// 列出采集项，最新更新在前；`agent_id` 存在时仅返回目标列表包含它的项。
-    pub async fn list_collect_items(
-        &self,
-        agent_id: Option<&str>,
-    ) -> Result<Vec<CollectItem>, GseError> {
+    pub async fn list_agent_specs(&self) -> Result<Vec<AgentSpec>, GseError> {
         let res = self
-            .execute("SELECT * FROM collect_items ORDER BY updated_at DESC", &[])
+            .execute("SELECT * FROM agent_specs ORDER BY agent_id", &[])
             .await?;
-        Ok(res
-            .rows
+        res.rows
             .iter()
-            .map(|row| row_to_collect_item(&res.columns, row))
-            .filter(|item| match agent_id {
-                Some(id) => item.agent_ids.iter().any(|a| a == id),
-                None => true,
-            })
-            .collect())
+            .map(|row| row_to_agent_spec(&res.columns, row))
+            .collect()
     }
 
-    /// 删除采集项；返回是否存在并删除。
-    pub async fn delete_collect_item(&self, item_id: &str) -> Result<bool, GseError> {
-        if self.get_collect_item(item_id).await?.is_none() {
+    /// 以 `agent_id` 为主键幂等保存生效状态。
+    pub async fn upsert_agent_spec_state(&self, s: &AgentSpecState) -> Result<(), GseError> {
+        let enc = |e: Result<String, serde_json::Error>| {
+            e.map_err(|e| GseError::new("invalid_argument", e.to_string()))
+        };
+        let applied = enc(serde_json::to_string(&s.applied))?;
+        let diff = enc(serde_json::to_string(&s.diff))?;
+        let not_enforced = enc(serde_json::to_string(&s.not_enforced))?;
+        let sql = "INSERT INTO agent_spec_states
+                     (agent_id, revision, applied, diff, not_enforced, outcome, detail, reported_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(agent_id) DO UPDATE SET
+                     revision = excluded.revision,
+                     applied = excluded.applied,
+                     diff = excluded.diff,
+                     not_enforced = excluded.not_enforced,
+                     outcome = excluded.outcome,
+                     detail = excluded.detail,
+                     reported_at = excluded.reported_at";
+        self.execute(
+            sql,
+            &[
+                text(&s.agent_id),
+                text(&s.revision),
+                SqlValue::Text(applied),
+                SqlValue::Text(diff),
+                SqlValue::Text(not_enforced),
+                text(&s.outcome),
+                text(&s.detail),
+                text(&s.reported_at),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_agent_spec_state(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<AgentSpecState>, GseError> {
+        let res = self
+            .execute(
+                "SELECT * FROM agent_spec_states WHERE agent_id = ?",
+                &[text(agent_id)],
+            )
+            .await?;
+        match res.rows.first() {
+            Some(row) => Ok(Some(row_to_agent_spec_state(&res.columns, row)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn list_agent_spec_states(&self) -> Result<Vec<AgentSpecState>, GseError> {
+        let res = self
+            .execute("SELECT * FROM agent_spec_states ORDER BY agent_id", &[])
+            .await?;
+        res.rows
+            .iter()
+            .map(|row| row_to_agent_spec_state(&res.columns, row))
+            .collect()
+    }
+
+    /// 删除期望 spec（删除 Agent 时级联清理）。返回是否存在并删除。
+    pub async fn remove_agent_spec(&self, agent_id: &str) -> Result<bool, GseError> {
+        if self.get_agent_spec(agent_id).await?.is_none() {
             return Ok(false);
         }
         self.execute(
-            "DELETE FROM collect_items WHERE item_id = ?",
-            &[text(item_id)],
+            "DELETE FROM agent_specs WHERE agent_id = ?",
+            &[text(agent_id)],
         )
         .await?;
         Ok(true)
     }
 
-    // ---- agent_configs ----
-
-    /// 以 agent_id 为主键幂等保存运行时配置。
-    pub async fn upsert_agent_config(&self, c: &AgentConfig) -> Result<(), GseError> {
-        let sql = "INSERT INTO agent_configs (agent_id, host_id, cpu_limit_percent, mem_limit_percent, log_level, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(agent_id) DO UPDATE SET
-                     host_id = excluded.host_id,
-                     cpu_limit_percent = excluded.cpu_limit_percent,
-                     mem_limit_percent = excluded.mem_limit_percent,
-                     log_level = excluded.log_level,
-                     updated_at = excluded.updated_at";
-        let params = vec![
-            text(&c.agent_id),
-            text(&c.host_id),
-            opt_int(c.cpu_limit_percent),
-            opt_int(c.mem_limit_percent),
-            text(&c.log_level),
-            text(&c.updated_at),
-        ];
-        self.execute(sql, &params).await?;
-        Ok(())
-    }
-
-    pub async fn get_agent_config(&self, agent_id: &str) -> Result<Option<AgentConfig>, GseError> {
-        let res = self
-            .execute(
-                "SELECT * FROM agent_configs WHERE agent_id = ?",
-                &[text(agent_id)],
-            )
-            .await?;
-        Ok(res
-            .rows
-            .first()
-            .map(|row| row_to_agent_config(&res.columns, row)))
-    }
-
-    pub async fn list_agent_configs(&self) -> Result<Vec<AgentConfig>, GseError> {
-        let res = self
-            .execute("SELECT * FROM agent_configs ORDER BY agent_id", &[])
-            .await?;
-        Ok(res
-            .rows
-            .iter()
-            .map(|row| row_to_agent_config(&res.columns, row))
-            .collect())
-    }
-
-    /// 删除 Agent 运行时配置（删除 Agent 时级联清理用）。
-    pub async fn remove_agent_config(&self, agent_id: &str) -> Result<(), GseError> {
+    /// 删除生效状态（删除 Agent 时级联清理）。
+    pub async fn remove_agent_spec_state(&self, agent_id: &str) -> Result<(), GseError> {
         self.execute(
-            "DELETE FROM agent_configs WHERE agent_id = ?",
+            "DELETE FROM agent_spec_states WHERE agent_id = ?",
             &[text(agent_id)],
         )
         .await?;
@@ -1313,10 +1500,6 @@ fn text(v: &str) -> SqlValue {
     SqlValue::Text(v.to_string())
 }
 
-fn opt_int(v: Option<i64>) -> SqlValue {
-    v.map(SqlValue::Integer).unwrap_or(SqlValue::Null)
-}
-
 fn opt_text(v: Option<&str>) -> SqlValue {
     v.map(text).unwrap_or(SqlValue::Null)
 }
@@ -1477,15 +1660,49 @@ fn row_to_agent(columns: &[String], row: &[SqlValue]) -> Agent {
     }
 }
 
-fn row_to_agent_config(columns: &[String], row: &[SqlValue]) -> AgentConfig {
-    AgentConfig {
+/// 解析 spec JSON。
+///
+/// **解析失败必须是硬错误**：默默返回 `default()` 会把一份空 spec 当成「期望值」推给 Agent，
+/// 等于用坏数据把 Agent 的配置洗掉。
+fn row_to_agent_spec(columns: &[String], row: &[SqlValue]) -> Result<AgentSpec, GseError> {
+    let raw = field_text(columns, row, "spec");
+    let spec = serde_json::from_str::<gse_proto::AgentSpecWire>(&raw).map_err(|e| {
+        GseError::new(
+            "internal",
+            format!("agent_specs.spec 解析失败（数据损坏，拒绝当成空配置）: {e}"),
+        )
+    })?;
+    Ok(AgentSpec {
         agent_id: field_text(columns, row, "agent_id"),
-        host_id: field_text(columns, row, "host_id"),
-        cpu_limit_percent: field_opt_i64(columns, row, "cpu_limit_percent"),
-        mem_limit_percent: field_opt_i64(columns, row, "mem_limit_percent"),
-        log_level: field_text(columns, row, "log_level"),
+        revision: field_text(columns, row, "revision"),
+        spec,
         updated_at: field_text(columns, row, "updated_at"),
-    }
+    })
+}
+
+fn row_to_agent_spec_state(
+    columns: &[String],
+    row: &[SqlValue],
+) -> Result<AgentSpecState, GseError> {
+    let broken = |what: &str, e: serde_json::Error| {
+        GseError::new(
+            "internal",
+            format!("agent_spec_states.{what} 解析失败: {e}"),
+        )
+    };
+    Ok(AgentSpecState {
+        agent_id: field_text(columns, row, "agent_id"),
+        revision: field_text(columns, row, "revision"),
+        applied: serde_json::from_str(&field_text(columns, row, "applied"))
+            .map_err(|e| broken("applied", e))?,
+        diff: serde_json::from_str(&field_text(columns, row, "diff"))
+            .map_err(|e| broken("diff", e))?,
+        not_enforced: serde_json::from_str(&field_text(columns, row, "not_enforced"))
+            .map_err(|e| broken("not_enforced", e))?,
+        outcome: field_text(columns, row, "outcome"),
+        detail: field_text(columns, row, "detail"),
+        reported_at: field_text(columns, row, "reported_at"),
+    })
 }
 
 fn row_to_dataplane(columns: &[String], row: &[SqlValue]) -> DataplaneService {
@@ -1496,27 +1713,6 @@ fn row_to_dataplane(columns: &[String], row: &[SqlValue]) -> DataplaneService {
         status: field_text(columns, row, "status"),
         last_seen_at: field_opt_text(columns, row, "last_seen_at"),
         registered_at: field_text(columns, row, "registered_at"),
-    }
-}
-
-fn row_to_collect_item(columns: &[String], row: &[SqlValue]) -> CollectItem {
-    let agent_ids: Vec<String> =
-        serde_json::from_str(&field_text(columns, row, "agent_ids")).unwrap_or_default();
-    let collector: serde_json::Value =
-        serde_json::from_str(&field_text(columns, row, "collector_json"))
-            .unwrap_or(serde_json::Value::Null);
-    let storage: serde_json::Value =
-        serde_json::from_str(&field_text(columns, row, "storage_json"))
-            .unwrap_or(serde_json::Value::Null);
-    CollectItem {
-        item_id: field_text(columns, row, "item_id"),
-        agent_ids,
-        name: field_text(columns, row, "name"),
-        kind: field_text(columns, row, "kind"),
-        enabled: field_i64(columns, row, "enabled") != 0,
-        collector,
-        storage,
-        updated_at: field_text(columns, row, "updated_at"),
     }
 }
 
@@ -1652,6 +1848,308 @@ mod tests {
         ledger.init().await.expect("second init");
     }
 
+    fn spec_wire(item_ids: &[&str]) -> gse_proto::AgentSpecWire {
+        gse_proto::AgentSpecWire {
+            params: gse_proto::SpecParams {
+                cpu_limit_percent: Some(50),
+                log_level: "warn".to_string(),
+                ..Default::default()
+            },
+            items: item_ids
+                .iter()
+                .map(|id| gse_proto::SpecItem {
+                    item_id: id.to_string(),
+                    name: format!("item {id}"),
+                    kind: "log_file".to_string(),
+                    enabled: true,
+                    collector: serde_json::json!({"path_patterns": ["/var/log/*.log"]}),
+                    storage: serde_json::json!({"retention_days": 7}),
+                })
+                .collect(),
+        }
+    }
+
+    fn spec_row(agent_id: &str, spec: gse_proto::AgentSpecWire) -> AgentSpec {
+        AgentSpec {
+            agent_id: agent_id.to_string(),
+            revision: crate::spec::revision(&spec).expect("revision"),
+            spec,
+            updated_at: ledger_stamp(),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_spec_crud_roundtrip() {
+        let ledger = fresh_ledger("spec-crud").await;
+        let row = spec_row("a-1", spec_wire(&["i1"]));
+        ledger.upsert_agent_spec(&row).await.expect("upsert");
+        let got = ledger
+            .get_agent_spec("a-1")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(got, row);
+        // 幂等：重复保存不产生第二行。
+        ledger.upsert_agent_spec(&row).await.expect("re-upsert");
+        assert_eq!(ledger.list_agent_specs().await.expect("list").len(), 1);
+        assert!(ledger.get_agent_spec("nope").await.expect("get").is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_spec_state_roundtrip_keeps_diff() {
+        let ledger = fresh_ledger("spec-state").await;
+        let desired = spec_wire(&["i1", "i2"]);
+        let applied = spec_wire(&["i1"]);
+        let state = AgentSpecState {
+            agent_id: "a-1".to_string(),
+            revision: "ab12".to_string(),
+            applied: applied.clone(),
+            diff: crate::spec::diff(&desired, &applied).expect("diff"),
+            not_enforced: vec!["cpu_limit_percent".to_string()],
+            outcome: "partial".to_string(),
+            detail: "ok".to_string(),
+            reported_at: ledger_stamp(),
+        };
+        ledger
+            .upsert_agent_spec_state(&state)
+            .await
+            .expect("upsert");
+        let got = ledger
+            .get_agent_spec_state("a-1")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(got, state);
+        // diff 的 items 差异要能原样读回（它是页面「哪些采集项没生效」的唯一来源）。
+        assert_eq!(got.diff.items.added, vec!["i2".to_string()]);
+    }
+
+    /// 迁移必须能把「一条全局采集项 + 多个 agent_ids」展开成每台 Agent 各一份，
+    /// 且只出现在 collect_items 里的 Agent 也要建 spec。
+    #[tokio::test]
+    async fn migration_expands_legacy_items_per_agent_and_is_idempotent() {
+        let db = test_db("spec-migrate");
+        let _ = std::fs::remove_file(&db);
+        let ledger = Ledger::new(&db).expect("open");
+        ledger.init().await.expect("init");
+        ledger
+            .store
+            .execute(
+                "INSERT INTO agent_configs (agent_id, host_id, cpu_limit_percent, mem_limit_percent, log_level, updated_at)
+                 VALUES ('a-1', 'h-1', 50, NULL, 'warn', 't')",
+                &[],
+            )
+            .await
+            .expect("insert legacy config");
+        ledger
+            .store
+            .execute(
+                "INSERT INTO collect_items (item_id, agent_ids, name, kind, enabled, collector_json, storage_json, updated_at)
+                 VALUES ('i1', '[\"a-1\",\"a-2\"]', 'app log', 'log_file', 1, '{}', '{}', 't')",
+                &[],
+            )
+            .await
+            .expect("insert legacy item");
+
+        ledger.init().await.expect("re-init migrates");
+
+        let a1 = ledger
+            .get_agent_spec("a-1")
+            .await
+            .expect("get")
+            .expect("a-1 有 spec");
+        assert_eq!(a1.spec.params.cpu_limit_percent, Some(50));
+        assert_eq!(a1.spec.params.log_level, "warn");
+        assert_eq!(a1.spec.items.len(), 1);
+        assert_eq!(a1.spec.items[0].item_id, "i1");
+        assert_eq!(a1.spec.items[0].kind, "log_file");
+        // 只出现在 collect_items 里的 Agent 也要落地。
+        let a2 = ledger
+            .get_agent_spec("a-2")
+            .await
+            .expect("get")
+            .expect("a-2 有 spec");
+        assert_eq!(a2.spec.items.len(), 1);
+
+        // 幂等：再启动一次不得重复或覆盖。
+        ledger.init().await.expect("third init");
+        assert_eq!(ledger.list_agent_specs().await.expect("list").len(), 2);
+    }
+
+    /// 已有 spec 的库不得被旧表数据覆盖 —— 否则「重启即回滚配置」。
+    #[tokio::test]
+    async fn migration_never_overwrites_existing_specs() {
+        let db = test_db("spec-migrate-guard");
+        let _ = std::fs::remove_file(&db);
+        let ledger = Ledger::new(&db).expect("open");
+        ledger.init().await.expect("init");
+        let mine = spec_row("a-1", spec_wire(&["mine"]));
+        ledger.upsert_agent_spec(&mine).await.expect("upsert");
+        ledger
+            .store
+            .execute(
+                "INSERT INTO collect_items (item_id, agent_ids, name, kind, enabled, collector_json, storage_json, updated_at)
+                 VALUES ('legacy', '[\"a-1\"]', 'legacy', 'log_file', 1, '{}', '{}', 't')",
+                &[],
+            )
+            .await
+            .expect("insert legacy item");
+
+        ledger.init().await.expect("re-init");
+
+        let got = ledger
+            .get_agent_spec("a-1")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(got, mine);
+        assert_eq!(got.spec.items.len(), 1);
+        assert_eq!(got.spec.items[0].item_id, "mine");
+    }
+
+    #[tokio::test]
+    async fn corrupt_spec_row_is_an_error_not_a_default_spec() {
+        // 静默返回 default 会把空 spec 当成期望值推给 Agent，等于洗掉它的配置。
+        let ledger = fresh_ledger("spec-corrupt").await;
+        ledger
+            .store
+            .execute(
+                "INSERT INTO agent_specs (agent_id, revision, spec, updated_at)
+                 VALUES ('bad', 'rev', '{not json', 't')",
+                &[],
+            )
+            .await
+            .expect("insert corrupt row");
+        let err = ledger.get_agent_spec("bad").await.expect_err("必须报错");
+        assert_eq!(err.code, "internal");
+        assert!(ledger.list_agent_specs().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn token_rotation_keeps_previous_value_for_grace() {
+        let ledger = fresh_ledger("token-rotate").await;
+        ledger
+            .upsert_agent(&Agent {
+                agent_id: "a-1".to_string(),
+                host_id: "h-1".to_string(),
+                access_point_id: None,
+                token: "old".to_string(),
+                version: String::new(),
+                install_path: String::new(),
+                status: "unknown".to_string(),
+                last_heartbeat_at: None,
+                registered_at: ledger_stamp(),
+            })
+            .await
+            .expect("upsert agent");
+
+        let (token, prev) = ledger
+            .agent_tokens("a-1")
+            .await
+            .expect("tokens")
+            .expect("exists");
+        assert_eq!(token, "old");
+        assert_eq!(prev, None);
+
+        ledger
+            .rotate_agent_token("a-1", "new")
+            .await
+            .expect("rotate");
+        let (token, prev) = ledger
+            .agent_tokens("a-1")
+            .await
+            .expect("tokens")
+            .expect("exists");
+        assert_eq!(token, "new");
+        assert_eq!(prev.as_deref(), Some("old"), "旧 token 必须在宽限里可用");
+
+        ledger.clear_agent_prev_token("a-1").await.expect("clear");
+        let (_, prev) = ledger
+            .agent_tokens("a-1")
+            .await
+            .expect("tokens")
+            .expect("exists");
+        assert_eq!(prev, None);
+        assert!(ledger.agent_tokens("nope").await.expect("tokens").is_none());
+    }
+
+    /// 双凭据宽限的状态机：新值 → `Current`（可清宽限）、旧值 → `Previous`（放行）、其余 → `Rejected`。
+    #[tokio::test]
+    async fn verify_agent_token_accepts_previous_and_flags_current() {
+        let ledger = fresh_ledger("token-verify").await;
+        ledger
+            .upsert_agent(&Agent {
+                agent_id: "a-1".to_string(),
+                host_id: "h-1".to_string(),
+                access_point_id: None,
+                token: "old".to_string(),
+                version: String::new(),
+                install_path: String::new(),
+                status: "unknown".to_string(),
+                last_heartbeat_at: None,
+                registered_at: ledger_stamp(),
+            })
+            .await
+            .expect("upsert agent");
+
+        assert_eq!(
+            ledger
+                .verify_agent_token("a-1", "old")
+                .await
+                .expect("verify"),
+            AuthOutcome::Current,
+            "没有轮换时旧值就是当前值"
+        );
+        assert_eq!(
+            ledger
+                .verify_agent_token("a-1", "nope")
+                .await
+                .expect("verify"),
+            AuthOutcome::Rejected
+        );
+        assert_eq!(
+            ledger
+                .verify_agent_token("ghost", "old")
+                .await
+                .expect("verify"),
+            AuthOutcome::Rejected,
+            "不存在的 agent 不能认证"
+        );
+
+        ledger
+            .rotate_agent_token("a-1", "new")
+            .await
+            .expect("rotate");
+        // 这就是「下发是手动的」带来的窗口：agent 手上可能还是旧 token，
+        // 必须放行，否则它会永久失联、也就永远收不到新 token。
+        assert_eq!(
+            ledger
+                .verify_agent_token("a-1", "old")
+                .await
+                .expect("verify"),
+            AuthOutcome::Previous
+        );
+        assert_eq!(
+            ledger
+                .verify_agent_token("a-1", "new")
+                .await
+                .expect("verify"),
+            AuthOutcome::Current
+        );
+        // check_auth 也必须跟着放行旧值（它是同一份逻辑的布尔投影）。
+        assert!(ledger.check_auth("a-1", "old").await.expect("check_auth"));
+
+        ledger.clear_agent_prev_token("a-1").await.expect("clear");
+        assert_eq!(
+            ledger
+                .verify_agent_token("a-1", "old")
+                .await
+                .expect("verify"),
+            AuthOutcome::Rejected,
+            "宽限已结束，旧 token 必须被拒"
+        );
+    }
+
     fn dataplane(id: &str, ingest_url: &str, status: &str) -> DataplaneService {
         DataplaneService {
             service_id: id.to_string(),
@@ -1728,70 +2226,6 @@ mod tests {
             ledger.pick_ingest_url("agent-2").await.unwrap().as_deref(),
             Some("http://b:8081")
         );
-    }
-
-    fn collect_item(id: &str, agents: &[&str]) -> CollectItem {
-        CollectItem {
-            item_id: id.to_string(),
-            agent_ids: agents.iter().map(|a| a.to_string()).collect(),
-            name: format!("item-{id}"),
-            kind: "metrics_host".to_string(),
-            enabled: true,
-            collector: serde_json::json!({"interval_secs": 15}),
-            storage: serde_json::json!({"retention_days": 1}),
-            updated_at: ledger_stamp(),
-        }
-    }
-
-    #[tokio::test]
-    async fn collect_item_crud_and_agent_filter() {
-        let ledger = fresh_ledger("collect-crud").await;
-        ledger
-            .upsert_collect_item(&collect_item("i-1", &["a-1", "a-2"]))
-            .await
-            .unwrap();
-        ledger
-            .upsert_collect_item(&collect_item("i-2", &["a-2"]))
-            .await
-            .unwrap();
-
-        let got = ledger.get_collect_item("i-1").await.unwrap().unwrap();
-        assert_eq!(got.agent_ids, vec!["a-1", "a-2"]);
-        assert_eq!(got.collector["interval_secs"], 15);
-        assert!(got.enabled);
-
-        // 目标过滤：a-1 只命中 i-1，a-2 命中两条，a-3 为空。
-        assert_eq!(
-            ledger.list_collect_items(Some("a-1")).await.unwrap().len(),
-            1
-        );
-        assert_eq!(
-            ledger.list_collect_items(Some("a-2")).await.unwrap().len(),
-            2
-        );
-        assert!(ledger
-            .list_collect_items(Some("a-3"))
-            .await
-            .unwrap()
-            .is_empty());
-        assert_eq!(ledger.list_collect_items(None).await.unwrap().len(), 2);
-
-        // 关闭开关后仍在列表中（前端需要显示禁用的项）。
-        let mut disabled = collect_item("i-2", &["a-2"]);
-        disabled.enabled = false;
-        ledger.upsert_collect_item(&disabled).await.unwrap();
-        assert!(
-            !ledger
-                .get_collect_item("i-2")
-                .await
-                .unwrap()
-                .unwrap()
-                .enabled
-        );
-
-        assert!(ledger.delete_collect_item("i-1").await.unwrap());
-        assert!(!ledger.delete_collect_item("i-1").await.unwrap());
-        assert!(ledger.get_collect_item("i-1").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1875,30 +2309,6 @@ mod tests {
         assert_eq!(ledger.list_agents().await.expect("list").len(), 1);
         ledger.remove_agent("a-1").await.expect("remove");
         assert!(ledger.get_agent("a-1").await.expect("get").is_none());
-    }
-
-    #[tokio::test]
-    async fn agent_config_crud_roundtrip() {
-        let ledger = fresh_ledger("acfg-crud").await;
-        let cfg = AgentConfig {
-            agent_id: "a-1".to_string(),
-            host_id: "h-1".to_string(),
-            cpu_limit_percent: Some(50),
-            mem_limit_percent: None,
-            log_level: "warn".to_string(),
-            updated_at: ledger_stamp(),
-        };
-        ledger.upsert_agent_config(&cfg).await.expect("upsert");
-        let got = ledger
-            .get_agent_config("a-1")
-            .await
-            .expect("get")
-            .expect("exists");
-        assert_eq!(got.cpu_limit_percent, Some(50));
-        assert_eq!(got.mem_limit_percent, None);
-        assert_eq!(got.log_level, "warn");
-        ledger.upsert_agent_config(&cfg).await.expect("re-upsert");
-        assert_eq!(ledger.list_agent_configs().await.expect("list").len(), 1);
     }
 
     #[tokio::test]

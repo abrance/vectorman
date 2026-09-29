@@ -68,8 +68,12 @@ v1.1.0 已交付 APM 全链路与 eBPF 四类采集项（`ebpf_network` / `ebpf_
 2a. THE 清单 SHALL 包含 RBAC（ServiceAccount + ClusterRole + ClusterRoleBinding），
    授予 `get/list` `pods`（跨命名空间，供 Pod 名反查），凭据走 in-cluster ServiceAccount。
 3. THE `agent_id` SHALL 按节点稳定（用 Downward API 的 `spec.nodeName`），避免重启后变成新 Agent。
-4. THE Agent 配置 SHALL 通过 ConfigMap 提供（`server_addr` 指向 gse-server），
-   `agent_id`/`token` 通过 Secret 或预登记台账提供。
+4. THE Agent 配置**引导值** SHALL 通过 ConfigMap（`server_addr`）与 Secret（`agent_id`/`token`）提供；
+   WHILE Agent 与 gse-server 建连后，除 `server_addr` / `agent_id` 两个**不可下发**字段外，
+   其余运行参数 SHALL 可被 gse-server 下发覆盖（优先级与字段清单见
+   [`gse-agent-config-center`](../gse-agent-config-center/requirements.md) R1）。
+   **2026-09-29 修订**：原口径为「Agent 配置 SHALL 通过 ConfigMap 提供」——ConfigMap 从此只是引导值来源，
+   不是运行参数的唯一来源。
 5. IF 节点不满足 eBPF 前置条件（内核 < 5.8 / 无 BTF / 无权限），THE Agent SHALL 仍正常启动并纳管，
    仅把 eBPF 该项标记为不可用。
 

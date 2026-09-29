@@ -8,20 +8,20 @@ import {
   MemoryNotifier,
   MemoryQueryStore,
 } from "@vectorman/primitives";
-import { ApmAdapter, DataplaneAdapter, EbpfAdapter, FetchHttpClient, type CollectItem } from "@vectorman/adapters";
+import { ApmAdapter, DataplaneAdapter, EbpfAdapter, FetchHttpClient, type AgentSpecView } from "@vectorman/adapters";
 import { App } from "./App";
 import { RuntimeProvider } from "./runtime";
 
 class FakeHttp implements HttpClient {
   readonly calls: HttpRequest[] = [];
 
-  constructor(private readonly items: CollectItem[]) {}
+  constructor(private readonly specs: AgentSpecView[]) {}
 
   async request<T>(req: HttpRequest): Promise<HttpResponse<T>> {
     this.calls.push(req);
     const url = req.url;
-    if (req.method === "GET" && url.startsWith("/v1/collect-items")) {
-      return { status: 200, body: this.items as T };
+    if (url === "/v1/agent-specs") {
+      return { status: 200, body: this.specs as T };
     }
     if (url === "/v1/streams") {
       return {
@@ -412,33 +412,53 @@ class FakeHttp implements HttpClient {
         } as T,
       };
     }
-    return { status: 200, body: (this.items[0] ?? null) as T };
+    return { status: 200, body: (this.specs[0] ?? null) as T };
   }
 }
 
-const items: CollectItem[] = [
-  {
-    item_id: "item-1",
-    agent_ids: ["a-1"],
-    name: "cpu",
-    kind: "metrics_host",
-    enabled: true,
-    collector: { interval_secs: 15 },
-    storage: { retention_days: 1 },
-  },
-  {
-    item_id: "item-2",
-    agent_ids: ["a-2"],
-    name: "nginx logs",
-    kind: "log_file",
-    enabled: true,
-    collector: { path_patterns: ["/var/log/*.log"], start_mode: "tail", start_n: 0 },
-    storage: { retention_days: 2 },
-  },
+/// 采集项现在属于各台 Agent 的 spec：`/v1/agent-specs` 返回的是一台 Agent 一条视图。
+function specView(agentId: string, items: { item_id: string; name: string; kind: string }[]): AgentSpecView {
+  return {
+    agent_id: agentId,
+    host_id: `h-${agentId}`,
+    session_state: "online",
+    sync_status: "synced",
+    updated_at: null,
+    reported_at: null,
+    desired: {
+      revision: `rev-${agentId}`,
+      spec: {
+        params: {
+          heartbeat_interval_secs: 30,
+          allowed_interpreters: ["bash"],
+          job_default_interpreter: "bash",
+          max_concurrent_jobs: 1,
+          otlp_enabled: false,
+          otlp_listen: "0.0.0.0:4318",
+          otlp_max_body_bytes: 8388608,
+          otlp_allowed_cidrs: [],
+          log_level: "info",
+        },
+        items: items.map((i) => ({
+          ...i,
+          enabled: true,
+          collector: { interval_secs: 15 },
+          storage: { retention_days: 1 },
+        })),
+      },
+    },
+    applied: null,
+    diff: null,
+  };
+}
+
+const specViews: AgentSpecView[] = [
+  specView("a-1", [{ item_id: "item-1", name: "cpu", kind: "metrics_host" }]),
+  specView("a-2", [{ item_id: "item-2", name: "nginx logs", kind: "log_file" }]),
 ];
 
 function renderAt(path: string) {
-  const http = new FakeHttp(items);
+  const http = new FakeHttp(specViews);
   const adapter = new DataplaneAdapter(http);
   const apm = new ApmAdapter(http);
   const ebpf = new EbpfAdapter(http);
@@ -618,7 +638,7 @@ describe("settings page", () => {
 describe("dataplane shell", () => {
   it("routes to collect, metrics and logs pages", async () => {
     const collect = renderAt("/");
-    expect(await screen.findByText("新建采集项")).toBeTruthy();
+    expect(await screen.findByText("item-1")).toBeTruthy();
     collect.unmount();
 
     const metrics = renderAt("/metrics");
@@ -632,32 +652,30 @@ describe("dataplane shell", () => {
 });
 
 describe("collect page", () => {
-  it("toggles enabled through the row switch", async () => {
+  it("shows a read-only cross-agent overview", async () => {
     const { http } = renderAt("/");
-    const toggle = await screen.findByRole("switch", { name: "启用 cpu" });
-    fireEvent.click(toggle);
-    await waitFor(() => {
-      expect(http.calls.some((c) => c.method === "PUT" && c.url === "/v1/collect-items/item-1")).toBe(true);
-    });
-    const put = http.calls.find((c) => c.method === "PUT" && c.url === "/v1/collect-items/item-1");
-    expect((put?.body as { enabled: boolean }).enabled).toBe(false);
-  });
+    // 跨 Agent 展平：两条采集项分属两台 Agent。
+    expect(await screen.findByText("item-1")).toBeTruthy();
+    expect(screen.getByText("item-2")).toBeTruthy();
+    expect(screen.getAllByText("已同步").length).toBeGreaterThan(0);
+    // 流索引里的时间戳是 2024 年的固定值 → 早已超过 max(3×间隔, 60s)，判定「已停滞」。
+    expect(screen.getAllByText("已停滞").length).toBeGreaterThan(0);
 
-  it("deletes an item after confirmation", async () => {
-    const { http } = renderAt("/");
-    await screen.findByRole("switch", { name: "启用 cpu" });
-    fireEvent.click(screen.getByRole("button", { name: "删除 cpu" }));
-    const dialog = await screen.findByRole("dialog");
-    fireEvent.click(within(dialog).getByRole("button", { name: /删\s*除/ }));
+    // 只读：数据面不再提供任何采集项写接口。
     await waitFor(() => {
-      expect(http.calls.some((c) => c.method === "DELETE" && c.url === "/v1/collect-items/item-1")).toBe(true);
+      expect(http.calls.some((c) => c.url === "/v1/agent-specs")).toBe(true);
     });
+    for (const call of http.calls) {
+      expect(call.url).not.toContain("/v1/collect-items");
+    }
+    expect(screen.queryByRole("button", { name: "新建采集项" })).toBeNull();
+    expect(screen.queryByRole("switch")).toBeNull();
   });
 
   it("jumps to metrics with agent_id and data_id", async () => {
     const { http } = renderAt("/");
-    await screen.findByRole("switch", { name: "启用 cpu" });
-    fireEvent.click(screen.getByRole("button", { name: "数据检索 cpu" }));
+    await screen.findByText("item-1");
+    fireEvent.click(screen.getAllByRole("button", { name: "数据检索" })[0]);
     expect(await screen.findByRole("heading", { name: "指标检索" })).toBeTruthy();
     await waitFor(() => {
       const call = http.calls.find((c) => c.url.startsWith("/api/v1/query_range"));
@@ -665,16 +683,6 @@ describe("collect page", () => {
       const decoded = decodeURIComponent(call!.url);
       expect(decoded).toContain('agent_id="a-1"');
       expect(decoded).toContain('item_id="item-1"');
-    });
-  });
-
-  it("opens a create form with multi-select agents", async () => {
-    const { http } = renderAt("/");
-    fireEvent.click(await screen.findByRole("button", { name: "新建采集项" }));
-    expect((await screen.findAllByText("目标 Agents")).length).toBeGreaterThan(0);
-    expect(document.querySelector(".ant-select-multiple")).toBeTruthy();
-    await waitFor(() => {
-      expect(http.calls.some((c) => c.url === "/v1/agents")).toBe(true);
     });
   });
 });

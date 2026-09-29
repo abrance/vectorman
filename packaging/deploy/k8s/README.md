@@ -128,7 +128,7 @@ kubectl -n vectorman logs ds/gse-agent --tail=50          # 看挂载/降级日�
 
 # 集群侧：纳管与能力
 curl -sS https://vectorman.xiaoyxq.top/api/gse/agents | head -c 400  # 状态 online、心跳推进
-curl -sS https://vectorman.xiaoyxq.top/api/gse/agents/<node>/collect-items  # 采集项下发了什么
+curl -sS https://vectorman.xiaoyxq.top/api/gse/agents/<node>/spec  # 该节点下发了什么（参数 + 采集项）
 
 # 数据面：能力、边记录与 Pod 名
 curl -sS https://dataserver.xiaoyxq.top/v1/ebpf/capability | head -c 400
@@ -150,8 +150,11 @@ agent_ebpf_cpu_percent
 ## 5. 回滚
 
 ```bash
-# 方式一：停用采集项（Agent 侧 detach + 删 map，集群里 Pod 继续跑）
-curl -sS -X DELETE "$GSE/api/gse/collect-items/<item_id>"
+# 方式一：把该节点的 spec 里对应采集项 disable 或删掉，再下发
+#   先取当前 spec：curl -sS "$GSE/api/gse/agents/<node>/spec"
+#   改完（items[].enabled=false 或移除该条）后 PUT 回去，再 POST 下发：
+#   curl -sS -X PUT "$GSE/api/gse/agents/<node>/spec" -H 'Content-Type: application/json' -d @spec.json
+#   curl -sS -X POST "$GSE/api/gse/agents/<node>/spec/apply"
 # 方式二：删 DaemonSet
 kubectl -n vectorman delete ds gse-agent
 # 方式三：删清单全部对象（含 RBAC/ConfigMap/Secret）

@@ -1,5 +1,5 @@
 import type { HttpClient } from "@vectorman/primitives";
-import type { Agent } from "../gse/admin";
+import type { Agent, AgentSpecView, SpecItem } from "../gse/admin";
 import type { PromEnvelope } from "./prom";
 
 /// 采集项类型。
@@ -23,20 +23,10 @@ export type ExtractRule = {
   label: string;
 };
 
-/// 采集项：GSE 持久化并由 dataserver 反代读写。
-export type CollectItem = {
-  item_id: string;
-  agent_ids: string[];
-  name: string;
-  kind: CollectItemKind | string;
-  enabled: boolean;
-  collector: Record<string, unknown>;
-  storage: { retention_days: number };
-  updated_at?: string;
-};
-
-/// 新建/编辑采集项入参（不含 item_id）。
-export type CollectItemInput = Omit<CollectItem, "item_id" | "updated_at">;
+/// 新建/编辑采集项入参；`item_id` 缺省由服务端生成，编辑既有项时要原样带回。
+///
+/// `SpecItem` 本身定义在 `gse/admin.ts`（spec 是控制面概念），这里只补一个「入参」形状。
+export type SpecItemInput = Omit<SpecItem, "item_id"> & { item_id?: string };
 
 /// `/v1/streams` 单条流：`data_id` 即 `item_id`。
 export type StreamEntry = {
@@ -79,39 +69,18 @@ function enc(id: string): string {
   return encodeURIComponent(id);
 }
 
-/// dataserver SQL 口同源客户端：采集链路、采集项、指标与日志查询。
+/// dataserver SQL 口同源客户端：采集链路总览、指标与日志查询。
 export class DataplaneAdapter {
   constructor(private readonly http: HttpClient) {}
 
-  listCollectItems(agentId?: string): Promise<CollectItem[]> {
-    const query = agentId ? `?agent_id=${enc(agentId)}` : "";
+  /// 只读：per-Agent spec 列表（含期望采集项与生效状态）。
+  ///
+  /// 配置编辑走 console 直连 gse-server（`PUT /api/gse/agents/{id}/spec`），
+  /// 数据面只提供读，避免出现两个写入口。
+  listAgentSpecs(): Promise<AgentSpecView[]> {
     return this.http
-      .request<CollectItem[]>({ method: "GET", url: `/v1/collect-items${query}` })
+      .request<AgentSpecView[]>({ method: "GET", url: "/v1/agent-specs" })
       .then((r) => r.body);
-  }
-
-  getCollectItem(itemId: string): Promise<CollectItem> {
-    return this.http
-      .request<CollectItem>({ method: "GET", url: `/v1/collect-items/${enc(itemId)}` })
-      .then((r) => r.body);
-  }
-
-  createCollectItem(input: CollectItemInput): Promise<CollectItem> {
-    return this.http
-      .request<CollectItem>({ method: "POST", url: "/v1/collect-items", body: input })
-      .then((r) => r.body);
-  }
-
-  updateCollectItem(itemId: string, input: CollectItemInput): Promise<CollectItem> {
-    return this.http
-      .request<CollectItem>({ method: "PUT", url: `/v1/collect-items/${enc(itemId)}`, body: input })
-      .then((r) => r.body);
-  }
-
-  deleteCollectItem(itemId: string): Promise<void> {
-    return this.http
-      .request({ method: "DELETE", url: `/v1/collect-items/${enc(itemId)}` })
-      .then(() => undefined);
   }
 
   listStreams(): Promise<StreamEntry[]> {

@@ -27,8 +27,7 @@ use crate::config::ServerConfig;
 use crate::file_transfer::{submit_file_job, submit_file_rerun, FileJobSubmit};
 use crate::job_file_store::JobFileStore;
 use crate::ledger::{
-    ledger_stamp, AccessPoint, Agent, AgentConfig, CollectItem, DataplaneService, Host,
-    JobTemplate, Ledger,
+    ledger_stamp, AccessPoint, Agent, DataplaneService, Host, JobTemplate, Ledger,
 };
 use crate::rerun::RerunRequest;
 use crate::server::{submit_job, submit_job_with_template, submit_rerun, JobSubmit};
@@ -120,21 +119,12 @@ fn ledger_routes(admin: AdminState) -> Router {
             "/dataplanes/{service_id}",
             get(get_dataplane).delete(delete_dataplane),
         )
+        .route("/agent-specs", get(list_agent_specs))
         .route(
-            "/collect-items",
-            get(list_collect_items).post(create_collect_item),
+            "/agents/{agent_id}/spec",
+            get(get_agent_spec).put(put_agent_spec),
         )
-        .route(
-            "/collect-items/{item_id}",
-            get(get_collect_item)
-                .put(update_collect_item)
-                .delete(delete_collect_item),
-        )
-        .route(
-            "/agent-configs",
-            get(list_agent_configs).post(create_agent_config),
-        )
-        .route("/agent-configs/{agent_id}", get(get_agent_config))
+        .route("/agents/{agent_id}/spec/apply", post(apply_agent_spec))
         .route("/jobs", get(list_jobs).post(create_job))
         .route("/jobs/{job_id}", get(get_job))
         .route("/jobs/{job_id}/rerun", post(rerun_job))
@@ -447,8 +437,11 @@ async fn delete_agent(State(admin): State<AdminState>, Path(id): Path<String>) -
     if let Err(e) = ledger.remove_agent(&id).await {
         return err_json(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
-    // 级联清 Agent 运行时配置与活跃会话，保证删除后节点不可再被操作。
-    if let Err(e) = ledger.remove_agent_config(&id).await {
+    // 级联清 Agent 的期望 spec / 生效状态与活跃会话，保证删除后节点不可再被操作。
+    if let Err(e) = ledger.remove_agent_spec(&id).await {
+        return err_json(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+    if let Err(e) = ledger.remove_agent_spec_state(&id).await {
         return err_json(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
     if let Some(registry) = &admin.registry {
@@ -527,17 +520,126 @@ async fn delete_dataplane(
     }
 }
 
-// ---- collect-items ----
+// ---- agent spec ----
 
-#[derive(serde::Deserialize)]
-struct CollectItemsQuery {
-    agent_id: Option<String>,
+/// 采集项类型白名单。服务端校验与前端下拉共用同一份清单。
+fn is_item_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "metrics_host"
+            | "log_file"
+            | "log_k8s_stdout"
+            | "apm_otlp"
+            | "ebpf_network"
+            | "ebpf_tcp"
+            | "ebpf_process"
+            | "ebpf_syscall"
+    )
 }
 
+/// 列表与详情共用的视图。
+///
+/// 合并返回（期望 + 生效 + diff）是刻意的：列表页与采集链路总览都要这些字段，
+/// 分开三个接口会让前端对 N 台 Agent 打 3N 次请求。
+#[derive(serde::Serialize)]
+struct AgentSpecView {
+    agent_id: String,
+    host_id: String,
+    /// 会话口径（内存会话注册表），与台账 `status`（心跳口径）可能不一致。
+    session_state: String,
+    /// synced | stale | rejected | unspecified | unknown。
+    sync_status: &'static str,
+    /// 期望 spec 的更新时间；无期望时为空。
+    updated_at: Option<String>,
+    /// 生效快照的落库时间；无上报时为空。
+    reported_at: Option<String>,
+    desired: Option<SpecRevisionView>,
+    applied: Option<AppliedView>,
+    diff: Option<crate::spec::SpecDiff>,
+}
+
+#[derive(serde::Serialize)]
+struct SpecRevisionView {
+    revision: String,
+    spec: gse_proto::AgentSpecWire,
+}
+
+#[derive(serde::Serialize)]
+struct AppliedView {
+    revision: String,
+    outcome: String,
+    spec: gse_proto::AgentSpecWire,
+    not_enforced: Vec<String>,
+    detail: String,
+}
+
+/// 脱敏哨兵：读出去是它，写回来表示「保持原值」。
+const MASK: &str = "***";
+
+/// 敏感字段的对外表示：已设置 → `***`，未设置 → 空串（两者必须可区分，
+/// 否则前端无法判断「留空」到底意味着什么）。
+fn mask_secret(value: Option<&String>) -> Option<String> {
+    Some(match value {
+        Some(v) if !v.is_empty() => MASK.to_string(),
+        _ => String::new(),
+    })
+}
+
+fn mask_params(params: &gse_proto::SpecParams) -> gse_proto::SpecParams {
+    let mut masked = params.clone();
+    masked.token = mask_secret(params.token.as_ref());
+    masked.otlp_token = mask_secret(params.otlp_token.as_ref());
+    masked
+}
+
+fn mask_spec(spec: &gse_proto::AgentSpecWire) -> gse_proto::AgentSpecWire {
+    gse_proto::AgentSpecWire {
+        params: mask_params(&spec.params),
+        items: spec.items.clone(),
+    }
+}
+
+/// `null` 与「字段缺失」在 `Option<T>` 里都会解析成 `None`，而敏感字段必须区分：
+/// 缺失/空串 = 保持原值（前端只拿得到脱敏占位），`null` = 清空。
+fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(de).map(Some)
+}
+
+/// 敏感字段的写回语义。`field` 只用于错误信息。
+fn merge_secret(
+    incoming: Option<Option<&str>>,
+    existing: Option<&str>,
+    field: &str,
+) -> Result<Option<String>, GseError> {
+    match incoming {
+        // 字段缺失：保持原值。
+        None => Ok(existing.map(|s| s.to_string())),
+        // 显式 null：清空。
+        Some(None) => Ok(None),
+        Some(Some(v)) if v == MASK || v.is_empty() => {
+            // 哨兵是「保持原值」的意思，原值本来就没有说明前端在发一份它自己造出来的占位值 ——
+            // 静默当成空会把「没设置」与「设置过再被抹掉」混为一谈。
+            if v == MASK && existing.is_none_or(|e| e.is_empty()) {
+                return Err(GseError::new(
+                    "invalid_argument",
+                    format!("{field}: 传了脱敏占位值但当前并没有已设置的值"),
+                ));
+            }
+            Ok(existing.map(|s| s.to_string()))
+        }
+        Some(Some(v)) => Ok(Some(v.to_string())),
+    }
+}
+
+/// 单条采集项输入。`item_id` 缺省由服务端生成；已有项回传原 id 以保持稳定。
 #[derive(serde::Deserialize)]
-struct CollectItemInput {
+struct SpecItemInput {
     #[serde(default)]
-    agent_ids: Vec<String>,
+    item_id: String,
     #[serde(default)]
     name: String,
     #[serde(default)]
@@ -589,41 +691,18 @@ fn normalize_storage(v: &serde_json::Value) -> serde_json::Value {
     json!({"retention_days": days})
 }
 
-/// 校验输入并构造完整采集项：类型合法、目标至少一个、日志类含匹配模式。
-fn build_collect_item(item_id: &str, input: &CollectItemInput) -> Result<CollectItem, GseError> {
+/// 校验输入并构造采集项：名称非空、类型合法、日志类含匹配模式、eBPF 参数有界。
+fn build_spec_item(input: &SpecItemInput) -> Result<gse_proto::SpecItem, GseError> {
     if input.name.trim().is_empty() {
         return Err(GseError::new(
             "invalid_argument",
             "missing required field: name",
         ));
     }
-    if !matches!(
-        input.kind.as_str(),
-        "metrics_host"
-            | "log_file"
-            | "log_k8s_stdout"
-            | "apm_otlp"
-            | "ebpf_network"
-            | "ebpf_tcp"
-            | "ebpf_process"
-            | "ebpf_syscall"
-    ) {
+    if !is_item_kind(&input.kind) {
         return Err(GseError::new(
             "invalid_argument",
             format!("unsupported kind: {}", input.kind),
-        ));
-    }
-    let mut agent_ids: Vec<String> = Vec::new();
-    for a in &input.agent_ids {
-        let a = a.trim();
-        if !a.is_empty() && !agent_ids.iter().any(|x| x == a) {
-            agent_ids.push(a.to_string());
-        }
-    }
-    if agent_ids.is_empty() {
-        return Err(GseError::new(
-            "invalid_argument",
-            "missing required field: agent_ids",
         ));
     }
     match input.kind.as_str() {
@@ -780,174 +859,417 @@ fn build_collect_item(item_id: &str, input: &CollectItemInput) -> Result<Collect
         }
         _ => {}
     }
-    Ok(CollectItem {
-        item_id: item_id.to_string(),
-        agent_ids,
+    Ok(gse_proto::SpecItem {
+        item_id: if input.item_id.trim().is_empty() {
+            new_collect_item_id()
+        } else {
+            input.item_id.trim().to_string()
+        },
         name: input.name.trim().to_string(),
         kind: input.kind.clone(),
         enabled: input.enabled,
         collector: input.collector.clone(),
         storage: normalize_storage(&input.storage),
-        updated_at: ledger_stamp(),
     })
 }
 
-/// 保存或删除后向目标在线 Agent 推送过滤整表；无 registry 或推送失败不影响写入结果。
-async fn push_collect_items_to_agents(admin: &AdminState, agent_ids: &[String]) {
+/// 允许下发的心跳周期上限（判活窗口的 1/3）。
+///
+/// 超过它 Agent 会在两次心跳之间被判离线，表现成周期性「离线→上线」闪断，
+/// 采集器也会被反复重对齐 —— 这类配置错误必须在写库前拦住。
+fn heartbeat_limit_secs(admin: &AdminState) -> u64 {
+    admin
+        .cfg
+        .as_ref()
+        .map(|c| c.max_agent_heartbeat_interval_secs())
+        .unwrap_or(crate::config::DEFAULT_MAX_AGENT_HEARTBEAT_INTERVAL_SECS)
+}
+
+/// spec 的结构性校验（全部拦在写库前）。
+fn validate_spec(admin: &AdminState, spec: &gse_proto::AgentSpecWire) -> Result<(), GseError> {
+    let limit = heartbeat_limit_secs(admin);
+    if spec.params.heartbeat_interval_secs == 0 {
+        return Err(GseError::new(
+            "invalid_argument",
+            "heartbeat_interval_secs 必须大于 0",
+        ));
+    }
+    if spec.params.heartbeat_interval_secs > limit {
+        return Err(GseError::new(
+            "invalid_argument",
+            format!(
+                "heartbeat_interval_secs 不得大于 {limit}（判活窗口 heartbeat_timeout_secs/3 秒）"
+            ),
+        ));
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    for item in &spec.items {
+        if item.item_id.trim().is_empty() {
+            return Err(GseError::new("invalid_argument", "item_id 不得为空"));
+        }
+        if seen.contains(&item.item_id.as_str()) {
+            return Err(GseError::new(
+                "invalid_argument",
+                format!("item_id 重复: {}", item.item_id),
+            ));
+        }
+        seen.push(item.item_id.as_str());
+        if !is_item_kind(&item.kind) {
+            return Err(GseError::new(
+                "invalid_argument",
+                format!("unsupported kind: {}", item.kind),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// PUT 的请求体。
+///
+/// 非敏感字段是**整体覆盖**（缺失回落到内置默认值），只有 `token` / `otlp_token`
+/// 是「保持原值」语义 —— 因为前端读回来的永远是脱敏占位值。
+#[derive(serde::Deserialize)]
+#[serde(default)]
+struct SpecParamsInput {
+    heartbeat_interval_secs: u64,
+    allowed_interpreters: Vec<String>,
+    job_default_interpreter: String,
+    max_concurrent_jobs: usize,
+    job_work_dir: Option<String>,
+    otlp_enabled: bool,
+    otlp_listen: String,
+    otlp_max_body_bytes: usize,
+    #[serde(deserialize_with = "double_option")]
+    otlp_token: Option<Option<String>>,
+    otlp_allowed_cidrs: Vec<String>,
+    #[serde(deserialize_with = "double_option")]
+    token: Option<Option<String>>,
+    cpu_limit_percent: Option<i64>,
+    mem_limit_percent: Option<i64>,
+    log_level: String,
+}
+
+impl Default for SpecParamsInput {
+    /// 缺省值对齐 `SpecParams::default()`，敏感字段缺省为「不修改」。
+    fn default() -> Self {
+        let d = gse_proto::SpecParams::default();
+        Self {
+            heartbeat_interval_secs: d.heartbeat_interval_secs,
+            allowed_interpreters: d.allowed_interpreters,
+            job_default_interpreter: d.job_default_interpreter,
+            max_concurrent_jobs: d.max_concurrent_jobs,
+            job_work_dir: d.job_work_dir,
+            otlp_enabled: d.otlp_enabled,
+            otlp_listen: d.otlp_listen,
+            otlp_max_body_bytes: d.otlp_max_body_bytes,
+            otlp_token: None,
+            otlp_allowed_cidrs: d.otlp_allowed_cidrs,
+            token: None,
+            cpu_limit_percent: d.cpu_limit_percent,
+            mem_limit_percent: d.mem_limit_percent,
+            log_level: d.log_level,
+        }
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct SpecPutBody {
+    params: SpecParamsInput,
+    items: Vec<SpecItemInput>,
+}
+
+/// 同步状态：描述「期望值与生效值是否一致」。
+fn sync_status(
+    desired: Option<&crate::ledger::AgentSpec>,
+    state: Option<&crate::ledger::AgentSpecState>,
+) -> &'static str {
+    let Some(state) = state else {
+        return "unknown";
+    };
+    if state.outcome == gse_proto::spec_outcome::REJECTED {
+        return "rejected";
+    }
+    match desired {
+        // 没有期望 spec：Agent 跑的是本地文件基线，无从谈「同步」。
+        None => "unspecified",
+        Some(d) if d.revision == state.revision => "synced",
+        Some(_) => "stale",
+    }
+}
+
+/// 组装一台 Agent 的视图。`session_state` 由调用方给出（列表一次取全量注册表）。
+fn spec_view(
+    agent_id: &str,
+    host_id: String,
+    session_state: String,
+    desired: Option<&crate::ledger::AgentSpec>,
+    state: Option<&crate::ledger::AgentSpecState>,
+) -> AgentSpecView {
+    AgentSpecView {
+        agent_id: agent_id.to_string(),
+        host_id,
+        session_state,
+        sync_status: sync_status(desired, state),
+        updated_at: desired.map(|d| d.updated_at.clone()),
+        reported_at: state.map(|s| s.reported_at.clone()),
+        desired: desired.map(|d| SpecRevisionView {
+            revision: d.revision.clone(),
+            spec: mask_spec(&d.spec),
+        }),
+        applied: state.map(|s| AppliedView {
+            revision: s.revision.clone(),
+            outcome: s.outcome.clone(),
+            spec: mask_spec(&s.applied),
+            not_enforced: s.not_enforced.clone(),
+            detail: s.detail.clone(),
+        }),
+        diff: state.map(|s| s.diff.clone()),
+    }
+}
+
+/// 某台 Agent 的会话口径；无注册表（管理端口独立部署）时恒为 `absent`。
+async fn session_state_of(admin: &AdminState, agent_id: &str) -> String {
     let Some(registry) = admin.registry.as_ref() else {
-        return;
+        return "absent".to_string();
     };
-    crate::server::push_collect_items_to(&admin.ledger, registry, agent_ids).await;
-}
-
-async fn list_collect_items(
-    State(admin): State<AdminState>,
-    Query(q): Query<CollectItemsQuery>,
-) -> Response {
-    match admin.ledger.list_collect_items(q.agent_id.as_deref()).await {
-        Ok(v) => ok(&v),
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
+    match registry.get(agent_id).await {
+        Some(s) => format!("{:?}", s.state).to_lowercase(),
+        None => "absent".to_string(),
     }
 }
 
-async fn get_collect_item(
-    State(admin): State<AdminState>,
-    Path(item_id): Path<String>,
-) -> Response {
-    match admin.ledger.get_collect_item(&item_id).await {
-        Ok(Some(i)) => ok(&i),
-        Ok(None) => err_json(
-            StatusCode::NOT_FOUND,
-            GseError::new("not_found", format!("collect item {item_id} not found")),
-        ),
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
-    }
-}
-
-async fn create_collect_item(
-    State(admin): State<AdminState>,
-    body: Result<Json<CollectItemInput>, axum::extract::rejection::JsonRejection>,
-) -> Response {
-    let Json(input) = match body {
-        Ok(b) => b,
-        Err(e) => return from_json_err(e),
-    };
-    let item = match build_collect_item(&new_collect_item_id(), &input) {
-        Ok(i) => i,
-        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
-    };
-    if let Err(e) = admin.ledger.upsert_collect_item(&item).await {
-        return err_json(StatusCode::INTERNAL_SERVER_ERROR, e);
-    }
-    push_collect_items_to_agents(&admin, &item.agent_ids).await;
-    created(&item)
-}
-
-async fn update_collect_item(
-    State(admin): State<AdminState>,
-    Path(item_id): Path<String>,
-    body: Result<Json<CollectItemInput>, axum::extract::rejection::JsonRejection>,
-) -> Response {
-    let Json(input) = match body {
-        Ok(b) => b,
-        Err(e) => return from_json_err(e),
-    };
-    let old = match admin.ledger.get_collect_item(&item_id).await {
-        Ok(Some(i)) => i,
-        Ok(None) => {
-            return err_json(
-                StatusCode::NOT_FOUND,
-                GseError::new("not_found", format!("collect item {item_id} not found")),
-            )
-        }
+/// 列表：台账里的每台 Agent 一行（含期望、生效与 diff）。
+async fn list_agent_specs(State(admin): State<AdminState>) -> Response {
+    let agents = match admin.ledger.list_agents().await {
+        Ok(v) => v,
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
-    let item = match build_collect_item(&item_id, &input) {
-        Ok(i) => i,
-        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
-    };
-    if let Err(e) = admin.ledger.upsert_collect_item(&item).await {
-        return err_json(StatusCode::INTERNAL_SERVER_ERROR, e);
-    }
-    // 新旧目标合并推送：被移出列表的 Agent 也要收到更新，停止该项采集。
-    let mut targets = old.agent_ids;
-    targets.extend(item.agent_ids.iter().cloned());
-    push_collect_items_to_agents(&admin, &targets).await;
-    ok(&item)
-}
-
-async fn delete_collect_item(
-    State(admin): State<AdminState>,
-    Path(item_id): Path<String>,
-) -> Response {
-    let old = match admin.ledger.get_collect_item(&item_id).await {
-        Ok(Some(i)) => i,
-        Ok(None) => {
-            return err_json(
-                StatusCode::NOT_FOUND,
-                GseError::new("not_found", format!("collect item {item_id} not found")),
-            )
-        }
+    let desired = match admin.ledger.list_agent_specs().await {
+        Ok(v) => v,
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
-    match admin.ledger.delete_collect_item(&item_id).await {
-        Ok(true) => {
-            push_collect_items_to_agents(&admin, &old.agent_ids).await;
-            StatusCode::NO_CONTENT.into_response()
+    let states = match admin.ledger.list_agent_spec_states().await {
+        Ok(v) => v,
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let mut views: Vec<AgentSpecView> = agents
+        .iter()
+        .map(|a| {
+            let d = desired.iter().find(|d| d.agent_id == a.agent_id);
+            let s = states.iter().find(|s| s.agent_id == a.agent_id);
+            // 占位：session_state 需要 await，下面统一填。
+            spec_view(&a.agent_id, a.host_id.clone(), "absent".to_string(), d, s)
+        })
+        .collect();
+    for (view, agent) in views.iter_mut().zip(agents.iter()) {
+        view.session_state = session_state_of(&admin, &agent.agent_id).await;
+    }
+    // 有期望 spec 但台账里没有对应 Agent 的行也一并列出（数据不一致时要看得见，而不是消失）。
+    for d in &desired {
+        if agents.iter().any(|a| a.agent_id == d.agent_id) {
+            continue;
         }
-        Ok(false) => err_json(
+        let s = states.iter().find(|s| s.agent_id == d.agent_id);
+        views.push(spec_view(
+            &d.agent_id,
+            String::new(),
+            session_state_of(&admin, &d.agent_id).await,
+            Some(d),
+            s,
+        ));
+    }
+    views.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+    ok(&views)
+}
+
+async fn get_agent_spec(State(admin): State<AdminState>, Path(agent_id): Path<String>) -> Response {
+    let desired = match admin.ledger.get_agent_spec(&agent_id).await {
+        Ok(v) => v,
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let state = match admin.ledger.get_agent_spec_state(&agent_id).await {
+        Ok(v) => v,
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let host_id = match admin.ledger.get_agent(&agent_id).await {
+        Ok(Some(a)) => a.host_id,
+        Ok(None) => String::new(),
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    // 从未保存过、也从未上报过：确实是「没有这个东西」。
+    if desired.is_none() && state.is_none() {
+        return err_json(
             StatusCode::NOT_FOUND,
-            GseError::new("not_found", format!("collect item {item_id} not found")),
-        ),
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
+            GseError::new("not_found", format!("agent {agent_id} 没有 spec")),
+        );
     }
+    let session_state = session_state_of(&admin, &agent_id).await;
+    ok(&spec_view(
+        &agent_id,
+        host_id,
+        session_state,
+        desired.as_ref(),
+        state.as_ref(),
+    ))
 }
 
-// ---- agent_configs ----
-
-async fn list_agent_configs(State(admin): State<AdminState>) -> Response {
-    match admin.ledger.list_agent_configs().await {
-        Ok(v) => ok(&v),
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
-    }
-}
-
-async fn create_agent_config(
+/// 保存期望 spec（**只写台账，不推送**）。
+async fn put_agent_spec(
     State(admin): State<AdminState>,
-    body: Result<Json<AgentConfig>, axum::extract::rejection::JsonRejection>,
+    Path(agent_id): Path<String>,
+    body: Result<Json<SpecPutBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let Json(cfg) = match body {
+    let Json(body) = match body {
         Ok(b) => b,
         Err(e) => return from_json_err(e),
     };
-    if let Some(resp) = require(!cfg.agent_id.trim().is_empty(), "agent_id") {
-        return resp;
+    // `apply` 是 `/{agent_id}/spec/apply` 的静态段，被路由吃掉会表现为
+    // 「保存成功但下发打到了别的 Agent」。
+    if agent_id == "apply" {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            GseError::new("invalid_argument", "agent_id \"apply\" 是保留字"),
+        );
     }
-    if let Some(resp) = require(!cfg.host_id.trim().is_empty(), "host_id") {
-        return resp;
+    let existing_agent = match admin.ledger.get_agent(&agent_id).await {
+        Ok(v) => v,
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    if existing_agent.is_none() {
+        return err_json(
+            StatusCode::NOT_FOUND,
+            GseError::new("not_found", format!("agent {agent_id} 未登记")),
+        );
     }
-    let mut cfg = cfg;
-    if cfg.log_level.is_empty() {
-        cfg.log_level = "info".to_string();
+    let existing = match admin.ledger.get_agent_spec(&agent_id).await {
+        Ok(v) => v,
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let params = match body
+        .params
+        .into_params(existing.as_ref().map(|e| &e.spec.params))
+    {
+        Ok(p) => p,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+    };
+    let mut items = Vec::with_capacity(body.items.len());
+    for input in &body.items {
+        match build_spec_item(input) {
+            Ok(i) => items.push(i),
+            Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+        }
     }
-    cfg.updated_at = ledger_stamp();
-    match admin.ledger.upsert_agent_config(&cfg).await {
-        Ok(()) => created(&cfg),
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
+    let spec = gse_proto::AgentSpecWire { params, items };
+    if let Err(e) = validate_spec(&admin, &spec) {
+        return err_json(StatusCode::BAD_REQUEST, e);
     }
+    let revision = match crate::spec::revision(&spec) {
+        Ok(r) => r,
+        Err(e) => {
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                GseError::new("internal", e),
+            )
+        }
+    };
+    let desired = crate::ledger::AgentSpec {
+        agent_id: agent_id.clone(),
+        revision,
+        spec,
+        updated_at: ledger_stamp(),
+    };
+    if let Err(e) = admin.ledger.upsert_agent_spec(&desired).await {
+        return err_json(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+
+    // token 轮换：`agents.token` 才是认证用的真相源，必须在这里跟上，
+    // 否则 Agent 收到新 token 重连会被拒。旧值进 `prev_token` 做宽限
+    // （下发是手动的，agent 可能在这之前就重连过）。
+    let new_token = desired.spec.params.token.clone();
+    if let Some(new_token) = new_token {
+        match admin.ledger.agent_tokens(&agent_id).await {
+            Ok(Some((current, _))) if current == new_token => {}
+            Ok(Some(_)) => {
+                if let Err(e) = admin.ledger.rotate_agent_token(&agent_id, &new_token).await {
+                    return err_json(StatusCode::INTERNAL_SERVER_ERROR, e);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
+        }
+    }
+
+    ok(&spec_view(
+        &agent_id,
+        existing_agent.map(|a| a.host_id).unwrap_or_default(),
+        session_state_of(&admin, &agent_id).await,
+        Some(&desired),
+        admin
+            .ledger
+            .get_agent_spec_state(&agent_id)
+            .await
+            .ok()
+            .flatten()
+            .as_ref(),
+    ))
 }
 
-async fn get_agent_config(
+/// 下发该 Agent 的期望 spec 并取回执。
+async fn apply_agent_spec(
     State(admin): State<AdminState>,
     Path(agent_id): Path<String>,
 ) -> Response {
-    match admin.ledger.get_agent_config(&agent_id).await {
-        Ok(Some(c)) => ok(&c),
-        Ok(None) => err_json(
-            StatusCode::NOT_FOUND,
-            GseError::new("not_found", format!("agent config {agent_id} not found")),
-        ),
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
+    let Some(registry) = admin.registry.as_ref() else {
+        return err_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            GseError::new("unavailable", "管理端口独立部署，无会话注册表，无法下发"),
+        );
+    };
+    match crate::server::push_agent_spec(&admin.ledger, registry, &agent_id).await {
+        Ok(ack) => ok(&json!({"ok": true, "ack": ack})),
+        Err(e) => {
+            let status = match e.code.as_str() {
+                "not_found" => StatusCode::NOT_FOUND,
+                "agent_offline" => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            err_json(status, e)
+        }
+    }
+}
+
+/// 把请求体里的参数合并成完整的 `SpecParams`（敏感字段按「保持原值」语义）。
+impl SpecParamsInput {
+    fn into_params(
+        self,
+        existing: Option<&gse_proto::SpecParams>,
+    ) -> Result<gse_proto::SpecParams, GseError> {
+        Ok(gse_proto::SpecParams {
+            heartbeat_interval_secs: self.heartbeat_interval_secs,
+            allowed_interpreters: self.allowed_interpreters,
+            job_default_interpreter: self.job_default_interpreter,
+            max_concurrent_jobs: self.max_concurrent_jobs,
+            job_work_dir: self.job_work_dir,
+            otlp_enabled: self.otlp_enabled,
+            otlp_listen: self.otlp_listen,
+            otlp_max_body_bytes: self.otlp_max_body_bytes,
+            otlp_token: merge_secret(
+                self.otlp_token.as_ref().map(|v| v.as_deref()),
+                existing.and_then(|e| e.otlp_token.as_deref()),
+                "otlp_token",
+            )?,
+            otlp_allowed_cidrs: self.otlp_allowed_cidrs,
+            token: merge_secret(
+                self.token.as_ref().map(|v| v.as_deref()),
+                existing.and_then(|e| e.token.as_deref()),
+                "token",
+            )?,
+            cpu_limit_percent: self.cpu_limit_percent,
+            mem_limit_percent: self.mem_limit_percent,
+            log_level: self.log_level,
+        })
     }
 }
 
@@ -1655,7 +1977,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn access_points_and_agent_configs_crud() {
+    async fn access_points_crud_and_spec_requires_registered_agent() {
         let (mut app, _ledger) = app_ledger("misc").await;
 
         let (status, _) = send(
@@ -1674,30 +1996,19 @@ mod tests {
         let (status, _) = send(&mut app, req("GET", "/api/gse/access-points/ghost", None)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
+        // 未登记的 Agent 不能存 spec。
+        let (status, body) = send(&mut app, req("GET", "/api/gse/agents/ghost/spec", None)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
         let (status, body) = send(
             &mut app,
             req(
-                "POST",
-                "/api/gse/agent-configs",
-                Some(r#"{"agent_id":"a-1","host_id":"h-1","cpu_limit_percent":50}"#),
+                "PUT",
+                "/api/gse/agents/ghost/spec",
+                Some(r#"{"params":{"heartbeat_interval_secs":30},"items":[]}"#),
             ),
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED, "{body}");
-        assert!(body.contains("\"log_level\":\"info\""), "{body}");
-        let (status, body) = send(&mut app, req("GET", "/api/gse/agent-configs/a-1", None)).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("50"), "{body}");
-        let (status, body) = send(
-            &mut app,
-            req(
-                "POST",
-                "/api/gse/agent-configs",
-                Some(r#"{"host_id":"h-1"}"#),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     }
 
     #[tokio::test]
@@ -1725,19 +2036,20 @@ mod tests {
         send(
             &mut app,
             req(
-                "POST",
-                "/api/gse/agent-configs",
-                Some(r#"{"agent_id":"a-1","host_id":"h-1","cpu_limit_percent":50}"#),
+                "PUT",
+                "/api/gse/agents/a-1/spec",
+                Some(r#"{"params":{"heartbeat_interval_secs":30},"items":[]}"#),
             ),
         )
         .await;
+        assert!(ledger.get_agent_spec("a-1").await.expect("get").is_some());
 
         let (status, _) = send(&mut app, req("DELETE", "/api/gse/agents/a-1", None)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(ledger.get_agent("a-1").await.expect("get").is_none());
         assert!(
-            ledger.get_agent_config("a-1").await.expect("get").is_none(),
-            "agent config should be cascaded away"
+            ledger.get_agent_spec("a-1").await.expect("get").is_none(),
+            "agent spec should be cascaded away"
         );
         // host 不随 agent 删除而消失。
         assert!(ledger.get_host("h-1").await.expect("get").is_some());
@@ -1803,236 +2115,272 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_items_crud_and_validation() {
-        let (mut app, _ledger) = app_ledger("collect-items").await;
+    async fn agent_spec_validation_masking_and_roundtrip() {
+        let (mut app, ledger) = app_ledger("agent-spec").await;
+        for id in ["a-1", "a-2"] {
+            ledger
+                .upsert_agent(&Agent {
+                    agent_id: id.to_string(),
+                    host_id: "h-1".to_string(),
+                    access_point_id: None,
+                    token: "tok".to_string(),
+                    version: String::new(),
+                    install_path: String::new(),
+                    status: "unknown".to_string(),
+                    last_heartbeat_at: None,
+                    registered_at: ledger_stamp(),
+                })
+                .await
+                .expect("seed agent");
+        }
+        let put = |body: &str| req("PUT", "/api/gse/agents/a-1/spec", Some(body));
 
         // 非法 kind。
         let (status, body) = send(
             &mut app,
             req(
-                "POST",
-                "/api/gse/collect-items",
-                Some(r#"{"name":"x","kind":"nope","agent_ids":["a-1"],"collector":{}}"#),
+                "PUT",
+                "/api/gse/agents/a-1/spec",
+                Some(r#"{"items":[{"name":"x","kind":"nope","collector":{}}]}"#),
             ),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("kind"), "{body}");
 
-        // 缺目标 Agent。
+        // 采集项缺 name。
         let (status, body) = send(
             &mut app,
             req(
-                "POST",
-                "/api/gse/collect-items",
-                Some(r#"{"name":"x","kind":"metrics_host","agent_ids":[],"collector":{}}"#),
+                "PUT",
+                "/api/gse/agents/a-1/spec",
+                Some(r#"{"items":[{"kind":"metrics_host","collector":{}}]}"#),
             ),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("name"), "{body}");
 
         // log_file 缺 path_patterns。
         let (status, body) = send(
             &mut app,
             req(
-                "POST",
-                "/api/gse/collect-items",
-                Some(r#"{"name":"x","kind":"log_file","agent_ids":["a-1"],"collector":{}}"#),
+                "PUT",
+                "/api/gse/agents/a-1/spec",
+                Some(r#"{"items":[{"name":"x","kind":"log_file","collector":{}}]}"#),
             ),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("path_patterns"), "{body}");
 
-        // eBPF 采集项：类型白名单 + 明显非法的字段在第一道闸就拒掉。
+        // eBPF：类型白名单 + 明显非法字段在第一道闸就拒。
         let (status, body) = send(
             &mut app,
-            req(
-                "POST",
-                "/api/gse/collect-items",
-                Some(
-                    r#"{"name":"ebpf","kind":"ebpf_network","agent_ids":["a-1"],"collector":{"port_include":"8080"}}"#,
-                ),
-            ),
+            put(r#"{"items":[{"name":"ebpf","kind":"ebpf_network","collector":{"port_include":"8080"}}]}"#),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("array of ports"), "{body}");
-
         let (status, body) = send(
             &mut app,
-            req(
-                "POST",
-                "/api/gse/collect-items",
-                Some(
-                    r#"{"name":"ebpf","kind":"ebpf_tcp","agent_ids":["a-1"],"collector":{"bucket_secs":600}}"#,
-                ),
-            ),
+            put(r#"{"items":[{"name":"ebpf","kind":"ebpf_tcp","collector":{"bucket_secs":600}}]}"#),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("1..=60"), "{body}");
-
         let (status, body) = send(
             &mut app,
-            req(
-                "POST",
-                "/api/gse/collect-items",
-                Some(
-                    r#"{"name":"ebpf","kind":"ebpf_process","agent_ids":["a-1"],"collector":{"raw_events_enabled":true,"raw_events_sample_ratio":1.5}}"#,
-                ),
-            ),
+            put(r#"{"items":[{"name":"ebpf","kind":"ebpf_process","collector":{"raw_events_enabled":true,"raw_events_sample_ratio":1.5}}]}"#),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("raw_events_sample_ratio"), "{body}");
 
-        // 合法配置要能创建成功（否则前端拿不到可用形态）。
+        // apm_otlp：名单与攒批上限。
         let (status, body) = send(
             &mut app,
-            req(
-                "POST",
-                "/api/gse/collect-items",
-                Some(
-                    r#"{"name":"ebpf-net","kind":"ebpf_network","agent_ids":["a-1"],"collector":{"bucket_secs":10,"flush_interval_secs":10,"port_include":[8080,8443],"include_loopback":false,"raw_events_enabled":false}}"#,
-                ),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::CREATED, "{body}");
-        assert!(body.contains("ebpf_network"), "{body}");
-
-        // **每一种 eBPF 类型都要能建**：此前白名单漏了 `ebpf_syscall`，
-        // 结果这个采集项只能靠改代码之外的办法建（前端/API 全部被拒 `unsupported kind`）。
-        // 逐类型建一遍，新增类型忘了加白名单时这里会红。
-        for kind in ["ebpf_network", "ebpf_tcp", "ebpf_process", "ebpf_syscall"] {
-            let payload = format!(
-                r#"{{"name":"k","kind":"{kind}","agent_ids":["a-1"],"collector":{{"flush_interval_secs":10}}}}"#
-            );
-            let (status, body) = send(
-                &mut app,
-                req("POST", "/api/gse/collect-items", Some(payload.as_str())),
-            )
-            .await;
-            assert_eq!(status, StatusCode::CREATED, "{kind}: {body}");
-            assert!(body.contains(kind), "{kind}: {body}");
-        }
-
-        // apm_otlp：名单与攒批上限都要校验。
-        let (status, body) = send(
-            &mut app,
-            req(
-                "POST",
-                "/api/gse/collect-items",
-                Some(
-                    r#"{"name":"apm","kind":"apm_otlp","agent_ids":["a-1"],"collector":{"service_allowlist":"order-api"}}"#,
-                ),
-            ),
+            put(r#"{"items":[{"name":"apm","kind":"apm_otlp","collector":{"service_allowlist":"order-api"}}]}"#),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("must be an array"), "{body}");
-
         let (status, body) = send(
             &mut app,
-            req(
-                "POST",
-                "/api/gse/collect-items",
-                Some(
-                    r#"{"name":"apm","kind":"apm_otlp","agent_ids":["a-1"],"collector":{"batch_max_records":9000}}"#,
-                ),
-            ),
+            put(r#"{"items":[{"name":"apm","kind":"apm_otlp","collector":{"batch_max_records":9000}}]}"#),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("1..=5000"), "{body}");
 
+        // 心跳周期：0 与超过判活窗口 1/3 都要在写库前拦住
+        // （cfg 为 None → 兜底上限 30s，即默认判活窗口 90s 的三分之一）。
         let (status, body) = send(
             &mut app,
-            req(
-                "POST",
-                "/api/gse/collect-items",
-                Some(
-                    r#"{"name":"apm","kind":"apm_otlp","agent_ids":["a-1"],"collector":{"service_allowlist":["order-api"],"attribute_allowlist":["http.request.method"],"batch_max_records":50,"flush_interval_secs":10},"storage":{"retention_days":3}}"#,
-                ),
-            ),
+            put(r#"{"params":{"heartbeat_interval_secs":0},"items":[]}"#),
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED, "{body}");
-        assert!(body.contains("\"kind\":\"apm_otlp\""), "{body}");
-        assert!(body.contains("\"retention_days\":3"), "{body}");
-
-        // 合法创建：目标去重去空白，storage 缺省回落 1 天。
-        let create = r#"{"name":"cpu","kind":"metrics_host","agent_ids":["a-1","a-1"," a-2 ",""],"collector":{"interval_secs":15},"storage":{}}"#;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("heartbeat_interval_secs"), "{body}");
         let (status, body) = send(
             &mut app,
-            req("POST", "/api/gse/collect-items", Some(create)),
+            put(r#"{"params":{"heartbeat_interval_secs":999},"items":[]}"#),
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED, "{body}");
-        assert!(body.contains("\"retention_days\":1"), "{body}");
-        assert!(body.contains("\"agent_ids\":[\"a-1\",\"a-2\"]"), "{body}");
-        let created: serde_json::Value = serde_json::from_str(&body).expect("json");
-        let item_id = created["item_id"].as_str().expect("item_id").to_string();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("heartbeat_interval_secs"), "{body}");
 
-        // 列表：全部与按 agent 过滤。
-        let (status, body) = send(&mut app, req("GET", "/api/gse/collect-items", None)).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(body.contains(&item_id), "{body}");
+        // item_id 重复。
         let (status, body) = send(
             &mut app,
-            req("GET", "/api/gse/collect-items?agent_id=a-2", None),
+            put(r#"{"items":[{"item_id":"dup","name":"a","kind":"metrics_host"},{"item_id":"dup","name":"b","kind":"metrics_host"}]}"#),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(body.contains(&item_id), "{body}");
-        let (status, body) = send(
-            &mut app,
-            req("GET", "/api/gse/collect-items?agent_id=a-9", None),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body.trim(), "[]", "{body}");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("重复"), "{body}");
 
-        // 单条与 404。
-        let (status, _) = send(
-            &mut app,
-            req("GET", &format!("/api/gse/collect-items/{item_id}"), None),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        let (status, _) = send(&mut app, req("GET", "/api/gse/collect-items/ghost", None)).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-
-        // 更新为关闭并缩减目标；保存周期改为 2 天。
-        let update = r#"{"name":"cpu","kind":"metrics_host","enabled":false,"agent_ids":["a-1"],"collector":{"interval_secs":15},"storage":{"retention_days":2}}"#;
+        // 保留字 agent_id。
         let (status, body) = send(
             &mut app,
             req(
                 "PUT",
-                &format!("/api/gse/collect-items/{item_id}"),
-                Some(update),
+                "/api/gse/agents/apply/spec",
+                Some(r#"{"params":{"heartbeat_interval_secs":30},"items":[]}"#),
             ),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(body.contains("\"enabled\":false"), "{body}");
-        assert!(body.contains("\"retention_days\":2"), "{body}");
-        assert!(!body.contains("a-2"), "{body}");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("保留字"), "{body}");
 
-        // 删除 204，再取 404。
-        let (status, _) = send(
+        // 合法：四种 eBPF 类型都要能建（此前白名单漏过 ebpf_syscall），
+        // 加一个 apm_otlp 与 log_file，并验证 storage 归一。
+        let items = [
+            r#"{"name":"ebpf-net","kind":"ebpf_network","collector":{"bucket_secs":10,"flush_interval_secs":10,"port_include":[8080,8443],"include_loopback":false,"raw_events_enabled":false}}"#,
+            r#"{"name":"ebpf-tcp","kind":"ebpf_tcp","collector":{"flush_interval_secs":10}}"#,
+            r#"{"name":"ebpf-proc","kind":"ebpf_process","collector":{"flush_interval_secs":10}}"#,
+            r#"{"name":"ebpf-sys","kind":"ebpf_syscall","collector":{"flush_interval_secs":10}}"#,
+            r#"{"name":"apm","kind":"apm_otlp","collector":{"service_allowlist":["order-api"],"batch_max_records":50,"flush_interval_secs":10},"storage":{"retention_days":3}}"#,
+            r#"{"name":"app log","kind":"log_file","collector":{"path_patterns":["/var/log/*.log"]}}"#,
+        ];
+        let body = format!(
+            r#"{{"params":{{"heartbeat_interval_secs":15}},"items":[{}]}}"#,
+            items.join(",")
+        );
+        let (status, resp) = send(&mut app, put(&body)).await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        assert!(resp.contains("\"retention_days\":3"), "{resp}");
+        assert!(
+            resp.contains("\"retention_days\":1"),
+            "缺省应回落 1 天: {resp}"
+        );
+        assert!(resp.contains("ebpf_syscall"), "{resp}");
+
+        // 生成的 item_id 稳定：读回来还是那一批。
+        let (_, body) = send(&mut app, req("GET", "/api/gse/agents/a-1/spec", None)).await;
+        let view: serde_json::Value = serde_json::from_str(&body).expect("json");
+        let ids: Vec<String> = view["desired"]["spec"]["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|i| i["item_id"].as_str().expect("item_id").to_string())
+            .collect();
+        assert_eq!(ids.len(), 6);
+        assert!(ids.iter().all(|id| !id.is_empty()));
+        // 有期望但从未上报：按口径是 unknown（无生效快照）。
+        // 页面靠 desired != null 区分「配了没下发」与「什么都没配」。
+        assert_eq!(view["sync_status"], "unknown");
+        assert_eq!(view["session_state"], "absent");
+
+        // 再存一次同样的 items（带原 item_id）→ revision 不变（幂等）。
+        let rev1 = view["desired"]["revision"]
+            .as_str()
+            .expect("rev")
+            .to_string();
+        let items_with_ids: Vec<String> = view["desired"]["spec"]["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|i| serde_json::to_string(i).expect("encode"))
+            .collect();
+        let body = format!(
+            r#"{{"params":{{"heartbeat_interval_secs":15}},"items":[{}]}}"#,
+            items_with_ids.join(",")
+        );
+        let (status, resp) = send(&mut app, put(&body)).await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        assert!(
+            resp.contains(&rev1),
+            "同内容重复保存 revision 必须不变: {resp}"
+        );
+
+        // 脱敏：写入的 token 不得出现在响应里，读出去只有占位值。
+        let (status, resp) = send(
             &mut app,
-            req("DELETE", &format!("/api/gse/collect-items/{item_id}"), None),
+            put(r#"{"params":{"heartbeat_interval_secs":15,"token":"s3cret"},"items":[]}"#),
         )
         .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
-        let (status, _) = send(
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        assert!(!resp.contains("s3cret"), "凭据不得出现在响应里: {resp}");
+        assert!(resp.contains("***"), "{resp}");
+        // 且必须真的落库（认证用的是 agents.token）。
+        let (token, prev) = ledger
+            .agent_tokens("a-1")
+            .await
+            .expect("tokens")
+            .expect("exists");
+        assert_eq!(token, "s3cret");
+        assert_eq!(prev.as_deref(), Some("tok"), "旧 token 进宽限");
+
+        // 用哨兵写回 = 保持原值。
+        let (status, resp) = send(
             &mut app,
-            req("GET", &format!("/api/gse/collect-items/{item_id}"), None),
+            put(r#"{"params":{"heartbeat_interval_secs":15,"token":"***"},"items":[]}"#),
         )
         .await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let desired = ledger
+            .get_agent_spec("a-1")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(
+            desired.spec.params.token.as_deref(),
+            Some("s3cret"),
+            "哨兵写回不得把凭据洗掉"
+        );
+
+        // 没有原值却传哨兵 → 400（前端不该自己造占位值）。
+        let (status, resp) = send(
+            &mut app,
+            put(r#"{"params":{"heartbeat_interval_secs":15,"token":"***","otlp_token":"***"},"items":[]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+
+        // 列表：两台 Agent 都在，且不带凭据。
+        let (status, body) = send(&mut app, req("GET", "/api/gse/agent-specs", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("a-2"), "{body}");
+        assert!(!body.contains("s3cret"), "{body}");
+
+        // 管理端口独立部署（无注册表）时下发返回 503，而不是假装成功。
+        let (status, body) = send(
+            &mut app,
+            req("POST", "/api/gse/agents/a-1/spec/apply", None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+
+        // 旧路由整组消失。
+        for path in [
+            "/api/gse/collect-items",
+            "/api/gse/collect-items/i-1",
+            "/api/gse/agent-configs",
+            "/api/gse/agent-configs/a-1",
+        ] {
+            let (status, _) = send(&mut app, req("GET", path, None)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path} 应当已删除");
+        }
     }
 
     #[tokio::test]

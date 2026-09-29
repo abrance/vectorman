@@ -1,70 +1,57 @@
-import { Button, Form, Input, InputNumber, Space, Table } from "antd";
-import { useEffect, useState } from "react";
-import type { AgentConfig } from "@vectorman/adapters";
+import { Alert, Button, Modal, Space, Table, Tag, Typography } from "antd";
+import { useEffect } from "react";
+import { useNavigate } from "react-router-dom";
+import {
+  COLLECT_KINDS,
+  type AgentSpecView,
+} from "@vectorman/adapters";
+import { formatTimestamp } from "@vectorman/primitives";
 import { useRuntime } from "../app/runtime";
 import { toAppError } from "../features/ledger/errors";
-import { useAgentConfigs } from "../features/ledger/use-agent-configs";
-import { LedgerDrawer, type DrawerMode } from "../ui/ledger-drawer";
+import { syncStatusMeta } from "../features/ledger/spec-diff";
+import { useAgentSpecs } from "../features/ledger/use-agent-specs";
 
+const kindLabel = (kind: string) => COLLECT_KINDS.find((k) => k.value === kind)?.label ?? kind;
+
+/// 「Agent 配置」列表：一台 Agent 一行，一眼看是否同步。
 export function AgentConfigsPage() {
   const { notifier } = useRuntime();
-  const { list, refresh, getOne, save } = useAgentConfigs();
-  const [form] = Form.useForm<AgentConfig>();
-  const [open, setOpen] = useState(false);
-  const [mode, setMode] = useState<DrawerMode>("create");
-  const [submitting, setSubmitting] = useState(false);
-  const [missing, setMissing] = useState<string | null>(null);
+  const { list, refresh, apply } = useAgentSpecs();
+  const navigate = useNavigate();
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
 
-  const openCreate = () => {
-    setMode("create");
-    setMissing(null);
-    form.resetFields();
-    setOpen(true);
-  };
-
-  const load = async (id: string, next: DrawerMode) => {
-    setMode(next);
-    setMissing(null);
-    form.resetFields();
-    setOpen(true);
-    try {
-      form.setFieldsValue(await getOne(id));
-    } catch (e) {
-      setMissing(toAppError(e).message);
-    }
-  };
-
-  const submit = async () => {
-    const values = form.getFieldsValue();
-    if (!values.agent_id?.trim() || !values.host_id?.trim()) {
-      notifier.warning("缺少必填字段：agent_id、host_id");
-      return;
-    }
-    setSubmitting(true);
-    try {
-      await save({
-        ...values,
-        log_level: values.log_level?.trim() ? values.log_level : "info",
-      });
-      setOpen(false);
-    } catch (e) {
-      notifier.error(toAppError(e));
-    } finally {
-      setSubmitting(false);
-    }
+  const confirmApply = (row: AgentSpecView) => {
+    Modal.confirm({
+      title: `下发 ${row.agent_id} 的配置？`,
+      content:
+        row.session_state === "online"
+          ? "会把该 Agent 的期望配置（运行参数 + 采集项）整份推送，并取回生效回执。"
+          : "该 Agent 当前没有在线会话，下发会被拒绝（配置仍可先保存）。",
+      okText: "下发",
+      cancelText: "取消",
+      onOk: async () => {
+        try {
+          await apply(row.agent_id);
+        } catch (e) {
+          notifier.error(toAppError(e));
+          throw e;
+        }
+      },
+    });
   };
 
   return (
     <Space direction="vertical" style={{ width: "100%" }} size="middle">
       <Space>
-        <Button type="primary" onClick={openCreate}>
-          保存
+        <Button type="primary" onClick={() => void refresh()}>
+          刷新
         </Button>
-        <Button onClick={() => void refresh()}>刷新</Button>
+        <Typography.Text type="secondary">
+          一行一台 Agent：期望配置（参数 + 采集项）与生效值不一致时标「未同步」，点「下发」才推送。
+        </Typography.Text>
       </Space>
       <Table
         rowKey="agent_id"
@@ -74,51 +61,88 @@ export function AgentConfigsPage() {
         columns={[
           { title: "agent_id", dataIndex: "agent_id" },
           { title: "host_id", dataIndex: "host_id" },
-          { title: "cpu_limit_percent", dataIndex: "cpu_limit_percent" },
-          { title: "mem_limit_percent", dataIndex: "mem_limit_percent" },
-          { title: "log_level", dataIndex: "log_level" },
+          {
+            title: "会话",
+            dataIndex: "session_state",
+            render: (state: string) =>
+              state === "online" ? <Tag color="green">online</Tag> : <Tag>{state || "—"}</Tag>,
+          },
+          {
+            title: "同步状态",
+            dataIndex: "sync_status",
+            render: (status: AgentSpecView["sync_status"]) => {
+              const meta = syncStatusMeta(status);
+              return <Tag color={meta.color}>{meta.label}</Tag>;
+            },
+          },
+          {
+            title: "revision",
+            dataIndex: ["desired", "revision"],
+            render: (rev: string | undefined) => (
+              <Typography.Text code>{rev ? rev.slice(0, 8) : "—"}</Typography.Text>
+            ),
+          },
+          {
+            title: "更新时间",
+            dataIndex: "updated_at",
+            render: (v: string | null) => formatTimestamp(v),
+          },
+          {
+            title: "上报时间",
+            dataIndex: "reported_at",
+            render: (v: string | null) => formatTimestamp(v),
+          },
+          {
+            title: "采集项",
+            dataIndex: ["desired", "spec", "items"],
+            render: (items: unknown[] | undefined) =>
+              items?.length ? (
+                <Space size={4} wrap>
+                  {items.slice(0, 3).map((raw) => {
+                    const item = raw as { item_id: string; kind: string };
+                    return (
+                      <Tag key={item.item_id}>{kindLabel(item.kind)}</Tag>
+                    );
+                  })}
+                  {(items?.length ?? 0) > 3 ? <Tag>+{(items?.length ?? 0) - 3}</Tag> : null}
+                </Space>
+              ) : (
+                <Typography.Text type="secondary">无</Typography.Text>
+              ),
+          },
           {
             title: "操作",
             render: (_, row) => (
               <Space>
-                <Button type="link" onClick={() => void load(row.agent_id, "view")}>
-                  查看
+                <Button type="link" onClick={() => navigate(`/agent-configs/${encodeURIComponent(row.agent_id)}`)}>
+                  查看 / 编辑
                 </Button>
-                <Button type="link" onClick={() => void load(row.agent_id, "edit")}>
-                  编辑
+                <Button type="link" disabled={!row.desired} onClick={() => confirmApply(row)}>
+                  下发
                 </Button>
               </Space>
             ),
           },
         ]}
+        expandable={{
+          expandedRowRender: (row) => {
+            const meta = syncStatusMeta(row.sync_status);
+            const enforced = row.applied?.not_enforced ?? [];
+            return (
+              <Space direction="vertical" style={{ width: "100%" }} size={4}>
+                <Alert type="info" showIcon message={meta.hint} />
+                {enforced.length > 0 ? (
+                  <Alert
+                    type="warning"
+                    showIcon
+                    message={`未实现字段（仅记录，不下发生效）：${enforced.join("、")}`}
+                  />
+                ) : null}
+              </Space>
+            );
+          },
+        }}
       />
-      <LedgerDrawer
-        open={open}
-        title={mode === "create" ? "保存配置" : mode === "edit" ? "编辑配置" : "查看配置"}
-        mode={mode}
-        loading={submitting}
-        missing={missing}
-        onClose={() => setOpen(false)}
-        onSubmit={() => void submit()}
-      >
-        <Form form={form} layout="vertical" disabled={mode === "view"}>
-          <Form.Item name="agent_id" label="agent_id" rules={[{ required: true }]}>
-            <Input disabled={mode === "edit"} />
-          </Form.Item>
-          <Form.Item name="host_id" label="host_id" rules={[{ required: true }]}>
-            <Input />
-          </Form.Item>
-          <Form.Item name="cpu_limit_percent" label="cpu_limit_percent">
-            <InputNumber style={{ width: "100%" }} />
-          </Form.Item>
-          <Form.Item name="mem_limit_percent" label="mem_limit_percent">
-            <InputNumber style={{ width: "100%" }} />
-          </Form.Item>
-          <Form.Item name="log_level" label="log_level">
-            <Input />
-          </Form.Item>
-        </Form>
-      </LedgerDrawer>
     </Space>
   );
 }

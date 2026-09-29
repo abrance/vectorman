@@ -1,4 +1,10 @@
-/// GSE Agent 配置，支持 TOML 文件 + `GSE_` 前缀环境变量覆盖。
+/// GSE Agent 配置：TOML 文件 + `GSE_` 前缀环境变量覆盖。
+///
+/// **这是引导值，不是唯一来源**。运行期取值优先级：
+/// `Server 下发的 spec > 本地文件重读（SIGHUP）> 环境变量 > TOML > 内置缺省`。
+/// 可被下发覆盖的是运行参数（心跳周期、作业执行、OTLP、token）；
+/// `server_addr` / `agent_id` 不可下发，只能改文件并重启进程。
+/// 详见 `crate::spec_apply` 与本模块的 `default()`。
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct AgentConfig {
     /// Server 地址。

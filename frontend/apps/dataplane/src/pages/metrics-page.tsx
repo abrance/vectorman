@@ -6,7 +6,7 @@ import { useSearchParams } from "react-router-dom";
 import type { QueryRecord } from "@vectorman/primitives";
 import type { PromEnvelope } from "@vectorman/adapters";
 import { latestValue, metricExpr, promSeries, rangeParams } from "../features/prom";
-import { useCollectItems } from "../features/use-collect";
+import { useSpecCatalog } from "../features/use-collect";
 import { useMetrics } from "../features/use-metrics";
 import { LineChart } from "../ui/line-chart";
 import "./metrics-page.css";
@@ -39,7 +39,7 @@ export function MetricsPage() {
   const [preset, setPreset] = useState<PresetKey>("1h");
   const [range, setRange] = useState<[Dayjs, Dayjs]>(() => presetRange("1h"));
   const [custom, setCustom] = useState("");
-  const { list, agents, refresh: loadCatalog, loadAgents } = useCollectItems();
+  const { list, agents, refresh: loadCatalog, loadAgents } = useSpecCatalog();
   const cpu = useMetrics("metrics.cpu");
   const mem = useMetrics("metrics.mem");
   const customQuery = useMetrics("metrics.custom");

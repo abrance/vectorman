@@ -301,11 +301,16 @@ interface Notifier {
 | `upsertAgent` | POST | `/api/gse/agents` |
 | `getAgent` | GET | `/api/gse/agents/{agent_id}` |
 | `deleteAgent` | DELETE | `/api/gse/agents/{agent_id}` |
-| `listAgentConfigs` | GET | `/api/gse/agent-configs` |
-| `upsertAgentConfig` | POST | `/api/gse/agent-configs` |
-| `getAgentConfig` | GET | `/api/gse/agent-configs/{agent_id}` |
+| `listAgentConfigs` | GET | ~~`/api/gse/agent-configs`~~（2026-09-29 删除） |
+| `listAgentSpecs` | GET | `/api/gse/agent-specs` |
+| `getAgentSpec` | GET | `/api/gse/agents/{agent_id}/spec` |
+| `putAgentSpec` | PUT | `/api/gse/agents/{agent_id}/spec` |
+| `applyAgentSpec` | POST | `/api/gse/agents/{agent_id}/spec/apply` |
 
-DTO 与 `crates/gse-server-core/src/ledger.rs` 字段同名：`Host`、`AccessPoint`、`Agent`、`AgentConfig`。路径参数做 `encodeURIComponent`。
+DTO 与 `crates/gse-server-core/src/ledger.rs` 字段同名：`Host`、`AccessPoint`、`Agent`、`AgentSpec`。路径参数做 `encodeURIComponent`。
+
+**2026-09-29 修订**：`AgentConfig` 与 `/api/gse/agent-configs*`、`/api/gse/collect-items*` 整组被
+`gse-agent-config-center` 取代（采集项并入 per-Agent spec）；DTO 改名 `AgentSpec`，方法表见上。
 
 `SqlHttpAdapter` 前缀 `/api/sql`：
 
@@ -350,7 +355,7 @@ DTO 与 `crates/gse-server-core/src/ledger.rs` 字段同名：`Host`、`AccessPo
 | Host | `host_id`, `inner_ip` |
 | AccessPoint | `id`, `name`, `server_ip`, `rpc_port` |
 | Agent | `agent_id`, `host_id`, `token` |
-| AgentConfig | `agent_id`, `host_id` |
+| AgentSpec（2026-09-29 取代 AgentConfig） | `agent_id`（路径参数）+ `params` + `items` |
 
 其余字段可选，缺省为空字符串或 `null`，与 serde `default` 一致。
 

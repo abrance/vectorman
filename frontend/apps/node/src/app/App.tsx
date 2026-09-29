@@ -1,6 +1,7 @@
 import { Layout, Menu } from "antd";
 import { Navigate, NavLink, Route, Routes, useLocation } from "react-router-dom";
 import { AccessPointsPage } from "../pages/access-points-page";
+import { AgentConfigPage } from "../pages/agent-config-page";
 import { AgentConfigsPage } from "../pages/agent-configs-page";
 import { AgentsPage } from "../pages/agents-page";
 import { HostsPage } from "../pages/hosts-page";
@@ -29,6 +30,7 @@ export function App() {
           <Route path="/access-points" element={<AccessPointsPage />} />
           <Route path="/agents" element={<AgentsPage />} />
           <Route path="/agent-configs" element={<AgentConfigsPage />} />
+          <Route path="/agent-configs/:agentId" element={<AgentConfigPage />} />
         </Routes>
       </Layout.Content>
     </Layout>

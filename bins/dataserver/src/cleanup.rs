@@ -14,12 +14,29 @@ use dataplane_log::{LogFilter, LogStore};
 use dataplane_sql::RelationalStore;
 use dataplane_ts::{TimeSeriesStore, TsMatcher, TsMatcherOp, TsSeriesSelection};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// 一天的微秒数。
 pub const MICROS_PER_DAY: i64 = 86_400 * 1_000_000;
 
 const RETAIN_PREFIX: &[u8] = b"retain/";
+
+/// 上一轮 live 采集项集合的 KV 前缀：`spec-live/{item_id}` → `{"retention_days":N}`。
+///
+/// 为什么要记：采集项现在是 per-Agent spec 里的一段，**没有 per-item 删除事件** ——
+/// 运维把它从 spec 里去掉、或把它 `enabled=false`，服务端只会少返回一条，
+/// 不会告诉任何人「这条被删了」。要按它原来的保留期清理数据，就只能自己记住上一轮有哪些。
+const LIVE_PREFIX: &[u8] = b"spec-live/";
+
+/// `spec-live/{item_id}` 键。
+pub fn live_key(item_id: &str) -> String {
+    format!("spec-live/{item_id}")
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct LiveValue {
+    retention_days: u32,
+}
 
 /// 仍在 GSE 列表中的采集项。
 #[derive(Debug, Clone)]
@@ -140,26 +157,42 @@ pub fn retention_days_from_item(v: &Value) -> u32 {
     1
 }
 
-/// 解析 GSE 采集项列表响应。
-pub fn parse_collect_items(body: &str) -> Vec<LiveItem> {
+/// 解析 GSE `/api/gse/agent-specs` 响应为 live 采集项。
+///
+/// 响应是「每台 Agent 一条视图」，采集项在 `desired.spec.items` 里。
+/// 同一条 `item_id` 可能出现在多台 Agent 的 spec 里（迁移会把全局采集项展开成多份拷贝，
+/// 之后各自可改），因此按 `item_id` 合并：`kind` 取首个非空，`retention_days` **取最大值**
+/// —— 口径冲突时宁可不提早删数据。
+///
+/// `enabled = false` 的项**不算 live**：它已经停止采集，数据按保留期清理。
+pub fn parse_agent_specs(body: &str) -> Vec<LiveItem> {
     let Ok(v) = serde_json::from_str::<Value>(body) else {
         return Vec::new();
     };
-    let items: Vec<Value> = if let Some(arr) = v.as_array() {
-        arr.clone()
-    } else if let Some(arr) = v.get("items").and_then(|x| x.as_array()) {
-        arr.clone()
-    } else if v.get("item_id").is_some() {
-        vec![v]
-    } else {
+    let Some(views) = v.as_array() else {
         return Vec::new();
     };
-    items
-        .iter()
-        .filter_map(|item| {
-            let item_id = item.get("item_id")?.as_str()?.to_string();
+    let mut by_id: BTreeMap<String, LiveItem> = BTreeMap::new();
+    for view in views {
+        let Some(items) = view
+            .pointer("/desired/spec/items")
+            .and_then(|x| x.as_array())
+        else {
+            continue;
+        };
+        for item in items {
+            let Some(item_id) = item.get("item_id").and_then(|x| x.as_str()) else {
+                continue;
+            };
             if item_id.is_empty() {
-                return None;
+                continue;
+            }
+            if !item
+                .get("enabled")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(true)
+            {
+                continue;
             }
             let kind = item
                 .get("kind")
@@ -167,31 +200,95 @@ pub fn parse_collect_items(body: &str) -> Vec<LiveItem> {
                 .unwrap_or_default()
                 .to_string();
             // eBPF 侧的边聚合体积远小于日志明细、排障窗口更长，缺省 3 天（其余缺省 1 天）。
-            let retention_days = if kind.starts_with("ebpf") {
+            let days = if kind.starts_with("ebpf") {
                 dataplane_apm::ebpf_retention::retention_days(item)
             } else {
                 retention_days_from_item(item)
             };
-            Some(LiveItem {
-                item_id,
-                retention_days,
-                kind,
-            })
-        })
-        .collect()
+            let entry = by_id
+                .entry(item_id.to_string())
+                .or_insert_with(|| LiveItem {
+                    item_id: item_id.to_string(),
+                    retention_days: days,
+                    kind: kind.clone(),
+                });
+            entry.retention_days = entry.retention_days.max(days);
+            if entry.kind.is_empty() {
+                entry.kind = kind;
+            }
+        }
+    }
+    by_id.into_values().collect()
 }
 
 /// 拉取 live 采集项；GSE 不可达返回错误，调用方继续处理 retain/。
 pub async fn fetch_live_items(gse_admin_url: &str) -> Result<Vec<LiveItem>, DataplaneError> {
-    let url = join_gse_url(gse_admin_url, "/api/gse/collect-items", None);
+    let url = join_gse_url(gse_admin_url, "/api/gse/agent-specs", None);
     let (status, body) = gse_call("GET", &url, b"").await?;
     if status != 200 {
         return Err(DataplaneError::new(
             ErrorCode::Unavailable,
-            format!("gse collect-items HTTP {status}"),
+            format!("gse agent-specs HTTP {status}"),
         ));
     }
-    Ok(parse_collect_items(&body))
+    Ok(parse_agent_specs(&body))
+}
+
+/// 与上一轮 live 集合比对，处理「消失」与「回来」两种变化。
+///
+/// - **消失**（从 spec 里删掉，或 `enabled=false`）：写 `retain/{item_id}`，按它上次的
+///   保留天数排一次清理；这是新模型下已删采集项数据的唯一清理入口。
+/// - **回来**（重新启用/加回）：删掉 `retain/{item_id}`，撤销之前的删除计划 ——
+///   否则一次临时停用就会在保留期到点时把数据删掉。
+///
+/// 调用方必须先确认「拿到了 live 列表」：拿不到时调用本函数会把所有项误判成已删除。
+pub async fn mark_removed_items(
+    kv: &dyn KvStore,
+    live: &[LiveItem],
+    now_micros: i64,
+) -> Result<usize, DataplaneError> {
+    let live_ids: Vec<&str> = live.iter().map(|i| i.item_id.as_str()).collect();
+    let previous = kv.scan_prefix(LIVE_PREFIX).await?;
+    let mut marked = 0;
+    for (key, value) in previous {
+        let key_s = String::from_utf8_lossy(&key);
+        let Some(item_id) = key_s.strip_prefix("spec-live/") else {
+            continue;
+        };
+        if item_id.is_empty() || live_ids.contains(&item_id) {
+            continue;
+        }
+        let days = serde_json::from_slice::<LiveValue>(&value)
+            .map(|v| v.retention_days)
+            .unwrap_or(1);
+        let days = clamp_retention_days(days);
+        let until = now_micros + days as i64 * MICROS_PER_DAY;
+        let payload = json!({"until_micros": until});
+        kv.set(
+            retain_key(item_id).as_bytes(),
+            payload.to_string().as_bytes(),
+        )
+        .await?;
+        kv.delete(&key).await?;
+        marked += 1;
+        println!("retention: item {item_id} left the specs, retain for {days} day(s)");
+    }
+    for item in live {
+        let retain = retain_key(&item.item_id);
+        if kv.exists(retain.as_bytes()).await.unwrap_or(false) {
+            kv.delete(retain.as_bytes()).await?;
+            println!(
+                "retention: item {} came back, cancelled pending delete",
+                item.item_id
+            );
+        }
+        let value = serde_json::to_vec(&LiveValue {
+            retention_days: item.retention_days,
+        })
+        .map_err(|e| DataplaneError::new(ErrorCode::QueryFailed, e.to_string()))?;
+        kv.set(live_key(&item.item_id).as_bytes(), &value).await?;
+    }
+    Ok(marked)
 }
 
 fn data_id_filter(item_id: &str, to_ts: Option<i64>) -> LogFilter {
@@ -420,20 +517,32 @@ pub async fn run_cleanup(
     now_micros: i64,
     tracker: &mut TsCleanTracker,
 ) -> Result<CleanupReport, DataplaneError> {
+    // `None` = 「没拿到 live 列表」（GSE 不可达 / 未配置），与「列表为空」必须在语义上分开：
+    // 把前者当成空列表会让 `mark_removed_items` 把**所有**采集项误判成已删除、
+    // 进而删掉全部历史数据。
     let live = match gse_admin_url {
         Some(url) => match fetch_live_items(url).await {
-            Ok(items) => items,
+            Ok(items) => Some(items),
             Err(e) => {
                 eprintln!(
-                    "retention cleanup: fetch collect-items failed: {}: {}",
+                    "retention cleanup: fetch agent-specs failed: {}: {}",
                     e.code.as_str(),
                     e.message
                 );
-                Vec::new()
+                None
             }
         },
-        None => Vec::new(),
+        None => None,
     };
+    if let Some(items) = live.as_ref() {
+        if let Err(e) = mark_removed_items(kv, items, now_micros).await {
+            eprintln!(
+                "retention cleanup: mark removed items failed: {}",
+                e.message
+            );
+        }
+    }
+    let live = live.unwrap_or_default();
     // 时序先于日志：`apply_retention` 会删除 `retain/` 键。
     let ts_report = apply_ts_retention(ts, kv, &live, global_ts_days, now_micros, tracker).await?;
     let retention = apply_retention(sql, log, kv, &live, now_micros).await?;
@@ -580,22 +689,133 @@ mod ebpf_retention_tests {
     }
 
     #[test]
-    fn parse_collect_items_marks_ebpf_kind_and_default_days() {
-        let body = r#"{"items":[
-            {"item_id":"e1","kind":"ebpf_network"},
-            {"item_id":"e2","kind":"ebpf_tcp","storage":{"retention_days":7}},
-            {"item_id":"l1","kind":"log_file"}
-        ]}"#;
-        let items = parse_collect_items(body);
-        assert_eq!(items.len(), 3);
+    fn parse_agent_specs_marks_ebpf_kind_and_default_days() {
+        let body = r#"[
+          {"agent_id":"a-1","desired":{"spec":{"items":[
+            {"item_id":"e1","kind":"ebpf_network","enabled":true},
+            {"item_id":"e2","kind":"ebpf_tcp","enabled":true,"storage":{"retention_days":7}},
+            {"item_id":"l1","kind":"log_file","enabled":true},
+            {"item_id":"off","kind":"log_file","enabled":false}
+          ]}}}
+        ]"#;
+        let mut items = parse_agent_specs(body);
+        items.sort_by(|a, b| a.item_id.cmp(&b.item_id));
+        // 停用的项不算 live：它已停止采集，数据按保留期清理。
+        assert_eq!(items.len(), 3, "{items:?}");
+        assert_eq!(items[0].item_id, "e1");
         assert!(items[0].is_ebpf());
         assert_eq!(
             items[0].retention_days, 3,
             "eBPF 采集项缺省 3 天（需求 14.1）"
         );
+        assert_eq!(items[1].item_id, "e2");
         assert_eq!(items[1].retention_days, 7, "显式配置优先");
+        assert_eq!(items[2].item_id, "l1");
         assert!(!items[2].is_ebpf());
         assert_eq!(items[2].retention_days, 1, "日志类仍缺省 1 天");
+    }
+
+    /// 同一条 `item_id` 出现在多台 Agent 的 spec 里时按最大保留期合并：
+    /// 取小了会提早删数据，取大了只是多留几天。
+    #[test]
+    fn parse_agent_specs_dedups_by_item_id_taking_max_retention() {
+        let body = r#"[
+          {"agent_id":"a-1","desired":{"spec":{"items":[
+            {"item_id":"same","kind":"log_file","enabled":true,"storage":{"retention_days":1}}
+          ]}}},
+          {"agent_id":"a-2","desired":{"spec":{"items":[
+            {"item_id":"same","kind":"log_file","enabled":true,"storage":{"retention_days":9}}
+          ]}}},
+          {"agent_id":"a-3","applied":{"spec":{"items":[
+            {"item_id":"not-desired","kind":"log_file","enabled":true}
+          ]}}}
+        ]"#;
+        let items = parse_agent_specs(body);
+        assert_eq!(items.len(), 1, "按 item_id 合并，且只看期望值: {items:?}");
+        assert_eq!(items[0].item_id, "same");
+        assert_eq!(items[0].retention_days, 9, "冲突取最大值");
+    }
+
+    #[test]
+    fn parse_agent_specs_tolerates_garbage() {
+        assert!(parse_agent_specs("not json").is_empty());
+        assert!(parse_agent_specs("{}").is_empty());
+        assert!(parse_agent_specs(r#"[{"agent_id":"a-1"}]"#).is_empty());
+    }
+
+    fn live(item_id: &str, days: u32) -> LiveItem {
+        LiveItem {
+            item_id: item_id.to_string(),
+            retention_days: days,
+            kind: "log_file".to_string(),
+        }
+    }
+
+    /// 采集项从 spec 里消失 → 按上次的保留期排一次清理；重新出现 → 撤销删除计划。
+    ///
+    /// 这是新模型下「已删采集项的数据」唯一的清理入口：per-Agent spec 没有删除事件。
+    #[tokio::test]
+    async fn mark_removed_items_schedules_delete_and_cancels_on_return() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = dataplane_kv::RedbKvStore::new(dir.path().join("kv")).unwrap();
+        let now = 1_000_000_000_000i64;
+
+        // 第一轮：两条 live。
+        let marked = mark_removed_items(&kv, &[live("i1", 7), live("i2", 1)], now)
+            .await
+            .expect("mark");
+        assert_eq!(marked, 0, "首轮没有任何东西消失");
+        assert!(kv.exists(live_key("i1").as_bytes()).await.unwrap());
+        assert!(
+            !kv.exists(retain_key("i1").as_bytes()).await.unwrap(),
+            "live 项不应有删除计划"
+        );
+
+        // 第二轮：i2 消失、i1 保留 → 只给 i2 排删除，按它自己的 1 天。
+        let marked = mark_removed_items(&kv, &[live("i1", 7)], now)
+            .await
+            .expect("mark");
+        assert_eq!(marked, 1);
+        let raw = kv.get(retain_key("i2").as_bytes()).await.expect("retain");
+        let meta: Value = serde_json::from_slice(&raw).expect("json");
+        assert_eq!(
+            meta["until_micros"].as_i64(),
+            Some(now + MICROS_PER_DAY),
+            "按消失前记录的保留天数排期"
+        );
+        assert!(!kv.exists(live_key("i2").as_bytes()).await.unwrap());
+
+        // 第三轮：i2 回来了 → 撤销删除计划，否则一次临时停用就会在到期时删掉数据。
+        let marked = mark_removed_items(&kv, &[live("i1", 7), live("i2", 1)], now)
+            .await
+            .expect("mark");
+        assert_eq!(marked, 0);
+        assert!(
+            !kv.exists(retain_key("i2").as_bytes()).await.unwrap(),
+            "回来的采集项必须撤销删除计划"
+        );
+        assert!(kv.exists(live_key("i2").as_bytes()).await.unwrap());
+    }
+
+    /// 同一条 `item_id` 的保留期在多台 Agent 的 spec 里不一致时，按最大的记录：
+    /// 取小了会提早删数据。
+    #[tokio::test]
+    async fn mark_removed_items_uses_recorded_retention_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = dataplane_kv::RedbKvStore::new(dir.path().join("kv")).unwrap();
+        let now = 5_000_000i64;
+
+        mark_removed_items(&kv, &[live("i1", 9)], now)
+            .await
+            .expect("mark");
+        mark_removed_items(&kv, &[], now).await.expect("mark");
+
+        let raw = kv.get(retain_key("i1").as_bytes()).await.expect("retain");
+        let meta: Value = serde_json::from_slice(&raw).expect("json");
+        assert_eq!(
+            meta["until_micros"].as_i64(),
+            Some(now + 9 * MICROS_PER_DAY)
+        );
     }
 }
 

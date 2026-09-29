@@ -1,9 +1,9 @@
-import type { CollectItem, CollectItemInput, CollectItemKind, ExtractRule } from "@vectorman/adapters";
+import type { SpecItem } from "../gse/admin";
+import type { CollectItemKind, ExtractRule, SpecItemInput } from "./ingest";
 
 /// 采集项表单的扁平值；按 `kind` 只提交相关字段。
 export type CollectFormValues = {
   name: string;
-  agent_ids: string[];
   kind: CollectItemKind;
   enabled: boolean;
   retention_days: number;
@@ -105,7 +105,10 @@ export function splitList(value: string | undefined): string[] {
 }
 
 /// 表单值 → 采集项入参；按类型裁剪 `collector`，`retention_days` 缺省 1。
-export function toCollectItemInput(values: CollectFormValues): CollectItemInput {
+///
+/// 不产生 `agent_ids`：采集项现在属于**某台 Agent 的 spec**，归属由调用方（spec 页）决定。
+/// `item_id` 也不在这里生成：编辑既有项时要原样带回，新增项由服务端生成。
+export function toCollectItemInput(values: CollectFormValues): SpecItemInput {
   let collector: Record<string, unknown>;
   if (values.kind === "metrics_host") {
     collector = { interval_secs: positive(values.interval_secs, DEFAULT_INTERVAL) };
@@ -147,7 +150,6 @@ export function toCollectItemInput(values: CollectFormValues): CollectItemInput 
   }
   return {
     name: values.name.trim(),
-    agent_ids: values.agent_ids,
     kind: values.kind,
     enabled: values.enabled,
     collector,
@@ -172,12 +174,11 @@ function num(collector: Record<string, unknown>, key: string): number | undefine
 }
 
 /// 采集项 → 表单值；缺失字段回落到默认值，供编辑/详情回填。
-export function toCollectFormValues(item: CollectItem): CollectFormValues {
+export function toCollectFormValues(item: SpecItem): CollectFormValues {
   const collector = item.collector ?? {};
   const clean = (collector.clean ?? {}) as Record<string, unknown>;
   return {
     name: item.name,
-    agent_ids: item.agent_ids,
     kind: item.kind as CollectItemKind,
     enabled: item.enabled,
     retention_days: item.storage?.retention_days ?? 1,

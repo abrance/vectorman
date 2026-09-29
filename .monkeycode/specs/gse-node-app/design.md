@@ -20,7 +20,7 @@ graph TD
         HOSTS["HostsPage 列表"]
         APS["AccessPointsPage 列表"]
         AGENTS["AgentsPage 列表加 30s 轮询"]
-        CFGS["AgentConfigsPage 列表"]
+        CFGS["AgentConfigsPage 列表 + AgentConfigPage 整页详情"]
         DRAWER["右侧 Drawer 查看或表单"]
         MODAL["Modal.confirm 删除"]
     end
@@ -28,7 +28,7 @@ graph TD
         HOSTF["useHosts"]
         APF["useAccessPoints"]
         AGF["useAgents"]
-        CFGF["useAgentConfigs"]
+        CFGF["useAgentSpecs"]
     end
     PRIM["@vectorman/primitives"]
     ADAPT["@vectorman/adapters GseAdminAdapter"]
@@ -120,7 +120,8 @@ frontend/apps/node/                 # @vectorman/node
 | `/hosts` | 主机列表 + 抽屉 |
 | `/access-points` | 接入点列表 + 抽屉 |
 | `/agents` | Agent 列表 + 抽屉 + 轮询 |
-| `/agent-configs` | 配置列表 + 抽屉 |
+| `/agent-configs` | 配置中心列表（会话 / sync_status / revision）+ 跳转整页详情 |
+| `/agent-configs/{agent_id}` | 整页详情：分组表单 / 原始 JSON / 逐字段差异 / 采集项列表（随 spec 保存与下发）+ 单台下发 |
 
 抽屉开关用页面本地 state，不进 URL。刷新回到对应列表、抽屉关闭。
 
@@ -141,7 +142,10 @@ frontend/apps/node/                 # @vectorman/node
 | `accessPoints.list` | AccessPoint[] |
 | `agents.list` | Agent[] |
 | `agents.one.{id}` | Agent |
-| `agentConfigs.list` | AgentConfig[] |
+| `agentSpecs.list` | AgentSpec 摘要数组 |
+| `agentSpecs.one.{id}` | AgentSpec 详情 |
+
+**2026-09-29 修订**：key 由 `agentConfigs.list` 改为 `agentSpecs.list` / `agentSpecs.one.{id}`（per-Agent spec 模型，见 `gse-agent-config-center`）。
 
 成功写操作后：`Notifier.success`，重新 `list*`。失败：`Notifier.error`，列表保持 QueryStore 中上一份 success 数据。提交中 `setLoading`，抽屉提交按钮 `disabled`。
 
@@ -165,7 +169,11 @@ Agent token：
 
 `host_id`、`access_point_id` 为 `Input`，无 Select。
 
-Agent 配置无删除按钮。`log_level` 空则提交 `"info"`，与后端默认一致。
+Agent 配置：**保存只写期望配置（整份 spec），不触发下发**；下发是列表行与整页详情里的独立动作，**只作用于单台 Agent**（不提供批量），带 `Modal.confirm`。
+`log_level` 空则提交 `"info"`，与后端默认一致。详情四视图与 spec 字段见 `gse-agent-config-center` 与 `gse-node-app/requirements.md` R6。
+
+**2026-09-29 修订（二次）**：详情由抽屉改为独立整页 `/agent-configs/{agent_id}`；取消批量下发；
+不提供「删除期望 spec」（一旦有过期望 spec，Agent 就回不到纯本地文件基线）；采集项在该页可增删改，随 spec 一起保存与下发。
 
 ### 删除
 
@@ -181,7 +189,12 @@ AccessPoint：必填 `id`、`name`、`server_ip`、`rpc_port`；可选 `file_por
 
 Agent：create 必填 `agent_id`、`host_id`、`token`；可选 `access_point_id`、`version`、`install_path`。`status` / `last_heartbeat_at` 只读，create 不提交（后端强制 `unknown`）。
 
-AgentConfig：必填 `agent_id`、`host_id`；可选 `cpu_limit_percent`、`mem_limit_percent`、`log_level`。
+AgentConfig：改名为 **AgentSpec** —— `agent_id`（路径参数，不在 body）+ `params`（`heartbeat_interval_secs`、`allowed_interpreters`、
+`job_default_interpreter`、`max_concurrent_jobs`、`job_work_dir`、`otlp_enabled`、`otlp_listen`、`otlp_max_body_bytes`、
+`otlp_token`、`otlp_allowed_cidrs`、`token`、`cpu_limit_percent`、`mem_limit_percent`、`log_level`）
++ `items`（`item_id`、`name`、`kind`、`enabled`、`collector`、`storage`）。
+`host_id` 不再在 spec 里填（`agents` 台账已有）；`token` / `otlp_token` 用密码控件，占位值表示「已设置，留空不修改」。
+**2026-09-29 修订（二次）**：原 AgentConfig 的 `agent_id`/`host_id` 必填与三个字段口径已废弃。
 
 空必填：阻止提交，`Notifier.warning` 指出字段名。
 

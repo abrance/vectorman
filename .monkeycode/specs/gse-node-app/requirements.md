@@ -46,8 +46,17 @@
 - 验收：WHEN 运维打开 Agent 列表，THE 应用 SHALL 展示 `agent_id`、`host_id`、`status`、`last_heartbeat_at`、`version`，且不展示 `token`；THE Agent 预登记表单 SHALL 要求以文本输入 `agent_id`、`host_id` 与 `token`，并允许以文本输入 `access_point_id`、`version`、`install_path`。
 ### Requirement 6: Agent 运行时配置
 
-- AS 运维人员, I want 为每个 Agent 保存资源上限与日志级别, so that 配置可在台账中查询。
-- 验收：WHEN 运维打开 Agent 配置列表，THE 应用 SHALL 展示 `agent_id`、`host_id`、`cpu_limit_percent`、`mem_limit_percent`、`log_level`；THE 配置保存表单 SHALL 要求填写 `agent_id` 与 `host_id`，并允许填写 `cpu_limit_percent`、`mem_limit_percent`、`log_level`。
+- AS 运维人员, I want 为每个 Agent 保存运行参数并下发到 Agent、看到是否真的生效, so that 配置不是只在台账里躺着。
+- 验收：WHEN 运维打开 Agent 配置列表，THE 应用 SHALL 展示 `agent_id`、`host_id`、会话状态、同步状态（`synced` / `stale` / `rejected` / `unknown`）、`revision`、`updated_at`、`reported_at`；THE 详情 SHALL 是**独立整页**（`/agent-configs/{agent_id}`），四个视图：分组表单（作业执行 / OTLP / 资源与日志 / 身份只读）、原始 JSON、逐字段差异（`changed` 高亮 + `not_enforced` 标注）、采集项列表（可增删改）。
+- 验收：THE 保存 SHALL 整体覆盖该 Agent 的**期望 spec**（Agent 参数 + 采集项数组）且**不触发下发**；下发 SHALL 是独立动作、**只作用于单台 Agent**（不提供跨 Agent 批量），并带二次确认。
+- 验收：WHEN 该 Agent 无期望 spec，THE 表单 SHALL 用 Agent 上报的本地生效值预填。
+  —— 详细的 spec 字段、校验与同步语义见 [`gse-agent-config-center`](../gse-agent-config-center/requirements.md) R1/R2/R10。
+- 验收：`token` / `otlp_token` SHALL 以密码控件展示与提交；占位值表示「已设置，留空不修改」；任何视图 SHALL NOT 展示凭据明文。
+- 验收：`cpu_limit_percent` / `mem_limit_percent` / `log_level` SHALL 标注为「未实现（仅记录）」——见
+  [`gse-agent-config-center`](../gse-agent-config-center/requirements.md) R11。
+  **2026-09-29 修订（二次）**：详情改为独立整页（不再用抽屉）、取消批量下发、采集项从「只读命中清单」改为「可增删改的 `items`（随 spec 一起保存与下发）」。
+  **2026-09-29 修订**：原口径为「为每个 Agent 保存资源上限与日志级别，配置可在台账中查询」，
+  现升级为下发 + 热加载 + 生效核验。
 ### Requirement 7: 校验与错误提示
 
 - AS 运维人员, I want 缺字段和后端失败有明确提示, so that 我知道下一步改什么。
