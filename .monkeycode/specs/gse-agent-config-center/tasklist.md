@@ -395,3 +395,26 @@ tsink 0.10 默认 `background_fail_fast: true` —— **任何一次后台 worke
 
 **部署 runbook 补充**：升级 dataserver 时不要 `kubectl delete pod`（会与旧进程重叠）；
 用 `scale 0 → 确认主机上没有 dataserver 进程 → scale 1`。
+
+### 13. v1.3.2 发布与验收（2026-09-29 深夜）
+
+**tag**：`server/v1.3.2` + `agent/v1.3.2` + `v1.3.2`（提交 `a297c79`）→ 镜像 `v1.3.2-a297c79`；
+**cops**：PR #71 → CD 成功（dataserver 新 pod、单进程、0 重启）。
+
+| 动作 | 结果 |
+| --- | --- |
+| k8s agent 镜像 | `ctr images pull` + `tag` + `set image` → `vectorman-gse-agent:1.3.2`；容器内实测有 `/bin/sh` 与 `/tmp` |
+| 该 Agent 的 spec | `allowed_interpreters = ["sh"]`、`job_default_interpreter = "sh"`（**下发 spec 覆盖文件，不同步改就仍然 spawn 失败**） |
+| daemonset ConfigMap | 同步加了 `allowed_interpreters = ["sh"]` / `job_default_interpreter = "sh"`（清掉 spec 时仍可用） |
+
+**验收**：
+
+| 项 | 结果 |
+| --- | --- |
+| 脚本作业 `--interpreter sh` | `succeeded` / `exit=0`，stdout 正常（`whoami=root`、容器内 `/` 可见）——用户报的问题已解决 |
+| 不指定解释器（服务端默认 bash） | `rejected` + `error=interpreter_not_allowed` —— **明确拒绝**而不是 `spawn failed`，可定位 |
+| dataserver | `degraded=false`、`background_errors_total=0`、`series_count=7531`；写入实测 `accepted=1` 且可查回 |
+| agent 丢包 | 最近 60s = 0 |
+
+**遗留**：作业提交表单的解释器是必填项且默认 `bash`，在只有 `sh` 的节点上要手动选 `sh`。
+更顺手做法是让前端下拉按目标 Agent 的 `allowed_interpreters` 动态给值（本次未做）。
