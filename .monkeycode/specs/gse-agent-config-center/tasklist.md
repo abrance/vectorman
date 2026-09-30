@@ -479,3 +479,50 @@ agent 上报失败 → 连接被重建；此后即便不再重连，采集器也
 
 **部署注意**：修复只在**新会话**生效 —— 升级后 agent 必须重连（重启进程/升镜像）才会重投，
 否则旧会话里没有采集器可救。
+
+### 16. 三台 VM agent 升级到 v1.3.4 并下发采集 spec（2026-09-30）
+
+**背景**：`cloud2-agent` / `debian12-agent` / `testbkee` 的 `desired` 为 `null`（`sync_status=unspecified`），
+而本地配置文件里**已经没有采集项**（items 完全归 spec 中心）→ 三台实际处于**不采集**状态。
+止血还要补 v1.3.4 的重连修复，否则一有采集项再遇重连就会重现「采集器全消失」。
+
+**第 0 步：先看真实状态，别信台账的版本字段**
+
+台账 `agents.version` **只在登记时写入、之后永不刷新**（`AuthRequest` 只有 `agent_id`/`token`，
+没有 version 字段）—— 查出来是 `1.1.0` / `1.2.0-rc1`，**实际三台都跑 1.3.1**（用脚本作业
+`sha256sum` + `--version` 实测）。判断版本一律以目标机上的二进制为准。
+
+**第 1 步：升级（`file_transfer` + `agent_upgrade`，v1.3.1 → v1.3.4）**
+
+```bash
+vmctl jobs submit --kind file_transfer --upload <解包的 gse-agent> --to-agent <A> --to-path /tmp/gse-agent-1.3.4 --wait
+vmctl jobs submit --kind agent_upgrade --agent-id <A> --binary-path /tmp/gse-agent-1.3.4 --sha256 4c0f6853... --wait
+```
+
+- 三台作业回执多为 `running`（agent 升级中途自我重启，回执会丢）——**这是正常的**，用第 2 步复验。
+- 复验：`sha256=4c0f68531b3b…b641d`、`--version` = `gse-agent 1.3.4`、进程已换 PID。
+- `testbkee` 无 systemd unit（`ctl.sh` 布局、用户 `test`），升级脚本的 ctl 分支覆盖到了。
+
+**第 2 步：下发采集项（每台一份 `metrics_host`）**
+
+`PUT /api/gse/agents/{id}/spec` + `POST .../spec/apply`，`params` 用当前生效快照但**剔除
+`token`/`otlp_token`**（`double_option` 语义：缺省=保持原值，传空串可能被当成清空凭据）：
+
+```json
+{"item_id":"item-<agent>-metrics-host","name":"<host>-metrics_host","kind":"metrics_host",
+ "enabled":true,"collector":{"interval_secs":15},"storage":{"retention_days":7}}
+```
+
+三台回执均为 `outcome=applied items=1 not_enforced=[]`。
+
+**验收**（下发后 60 秒）：
+
+| agent | 流 | `cpu_usage` 查询 |
+| --- | --- | --- |
+| cloud2-agent | `item-cloud2-agent-metrics-host` 上报中 | 1 序列，最新 0.99% |
+| debian12-agent | `item-debian12-agent-metrics-host` 上报中 | 1 序列，最新 3.16% |
+| testbkee | `item-testbkee-metrics-host` 上报中 | 1 序列，最新 37.5% |
+| ser539375215934 | 7 条流（4 个 eBPF 项 + 指标）持续增长 | （eBPF 项不产 `cpu_usage`，正常） |
+
+**遗留（未做）**：台账 `agents.version` 不刷新。修法：`AuthRequest` 增加 `version`
+（`#[serde(default)]` 兼容旧 agent），认证时刷新记录 —— 否则控制台显示的版本永远是登记时那个。
