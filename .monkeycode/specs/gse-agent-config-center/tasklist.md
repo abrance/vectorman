@@ -447,3 +447,35 @@ tsink 0.10 默认 `background_fail_fast: true` —— **任何一次后台 worke
   每次新的后台错误都会打一条带当前累计值和最后错误的 warn。
 - 新增回归测试 `background_flush_produces_no_errors`：写入后等 10 秒（让 flush worker 至少跑一轮），
   断言 `background_errors_total == 0` —— 覆盖「后台 flush 一声不吭」这一类问题。
+
+### 15. 严重缺陷：重连后采集器全部消失且不报错（v1.3.4 修）
+
+**现象**（生产实测）：k8s 节点 agent 自 `2026-09-30T17:25:35Z` 起 **10 小时零数据**；
+进程近乎空转（10 小时只消耗 20 秒 CPU、5 秒内仅 6 次网络调用）；
+pod 日志在 `drop oldest ...` 之后只剩一句 `spec pulled, revision=5d3ea1180c480f0f outcome=unchanged`，
+**没有任何错误**；容器 0 重启、心跳正常（服务端显示 online）。
+
+**根因链**（`spec_apply.rs` + `collect/mod.rs` 的组合缺陷，本轮 spec 中心引入）：
+
+1. 每次（重）连，`CollectorHandle::new_with_shared` 都新建一个 supervisor
+   （`shared.control` 的发送端被替换 → 旧 supervisor 的 `rx.recv()` 返回 `None` → 退出）。
+2. supervisor 退出时会 **`abort()` 掉全部采集器**，而这条路径**完全静默**（日志干净）。
+3. 新 supervisor 的 `runners` 是空的，只能靠紧随其后的 spec 拉取把它填上。
+4. `apply_push` 在 **revision 未变**（或服务端没有期望 spec）时**提前 return**，什么都不投
+   —— 于是新 supervisor 永远是空的：**采集器全部消失、不报错、不再恢复**。
+   设计文档里「重连即收敛」这条主路径，实际只在「内容变了」时才成立。
+
+**为什么 17:25 会重连**：dataserver 侧的时序存储当时正处在启动期异常状态，
+agent 上报失败 → 连接被重建；此后即便不再重连，采集器也不会自己回来（没有别的东西会重投 items）。
+
+**修复**：
+
+- `replay_applied_items(rt)`：两处提前返回都先把「当前生效的采集项」重投一次
+  （幂等：`reconcile` 按指纹比对，已在跑的采集器不会被重启，只有 items 缺失时才拉起）。
+- supervisor 控制通道关闭时**出声**：`collect supervisor control closed, stopping N collector(s)`
+  —— 这条路径会 abort 掉所有采集器，不该再静默。
+- 回归测试两条：`unchanged_revision_still_replays_items_to_supervisor`、
+  `absent_spec_still_replays_items_to_supervisor`（用 `CollectShared` 上的测试计数断言重投确实发生）。
+
+**部署注意**：修复只在**新会话**生效 —— 升级后 agent 必须重连（重启进程/升镜像）才会重投，
+否则旧会话里没有采集器可救。

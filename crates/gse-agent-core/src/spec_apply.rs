@@ -231,6 +231,9 @@ pub fn rejects_immutable_fields(raw: &[u8]) -> Option<String> {
 pub async fn apply_push(rt: &Arc<RuntimeConfig>, push: AgentSpecPush) -> AgentSpecAck {
     let Some(spec) = push.spec else {
         // 服务端说「没有期望 spec」：保持本地基线，顺带把现状报上去。
+        // 但仍要把「当前生效的采集项」重投一次：认证成功后新起的 supervisor 是空的
+        // （见 `replay_applied_items`），不重投就等于本地基线的采集器一个都不跑。
+        replay_applied_items(rt).await;
         rt.schedule_report();
         let ack = build_ack(
             rt,
@@ -244,7 +247,10 @@ pub async fn apply_push(rt: &Arc<RuntimeConfig>, push: AgentSpecPush) -> AgentSp
     };
     let current = rt.applied_revision().await;
     if !current.is_empty() && current == push.revision {
-        // 幂等：不重启任何采集器、不重建执行器、不断连。
+        // **幂等但必须重投**：reconcile 按指纹比对，已在跑的采集器不会被重启；
+        // 而重建 supervisor 的那次重连（见 `replay_applied_items`）正需要这一次投递来把
+        // 采集器重新拉起来 —— 这里提前 return 曾导致重连后**采集器全部消失且不报错**。
+        replay_applied_items(rt).await;
         let ack = build_ack(rt, push.revision, spec_outcome::UNCHANGED, String::new()).await;
         rt.remember(&ack).await;
         return ack;
@@ -261,6 +267,21 @@ pub async fn apply_push(rt: &Arc<RuntimeConfig>, push: AgentSpecPush) -> AgentSp
     let ack = build_ack(rt, push.revision, outcome, String::new()).await;
     rt.remember(&ack).await;
     ack
+}
+
+/// 把「当前生效的采集项」重新投给 supervisor。
+///
+/// **为什么必须重投**：每次（重）连，`collect::CollectorHandle::new_with_shared` 都会新建一个
+/// supervisor，而新 supervisor 的 `runners` 是空的；旧的那个因为控制通道被替换（旧发送端 drop）
+/// 会 `rx.recv() == None` → 退出并 **abort 掉全部采集器**。
+///
+/// 于是「重连」这条路径上唯一的救兵就是紧随其后的 spec 拉取 —— 而它在 revision 未变
+/// （或服务端没有期望 spec）时提前 return，什么都不下发。后果是**采集器全部停摆且不报错**：
+/// 2026-09-30 生产实测，一次重连后 10 小时零数据、进程 10 小时只消耗 20 秒 CPU，
+/// 日志里只有那句 `spec pulled ... outcome=unchanged`。
+async fn replay_applied_items(rt: &Arc<RuntimeConfig>) {
+    let items = rt.applied.read().await.items.clone();
+    rt.collector().apply_spec(items, false).await;
 }
 
 /// 应用本地文件里的参数（`SIGHUP` 重读路径）。
@@ -425,6 +446,52 @@ mod tests {
             collector: serde_json::json!({"interval_secs": 15}),
             storage: serde_json::json!({"retention_days": 1}),
         }
+    }
+
+    /// 重连（新建 supervisor）后，服务端回同一个 revision 时**必须**把采集项重投一次：
+    /// 不重投 = 新 supervisor 永远没有采集器（生产实测 10 小时零数据、日志里只有 outcome=unchanged）。
+    #[tokio::test]
+    async fn unchanged_revision_still_replays_items_to_supervisor() {
+        let rt = runtime();
+        let items = vec![item("i1", "metrics_host")];
+        let first = apply_push(&rt, push("rev-1", params(30), items.clone())).await;
+        assert_eq!(first.outcome, spec_outcome::APPLIED);
+        let after_first = rt.collector().apply_count();
+        assert_eq!(after_first, 1, "首次应用要投一次");
+
+        let again = apply_push(&rt, push("rev-1", params(30), items)).await;
+        assert_eq!(again.outcome, spec_outcome::UNCHANGED, "幂等：内容没变");
+        assert_eq!(
+            rt.collector().apply_count(),
+            after_first + 1,
+            "revision 未变也必须重投采集项，否则重连后采集器全没了"
+        );
+    }
+
+    /// 服务端「没有期望 spec」时也要重投当前基线，否则本地基线的采集器一个都不会启动。
+    #[tokio::test]
+    async fn absent_spec_still_replays_items_to_supervisor() {
+        let rt = runtime();
+        apply_push(
+            &rt,
+            push("rev-1", params(30), vec![item("i1", "metrics_host")]),
+        )
+        .await;
+        let before = rt.collector().apply_count();
+        let ack = apply_push(
+            &rt,
+            AgentSpecPush {
+                revision: "rev-1".to_string(),
+                spec: None,
+            },
+        )
+        .await;
+        assert_eq!(ack.outcome, spec_outcome::UNCHANGED);
+        assert_eq!(
+            rt.collector().apply_count(),
+            before + 1,
+            "无期望 spec 也要重投基线采集项"
+        );
     }
 
     #[test]
