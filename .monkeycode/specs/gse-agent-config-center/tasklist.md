@@ -581,3 +581,34 @@ Agent：3 台 VM 用 `file_transfer` + `agent_upgrade`，k8s 节点用 `ctr imag
 **CI 教训**：本次 `cargo fmt --all --check` 没跑，Rust CI 的 **Check formatting** 步骤挂在
 `server.rs` 里那行超长的 `eprintln!` 上（PR #110，Rust CI 33s 就 fail）→ 补 PR #111。
 提交前固定跑 `cargo fmt --all --check`（本地 test + clippy 全绿也挡不住这个）。
+
+### 18. 作业槽位释放时机（v1.3.6，2026-09-30）
+
+**来源**：v1.3.5 的文档 PR（#112）在 CI 上挂了 `e2e_template_submit_and_save_as_template` ——
+作业回执是 `status=Rejected error=Some("busy")`，而 main 的同代码 push 跑是绿的 → 先按 flaky 查，
+查出的是**真竞态**（不是测试问题）。
+
+**根因**（`crates/gse-agent-core/src/job.rs` 的 `handle_exec`）：派生任务里顺序反了
+
+```rust
+let result = run_job(&cfg, exec).await;
+send_result(&end, &result, &result.job_id).await;  // 先上报
+drop(permit);                                      // 后释放槽位
+```
+
+服务端是在**收到 `job_result` 那一刻**才把作业置为终态的，而 `send_result` 是一次 RPC：
+于是存在一个窗口 —— 服务端/控制台/测试**已经看到「成功」**，Agent 却仍认为自己忙
+（`max_concurrent_jobs=1` 的槽位没还），此刻提交的下一个作业被拒 `busy`。
+表现就是「上一个作业刚成功，紧接着提交就 busy」，重试一下又好了。
+
+**修法**：`drop(permit)` 提到 `send_result` 之前（一行位置调整）。
+释放的是**执行**槽位，与上报无关；释放在前则窗口闭合 ——
+任何已观察到终态的调用方，都能立即提交下一个作业。上报本身仍是异步的，不阻塞执行。
+
+**回归测试**：`permit_released_before_result_report`。要点是**必须在对端注册一个永不返回的
+`job_result` 处理器**才能把窗口放大成必然：
+
+- 注册在**发起 call 的对端**（Agent 侧用 A 端 call，则处理器要注册在 B 端）；
+  注册错边会立刻收到 geminio 的 `NoSuchMethod`，上报秒返回 → 测试**假绿**（第一版就这么假绿过一次）。
+- 对端**不注册**处理器同样假绿（同上原因）。
+- 已验证反向有效：把 `drop(permit)` 挪回 `send_result` 之后，该测试立刻以 `busy` 失败。

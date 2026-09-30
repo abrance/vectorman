@@ -128,8 +128,12 @@ impl JobExecutor {
         let ack_job_id = exec.job_id.clone();
         tokio::spawn(async move {
             let result = run_job(&cfg, exec).await;
-            send_result(&end, &result, &result.job_id).await;
+            // **先释放槽位、再上报结果**（实测踩到的竞态）：上报是一次 RPC，服务端收到才把作业
+            // 置为终态；如果先上报后释放，就存在一个窗口 —— 服务端/界面已经看到「成功」，
+            // 而 agent 还认为自己忙 → 此刻提交的下一个作业被拒 `busy`。
+            // 释放在前则闭合这个窗口：任何已观察到终态的调用方，都能立即提交下一个作业。
             drop(permit);
+            send_result(&end, &result, &result.job_id).await;
         });
         JobAck {
             job_id: ack_job_id,
@@ -581,5 +585,64 @@ mod tests {
         assert!(executor.interpreter_allowed("bash"));
         assert!(executor.interpreter_allowed("python3"));
         assert!(!executor.interpreter_allowed("perl"));
+    }
+
+    /// **竞态回归**（CI 上真实挂过：`e2e_template_submit_and_save_as_template` 收到 `busy`）：
+    /// 作业进程结束后，服务端是在收到 `job_result` 那一刻才把作业置为终态的；
+    /// 若槽位等上报完才释放，就存在一个窗口 —— 调用方已看到「成功」，
+    /// 而 agent 还认为自己忙，此刻提交的下一个作业被拒 `busy`。
+    ///
+    /// 这里把窗口放大成必然：对端**不处理任何 RPC**（geminio 的 `call` 会一直挂着），
+    /// 所以 `job_result` 上报永不返回。此时槽位必须已经释放。
+    #[tokio::test]
+    async fn permit_released_before_result_report() {
+        use geminio::{dial, DialOptions, EndListener, ListenOptions};
+
+        let dir = temp_dir("permit");
+        let marker = dir.join("job1.done");
+        let listener = EndListener::bind("127.0.0.1:0", ListenOptions::default())
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let accept_task = tokio::spawn(async move { listener.accept().await.expect("accept").0 });
+        let (other_side, _cd) = dial(addr, DialOptions::default()).await.expect("dial");
+        let agent_end = accept_task.await.expect("accept task");
+        // 关键：注册一个**永不返回**的处理器，让 `job_result` 上报永远挂住。
+        // 注册必须在 **call 的对端**（这里 agent 侧用 `agent_end` 发起 call，
+        // 请求由 `other_side` 处理）；注册错边会立刻收到 `NoSuchMethod`，
+        // 上报秒返回 → 窗口构造不出来，测试假绿（第一版就这么假绿过）。
+        other_side
+            .register("job_result", |_req: Bytes| async move {
+                std::future::pending::<()>().await;
+                Ok(Bytes::new())
+            })
+            .await
+            .expect("register");
+
+        let executor = JobExecutor::new(cfg(&dir));
+        let first = serde_json::to_vec(&exec(&format!("touch {}", marker.display()), 30)).unwrap();
+        let ack = executor
+            .handle_exec(&Bytes::from(first), agent_end.clone())
+            .await;
+        assert!(ack.accepted, "第一个作业应被受理: {ack:?}");
+
+        // 等作业真的跑完（脚本落了 marker），再多给一点时间让上报任务进入阻塞。
+        for _ in 0..200 {
+            if marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(marker.exists(), "第一个作业应当已经执行完");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let second = serde_json::to_vec(&exec("echo second", 30)).unwrap();
+        let ack = executor
+            .handle_exec(&Bytes::from(second), agent_end.clone())
+            .await;
+        assert!(
+            ack.accepted,
+            "结果上报还挂着时槽位就应已释放，实际被拒: {ack:?}"
+        );
     }
 }
