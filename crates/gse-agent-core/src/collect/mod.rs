@@ -53,6 +53,9 @@ pub struct CollectShared {
     /// 放在共享状态上而不是句柄上：`RuntimeConfig` 持有共享状态、句柄只在建连时出现，
     /// 而 spec 变更（含 token 变更后的重连）必须能随时投递。
     control: tokio::sync::RwLock<Option<mpsc::UnboundedSender<Control>>>,
+    /// 测试用：`apply_spec` 被调用的次数（含 supervisor 未就绪时的丢弃）。
+    #[cfg(test)]
+    applies: std::sync::atomic::AtomicU64,
 }
 
 impl CollectShared {
@@ -64,6 +67,8 @@ impl CollectShared {
             buffer: Buffer::new(DEFAULT_MAX_RECORDS),
             otlp: tokio::sync::RwLock::new(OtlpRuntime::default()),
             control: tokio::sync::RwLock::new(None),
+            #[cfg(test)]
+            applies: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -93,6 +98,9 @@ impl CollectShared {
 
     /// 应用一批采集项（可空表，表示停止全部）；`force_otlp_rebind` 见 [`Control::SpecChanged`]。
     pub async fn apply_spec(&self, items: Vec<SpecItem>, force_otlp_rebind: bool) {
+        #[cfg(test)]
+        self.applies
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let guard = self.control.read().await;
         match guard.as_ref() {
             Some(tx) => {
@@ -112,6 +120,12 @@ impl CollectShared {
         if let Some(tx) = self.control.read().await.as_ref() {
             let _ = tx.send(Control::PullAddr);
         }
+    }
+
+    /// 测试用：`apply_spec` 调用次数。
+    #[cfg(test)]
+    pub(crate) fn apply_count(&self) -> u64 {
+        self.applies.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub async fn host_id(&self) -> Option<String> {
@@ -344,7 +358,15 @@ async fn supervise(shared: Arc<CollectShared>, end: End, mut rx: mpsc::Unbounded
                     started = true;
                     pull_addr(&shared, &end).await;
                 }
-                None => break,
+                // 控制通道关闭 = 本次建连结束：**下面会 abort 掉所有采集器**。
+                // 这条路径此前完全静默（实测「采集器全没了但日志干净」就是这么来的）。
+                None => {
+                    eprintln!(
+                        "gse-agent: collect supervisor control closed, stopping {} collector(s)",
+                        runners.len()
+                    );
+                    break;
+                }
             },
             _ = tick.tick(), if started => {
                 if shared.ingest_url().await.is_none() {
