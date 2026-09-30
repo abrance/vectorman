@@ -236,6 +236,8 @@ async fn authenticate(end: &End, agent_id: &str, token: &str) -> Result<(), Agen
     let req = AuthRequest {
         agent_id: agent_id.to_string(),
         token: token.to_string(),
+        // 自报版本，服务端据此刷新台账 `agents.version`（否则控制台永远显示登记时的版本）。
+        version: vectorman_version::VERSION.to_string(),
     };
     let body = Bytes::from(
         serde_json::to_vec(&req)

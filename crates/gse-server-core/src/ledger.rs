@@ -801,6 +801,22 @@ impl Ledger {
         Ok(())
     }
 
+    /// 回写 Agent 自报版本（认证成功后调用）。
+    ///
+    /// 空串表示「本次不上报」，直接返回、不覆盖台账原值 —— 旧版 Agent 就走到这条分支，
+    /// 于是升级服务端不会把还没升级的 Agent 的版本清成空。
+    pub async fn set_agent_version(&self, agent_id: &str, version: &str) -> Result<(), GseError> {
+        if version.is_empty() {
+            return Ok(());
+        }
+        self.execute(
+            "UPDATE agents SET version = ? WHERE agent_id = ?",
+            &[text(version), text(agent_id)],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// 心跳回写最后心跳时间。
     pub async fn mark_heartbeat(&self, agent_id: &str, now: &str) -> Result<(), GseError> {
         self.execute(

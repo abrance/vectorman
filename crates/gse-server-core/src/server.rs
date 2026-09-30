@@ -1083,6 +1083,11 @@ async fn handle_auth(
     if let Err(e) = ledger.mark_online(&agent_id, &now.to_string()).await {
         eprintln!("gse-server: mark_online {agent_id} failed: {}", e.message);
     }
+    // 台账里的版本只在登记接口写库，Agent 升级后没人刷新它 → 控制台一直显示登记时的版本。
+    // 认证是每次重连/重启的必经之路，在这里回写最省事（空版本由 ledger 自己忽略）。
+    if let Err(e) = ledger.set_agent_version(&agent_id, &req.version).await {
+        eprintln!("gse-server: set_agent_version {agent_id} failed: {}", e.message);
+    }
     AuthReply {
         ok: true,
         reason: None,
@@ -1503,6 +1508,73 @@ mod tests {
             .await
             .expect("agent");
         ledger.mark_online(agent_id, "1").await.expect("online");
+    }
+
+    /// **台账版本回写**（实测踩到的坑）：`agents.version` 只在登记接口写库，
+    /// Agent 升级后没有任何地方刷新它 → 控制台永远显示登记那一刻的版本
+    /// （实测台账写 `1.1.0`，而目标机上跑的是 `1.3.4`）。
+    /// 现在认证请求带 Agent 自报版本，认证成功就回写台账；
+    /// 旧 Agent 不带该字段（空串）时**不得清空**已记录的版本。
+    #[tokio::test]
+    async fn auth_records_agent_version() {
+        use geminio::{dial, DialOptions};
+
+        let ledger = ledger("auth-version").await;
+        online_agent(&ledger, "a-1").await;
+        assert_eq!(agent_version(&ledger, "a-1").await, "1");
+
+        let listener = EndListener::bind("127.0.0.1:0", ListenOptions::default())
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let accept_task = tokio::spawn(async move { listener.accept().await.expect("accept").0 });
+        let (_c, _cd) = dial(addr, DialOptions::default()).await.expect("dial");
+        let end = accept_task.await.expect("accept task");
+
+        let cfg = ServerConfig {
+            auth_enabled: false,
+            ..ServerConfig::default()
+        };
+        let registry = SessionRegistry::new();
+        let authed: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        let reply = auth_with(&end, &registry, &cfg, &ledger, &authed, "1.3.5").await;
+        assert!(reply.ok, "{reply:?}");
+        assert_eq!(agent_version(&ledger, "a-1").await, "1.3.5");
+
+        let reply = auth_with(&end, &registry, &cfg, &ledger, &authed, "").await;
+        assert!(reply.ok, "{reply:?}");
+        assert_eq!(
+            agent_version(&ledger, "a-1").await,
+            "1.3.5",
+            "空版本（旧 Agent）不得把已记录的版本清空"
+        );
+    }
+
+    async fn auth_with(
+        end: &End,
+        registry: &SessionRegistry,
+        cfg: &ServerConfig,
+        ledger: &Ledger,
+        authed: &Arc<Mutex<Option<String>>>,
+        version: &str,
+    ) -> gse_proto::AuthReply {
+        let req = AuthRequest {
+            agent_id: "a-1".to_string(),
+            token: "tok".to_string(),
+            version: version.to_string(),
+        };
+        let body = Bytes::from(serde_json::to_vec(&req).expect("encode"));
+        handle_auth(&body, end, registry, cfg, ledger, authed).await
+    }
+
+    async fn agent_version(ledger: &Ledger, agent_id: &str) -> String {
+        ledger
+            .get_agent(agent_id)
+            .await
+            .expect("get")
+            .expect("agent")
+            .version
     }
 
     /// **重连接管回归**（实测踩到的 bug）：旧连接结束时，若注册表里已是

@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 gse-proto = { path = "../gse-proto" }
 gse-agent-ebpf = { path = "../gse-agent-ebpf" }
+# 认证时自报版本：与 `gse-agent --version` 同一个值（构建期注入，无新增三方依赖）。
+vectorman-version.workspace = true
 geminio.workspace = true
 tokio.workspace = true
 serde.workspace = true

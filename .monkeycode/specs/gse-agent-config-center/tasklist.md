@@ -526,3 +526,32 @@ vmctl jobs submit --kind agent_upgrade --agent-id <A> --binary-path /tmp/gse-age
 
 **遗留（未做）**：台账 `agents.version` 不刷新。修法：`AuthRequest` 增加 `version`
 （`#[serde(default)]` 兼容旧 agent），认证时刷新记录 —— 否则控制台显示的版本永远是登记时那个。
+
+### 17. 台账 `agents.version` 回写（v1.3.5，2026-09-30）
+
+**修复 TODO-1**。台账 `agents.version` 只在登记接口（`PUT /api/gse/agents`）写库，
+Agent 升级后没有任何地方刷新它 → 控制台永远显示登记那一刻的版本。
+实际后果不是「显示不准」这么轻：排查版本时据此判断会得出**完全相反**的结论
+（本次查出 `1.1.0`/`1.2.0-rc1`，目标机实测全是 `1.3.1`，白跑一轮）。
+
+**改法（协议向后兼容，服务端与 Agent 可分别升级）**
+
+| 位置 | 改动 |
+| --- | --- |
+| `crates/gse-proto` `AuthRequest` | 新增 `version: String`，**带 `#[serde(default)]`** |
+| `crates/gse-agent-core` `authenticate()` | 带上 `vectorman_version::VERSION`（与 `gse-agent --version` 同一个值，构建期注入，无新依赖） |
+| `gse-server-core` `handle_auth()` | 认证成功后 `ledger.set_agent_version(agent_id, version)` |
+| `ledger.set_agent_version()` | **空串直接返回**：不上报 ≠ 清空，旧 Agent 的版本保持原值 |
+
+**兼容性**（两个方向都必须成立，也是本次的测试点）：
+
+- 旧 Agent（不带 `version`）→ 新 Server：`#[serde(default)]` 兜住，认证照常成功，台账版本不动。
+- 新 Agent（带 `version`）→ 旧 Server：serde 默认忽略未知字段，认证照常成功（版本不回写，可接受）。
+
+**测试**
+
+- `gse-proto`: `auth_request_without_version_still_parses`（旧载荷可解析、回落空串）、`auth_request_roundtrip`。
+- `gse-server-core`: `auth_records_agent_version`（真传输 + 真 ledger：带版本→台账变 `1.3.5`；空版本→仍 `1.3.5`，不被清空）。
+
+**为什么记在认证而不是心跳**：认证是每次重连/重启的必经之路，一次连接一次写；心跳是 30s 一次的高频路径，
+没必要为「升级后刷新」付这个成本。Agent 升级必然重启 → 必然重新认证 → 必然刷新。
