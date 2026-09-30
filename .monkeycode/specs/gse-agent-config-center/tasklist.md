@@ -555,3 +555,29 @@ Agent 升级后没有任何地方刷新它 → 控制台永远显示登记那一
 
 **为什么记在认证而不是心跳**：认证是每次重连/重启的必经之路，一次连接一次写；心跳是 30s 一次的高频路径，
 没必要为「升级后刷新」付这个成本。Agent 升级必然重启 → 必然重新认证 → 必然刷新。
+
+#### 17.1 线上验收（v1.3.5，2026-09-30）
+
+发布：`server/v1.3.5` + `agent/v1.3.5` + `v1.3.5`（commit `7298598`，镜像 `v1.3.5-7298598`）。
+服务端走 cops PR #73（`strategy: Recreate`，旧 pod 删完才起新的 → 不存在 hostPath 重叠）；
+Agent：3 台 VM 用 `file_transfer` + `agent_upgrade`，k8s 节点用 `ctr images pull` + `tag` + `set image`。
+
+**验收（关键一条）**：升完不碰任何台账字段，`GET /api/gse/agents` 自己变了：
+
+| agent | 升级前台账 `version` | 修复后台账 `version` | 目标机实测 |
+| --- | --- | --- | --- |
+| cloud2-agent | 1.1.0 | **1.3.5** | ✅ |
+| debian12-agent | 1.1.0 | **1.3.5** | ✅ |
+| testbkee | 1.1.0 | **1.3.5** | ✅ |
+| ser539375215934 | 1.2.0-rc1 | **1.3.5** | ✅ |
+
+其余回归（同一次升级顺手验的）：
+
+- 四台 Agent 全部 `online`、四类流持续上报（含 k8s 节点的 eBPF）。
+- k8s Agent（alpine + `sh`）脚本作业仍正常：`status=succeeded exit=0`，`OK from gse-agent-27v75`。
+- dataserver 由 CD 重建后 `background_errors_total` 无增长、retention 正常 → Recreate + 关闭后台
+  fail-fast 的组合在升级路径上也稳（对照 tasklist 12/13 的旧写法：当时靠 `scale 0 → scale 1` 手工避重叠）。
+
+**CI 教训**：本次 `cargo fmt --all --check` 没跑，Rust CI 的 **Check formatting** 步骤挂在
+`server.rs` 里那行超长的 `eprintln!` 上（PR #110，Rust CI 33s 就 fail）→ 补 PR #111。
+提交前固定跑 `cargo fmt --all --check`（本地 test + clippy 全绿也挡不住这个）。
