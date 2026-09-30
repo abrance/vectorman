@@ -11,6 +11,15 @@ use serde::{Deserialize, Serialize};
 pub struct AuthRequest {
     pub agent_id: String,
     pub token: String,
+    /// Agent 自报版本（`vectorman_version::VERSION`）。
+    ///
+    /// 为什么要带上它：`agents.version` 此前只在登记接口写库，Agent 升级后没有任何地方
+    /// 刷新它，于是控制台永远显示登记那一刻的版本（实测台账 `1.1.0` 而目标机跑 `1.3.4`）。
+    ///
+    /// `#[serde(default)]` 是**兼容性要求**：尚未升级的旧 Agent 不带这个字段，
+    /// 缺了它必须仍能认证成功（空串 = 本次不上报版本，保持台账原值）。
+    #[serde(default)]
+    pub version: String,
 }
 
 /// Server 对认证请求的应答。
@@ -528,7 +537,17 @@ mod tests {
         roundtrip(&AuthRequest {
             agent_id: "web-01".to_string(),
             token: "tok-1".to_string(),
+            version: "1.3.5".to_string(),
         });
+    }
+
+    /// **兼容性回归**：旧 Agent 的认证请求没有 `version` 字段，必须仍能解析。
+    #[test]
+    fn auth_request_without_version_still_parses() {
+        let old = br#"{"agent_id":"web-01","token":"tok-1"}"#;
+        let req: AuthRequest = serde_json::from_slice(old).expect("旧 agent 载荷必须可解析");
+        assert_eq!(req.agent_id, "web-01");
+        assert_eq!(req.version, "", "缺字段回落到空串（不覆盖台账版本）");
     }
 
     #[test]

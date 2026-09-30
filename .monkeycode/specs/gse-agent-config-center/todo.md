@@ -15,11 +15,15 @@
 | Agent 认证后自动拉取（重连即收敛） | ✅ 上线（**v1.3.4 修过重连丢采集器，见 tasklist 15**） |
 | 逐字段生效核验（`outcome` / `not_enforced` / `sync_status` / diff） | ✅ 上线 |
 | 未实现字段（`cpu_limit_percent` / `mem_limit_percent` / `log_level`）只记录不生效 | ✅ 上线（UI 标「未实现（仅记录）」） |
+| 台账版本回写（Agent 自报） | ✅ v1.3.5 上线 |
 | 管理口密码鉴权 | ⚠️ 代码已实现（v1.3.1），**生产未开启** → TODO-3 |
 
 ## 二、TODO 清单
 
-### TODO-1 台账 `agents.version` 不刷新（控制台显示的版本永远是登记时那个）
+### ~~TODO-1 台账 `agents.version` 不刷新~~ ✅ 已修复（v1.3.5，见 tasklist 17）
+
+> 修法：`AuthRequest` 带 `version`（`#[serde(default)]` 兼容旧 Agent），认证成功后回写台账；
+> 空串表示「不上报」、不清空原值。下面保留问题分析，作为「别信台账版本字段」这个坑的记录。
 
 - **现象**：`GET /api/gse/agents` 显示 `cloud2-agent` / `debian12-agent` / `testbkee` = `1.1.0`、
   `ser539375215934` = `1.2.0-rc1`，而目标机上实测三台都是 `1.3.4`（`sha256sum` + `--version`）。
