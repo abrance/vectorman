@@ -612,3 +612,15 @@ drop(permit);                                      // 后释放槽位
   注册错边会立刻收到 geminio 的 `NoSuchMethod`，上报秒返回 → 测试**假绿**（第一版就这么假绿过一次）。
 - 对端**不注册**处理器同样假绿（同上原因）。
 - 已验证反向有效：把 `drop(permit)` 挪回 `send_result` 之后，该测试立刻以 `busy` 失败。
+
+#### 18.1 线上验收（v1.3.6，2026-09-30）
+
+发布：`agent/v1.3.6` + `v1.3.6`（commit `17bde09`，镜像 `v1.3.6-17bde09`）。
+仅 Agent 侧改动，服务端不用动（仍在 `v1.3.5-7298598`）。
+四台都是 `file_transfer` + `agent_upgrade`（k8s 节点是 `ctr pull` + `tag` + `set image`）。
+
+| 验收项 | 结果 |
+| --- | --- |
+| 四台 Agent 版本 | `1.3.6`（台账 `version` 也自动跟着变，v1.3.5 的修复顺带复验） |
+| 四台状态 | 全部 `online` |
+| **竞态**：上一个作业成功、紧接着提交下一个 | k8s 节点与 cloud2 均 `succeeded`，**不再 `busy`** |
