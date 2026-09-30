@@ -400,8 +400,9 @@ async fn main() -> ExitCode {
         let stats_metrics = metrics.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
-            // 已经报过的后台错误，避免每分钟刷一条同样的日志。
-            let mut reported_background_error: Option<String> = None;
+            // 已经报过的错误次数：**同一个错误再次发生也要再报一条**（原先按错误文本去重，
+            // 结果同一条错误只报一次，后面再发生就彻底静默了）。
+            let mut reported_background_errors = 0u64;
             loop {
                 ticker.tick().await;
                 let Ok(stats) = stats_state.ts.storage_stats().await else {
@@ -409,15 +410,14 @@ async fn main() -> ExitCode {
                 };
                 // 存储降级必须出声：2026-09-29 那次静默丢数据的代价是 3 小时 41 分，
                 // 期间只有查询 `/v1/ts/stats` 才看得出来。
-                let current = stats.last_background_error.clone().unwrap_or_default();
-                if stats.background_errors_total > 0
-                    && reported_background_error.as_deref() != Some(current.as_str())
-                {
+                if stats.background_errors_total > reported_background_errors {
                     eprintln!(
-                        "dataserver: ts storage degraded（background_errors_total={}, degraded={}）: {current}",
-                        stats.background_errors_total, stats.degraded
+                        "dataserver: ts storage degraded（background_errors_total={}, degraded={}）: {}",
+                        stats.background_errors_total,
+                        stats.degraded,
+                        stats.last_background_error.as_deref().unwrap_or("(未提供)")
                     );
-                    reported_background_error = Some(current);
+                    reported_background_errors = stats.background_errors_total;
                 }
                 stats_metrics.set_gauge("dataserver_ts_series_count", stats.series_count as f64);
                 stats_metrics.set_gauge(
@@ -430,6 +430,13 @@ async fn main() -> ExitCode {
                 );
                 stats_metrics
                     .set_gauge("dataserver_ts_wal_size_bytes", stats.wal_size_bytes as f64);
+                // 注意：tsink 的 `degraded` 是**粘滞**的（发生过一次后台错误就永远为 true），
+                // 直接拿它告警会变成永久误报。要告警请用这个单调计数器：
+                //   increase(dataserver_ts_background_errors_total[10m]) > 0
+                stats_metrics.set_gauge(
+                    "dataserver_ts_background_errors_total",
+                    stats.background_errors_total as f64,
+                );
                 stats_metrics.set_gauge(
                     "dataserver_ts_degraded",
                     if stats.degraded { 1.0 } else { 0.0 },

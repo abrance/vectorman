@@ -418,3 +418,32 @@ tsink 0.10 默认 `background_fail_fast: true` —— **任何一次后台 worke
 
 **遗留**：作业提交表单的解释器是必填项且默认 `bash`，在只有 `sh` 的节点上要手动选 `sh`。
 更顺手做法是让前端下拉按目标 Agent 的 `allowed_interpreters` 动态给值（本次未做）。
+
+### 14. tsink 启动期 ENOENT 的定性（v1.3.3 前的调查）
+
+修完 fail-fast 之后生产仍显示 `degraded=true`、`background_errors_total=3`，追查结论：
+
+- **pod 已连续运行 7 小时、0 重启、只有 1 个 dataserver 进程** → 那 3 次错误是**启动瞬间**发生的，之后 7 小时再没增加。
+- 错误文本 `flush worker error: IO error: No such file or directory (os error 2)` **不带路径**
+  （tsink 的 worker 监督器只包一层 `"{worker} worker error: {err}"`）。
+- **本机用当前生产数据完整副本**（926 段 / 7561 序列）+ 打开自监控（每 5s 往同一个 store 写）
+  + 真实写入 + strace 复跑：`degraded=false`、`background_errors_total=0` —— **复现不出来**，
+  说明与启动时序有关（大 store 的首轮 flush/压缩 + 启动突发写入），不是数据损坏或持续状态。
+- strace 里可见的 ENOENT 全是**探测可选文件的正常行为**：
+  `lane_blob/.compaction-replacements`、`series_index.delta.bin`、`lane_blob/segments`、
+  `.rollups/policies.json`、`.rollups/state.json`、`logs/meta.json`、`series_index.delta.d/delta-*.bin`。
+  推测启动那一瞬其中一个探测被 flush worker 当成硬错误上报了。
+- **影响**：关掉 fail-fast 后它只涨计数器（写入照常，实测 `accepted=1` 且查得回）；
+  在此之前它会**永久停掉写入**（3 小时 41 分静默丢数据）。
+- **运维判断法**：看到 `background_errors_total` 在启动后增长时，先验证写入闭环
+  （`POST /v1/ingest` 然后 query 查回），**不要**因此重启 pod —— 重启会再来一次同样的启动期噪声。
+
+**v1.3.3 补的可观测性缺口**（上一版留的坑）：
+
+- `degraded` 在 tsink 里是**粘滞**的（发生过一次就永远 true）→ 拿它告警等于永久误报。
+  新增单调计数器指标 `dataserver_ts_background_errors_total`，告警用
+  `increase(dataserver_ts_background_errors_total[10m]) > 0`。
+- warn 日志原先**按错误文本去重** → 同一条错误第二次发生就彻底静默。改成**按计数增长**去重：
+  每次新的后台错误都会打一条带当前累计值和最后错误的 warn。
+- 新增回归测试 `background_flush_produces_no_errors`：写入后等 10 秒（让 flush worker 至少跑一轮），
+  断言 `background_errors_total == 0` —— 覆盖「后台 flush 一声不吭」这一类问题。

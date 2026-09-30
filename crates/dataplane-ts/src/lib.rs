@@ -677,6 +677,31 @@ mod tests {
         }
     }
 
+    /// 写入之后必须经得起后台 flush 的一轮 —— 生产上「一次后台错误」曾把存储永久停掉
+    /// （见 tasklist 第 12 节）。这里等足够长时间让 flush worker 跑过，断言它一声不吭。
+    #[tokio::test]
+    async fn background_flush_produces_no_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with(dir.path(), TsRetentionConfig::default());
+        store
+            .write(point("m", "flush-probe", now_micros(), 1.0))
+            .await
+            .unwrap();
+        // 等 flush worker 至少跑过一轮（tsink 的 flush 周期是秒级）。
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let stats = store.storage_stats().await.unwrap();
+            if stats.background_errors_total > 0 {
+                panic!(
+                    "后台 flush 报错：{:?}（degraded={}）",
+                    stats.last_background_error, stats.degraded
+                );
+            }
+        }
+        let stats = store.storage_stats().await.unwrap();
+        assert_eq!(stats.background_errors_total, 0);
+    }
+
     #[tokio::test]
     async fn storage_stats_reports_config_and_series() {
         let dir = tempfile::tempdir().unwrap();
