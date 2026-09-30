@@ -1086,7 +1086,10 @@ async fn handle_auth(
     // 台账里的版本只在登记接口写库，Agent 升级后没人刷新它 → 控制台一直显示登记时的版本。
     // 认证是每次重连/重启的必经之路，在这里回写最省事（空版本由 ledger 自己忽略）。
     if let Err(e) = ledger.set_agent_version(&agent_id, &req.version).await {
-        eprintln!("gse-server: set_agent_version {agent_id} failed: {}", e.message);
+        eprintln!(
+            "gse-server: set_agent_version {agent_id} failed: {}",
+            e.message
+        );
     }
     AuthReply {
         ok: true,
