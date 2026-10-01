@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:7101";
+/// dataserver SQL 口缺省地址，与 `dpc --sql-url` 一致。
+pub const DEFAULT_DATA_URL: &str = "http://127.0.0.1:8081";
 pub const WAIT_INTERVAL: Duration = Duration::from_secs(1);
 pub const WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -23,7 +25,7 @@ pub struct Output {
 }
 
 impl Output {
-    fn ok(body: String) -> Self {
+    pub fn ok(body: String) -> Self {
         Self {
             stdout: body,
             stderr: String::new(),
@@ -31,7 +33,7 @@ impl Output {
         }
     }
 
-    fn err(code: u8, stderr: String) -> Self {
+    pub fn err(code: u8, stderr: String) -> Self {
         Self {
             stdout: String::new(),
             stderr,
@@ -243,6 +245,36 @@ pub fn join_url(base: &str, path: &str) -> String {
     }
 }
 
+/// 数据面（dataserver SQL 口）的**只读**客户端：`agents status` / `agents doctor` 用它读
+/// `/v1/streams`、`/v1/ebpf/capability`、`/health`。
+///
+/// 刻意只有 `get`：本 feature 不做 `data` 子命名空间（见 vmctl-collect-chain 修订记录），
+/// 数据面的写与查询仍由 `dpc` 提供。
+pub struct DataClient<'a, T: Transport> {
+    pub base_url: String,
+    pub transport: &'a T,
+}
+
+impl<'a, T: Transport> DataClient<'a, T> {
+    /// 原样透传的只读 GET：返回 `(status, body)`，由调用方决定判定与退出码。
+    pub fn get_raw(&self, path: &str) -> Result<(u16, String), String> {
+        self.transport
+            .send("GET", &join_url(&self.base_url, path), None)
+    }
+
+    pub fn health(&self) -> Result<(u16, String), String> {
+        self.get_raw("/health")
+    }
+
+    pub fn streams(&self) -> Result<(u16, String), String> {
+        self.get_raw("/v1/streams")
+    }
+
+    pub fn ebpf_capability(&self) -> Result<(u16, String), String> {
+        self.get_raw("/v1/ebpf/capability")
+    }
+}
+
 pub fn read_script_file(path: &Path) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("read script file {}: {e}", path.display()))
 }
@@ -398,6 +430,35 @@ impl<'a, T: Transport> Client<'a, T> {
 
     pub fn agents_get(&self, agent_id: &str) -> Output {
         self.get(&format!("/api/gse/agents/{}", enc(agent_id)))
+    }
+
+    /// 全部 Agent 的 spec 总览（期望 + 生效 + sync_status + diff）。
+    pub fn agents_specs(&self) -> Output {
+        self.get("/api/gse/agent-specs")
+    }
+
+    /// 单台 Agent 的 spec 视图；Agent 从未保存也从未上报时为 404。
+    pub fn agents_spec_get(&self, agent_id: &str) -> Output {
+        self.get(&format!("/api/gse/agents/{}/spec", enc(agent_id)))
+    }
+
+    /// 保存期望 spec（**只写台账，不推送**）。请求体由调用方原样给出 ——
+    /// CLI 不补默认值：服务端用 `double_option` 区分「字段缺失 = 不修改」与「null = 清空」。
+    pub fn agents_spec_put(&self, agent_id: &str, body: &str) -> Output {
+        let url = join_url(
+            &self.base_url,
+            &format!("/api/gse/agents/{}/spec", enc(agent_id)),
+        );
+        http_to_output(self.transport.send("PUT", &url, Some(body)))
+    }
+
+    /// 下发整份 spec（单台 Agent，无请求体）。
+    pub fn agents_spec_apply(&self, agent_id: &str) -> Output {
+        let url = join_url(
+            &self.base_url,
+            &format!("/api/gse/agents/{}/spec/apply", enc(agent_id)),
+        );
+        http_to_output(self.transport.send("POST", &url, None))
     }
 
     pub fn jobs_get(&self, job_id: &str) -> Output {
@@ -729,11 +790,130 @@ impl<'a, T: Transport> Client<'a, T> {
     }
 }
 
+/// 测试专用的脚本化 transport：按顺序回放 `(status, body)` 并记录每次调用。
+///
+/// 放在 lib 里（而非某个 `#[cfg(test)] mod`）是为了让 **二进制** 的 `main.rs`
+/// 也能用自己的测试模块复用它 —— 二进制测试模块看不见 lib 私有测试项。
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    use super::{HttpResponse, RequestBody, Transport};
+    use std::sync::Mutex;
+
+    /// 脚本化 transport：按 URL 后缀匹配路由表，回放对应响应并记录每次调用。
+    ///
+    /// **刻意不按调用顺序回放**：`doctor` 会并发发起多个请求，顺序不确定；
+    /// 顺序回放会让测试变成随机失败（实测踩到过一次）。
+    /// 一次脚本化响应。
+    pub type MockResponse = Result<(u16, String), String>;
+
+    pub struct Mock {
+        inner: Mutex<MockInner>,
+    }
+
+    struct MockInner {
+        routes: Vec<(String, MockResponse)>,
+        /// 无匹配路由时的兜底（模拟「额外的、未预期的请求」）。
+        fallback: MockResponse,
+        calls: Vec<(String, String, Option<String>)>,
+    }
+
+    impl Mock {
+        /// 顺序回放模式（单个请求的命令用；`doctor` / `status` 请用 [`Mock::routed`]）。
+        pub fn new(next: Vec<MockResponse>) -> Self {
+            let routes = next
+                .into_iter()
+                .enumerate()
+                .map(|(i, r)| (format!("#{i}"), r))
+                .collect();
+            Self {
+                inner: Mutex::new(MockInner {
+                    routes,
+                    fallback: Err("no more mock responses".into()),
+                    calls: Vec::new(),
+                }),
+            }
+        }
+
+        /// 路由模式：`(url 后缀, 响应)`。按**最长后缀匹配**，与调用顺序无关。
+        pub fn routed(routes: Vec<(&str, MockResponse)>) -> Self {
+            let mut routes: Vec<(String, _)> = routes
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect();
+            // 长后缀优先，避免 `/agents` 吃掉 `/agents/a-1/spec`。
+            routes.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
+            Self {
+                inner: Mutex::new(MockInner {
+                    routes,
+                    fallback: Err("no mock route matched".into()),
+                    calls: Vec::new(),
+                }),
+            }
+        }
+
+        /// `(method, url, body)` 三元组，按调用顺序。
+        pub fn calls(&self) -> Vec<(String, String, Option<String>)> {
+            self.inner.lock().expect("lock").calls.clone()
+        }
+
+        pub fn call_count(&self) -> usize {
+            self.calls().len()
+        }
+    }
+
+    impl Transport for Mock {
+        fn exchange(
+            &self,
+            method: &str,
+            url: &str,
+            body: RequestBody<'_>,
+        ) -> Result<HttpResponse, String> {
+            let body = match body {
+                RequestBody::Empty => None,
+                RequestBody::Json(payload) => Some(payload.to_string()),
+                RequestBody::MultipartFile {
+                    field,
+                    filename,
+                    data,
+                } => Some(format!("multipart:{field}:{filename}:{} bytes", data.len())),
+            };
+            let mut inner = self.inner.lock().expect("lock");
+            inner
+                .calls
+                .push((method.to_string(), url.to_string(), body));
+            let hit = inner
+                .routes
+                .iter()
+                .find(|(key, _)| key.starts_with('#') || url.ends_with(key.as_str()))
+                .map(|(_, r)| r.clone())
+                .unwrap_or_else(|| inner.fallback.clone());
+            // 顺序模式（`#0` `#1` ...）按调用次数取对应下标。
+            let hit = match &hit {
+                Ok(_) if inner.routes.first().is_some_and(|(k, _)| k == "#0") => {
+                    let idx = inner
+                        .calls
+                        .len()
+                        .saturating_sub(1)
+                        .min(inner.routes.len().saturating_sub(1));
+                    inner.routes[idx].1.clone()
+                }
+                _ => hit,
+            };
+            match hit {
+                Ok((status, body)) => Ok(HttpResponse {
+                    status,
+                    body: body.into_bytes(),
+                }),
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use crate::test_support::Mock;
 
     /// 起一个只回显请求头的极简 HTTP 服务（避免为一条断言引入依赖）。
     fn echo_auth_server() -> (String, std::sync::mpsc::Receiver<String>) {
@@ -791,64 +971,6 @@ mod tests {
                 rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
                 expected
             );
-        }
-    }
-
-    struct Mock {
-        inner: Mutex<MockInner>,
-    }
-
-    struct MockInner {
-        next: VecDeque<Result<(u16, String), String>>,
-        calls: Vec<(String, String, Option<String>)>,
-    }
-
-    impl Mock {
-        fn new(next: Vec<Result<(u16, String), String>>) -> Self {
-            Self {
-                inner: Mutex::new(MockInner {
-                    next: next.into(),
-                    calls: Vec::new(),
-                }),
-            }
-        }
-
-        fn calls(&self) -> Vec<(String, String, Option<String>)> {
-            self.inner.lock().expect("lock").calls.clone()
-        }
-    }
-
-    impl Transport for Mock {
-        fn exchange(
-            &self,
-            method: &str,
-            url: &str,
-            body: RequestBody<'_>,
-        ) -> Result<HttpResponse, String> {
-            let body = match body {
-                RequestBody::Empty => None,
-                RequestBody::Json(payload) => Some(payload.to_string()),
-                RequestBody::MultipartFile {
-                    field,
-                    filename,
-                    data,
-                } => Some(format!("multipart:{field}:{filename}:{} bytes", data.len())),
-            };
-            let mut inner = self.inner.lock().expect("lock");
-            inner
-                .calls
-                .push((method.to_string(), url.to_string(), body));
-            match inner
-                .next
-                .pop_front()
-                .unwrap_or_else(|| Err("no more mock responses".into()))
-            {
-                Ok((status, body)) => Ok(HttpResponse {
-                    status,
-                    body: body.into_bytes(),
-                }),
-                Err(e) => Err(e),
-            }
         }
     }
 
