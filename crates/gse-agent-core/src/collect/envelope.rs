@@ -60,6 +60,23 @@ pub struct IngestReply {
     pub status: String,
     #[serde(default)]
     pub code: Option<String>,
+    /// 被拒记录（`status=partial` 时非空）。
+    ///
+    /// 必须解析出来：Agent 此前**完全忽略**它 —— 服务端把整批边拒成 `partial`
+    /// （实测 6400+ 条只入库 1 条），而 Agent 侧零日志、零重试，数据静默消失。
+    #[serde(default)]
+    pub failures: Vec<IngestFailure>,
+}
+
+/// 单条被拒记录的原因。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct IngestFailure {
+    #[serde(default)]
+    pub record_id: String,
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub message: String,
 }
 
 /// span 内的事件（对齐 OTel `Span.Event`）。
@@ -133,4 +150,40 @@ pub struct TraceSpanRecord {
     pub collector: String,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IngestReply;
+
+    /// **静默丢数回归**：服务端把部分记录拒了会回 `status=partial` + `failures`，
+    /// Agent 必须能解析出来才能把原因打到日志里。
+    /// 此前 `IngestReply` 没有这个字段 → 「拒了 6400 条只入库 1 条」在 Agent 侧零信号。
+    #[test]
+    fn parses_partial_reply_failures() {
+        let raw = br#"{
+            "batch_id":"b-1",
+            "accepted":0,
+            "status":"partial",
+            "failures":[{
+                "record_id":"a-1:123:10.0.0.1:1:10.0.0.2:2:tcp",
+                "code":"invalid_argument",
+                "message":"connections must be >= 1"
+            }]
+        }"#;
+        let reply: IngestReply = serde_json::from_slice(raw).expect("partial 应答必须可解析");
+        assert_eq!(reply.status, "partial");
+        assert_eq!(reply.accepted, 0);
+        assert_eq!(reply.failures.len(), 1);
+        assert_eq!(reply.failures[0].message, "connections must be >= 1");
+    }
+
+    /// 正常应答不带 `failures` 字段（旧版 dataserver 也不带），必须仍能解析。
+    #[test]
+    fn parses_ok_reply_without_failures() {
+        let raw = br#"{"batch_id":"b-2","accepted":3,"status":"ok"}"#;
+        let reply: IngestReply = serde_json::from_slice(raw).expect("ok 应答必须可解析");
+        assert_eq!(reply.accepted, 3);
+        assert!(reply.failures.is_empty());
+    }
 }

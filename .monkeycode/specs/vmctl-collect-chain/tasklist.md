@@ -306,3 +306,23 @@ summary: not reporting …                  summary: ok   (exit 0)
 
 修复落在 `ebpf-observability`（Agent 侧），本 feature 只做验收：
 `GET /v1/ebpf/capability` 的 `reported` 恢复为环境中 eBPF 采集项数。
+
+### 11.1 复验时抓到的两个真问题（2026-10-01，均已在 Agent 侧修复）
+
+`doctor`/`status` 这两条命令的价值在这天兑现了两次 —— 它们把两个**在两端都看不见**的数据问题翻了出来：
+
+1. **dataserver OOM 崩溃循环（生产中断）**：`dataserver` 容器 `limits.memory=1Gi`，
+   而进程稳态 RSS 在 **0.7～1.05GB** 之间抖动（启动 15 秒就到 880MB）→ 平均几分钟 OOM 一次，
+   `CrashLoopBackOff`；期间 `/v1/*` 全部不可用（Traefik 直接回 `no available server`），
+   Agent 侧刷 `dataplane_addr unavailable: no online dataplane` + `drop oldest batch`。
+   **处置**：`scale 0 → 确认主机无 dataserver 进程 → set resources --limits=memory=2Gi → scale 1`；
+   起来后 RSS 峰值 ~1.05GB，稳定 `1/1 Ready`。
+   **教训**：`dataserver` 的内存上限（1Gi）与它的真实占用太贴，**升级巡检要把 RSS 与 limit 的比值当指标看**。
+
+2. **边记录几乎全丢（见 `ebpf-observability/todo.md` TODO-14）**：
+   `status` 显示 `ebpf_edges` 长期 `stale`，一查是 `connections == 0` 的边被服务端整条拒
+   （`accepted=1` / `invalid=6415`），而 Agent 把 `partial` 当成功、`IngestReply` 又不解析 `failures`
+   → 数据静默消失。已修（v1.3.10）：Agent 不再产出无新建连接的边，且 `partial` 会打日志。
+
+> 两条都不是本 feature 引入的，但都是本 feature 的命令**第一次真正跑起来**才暴露的 ——
+> 这正是 §11 那句话的注脚：命令做完了，不等于链路是通的。

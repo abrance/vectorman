@@ -487,3 +487,38 @@ curl -s http://127.0.0.1:18081/v1/ebpf/capability
 # 过 60 秒滞后窗口后查指标
 curl -s "http://127.0.0.1:19090/api/v1/query?query=ebpf_edge_connections_total"
 ```
+
+## 二·补 TODO-14（高）`connections == 0` 的边记录被服务端整条拒 —— 边数据几乎全丢（✅ 已修复 v1.3.10）
+
+- **发现于** 2026-10-01 `vmctl agents doctor` 真集群复验（`vmctl-collect-chain` §11）：
+  `agents status ser539375215934` 的 `ebpf_edges` 一项长期 `stale`，而同一采集项的指标照常上报。
+- **实测证据**（cloud3，dataserver 自监控）：
+  - `dataserver_ingest_records_total{data_type="ebpf_edges",result="accepted"}` = **1**
+  - `dataserver_ingest_records_total{data_type="ebpf_edges",result="invalid"}` = **6415**（60 秒内还在以 ~330/分钟增长）
+  - `dataserver_ingest_batches_total{data_type="ebpf_edges",status="partial"}` = 141
+  - `GET /api/v1/query?query=ebpf_edge_connections_total` → **0 条序列**
+  - Agent 侧一切「正常」：`agent_ebpf_edges_total` 18706 → 19103（70 秒内 +397）、`read_errors=0`
+- **根因**：两条口径错位。
+  1. Agent 的 `is_empty()` 判定是「**全零**才跳过」，而 `connections` 只在
+     `inet_sock_set_state → TCP_ESTABLISHED` 时 +1（`gse-ebpf-programs/src/network.rs:161`），
+     关闭连接时的「存续时长/字节」增量会落在**本桶没有新建连接**的桶里 —— 这类增量非全零、
+     会过 `is_empty` 并产出边记录，但 `connections == 0`。
+  2. 服务端不变量是 `connections >= 1`（`dataplane-ingest/src/edge.rs`，
+     文档口径「`connections` = 桶内新建连接数」），于是这类记录**整条**被判 `partial`。
+  3. Agent 侧 `post_ingest` 把 `partial` 当 **成功**（`Confirm`）—— 既不重试也不打日志，
+     且 `IngestReply` 当时**根本没有 `failures` 字段**，服务端给的原因被直接丢掉。
+     → 表现就是「边数据几乎全丢，但两端都看不见」。
+- **修法**（agent 侧，Agent 与 dataserver 都不用改协议）：
+  - `run_loop`：`delta.connections == 0` 时不出边记录（成不了边），并计入新计数器
+    `agent_ebpf_edges_skipped_total`（这类路径必须计数，否则又是静默丢数）。
+  - `IngestReply` 增加 `failures: Vec<IngestFailure>`（`record_id`/`code`/`message`），
+    `post_ingest` 在 `status=partial` 时把**第一条**拒绝原因打到日志
+    （`ingest partial batch=… accepted=… rejected=… first=<message> (<record_id>)`）。
+    正常路径 `status=ok` 一行不打。
+- **口径影响（已知限制，非缺陷）**：长连接在**关闭桶**里的字节/时长增量不再上报 ——
+  模型里边的字节/时长归「新建连接」那个桶。要完整统计需要「按 key 暂存增量、下次有新建连接时合并上报」，
+  属独立的准确性工作，本 TODO 不做（先止住 99.98% 的丢失）。
+- **验收**：`ebpf_edge_connections_total` 有序列、`result=accepted` 持续增长、
+  `result=invalid` 停止增长、`vmctl agents status` 的 `ebpf_edges` 一行不再是 `stale`。
+- **测试**：`zero_connection_delta_skips_edge_and_counts`（无新建连接 → 无记录且计数 +1）、
+  `parses_partial_reply_failures` / `parses_ok_reply_without_failures`（应答解析）。

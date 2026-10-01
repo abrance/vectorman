@@ -659,6 +659,7 @@ fn main() -> ExitCode {
         map_overflow_dropped: 0,
         rate_limited: totals.rate_limited,
         buffer_dropped: 0,
+        edges_skipped: 0,
         // 与采集循环同源：工具也用真实的 CPU 采样器。
         cpu_percent: cpu_tracker.percent(),
         degraded: cpu_tracker.degraded(),

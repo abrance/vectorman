@@ -128,6 +128,10 @@ pub struct EbpfStats {
     pub rate_limited: AtomicU64,
     /// 被**上行缓冲**淘汰的记录数（容量满时淘汰最旧；只在日志里出现等于看不见）。
     pub buffer_dropped: AtomicU64,
+    /// 因「本桶没有新建连接」而不产出边记录的增量数。
+    ///
+    /// 单列一个计数器是因为这是一条**静默丢数**路径：不计数就只能靠服务端的 `invalid` 计数发现。
+    pub edges_skipped: AtomicU64,
     /// CPU 占比（百分比 × 100，存整数避免原子浮点）；由 [`EbpfStats::set_cpu`] 写入。
     cpu_percent: AtomicU64,
     /// `max_cpu_percent` 连续超限标记。
@@ -146,6 +150,7 @@ pub struct EbpfSnapshot {
     pub map_overflow_dropped: u64,
     pub rate_limited: u64,
     pub buffer_dropped: u64,
+    pub edges_skipped: u64,
     pub cpu_percent: f64,
     pub degraded: bool,
 }
@@ -170,6 +175,7 @@ impl EbpfStats {
             map_overflow_dropped: self.map_overflow_dropped.load(Ordering::Relaxed),
             rate_limited: self.rate_limited.load(Ordering::Relaxed),
             buffer_dropped: self.buffer_dropped.load(Ordering::Relaxed),
+            edges_skipped: self.edges_skipped.load(Ordering::Relaxed),
             // CPU 与降级标记由采集循环写入（`set_cpu`），默认 0/未降级。
             cpu_percent: self.cpu_percent.load(Ordering::Relaxed) as f64 / 100.0,
             degraded: self.degraded.load(Ordering::Relaxed),
@@ -280,6 +286,17 @@ pub async fn run_loop(
             };
             if !config::keep(&filter, &cfg) {
                 stats.filtered.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            // **本桶没有新建连接就不出边记录**（服务端不变量 `connections >= 1`，
+            // `connections` 的定义就是「桶内新建连接数」）。
+            //
+            // 实测踩过：关闭连接时的「存续时长/字节」增量会落在「本桶无新建连接」的桶里，
+            // 这类增量过了 `is_empty`（不全为零）却成不了边 → 上报过去被整条拒为 `partial`，
+            // 结果 **6400+ 条边只入库 1 条**（改前 cloud3 实测：`accepted=1` / `invalid=6415`），
+            // 而 Agent 侧一点信号都没有。
+            if delta.connections == 0 {
+                stats.edges_skipped.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             if let Some(record) = edge_record(
@@ -755,7 +772,7 @@ pub fn stats_metrics(
     snapshot: &EbpfSnapshot,
 ) -> Vec<serde_json::Value> {
     let ts = now_micros();
-    let rows: [(&str, u64); 9] = [
+    let rows: [(&str, u64); 10] = [
         ("agent_ebpf_flushes_total", snapshot.flushes),
         ("agent_ebpf_edges_total", snapshot.edges),
         ("agent_ebpf_metric_points_total", snapshot.metrics),
@@ -768,6 +785,7 @@ pub fn stats_metrics(
         ),
         ("agent_ebpf_rate_limited_total", snapshot.rate_limited),
         ("agent_ebpf_buffer_dropped_total", snapshot.buffer_dropped),
+        ("agent_ebpf_edges_skipped_total", snapshot.edges_skipped),
     ];
     // 两个非计数器口径：CPU 占比是小数百分比、降级是 0/1 标记。
     let gauges: [(&str, f64); 2] = [
@@ -952,6 +970,49 @@ mod tests {
         );
     }
 
+    /// **边记录不变量回归**（cloud3 实测：6400+ 条边只入库 1 条）：
+    /// 「本桶无新建连接」的增量不能产出边记录 —— 服务端不变量是 `connections >= 1`，
+    /// 报了会被整条拒成 `partial`。跳过要计数（`edges_skipped`），不能静默丢。
+    #[tokio::test]
+    async fn zero_connection_delta_skips_edge_and_counts() {
+        // 只有字节、没有新建连接：过了 `is_empty`（不全为零）但不是一条边。
+        let delta = ebpf_abi::ConnAggWire {
+            bytes_sent: 4096,
+            ..Default::default()
+        };
+        let source = Box::new(FakeSource {
+            snapshots: Mutex::new(vec![vec![(key(), vec![delta])]]),
+            contexts: vec![Some(ProcessContext::default())],
+        });
+        let sink = Arc::new(RecordingSink::default());
+        let cfg = EbpfConfig {
+            flush_interval_secs: 1,
+            ..EbpfConfig::default()
+        };
+        let stats = Arc::new(EbpfStats::default());
+        let handle = tokio::spawn(run_loop(
+            source,
+            sink.clone(),
+            cfg,
+            "item-ebpf".to_string(),
+            "agent-1".to_string(),
+            ok_report(),
+            stats.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(1_400)).await;
+        handle.abort();
+
+        assert!(
+            sink.edges.lock().unwrap().is_empty(),
+            "无新建连接的增量不得产出边记录: {:?}",
+            sink.edges.lock().unwrap()
+        );
+        assert!(
+            stats.snapshot().edges_skipped >= 1,
+            "跳过的增量必须计数（否则又是静默丢数）"
+        );
+    }
+
     #[test]
     fn sampling_ratio_behaves() {
         assert!(sample(1, 1.0) && sample(999, 1.0), "ratio=1 全采");
@@ -1041,11 +1102,12 @@ mod tests {
             map_overflow_dropped: 5,
             rate_limited: 6,
             buffer_dropped: 11,
+            edges_skipped: 13,
             cpu_percent: 2.5,
             degraded: true,
         };
         let points = stats_metrics("agent-1", "item-1", &snapshot);
-        assert_eq!(points.len(), 11, "9 个计数 + CPU 占比 + 降级标记");
+        assert_eq!(points.len(), 12, "10 个计数 + CPU 占比 + 降级标记");
         let value_of = |name: &str| -> f64 {
             points
                 .iter()
@@ -1059,6 +1121,7 @@ mod tests {
         assert_eq!(value_of("agent_ebpf_read_errors_total"), 1.0);
         assert_eq!(value_of("agent_ebpf_edges_total"), 9.0);
         assert_eq!(value_of("agent_ebpf_buffer_dropped_total"), 11.0);
+        assert_eq!(value_of("agent_ebpf_edges_skipped_total"), 13.0);
         assert_eq!(value_of("agent_ebpf_cpu_percent"), 2.5, "小数百分比不截断");
         assert_eq!(value_of("agent_ebpf_degraded"), 1.0);
         // 记录 ID 唯一（接入侧按 record_id 去重，重复 ID 会让后续点被吃掉）。
@@ -1066,7 +1129,7 @@ mod tests {
             .iter()
             .filter_map(|p| p["record_id"].as_str())
             .collect();
-        assert_eq!(ids.len(), 11);
+        assert_eq!(ids.len(), 12);
         assert_eq!(points[0]["tags"]["agent_id"], "agent-1");
         assert_eq!(points[0]["tags"]["item_id"], "item-1");
         assert_eq!(points[0]["field_name"], "value");
