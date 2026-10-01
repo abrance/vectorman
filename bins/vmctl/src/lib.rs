@@ -10,6 +10,8 @@ use serde::Serialize;
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:7101";
 /// dataserver SQL 口缺省地址，与 `dpc --sql-url` 一致。
 pub const DEFAULT_DATA_URL: &str = "http://127.0.0.1:8081";
+/// dataserver Prom 查询口缺省地址，与 `dpc --prom-url` 一致（仅 `data query` 使用）。
+pub const DEFAULT_PROM_URL: &str = "http://127.0.0.1:9090";
 pub const WAIT_INTERVAL: Duration = Duration::from_secs(1);
 pub const WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 

@@ -358,3 +358,89 @@ summary: ok
 
 > `doctor` 至此**没有已知盲区**：v1.3.9 修掉能力段（`reported: 0`），v1.3.10 修掉边记录（`stale`）。
 > 这两条都是它自己跑起来才暴露的 —— 命令的真正价值在这里，不在「能打印表格」。
+
+## 12. `data` 子命名空间（2026-10-01，复用 `dpc` 实现）
+
+规格依据：`requirements.md` Requirement 9 + 本次修订记录；设计见 `design.md` §「`data` 子命名空间」。
+前置：上一版修订记录明确「`data` 要做需先统一 `--sql-url` / `--data-url` 口径」——本节的 1.3 就是它。
+
+### 12.1 规格与口径（先改规格再动代码）
+
+- [x] 12.1.1 `requirements.md`：修订记录新增 2026-10-01 条目；R8 放开 `data`（保留「不改 `dpc` 行为与输出」）；新增 Requirement 9。
+- [x] 12.1.2 `design.md`：新增 `data` 子命名空间设计（拆分方案、地址口径表、为什么不走 `Transport`、输出/退出码、唯一写命令）；
+      Pitfalls 补 4 条（地址别名、不要铺到顶层、不改 `dpc` 输出、不要重复包错误）。
+
+### 12.2 `dpc` 拆 lib + bin（行为零变化）
+
+- [x] 12.2.1 `git mv bins/dpc/src/main.rs bins/dpc/src/lib.rs`；`Cli` / `Command` / `TsCommand` / `DpcError` / `run` 改 `pub`。
+- [x] 12.2.2 新增 `pub struct Endpoints { pub sql_url: String, pub prom_url: String }` 与
+      `pub fn dispatch(endpoints: &Endpoints, cli: &Cli) -> ExitCode`（把原 `main` 的错误打印收进来）。
+- [x] 12.2.3 新 `bins/dpc/src/main.rs`：`Cli::parse()` + `dpc::dispatch`，5 行以内。
+- [x] 12.2.4 验收：`dpc --help` / `dpc ts --help` / `dpc --version` 输出与改动前**逐字一致**；
+      `dpc` 原有 5 个单测仍通过；`cargo build -p dpc` 产物仍是单二进制。
+
+### 12.3 `vmctl data` 接线
+
+- [x] 12.3.1 `bins/vmctl/Cargo.toml` 增加 `dpc = { path = "../dpc" }`（无新三方依赖）。
+- [x] 12.3.2 `bins/vmctl/src/main.rs`：顶层 `Command::Data(DataArgs)`，其中 `#[command(subcommand)] command: dpc::Command`；
+      全局 `--data-url` 加 `alias = "sql-url"`；新增全局 `--prom-url`（缺省 `http://127.0.0.1:9090`）。
+- [x] 12.3.3 派发：`Data` 分支构造 `dpc::Endpoints { sql_url: data_url, prom_url }` 调 `dpc::dispatch`，
+      **不重复包错误**。
+- [x] 12.3.4 `--help` 验收：顶层多出 `data`（共 5 个）；`vmctl data --help` 列出 11 个子命令；
+      `vmctl data ts --help` 列出 `stats` / `delete`。
+- [x] 12.3.5 回归：`health` / `hosts` / `agents` / `jobs` 的输出与退出码不变（既有单测全绿）。
+
+### 12.4 测试
+
+- [x] 12.4.1 单测：`vmctl --help` 的顶层子命令集合 = `{health, hosts, agents, jobs, data}`（更新既有的「四个」断言）。
+- [x] 12.4.2 单测：`--sql-url` 能作为 `--data-url` 的别名被接受（解析后 `data_url` 相等）。
+- [x] 12.4.3 单测：`dpc::Command` 的 `logs` / `query` 参数在 `vmctl data` 下能正确解析（含可选参数省略）。
+- [x] 12.4.4 质量门：`cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features -- -D warnings`、
+      `cargo test --all-features` 全绿。
+
+### 12.5 文档与验收
+
+- [x] 12.5.1 `README.md` 的 `vmctl` 章节补 `data` 子命名空间（11 个子命令、两个地址参数、`ts delete` 是唯一写命令）。
+- [x] 12.5.2 真机验收（cloud3 数据面）：`vmctl data health|query|logs|edges|ebpf-capability|ts stats` 逐个执行，
+      记录退出码与关键输出；含一条**刻意失败**（错误 `--data-url`）断言 `code=` 与退出码 1。
+- [x] 12.5.3 把 12.5.2 结论写回本节下方；`.monkeycode/specs/README.md` 索引更新本 feature 的一句话。
+
+- **检查点 G**：`dpc` 行为零变化且可独立使用；`vmctl data` 与 `dpc` 输出逐字节一致（同参数同环境比对）。
+
+### 12.6 实施与验收结论（2026-10-01）
+
+**实现要点**
+
+- `bins/dpc`: `main.rs` → `lib.rs`（`Cli` / `Command` / `TsCommand` / `DpcError` / `run` 全 `pub`），
+  新增 `Endpoints { sql_url, prom_url }` 与 `dpc::dispatch(endpoints, command)`；
+  `main.rs` 变成 5 行。**`dpc` 的 `--help` / `--version` / 5 个单测全部照旧。**
+- `bins/vmctl`: 新增顶层 `data`（`cmd: dpc::Command`），全局 `--data-url` 加 `alias = "sql-url"`、
+  新增 `--prom-url`（`DEFAULT_PROM_URL = http://127.0.0.1:9090`）；派发直接 `return dpc::dispatch(...)`，
+  不重复包错误（两套前缀会打架）。
+- 零复制：`vmctl data` 与 `dpc` 共用同一份实现与同一个 `code=`/`url=` 错误口径。
+
+**与 `dpc` 的逐字节比对（真数据面 `dataserver.xiaoyxq.top`）**
+
+| 命令 | 结果 |
+| --- | --- |
+| `health` | ✅ 52 字节逐字节一致 |
+| `ebpf-capability` | ✅ 395 字节一致 |
+| `edges --limit 2` | ✅ 810 字节一致 |
+| `logs --limit 2` | ✅ 873 字节一致 |
+| `traces --limit 2` | ✅ 23 字节一致 |
+| `query --expr cpu_usage` | ✅ 500 字节一致 |
+| `ts stats` | ⚠️ 字段集合逐一相同；值逐字节比对**不适用** —— 该响应含 `memory_used_bytes` / `wal_size_bytes` / `sampled_at_ts` 等波动字段，`dpc` 自己连跑两次也不一样 |
+
+**退出码**：成功 `0`；错误地址时两边都输出同一条
+`url=… reason=… code=unavailable`（逐字节一致）且退出码 `1`。
+
+**`--help` 层级**
+
+- `vmctl --help` 顶层 = `health | hosts | agents | jobs | data`（既有单测从「恰好四个」改为固定集合断言）。
+- `vmctl data --help` 的 11 个子命令与 `dpc` 完全一致 —— 由单测 `data_mirrors_all_dpc_subcommands`
+  直接比对两个 clap 命令树（同名同序），防止「影子实现」走样。
+- `vmctl data ts --help` 里 `delete` 可见（唯一会改数据的命令，`--help` 与 README 都已标注）。
+
+**测试**：`cargo test -p vmctl --features test-support` 23 + 29 全绿（含新增的别名、参数绑定、
+命令树一致性 4 条）；`cargo test -p dpc` 5 条照旧；`cargo test --workspace --all-features` 全绿；
+clippy `-D warnings` 0 告警；fmt 干净。

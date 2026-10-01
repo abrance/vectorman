@@ -94,6 +94,53 @@ sequenceDiagram
 
 **不动的**：`crates/**`、`bins/dpc/**`、`bins/gse-server/**`、`bins/dataserver/**`、`frontend/**`。
 
+### `data` 子命名空间：复用 `dpc` 的同一份实现（2026-10-01 追加）
+
+要求是「把 `dpc` 的能力放进 `vmctl` 二进制」，而**不是**把 865 行查询代码拷一份。
+做法是把 `dpc` 拆成 `lib` + `bin`，`vmctl` 依赖它的 lib：
+
+| 文件 | 改动 |
+| --- | --- |
+| `bins/dpc/src/lib.rs` | 由原 `main.rs` 改名而来；`Cli` / `Command` / `TsCommand` / `DpcError` / `run` 全部 `pub`；新增 `pub struct Endpoints { sql_url, prom_url }` 与 `pub fn dispatch(endpoints, command)` |
+| `bins/dpc/src/main.rs` | 变薄：`Cli::parse()` → `dpc::dispatch`（**行为、输出、退出码一字不变**） |
+| `bins/dpc/Cargo.toml` | 增加 lib target（路径默认 `src/lib.rs`）；`[[bin]]` 保持 |
+| `bins/vmctl/Cargo.toml` | 依赖 `dpc = { path = "../dpc" }`（不引入新三方依赖：`dpc` 已有的 `clap`/`ureq`/`serde_json`/`urlencoding`/`dataplane-core` 都是现成的） |
+| `bins/vmctl/src/main.rs` | 新增顶层 `Command::Data { #[command(subcommand)] command: dpc::Command }`；两个全局参数 `--data-url`（加 `alias = "sql-url"`）与新增 `--prom-url`；派发时构造 `dpc::Endpoints` 调 `dpc::dispatch` |
+
+clap 组合要点：`dpc::Command` 是独立的 `Subcommand` enum，直接作为 `vmctl` 顶层变体的字段即可嵌套出
+`vmctl data query ...`；`--sql-url` 用 **alias**（而不是第二个字段）保证只有一个真源，`--help` 里仍显示 `--data-url`。
+
+#### 数据面地址口径（上一版修订记录要求的「先统一」）
+
+| 用途 | 参数 | 缺省 | 说明 |
+| --- | --- | --- | --- |
+| dataserver SQL 口（`/v1/streams`、`/v1/logs/search`、`/v1/ts/*`、`/v1/traces/*`、`/v1/edges/search`、`/v1/ebpf/*`） | 全局 `--data-url`（别名 `--sql-url`） | `http://127.0.0.1:8081` | `agents status` / `doctor` 本来就用它；现在 `data` 共用同一个值 |
+| dataserver Prom 查询口（`/api/v1/query`） | 全局 `--prom-url` | `http://127.0.0.1:9090` | 仅 `data query` 用 |
+
+两个缺省值与 `dpc` 一一对应，所以从 `dpc` 迁过来的命令**只改命令名**：
+`dpc --sql-url X --prom-url Y logs …` ⇔ `vmctl --data-url X --prom-url Y data logs …`。
+
+#### 为什么 `data` 不走 `vmctl` 的 `Transport`
+
+`vmctl` 自己的命令走 `lib.rs` 的 `Transport` trait（可注入 `Mock` 做单测）。`data` **刻意不复用**它：
+
+- 这些命令是**纯透传**（请求体由 5 个纯函数构造、响应正文原样落 stdout），业务逻辑全在 `dpc` 里，
+  已有单测；再经 `vmctl` 的 `Transport` 包一层只是把同一份逻辑拆到两个测试体系。
+- `dpc` 的实现依赖 `dataplane_core::ErrorCode` 的错误口径（`code=` 的输出）；套 `Transport` 要改 `dpc` 内部，
+  违反「不改 `dpc` 行为」。
+- 代价：`data` 子命令没有 `Mock` 级单测。补偿：`dpc` 的 5 个单测继续盖构造逻辑，
+  `vmctl` 侧只测**命令树与参数绑定**（不联网）。
+
+#### 输出与退出码
+
+与 `dpc` 完全一致：成功 = 正文落 stdout + 0；失败 = `url=… reason=… code=…` 落 stderr + 1。
+`vmctl` 的 `main` 里 `data` 分支不自己包错误（直接返回 `ExitCode`），否则会出现两套错误前缀。
+
+#### `data` 里唯一会改数据的命令
+
+`data ts delete`（`POST /v1/ts/delete`，按序列删历史点）。文档与 `--help` 必须点明；
+其余 10 个命令全部只读。不加额外交互确认 —— 它与 `dpc ts delete` 同能力，加了反而两边不一致。
+
 ### Transport 复用（不新增网络层）
 
 `UreqTransport` 已支持四件事：`Empty` / `Json` / `MultipartFile` 请求体、`Authorization: Bearer` 注入、
@@ -320,6 +367,14 @@ last_seen 不存在                                      → not_reporting
   tab 在不同终端宽度不同。用空格填充到固定列宽，与 `vmctl jobs list` 现状一致。
 - **`--table` 是增强不是替换**：默认透传（与 `dpc` 语义一致），`--table` 才渲染。
   反过来做会让现有脚本在 `vmctl` 升级后解析失败。
+- **`data` 不要另起一套地址参数**：`--sql-url` 只能是 `--data-url` 的别名（clap `alias`），
+  否则「同一个 SQL 口两个名字、两套缺省」迟早漂移 —— 这正是上一版修订记录要求「先统一」的那个坑。
+- **别把 `data::Command` 展开成 `vmctl` 的顶层子命令**：顶层已固定为 `health|hosts|agents|jobs`（+ 本次 `data`），
+  把 11 个查询命令铺到顶层会把 `--help` 淹掉，也与初稿的 `vmctl data ...` 命名空间不一致。
+- **`dpc` 拆 lib 时不要顺手「美颜」它的输出**：`dpc` 已有脚本在用（`url=… reason=… code=…` 被解析）。
+  本次只做可见性修改（`pub`）、不改任何格式化逻辑。
+- **`data` 分支不要重复包错误**：`vmctl::main` 已有 `Output` 的错误打印，
+  `dpc::dispatch` 也自带 `url=… reason=… code=…`。两边都包会出现双前缀。
 
 ## References
 

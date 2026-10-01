@@ -18,8 +18,8 @@ jobs / job-files），**per-Agent spec 的读、写、下发在 CLI 侧完全缺
 - `vmctl agents status <agent_id>`：逐采集项 × 逐 data_type 核验「采上来了没有」（结合数据面 stream）。
 - `vmctl agents doctor <agent_id>`：把链路每一段聚合到一条命令里（台账 / spec / 采集项 / eBPF 能力 / 数据面连通性）。
 
-范围边界见 Requirement 8：**本版不做 `data` 子命名空间**（`dpc` 已覆盖 dataserver 查询），
-**不提供采集项的一等资源 CRUD**（采集项是 spec 内的元素，`agent_ids` 已不存在）。
+范围边界见 Requirement 8：**不提供采集项的一等资源 CRUD**（采集项是 spec 内的元素，`agent_ids` 已不存在）、
+**不提供跨 Agent 批量下发**；dataserver 查询与运维能力见 Requirement 9（`vmctl data`，复用 `dpc` 实现）。
 
 ## Glossary
 
@@ -195,15 +195,15 @@ jobs / job-files），**per-Agent spec 的读、写、下发在 CLI 侧完全缺
 ### Requirement 8: 范围边界与前置依赖
 
 - AS 维护者, I want 明确本 feature 不动什么, so that 评审能一眼看到风险面。
-- 范围边界：THE vmctl SHALL NOT 实现 `data` 子命名空间（dataserver 查询仍由 `dpc` 提供，`dpc` 本版不动）；
-  SHALL NOT 提供采集项的一等资源 CRUD（`/api/gse/collect-items*` 已删除，采集项是 spec 内的元素）；
+- 范围边界：THE vmctl SHALL NOT 提供采集项的一等资源 CRUD（`/api/gse/collect-items*` 已删除，采集项是 spec 内的元素）；
   SHALL NOT 提供跨 Agent 批量下发与批量 spec 写入（服务端只有单台 Agent 的三个动作）；
   SHALL NOT 实现 spec 的强类型字段参数（`params` / `items` 一律由 JSON 承载）；
   SHALL NOT 实现主机/标签选择器展开（目标只能是显式 `agent_id`）；
   SHALL NOT 引入配置文件与 profile 机制（只认命令行参数与环境变量）；
   SHALL NOT 实现认证与授权逻辑（只做 Bearer 注入）；
   SHALL NOT 提供 spec 模板或预置示例；
-  SHALL NOT 改动 `dpc`、前端与台账数据模型；
+  SHALL NOT 改动的 **`dpc` 行为与输出**（它仍是独立二进制；Requirement 9 只把它的实现搬进可复用库）；
+  SHALL NOT 改动前端与台账数据模型；
   SHALL NOT 新增服务端路由（本 feature 纯客户端）。
 - 前置依赖：三条 GSE 路由（`GET /api/gse/agent-specs`、`GET|PUT /api/gse/agents/{id}/spec`、
   `POST /api/gse/agents/{id}/spec/apply`）与两条数据面路由（`GET /v1/streams`、`GET /v1/ebpf/capability`）
@@ -219,7 +219,40 @@ jobs / job-files），**per-Agent spec 的读、写、下发在 CLI 侧完全缺
      因为「部分上报」在链路上就是断的；
   5. spec 保存 ≠ 下发：`spec put` 之后必须 `spec apply`，`status` / `doctor` 会以 `dirty` 显式提示。
 
+### Requirement 9: dataserver 查询与运维子命名空间（`vmctl data`）
+
+- AS 运维, I want 一个二进制里既能下发采集配置又能查数据, so that 排查时不用在两个命令之间切换 URL 口径。
+- WHEN 用户执行 `vmctl data <子命令>`, THE vmctl SHALL 提供与 `dpc` **一一对应**的子命令：
+  `health` / `sql` / `query` / `logs` / `ts stats` / `ts delete` / `traces` / `trace` /
+  `edges` / `ebpf-events` / `ebpf-capability`（名称、参数名、语义与 `dpc` 一致）。
+- THE vmctl SHALL 复用 `dpc` 的**同一份实现**（`dpc` crate 的 lib target），SHALL NOT 复制一份查询逻辑。
+- THE vmctl SHALL 用全局 `--data-url`（SQL 口，别名 `--sql-url`）与全局 `--prom-url`（Prom 口）承载两个地址，
+  缺省与 `dpc` 一致（`http://127.0.0.1:8081` / `http://127.0.0.1:9090`）；
+  SHALL NOT 为 `data` 单独再定义一套地址参数。
+- THE vmctl SHALL 保持**透传**：响应正文原样写 stdout，不做字段裁剪或重排（与 `dpc` 及本 feature 既有口径一致）。
+- THE vmctl SHALL 保持退出码与错误口径一致：失败时 stderr 打 `url=... reason=... code=...`、退出码 1，
+  且不打印半截响应。
+- THE vmctl SHALL 在使用文档中把 `ts delete` 标为**唯一会改数据**的子命令（其余只读）。
+- 范围边界：SHALL NOT 给 `data` 加 `--password`（dataserver 鉴权与 `dpc` 现状一致，默认 `NoopAuth`）；
+  SHALL NOT 改 `dpc` 的输出与行为；SHALL NOT 引入 dataserver 之外的数据源。
+- 前置依赖：`dpc` crate 可被依赖（`bins/dpc` 新增 lib target）；`dpc` 现有 5 个单测保持通过。
+
 ## 修订记录
+
+### 2026-10-01：把 dataserver 查询并入 `vmctl data`（本次修订）
+
+用户决定：**把 `dpc` 的能力放进 `vmctl` 二进制**，命令行侧只维护一个入口。
+上一版修订记录里留的那句话正是本次要解决的前提（「`dpc` 的 `--sql-url` 口径与 `vmctl` 的 `--data-url` 需先统一」）。
+
+| 条款 | 上一版口径 | 本次修订 |
+| --- | --- | --- |
+| R8 范围边界 | **SHALL NOT 实现 `data` 子命名空间** | 放开：新增 Requirement 9；仍不得改动 `dpc` 的**行为与输出** |
+| R1 命名空间 | 只扩 `agents`，不新增顶层子命令 | 新增顶层 `data`（顶层子命令由 4 个变 5 个，既有单测断言同步更新） |
+| R9–R12 `data ...`（初稿） | 「整组移出本 feature（`dpc` 已覆盖，不重复实现）」 | **改为复用 `dpc` 的实现**（0 复制）：`dpc` 拆 `lib` + 保留原二进制，`vmctl` 依赖该 lib |
+| 数据面地址（新增） | 未定 | 全局 `--data-url`（SQL 口，**新增别名 `--sql-url`**，兼容 `dpc` 写法）+ 新增全局 `--prom-url`（Prom 查询口）；缺省值与 `dpc` 一致 |
+| `dpc` 二进制 | 「本版不动」 | 保持存在、行为不变（脚本兼容）；实现搬进 `dpc` crate 的 lib target，`main.rs` 变薄 |
+
+初稿中「本 feature 尚未实施、需按 `gse-agent-config-center` 调整」的对照表已由上一版修订记录承载。
 
 ### 2026-09-30：整体重新定范围（本版）
 

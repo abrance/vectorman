@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+# `data` 子命名空间复用 `dpc` 的实现（同一份命令定义与错误口径），不复制查询逻辑。
+dpc = { path = "../dpc" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 ureq = "2"
