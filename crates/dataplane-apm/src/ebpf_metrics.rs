@@ -542,7 +542,9 @@ pub struct CapabilityReport {
     pub reported: usize,
 }
 
-/// 能力状态的回看窗口：Agent 只在采集项启动/状态变化时上报一次，所以要能查到很久之前的点。
+/// 能力状态的回看窗口。Agent 现在**随每轮采集重报**该状态（2026-10-01 起，见 TODO-13），
+/// 所以窗口不必这么久；保留 7 天是为了容忍 Agent 长时间离线后再回来、
+/// 以及防止「刚好跨过清理边界」造成的能力状态短暂缺失。
 pub const CAPABILITY_LOOKBACK_MICROS: i64 = 7 * 24 * 3600 * 1_000_000;
 
 /// 回看窗口内的查询步长（秒）。
@@ -550,12 +552,12 @@ pub const CAPABILITY_STEP_SECS: i64 = 3_600;
 
 /// 读 `agent_ebpf_capability` 指标的最新值。
 ///
-/// 指标由 Agent 在每个采集项启动时上报一次（`field_value=1/0`，标签带
+/// 指标由 Agent 随每轮采集上报（`field_value=1/0`，标签带
 /// `agent_id`/`item_id`/`kernel_ok`/`btf_ok`/`capability_ok`/`kernel_release`/`reason`）。
 ///
 /// **不能用 instant 查询 + 当前时间**：Prom 的 instant 查询只回看几分钟，而能力点是**状态**，
-/// 可能几小时前才上报过一次；那样会把「早就上报过不可用」显示成「没有上报」。这里改用
-/// 7 天范围查询并取每条序列的最后一个样本。
+/// Agent 离线一段时间后最后一次上报可能已经很久；那样会把「早就上报过不可用」显示成「没有上报」。
+/// 这里用范围查询并取每条序列的最后一个样本。
 pub async fn capability_report(
     ts: &dyn TimeSeriesStore,
 ) -> Result<CapabilityReport, DataplaneError> {

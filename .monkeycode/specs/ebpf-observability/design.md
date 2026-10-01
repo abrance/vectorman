@@ -97,7 +97,7 @@ graph TD
 | BTF 可用 | `std::fs::metadata("/sys/kernel/btf/vmlinux")` 可读 | 同上 |
 | 权限 | 读 `/proc/self/status` 的 `CapEff`，检查 bit 39（`CAP_BPF`）与 bit 38（`CAP_PERFMON`），或 euid 为 0 | 同上 |
 
-校验结果上报：Agent 在流索引上报一个 `data_type=metrics` 的采集状态点（measurement `agent_ebpf_capability`，`field_name` 为检查项名，值 1/0，tags 带 `agent_id`、`reason`），链路页据此展示。校验只做一次（进程启动）+ 采集项启用时复查（内核热升级后可能变化）。
+校验结果上报：Agent 在流索引上报一个 `data_type=metrics` 的采集状态点（measurement `agent_ebpf_capability`，`field_name` 为检查项名，值 1/0，tags 带 `agent_id`、`reason`），链路页据此展示。**校验**只做一次（进程启动）+ 采集项启用时复查（内核热升级后可能变化）；**上报**则随每轮采集重报（`flush_interval_secs`），原因见下方「能力状态必须周期重报」。
 
 内核态程序加载失败（`EPERM`/`EINVAL`/验证器拒绝）时：在 Agent 日志输出 warn 一行（含 `item_id`、错误码、`errno` 文本与建议动作），进入退避重试（30 秒起，×2，上限 10 分钟），成功后恢复正常采集并清零退避。卸载时先 detach 再 drop links，最后删除 map（aya 的 `Ebpf` drop 语义），保证重复启停幂等。
 
@@ -120,8 +120,14 @@ graph TD
 - **前端**：`/ebpf` 页把「能力状态」放在页首（而不是单独页签）：它回答的是「为什么没有 eBPF 数据」，
   对两个视图都相关；且必须区分「没有 Agent 上报」与「上报了但不可用」，否则会被误读成「没数据」。
   图表沿用仓库既有的手绘 SVG（不引 echarts），与 APM/拓扑页保持一致。
-- **能力状态查询不能用 instant + 当前时间**：Prom instant 只回看几分钟，而 `agent_ebpf_capability` 是**状态**点（Agent 在采集项启动时上报一次），
+- **能力状态查询不能用 instant + 当前时间**：Prom instant 只回看几分钟，而 `agent_ebpf_capability` 是**状态**点，
   用 instant 会把「几小时前上报过不可用」显示成「没有上报」。实现改用 7 天范围查询并取每条序列最后一个样本。
+- **能力状态必须周期重报**（2026-10-01 修，TODO-13）：指标原先只在采集项启动时上报一次，
+  而 dataserver 是按 7 天窗口取「最后一个样本」—— 一次性样本一旦被保留期清掉，
+  就只剩「没有数据」，而这正是最需要区分「不可用」与「没数据」的场景。
+  现在改为**随每轮采集一起上报**（与 `stats_metrics` 同一次 `sink.metrics`），
+  前置校验失败的分支也改成周期重报（该分支不采集，只重报状态）。
+  因此 `CAPABILITY_LOOKBACK_MICROS` 的 7 天窗口从「必须这么久」退化成「容错余量」，不必改。
 - **热更新**：复用采集框架的 `reconcile`（按 `item_id` + 配置指纹）—— 配置变更或 `enabled=false` 会 abort 采集任务，任务 drop 时 `Ebpf` 随之 drop，从而 detach link 并删除 map。
 
 ### 内核态程序与挂载点
