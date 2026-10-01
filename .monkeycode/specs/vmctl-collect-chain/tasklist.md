@@ -129,9 +129,9 @@
 - [x] 6.2 集成测试接环境变量开关：`VECTORMAN_E2E_URL` / `VECTORMAN_E2E_DATA_URL` 都设置时运行，
       否则跳过（与 `ebpf-live.test.tsx` 同一约定）。本机起真服务跑一次：
       `specs` / `spec get` / `status` 三条，记录实测输出。
-- [ ] 6.3 真机验收（cloud3 或 testbkee）：五条命令逐个执行，记录退出码与关键输出；
+- [x] 6.3 真机验收（cloud3 或 testbkee）：五条命令逐个执行，记录退出码与关键输出；
       含一条**刻意失败**的用例（例如对未保存 spec 的 Agent 跑 `status`，断言报错文案与退出码 1）。
-- [ ] 6.4 把 6.3 的实测结论追加到本文件下方「实现完成情况」一节。
+- [x] 6.4 把 6.3 的实测结论追加到本文件下方「实现完成情况」一节。
 - [x] 6.5 若实现中发现需求 / 设计口径错误，**先改 `requirements.md` / `design.md` 再改代码**，
       并在修订记录里写明原因（本仓库已多次踩「照抄过期口径」的坑）。
 
@@ -189,3 +189,66 @@
   只改注释不留价值，规格修订记录已承载该结论）。
 - **§6.3 真机验收**：本机三件套实测已完成（上表）；cloud3 / testbkee 真集群复跑待做
   （与 `observability-hardening` 的集群验证同批执行更省事）。
+
+## 9. 真集群验收结果（2026-10-01，cloud3 k3s）
+
+镜像 `ghcr.io/abrance/vectorman-server:v1.3.7-38c1edf`（digest `sha256:8d9348c2…`），
+经 `kubectl set image` 升级三件套；Agent 侧 `v1.3.6` 未动（本 feature 不改 Agent）。
+
+### 五条命令逐个实测
+
+| 命令 | 实测结果 | 退出码 |
+| --- | --- | --- |
+| `agents specs --table` | 4 台 Agent，全部 `synced`（`items` 1/1/4/1） | 0 |
+| `agents spec get ser539375215934 --table` | `session_state: online`、`applied.outcome: applied`、`diff: empty` | 0 |
+| `agents spec put cloud2-agent -f` | 200；`sync_status` 由 `synced` → **`stale`**；revision 变更 | 0 |
+| `agents spec apply cloud2-agent` | 返回 `ack`；5 秒后 `sync_status` 回到 `synced` | 0 |
+| `agents status cloud2/debian12/testbkee` | 三台 VM 全绿，`summary: ok` | **0** |
+| `agents status ser539375215934` | 3 reporting / 1 not_reporting（见下） | 1 |
+| `agents doctor ser539375215934` | 5 段完整：会话 `online`、`job_channel_available: true`、`capability reported: 4` | 1 |
+| `agents status ghost-agent` | 404 + `agent ghost-agent 没有 spec`（刻意失败用例） | 1 |
+
+### 「不补默认值」的实测证据（本 feature 最关键的正确性属性）
+
+对 `cloud2-agent` 只提交 `{"params":{"max_concurrent_jobs":2}}`，其余 params 一个不给：
+
+| 字段 | 提交前 | 提交后 | 结论 |
+| --- | --- | --- | --- |
+| `max_concurrent_jobs` | 1 | **2** | 改到了 |
+| `allowed_interpreters` | `["bash","sh","python3"]` | 同左 | **未被清空** |
+| `heartbeat_interval_secs` | 30 | 30 | 未变 |
+| `otlp_listen` | `0.0.0.0:4318` | 同左 | 未变 |
+
+若 CLI 照自己的默认值补全，`allowed_interpreters` 会被重置成默认集、
+Agent 上原有的三解释器配置会静默丢失 —— 真集群证实了这条口径是对的。
+验收后已按备份**完整还原**（7 个字段逐项核对一致）。
+
+### 抓到的 bug：`ebpf_tcp` 期望 data_type 写错（已单开 PR #116）
+
+`ser539375215934` 有 4 个 eBPF 采集项。`agents status` 实测：
+
+```
+item-…-0  ebpf_edges  25   reporting
+item-…-1  ebpf_edges   0   not_reporting   ← 误报
+item-…-2  metrics    621   reporting
+item-…-3  metrics    497   reporting
+```
+
+该 item 的 kind 是 `ebpf_tcp`，它**只产出指标**：`EbpfItemKind::emits_edges()`
+（`crates/gse-agent-ebpf/src/attach.rs:61`）只对 `Network` 为真 —— 它和 `ebpf_network`
+用不同 map（`TCP_AGG` vs `CONN_AGG`），两边都发边记录会因 sqlite 主键覆盖写而互相丢数据。
+它在 `metrics` 上 `accepted=11`，是**健康的**。
+
+用真集群抓下的 spec + streams 复算两版映射：初版 1 个 `not_reporting` → 修正后 4/4 `reporting`。
+
+**为什么单测与本机实测都没抓到**：本机 scratch 环境只造了 `metrics` 与 `ebpf_edges`
+两种流，没有 `ebpf_tcp` 的真实上报；我当初推映射的依据是「各采集器的 push 调用点」，
+但 `network` 与 `tcp` 共用同一条 `run_loop`（`collect/ebpf.rs` 的 `_ =>` 分支）、
+共用一个 `EbpfSink` 实现，光看调用点分不出哪个 kind 走哪条 —— 真正的依据是 `emits_edges()`。
+
+修法与防回归见 PR #116（新增 `ebpf_kinds_follow_emits_edges_contract`，
+把映射表锚在代码契约上）。
+
+### 环境现状
+
+集群仍运行 `v1.3.7`；PR #116 合入后需重发 `server/v1.3.8` 才算闭环。
