@@ -11,3 +11,7 @@ serde_json = { workspace = true }
 ureq = "2"
 urlencoding = "2"
 vectorman-version.workspace = true
+
+[features]
+# 让二进制的测试模块也能复用 lib 的脚本化 transport（Mock）。
+test-support = []

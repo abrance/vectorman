@@ -20,7 +20,7 @@
 | 采集链路 | Agent 注册与心跳、流索引、eBPF 能力状态；**跨 Agent 只读总览**（采集项与上报状态） | `/` |
 | Agent 配置中心 | 一台 Agent 一份 **spec**（运行参数 + 该 Agent 的采集项）：保存期望 → 手动下发 → 逐字段生效核验；`token` 轮换带双凭据宽限 | console：`/agent-configs`、`/agent-configs/:agent_id` |
 | 作业与台账 | Host/Agent/AccessPoint/DataPlane 台账、作业提交/查询/重做、模板、文件传输 | console：`/hosts` `/agents` `/jobs` … |
-| 运维 CLI | `dpc`（dataserver 全接口）、`vmctl`（gse-server 台账与作业） | — |
+| 运维 CLI | `dpc`（dataserver 全接口）、`vmctl`（gse-server 台账与作业 + **per-Agent spec 读写/下发与生效核验**） | — |
 
 ## 组件
 
@@ -29,7 +29,7 @@ bins/dataserver   数据平面：接入 + 五类存储 + 查询（SQL HTTP / Pro
 bins/dpc          dataserver 运维命令行（health/sql/query/logs/ts/traces/edges/ebpf-events/…）
 bins/gse-server   GSE 调度端：Agent 会话、心跳、per-Agent spec 下发、作业与台账（RPC + HTTP 管理口）
 bins/gse-agent    GSE 执行端：部署在被观测机器，主动外连；spec 热加载（含 SIGHUP 重读本地配置）
-bins/vmctl        gse-server 的 HTTP 客户端 CLI
+bins/vmctl        gse-server 的 HTTP 客户端 CLI（台账 / 作业 / spec 读写与生效核验）
 bins/console      桌面门户（聚合其它组件入口）
 
 frontend/apps/dataplane   数据平面界面（采集链路/指标/日志/trace/拓扑/APM/eBPF/设置）
@@ -61,6 +61,54 @@ cd frontend && npm run build:dataplane            # → 浏览器打开 http://<
 #    （运行参数 + 采集项：metrics_host / log_file / log_k8s_stdout / apm_otlp / ebpf_*）
 #    保存只写期望，点「下发」才推送；采集链路页只做只读总览
 ```
+
+## 用 vmctl 配采集链路（命令行闭环）
+
+从「写 spec → 下发 → 数据真的采上来 → 出问题定位」全在命令行完成，不切页面：
+
+```bash
+# 0) 数据面地址（缺省 http://127.0.0.1:8081，与 dpc --sql-url 一致）
+--data-url http://127.0.0.1:8081
+
+# 1) 看全部 Agent 的配置与生效状态（sync_status: synced / stale / rejected / unspecified / unknown）
+vmctl agents specs --table
+vmctl agents specs --agent-id agent-1 --table
+
+# 2) 读 / 写 / 下发单台 Agent 的 spec
+vmctl agents spec get agent-1 --table
+vmctl agents spec put agent-1 -f spec.json    # 只写台账，不推送
+vmctl agents spec apply agent-1               # 下发；Agent 离线返回 409
+
+# 3) 核验「采上来了没有」：逐采集项 × 逐 data_type
+vmctl agents status agent-1
+
+# 4) 出问题看整条链路：台账 / spec / 采集项 / eBPF 能力 / 数据面连通性
+vmctl agents doctor agent-1
+```
+
+`agents status` 的输出与退出码（可直接接脚本）：
+
+```
+agent_id: agent-1
+spec: synced
+
+item_id      data_type  interval  last_seen  accepted  verdict
+i-metrics    metrics    15        0s         1         reporting
+i-ebpf-proc  metrics    30        1h5m       1         stale
+i-logfile    logs       15                   0         disabled
+
+summary: not reporting: i-ebpf-proc (metrics)=stale
+```
+
+- **退出码**：`status` / `doctor` 全绿才 0，否则 1（脚本可直接判链路通断）；其余命令 2xx 为 0。
+- **一个采集项可能对应多个 data_type**（`ebpf_process` / `ebpf_syscall` 上报 `metrics`，
+  `ebpf_network` / `ebpf_tcp` 上报 `ebpf_edges`，`apm_otlp` 上报 `traces`），所以表里是
+  一行一个 `(item_id, data_type)`。
+- **`dirty`（未下发）与 `stale`（已下发未上报）是两件事**：保存过 spec 但没 `apply` 时
+  stream 不可能更新，输出会显式标 `dirty`，别误判成采集故障。
+- `spec put` **不补默认值**：请求体原样转发。服务端用「字段缺失 = 不修改」区分于「显式 null = 清空」，
+  所以只写你要改的字段即可；`token` / `otlp_token` 也只在写时下发，读回时恒为脱敏值。
+- **`spec put` 之后必须 `spec apply`** —— 保存不等于生效。
 
 管理端口默认只监听回环、不认证；对外暴露时用环境变量加密码（空 = 不认证）：
 
@@ -140,9 +188,10 @@ cargo run -p gse-agent-core --example render-upgrade-script -- /path/to/new-gse-
 | --- | --- |
 | dataserver | `POST /v1/ingest`（采集接入）、`POST /v1/sql`、`POST /v1/logs/search`、`POST /v1/traces/search`、`GET /v1/traces/{id}`、`POST /v1/edges/search`、`POST /v1/ebpf/events/search`、`GET /v1/ebpf/capability`、`GET /v1/streams`、`GET|POST /v1/apm/service-aliases`、`GET /v1/apm/services`、`GET /v1/ts/stats`、`POST /v1/ts/delete`、`/health` |
 | dataserver（Prom） | `GET /api/v1/query`、`GET /api/v1/query_range` |
-| gse-server | `/api/gse/{hosts,agents,access-points,dataplanes,collect-items,agent-configs,jobs,job-templates,job-files}`、`/health` |
+| gse-server | `/api/gse/{hosts,agents,access-points,dataplanes,agent-specs,jobs,job-templates,job-files}`、
+`GET|PUT /api/gse/agents/{agent_id}/spec`、`POST /api/gse/agents/{agent_id}/spec/apply`、`/health` |
 
-`/v1/collect-items*` 在 dataserver 上是**反代到 GSE 管理口**（需 `gse_admin_url`）。
+`/v1/agent-specs` 在 dataserver 上是**只读反代到 GSE 管理口**（需 `gse_admin_url`）。
 鉴权中间件已装配，v1 默认关闭（`NoopAuth`）。
 
 ## eBPF 可观测的前置条件
@@ -172,7 +221,15 @@ cargo run -p gse-agent-core --example render-upgrade-script -- /path/to/new-gse-
 - syscall 采集里**只有 `openat` 带路径**（read/write/fsync 没有路径来源），路径仅出现在慢调用事件里且截断 256 字节；
 - 时序聚合指标的删除周期配置有**下限 60 秒**；
 - 跨进程并发写同一 `data_path` 不做文件锁，由调用方保证；
-- 前端没有真实浏览器 e2e：现有验证是 jsdom 渲染 + 真实接口（能挡住字段漂移，覆盖不到 CSS/布局）。
+- 前端没有真实浏览器 e2e：现有验证是 jsdom 渲染 + 真实接口（能挡住字段漂移，覆盖不到 CSS/布局）；
+- `vmctl agents status` / `doctor` 的 stream 读取依赖 dataserver 的 `GET /v1/streams`，
+  而 dataserver **默认无鉴权**（`[auth] enabled = false`）—— 未开鉴权时该读取同样裸奔；
+- `vmctl agents status` 对「一个采集项对应多个 data_type」取**任一未上报即判未通**的严格口径：
+  「部分上报」在链路上就是断的；eBPF 的原始事件（`ebpf`）不在核验范围（它是可选开关，
+  关掉不算故障）；
+- gse-server 管理口鉴权**默认关闭**（`GSE_SERVER_ADMIN_PASSWORD` 空 = 不认证），
+  未开启时 `vmctl --password` 无意义，`spec put` / `spec apply` 靠网络边界保护；
+- `vmctl` 没有 `data` 子命令（dataserver 查询仍用 `dpc`）—— 已评估过，见规格修订记录。
 
 ## 数据路径
 
