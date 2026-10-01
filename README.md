@@ -241,6 +241,10 @@ cargo run -p gse-agent-core --example render-upgrade-script -- /path/to/new-gse-
 - `vmctl agents status` 对「一个采集项对应多个 data_type」取**任一未上报即判未通**的严格口径：
   「部分上报」在链路上就是断的；eBPF 的原始事件（`ebpf`）不在核验范围（它是可选开关，
   关掉不算故障）；
+- `ebpf_edges` 是**事件驱动**的（只有出现新建连接才有记录），而 `status` 的 `stale` 阈值是
+  周期型口径（`max(3 × interval, 60)` 秒）—— **空闲节点上它可能报 `stale` 而链路其实是好的**。
+  判断「边到底有没有在采」请看派生指标：`vmctl data query --expr 'ebpf_edge_connections_total'`
+  有没有**当前时间**的样本（派生指标每分钟更新）。判定语义的改进见 `ebpf-observability/todo.md` TODO-15；
 - gse-server 管理口鉴权**默认关闭**（`GSE_SERVER_ADMIN_PASSWORD` 空 = 不认证），
   未开启时 `vmctl --password` 无意义，`spec put` / `spec apply` 靠网络边界保护；
 - `vmctl` 与 `dpc` 都能查 dataserver：`vmctl data <子命令>` 与 `dpc <子命令>` 是**同一份实现**

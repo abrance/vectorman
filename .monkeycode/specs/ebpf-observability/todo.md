@@ -540,3 +540,23 @@ curl -s "http://127.0.0.1:19090/api/v1/query?query=ebpf_edge_connections_total"
   `result=invalid` 停止增长、`vmctl agents status` 的 `ebpf_edges` 一行不再是 `stale`。
 - **测试**：`zero_connection_delta_skips_edge_and_counts`（无新建连接 → 无记录且计数 +1）、
   `parses_partial_reply_failures` / `parses_ok_reply_without_failures`（应答解析）。
+
+## 二·补 TODO-15（中）`vmctl agents status` 对事件驱动型 data_type 误报 `stale`
+
+- **发现于** 2026-10-01 的收尾巡检：`vmctl agents status ser539375215934` 的
+  `item-…-0 ebpf_edges` 判 `stale`，`summary: not reporting`；但同一时刻
+  `ebpf_edge_connections_total` 有 **517 条序列、最新样本 0 分钟前** —— 边链路是好的。
+- **根因**：`status.rs::threshold_secs` 用「周期型」口径 `max(3 × interval, 60)` 秒判所有 data_type。
+  而 `ebpf_edges` 是**事件驱动**的：按 TODO-14 的修法，只有「本桶有新建连接」才产出边记录，
+  所以空闲节点几十分钟没有新边是正常的（实测该节点原始边流 212 秒没动，派生指标却每分钟在更新）。
+- **影响**：假报警。运维会去追一个不存在的问题；更糟的是「狼来了」之后，真正的边链路故障
+  （TODO-14 那次连续 8 分钟以上零记录且 `accepted` 冻结）也会被当成噪声。
+- **可选修法**（需先定判定语义，故登记而不擅自改）：
+  1. **给事件驱动型单独的阈值下限**：`ebpf_edges` 用 `max(3 × interval, 15 分钟)`，
+     口径仍是 `stale`，不改退出码规则 —— 改动最小，但「安静」与「坏掉」仍然共用一个结论。
+  2. **新增 `idle` 判定**：事件驱动型且历史上报过、只是当前窗口无新记录 → `idle`（不算失败，
+     退出码不受影响），与 `stale`（超过长窗口仍无记录 = 大概率坏了）区分开。
+     语义最准，但要动 Requirement 5 的判定集合、`doctor` 的复用与退出码规则。
+  - 倾向 2（这个命令的价值就在「结论可信」，用同一个 stale 表达两件事迟早误导人）。
+- **验收**：空闲节点上 `status` 不再把 `ebpf_edges` 判成故障；而把边记录人为停掉
+  （例如下发 `connections == 0` 的旧版本 agent）后，长窗口内仍能判出「确实没在采」。
