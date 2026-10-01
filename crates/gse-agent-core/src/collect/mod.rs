@@ -195,7 +195,23 @@ fn post_ingest(agent: &ureq::Agent, ingest_url: &str, env: &DataEnvelope) -> Dis
                 return Disposition::Repull;
             }
             match reply {
-                Some(r) if r.status == "ok" || r.status == "partial" => Disposition::Confirm,
+                Some(r) if r.status == "ok" => Disposition::Confirm,
+                Some(r) if r.status == "partial" => {
+                    // 部分记录被服务端拒了：这些记录**不会重试**（重试也还是同样的字段问题），
+                    // 但必须让运维看得见 —— 否则就是「服务端拒了 6400 条、Agent 一声不吭」。
+                    // 只在真的被拒时打日志（正常路径 `status=ok` 一行为不打）。
+                    if let Some(first) = r.failures.first() {
+                        eprintln!(
+                            "gse-agent: ingest partial batch={} accepted={} rejected={} first={} ({})",
+                            r.batch_id,
+                            r.accepted,
+                            r.failures.len(),
+                            first.message,
+                            first.record_id
+                        );
+                    }
+                    Disposition::Confirm
+                }
                 Some(r) if r.code.as_deref() == Some("unavailable") => Disposition::Repull,
                 _ => Disposition::Retry,
             }
