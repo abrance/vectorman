@@ -135,11 +135,15 @@ jobs / job-files），**per-Agent spec 的读、写、下发在 CLI 侧完全缺
   | `metrics_host` | `metrics` |
   | `log_file`、`log_k8s_stdout` | `logs` |
   | `apm_otlp` | `traces` |
-  | `ebpf_network`、`ebpf_tcp` | `ebpf_edges` |
+  | `ebpf_network` | `ebpf_edges` |
+  | `ebpf_tcp` | `metrics` |
   | `ebpf_process`、`ebpf_syscall` | `metrics` |
 
-  映射依据：`crates/gse-agent-core/src/collect/ebpf.rs` 的 `EbpfSink::{edges,metrics,raw_events}`
-  与 `metrics.rs` / `logfile.rs` / `k8s.rs` / `otlp.rs` 的 `shared.push(...)` 调用点。
+  映射依据：`crates/gse-agent-ebpf/src/attach.rs` 的 `EbpfItemKind::emits_edges()`
+  （**仅 `Network` 为真**；`ebpf_tcp` 与 `ebpf_network` 用不同 map，两边都发边记录会因
+  sqlite 主键覆盖写而互相丢数据）与 `crates/gse-agent-core/src/collect/ebpf.rs` 的
+  `EbpfSink::{edges,metrics,raw_events}` 调用点，以及 `collect/{metrics,logfile,k8s,otlp}.rs`
+  的 `shared.push(...)`。
   验收：WHEN 某采集项的 kind 不在上表（新 kind），THE vmctl SHALL 以 `unknown_kind` 标注该行而不中断命令。
 - 验收：THE vmctl SHALL 逐 `(item_id, data_type)` 输出一行，含 `item_id`、`data_type`、stream 的
   `last_seen_micros`（无 stream 时为空）、stream 的 `accepted`（无 stream 时为 0）、
