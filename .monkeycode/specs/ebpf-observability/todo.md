@@ -490,6 +490,9 @@ curl -s "http://127.0.0.1:19090/api/v1/query?query=ebpf_edge_connections_total"
 
 ## 二·补 TODO-14（高）`connections == 0` 的边记录被服务端整条拒 —— 边数据几乎全丢（✅ 已修复 v1.3.10）
 
+> ✅ **已修复（v1.3.10，2026-10-01）**，线上复验：`accepted` 持续增长、`invalid` 停止增长，
+> `ebpf_edge_connections_total` 从 0 → 328 条序列，`vmctl agents doctor` 该段恢复 `reporting`。
+
 - **发现于** 2026-10-01 `vmctl agents doctor` 真集群复验（`vmctl-collect-chain` §11）：
   `agents status ser539375215934` 的 `ebpf_edges` 一项长期 `stale`，而同一采集项的指标照常上报。
 - **实测证据**（cloud3，dataserver 自监控）：

@@ -326,3 +326,35 @@ summary: not reporting …                  summary: ok   (exit 0)
 
 > 两条都不是本 feature 引入的，但都是本 feature 的命令**第一次真正跑起来**才暴露的 ——
 > 这正是 §11 那句话的注脚：命令做完了，不等于链路是通的。
+
+### 11.2 修复后的复验（v1.3.10，2026-10-01）
+
+`abrance/vectorman#118` → `agent/v1.3.10`（`v1.3.10`，镜像 `v1.3.10-b30d698`），
+k8s 节点用 `ctr pull`+`tag`+`set image`，三台 VM 用 `file_transfer`+`agent_upgrade`。
+
+**边记录（TODO-14）的修复证据**（dataserver 自监控，75 秒窗口）：
+
+| 计数器 | 修复后 t0 | t0 + 75s |
+| --- | --- | --- |
+| `ingest_records_total{data_type="ebpf_edges",result="accepted"}` | 2794 | **3037**（持续增长） |
+| `ingest_records_total{data_type="ebpf_edges",result="invalid"}` | 16325 | **16325（停止增长）** |
+
+- `GET /api/v1/query?query=ebpf_edge_connections_total` → **328 条序列**（修复前 0 条）
+- `ebpf_edges` 流的 `last_seen` 从 480 秒+ 回到 **1～2 秒**
+- 四台 Agent 全部升到 `1.3.10`（台账 `version` 自动跟随）
+
+**五条命令最终状态（`summary: ok`，退出码 0）**
+
+```
+== collect items ==
+item-1790554921748537-0  ebpf_edges  2s   29   reporting   ← 修复前长期 stale
+item-1790554922302785-1  metrics     7s   13   reporting
+item-1790554922845489-2  metrics     3s   908  reporting
+item-1790554923409501-3  metrics     6s   511  reporting
+== ebpf capability ==
+reported: 6      unavailable: none
+summary: ok
+```
+
+> `doctor` 至此**没有已知盲区**：v1.3.9 修掉能力段（`reported: 0`），v1.3.10 修掉边记录（`stale`）。
+> 这两条都是它自己跑起来才暴露的 —— 命令的真正价值在这里，不在「能打印表格」。
