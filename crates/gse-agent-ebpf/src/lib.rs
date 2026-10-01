@@ -243,10 +243,14 @@ pub async fn run_loop(
         }
         report_cpu(&mut cpu, &stats, &item_id, cfg.max_cpu_percent);
         // 自监控：限流丢弃/map 满/读取失败这些「没报错但出事了」的情况要能在 Prom 上看见。
-        sink.metrics(
-            &item_id,
-            stats_metrics(&agent_id, &item_id, &stats.snapshot()),
-        );
+        //
+        // 能力状态随每轮**重报**：它是「状态」而非「事件」，而 dataserver 的
+        // `capability_report` 是按 7 天窗口取每条序列的**最后一个样本**。只在启动时报一次的话，
+        // 样本被保留期清掉后就只剩「没有数据」，分不清「eBPF 不可用」与「没数据」
+        // （实测：`vmctl agents doctor` 的能力段读成 `reported: 0`，而 eBPF 数据照常上报）。
+        let mut records = stats_metrics(&agent_id, &item_id, &stats.snapshot());
+        records.push(capability_metric(&agent_id, &report, &item_id));
+        sink.metrics(&item_id, records);
         let bucket_ts = bucket_start(now_micros(), cfg.bucket_secs);
 
         let mut edges = Vec::new();
@@ -934,11 +938,17 @@ mod tests {
         assert!(edges[1]["src_service"].as_str().unwrap().is_empty());
 
         let metrics = sink.metrics.lock().unwrap().clone();
+        let capability = metrics
+            .iter()
+            .filter(|m| m["measurement"] == "agent_ebpf_capability")
+            .count();
+        assert!(capability >= 1, "能力状态必须先上报");
+        // **逐轮重报回归**：能力状态是「状态」而非「事件」，dataserver 按 7 天窗口取最后一个
+        // 样本；只上报一次的话，样本被保留期清掉后就分不清「eBPF 不可用」与「没数据」
+        // （实测：`vmctl agents doctor` 能力段读成 `reported: 0`）。间隔 1s、跑 2.4s → 至少两轮。
         assert!(
-            metrics
-                .iter()
-                .any(|m| m["measurement"] == "agent_ebpf_capability"),
-            "能力状态必须先上报"
+            capability >= 2,
+            "能力状态应随每一轮重报，实际只发了 {capability} 次"
         );
     }
 

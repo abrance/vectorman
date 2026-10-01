@@ -326,6 +326,13 @@ exec/exit/fork、以及新加的 syscall。**长期存在的 key 被严重少计
 
 ## 二·补 TODO-13（中）`agent_ebpf_capability` 只在采集器启动时上报一次，重启后 `/v1/ebpf/capability` 变空
 
+> ✅ **已修复（v1.3.9，2026-10-01）**：采「择一」的**方案 1（周期性重报）**。
+> 改法：`run_loop` 里把 `capability_metric` 并入每轮的 `stats_metrics`（同一次 `sink.metrics`）；
+> 前置校验失败的分支也改成周期重报（该分支不再采集，只重报状态）。
+> 回归测试：`loop_emits_edges_from_fake_snapshots` 增加「能力点至少 2 次」的断言
+> （去掉逐轮重报即失败：「实际只发了 1 次」）。
+> 下面保留问题分析，作为「状态型指标不能只上报一次」这个口径的记录。
+
 - **发现于** 2026-10-01 的 `vmctl agents doctor` 真集群验收（`vmctl-collect-chain` feature）。
   该命令的「eBPF 能力」段读到 `reported: 0`，而四台 Agent 的 eBPF 采集项都在正常上报数据。
 - **实测证据**（cloud3，dataserver `v1.3.8`）：

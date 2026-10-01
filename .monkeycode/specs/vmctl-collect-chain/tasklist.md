@@ -294,3 +294,15 @@ summary: not reporting …                  summary: ok   (exit 0)
 `drop oldest batch data_type=… records=…`（缓冲淘汰）。
 恢复后 `status` 即回到全绿。**这意味着滚动重启 dataserver 会丢一批缓冲数据**，
 属既有的背压/淘汰行为，与本次改动无关，但升级窗口建议避开数据密集期。
+
+## 11. `doctor` 能力段盲区的收口（2026-10-01，v1.3.9）
+
+§10 记录的 TODO-13（`agent_ebpf_capability` 只在采集器启动时上报一次 → `doctor` 的「eBPF 能力」段
+读成 `reported: 0`）**已修复**：Agent 侧改为随每轮采集重报能力状态（含前置校验失败分支）。
+
+对 `doctor` 的意义：该段此前**在本 feature 落地的当天就已经是坏的**（不是后来才坏的），
+表现为「有 eBPF 数据但能力未知」，而不是「不可用」。修复后四台 Agent 的
+`vmctl agents doctor` 该段恢复 `reported=N`，五个命令至此没有已知盲区。
+
+修复落在 `ebpf-observability`（Agent 侧），本 feature 只做验收：
+`GET /v1/ebpf/capability` 的 `reported` 恢复为环境中 eBPF 采集项数。

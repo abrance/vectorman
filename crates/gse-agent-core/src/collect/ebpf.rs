@@ -119,15 +119,22 @@ pub async fn run_item(
             report.reason.clone().unwrap_or_default(),
             report.advice.clone().unwrap_or_default()
         );
-        sink.metrics(
-            &item_id,
-            vec![gse_agent_ebpf::capability_metric(
-                &shared.agent_id,
-                &report,
+        // **周期性重报**「不可用」：能力状态是状态不是事件，dataserver 按 7 天窗口取最后样本
+        // （见 `capability_report`）。只报一次的话，样本被保留期清掉后链路页就只能看到
+        // 「没有数据」，而这恰好是「区分不可用与没数据」最需要它的时候（todo TODO-13）。
+        // 本项已不采集，这里就只干这一件事（任务会在重连/重下发时被 abort）。
+        let interval = std::time::Duration::from_secs(config.flush_interval_secs.max(1));
+        loop {
+            sink.metrics(
                 &item_id,
-            )],
-        );
-        return;
+                vec![gse_agent_ebpf::capability_metric(
+                    &shared.agent_id,
+                    &report,
+                    &item_id,
+                )],
+            );
+            tokio::time::sleep(interval).await;
+        }
     }
 
     // 可用性上报一次（链路页据此区分「eBPF 不可用」与「没有数据」）。
