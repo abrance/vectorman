@@ -19,8 +19,13 @@ pub const KIND_DATA_TYPES: &[(&str, &[&str])] = &[
     ("log_file", &["logs"]),
     ("log_k8s_stdout", &["logs"]),
     ("apm_otlp", &["traces"]),
+    // `ebpf_network` 是本家族里**唯一**产出边记录的（`EbpfItemKind::emits_edges`）。
     ("ebpf_network", &["ebpf_edges"]),
-    ("ebpf_tcp", &["ebpf_edges"]),
+    // `ebpf_tcp` **只产出指标**：它与 `ebpf_network` 用不同的 map（`TCP_AGG` vs `CONN_AGG`），
+    // 若两边都发边记录，同一个 `record_id` 会被后写的覆盖（sqlite 主键覆盖写）→ 两侧数据互丢。
+    // 故它没有 `ebpf_edges`。这条在 2026-10-01 的 cloud3 真集群验收中实测抓到：
+    // 初版写成 `ebpf_edges`，导致现网一个健康的 `ebpf_tcp` 采集项被报成 `not_reporting`。
+    ("ebpf_tcp", &["metrics"]),
     ("ebpf_process", &["metrics"]),
     ("ebpf_syscall", &["metrics"]),
 ];

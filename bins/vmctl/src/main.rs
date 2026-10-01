@@ -665,9 +665,33 @@ mod tests {
         assert_eq!(f("log_k8s_stdout"), vec!["logs"]);
         assert_eq!(f("apm_otlp"), vec!["traces"]);
         assert_eq!(f("ebpf_network"), vec!["ebpf_edges"]);
-        assert_eq!(f("ebpf_tcp"), vec!["ebpf_edges"]);
+        // `ebpf_tcp` 只出指标（`emits_edges()` 仅对 Network 为真）——
+        // 初版写成 ebpf_edges，在 cloud3 真集群上把一个健康的采集项报成了 not_reporting。
+        assert_eq!(f("ebpf_tcp"), vec!["metrics"]);
         assert_eq!(f("ebpf_process"), vec!["metrics"]);
         assert_eq!(f("ebpf_syscall"), vec!["metrics"]);
+    }
+
+    /// 把 CLI 的映射表锚在**代码自身的契约**上：`epbf_*` 家族里只有 `ebpf_network`
+    /// 声明产出边记录（`EbpfItemKind::emits_edges`）。若哪天某采集项改了产出类型，
+    /// 这条会在本地就红，而不是等到真集群上把健康采集项报成 `not_reporting`。
+    #[test]
+    fn ebpf_kinds_follow_emits_edges_contract() {
+        let f = |k: &str| {
+            status::KIND_DATA_TYPES
+                .iter()
+                .find(|(x, _)| *x == k)
+                .map(|(_, t)| t.to_vec())
+                .unwrap_or_default()
+        };
+        // 契约：emits_edges() 仅 Network 为真 -> 只有它期望 ebpf_edges。
+        assert_eq!(f("ebpf_network"), vec!["ebpf_edges"]);
+        for k in ["ebpf_tcp", "ebpf_process", "ebpf_syscall"] {
+            assert!(
+                !f(k).contains(&"ebpf_edges"),
+                "{k} 不产出边记录（emits_edges() 为假），不应期望 ebpf_edges"
+            );
+        }
     }
 
     #[test]

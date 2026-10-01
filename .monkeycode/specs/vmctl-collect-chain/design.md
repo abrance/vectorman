@@ -181,18 +181,27 @@ GSE 侧 `GET /api/gse/agents/{id}/spec` 的响应（`crates/gse-server-core/src/
 ### kind → data_type 映射（判定核心）
 
 ```rust
-/// 一个采集项可能产出多个 data_type。依据是各采集器的 push 调用点（见 design 参考脚注 1）。
+/// 一个采集项可能产出多个 data_type。依据是 `EbpfItemKind::emits_edges()`（仅 Network 为真）
+/// 与各采集器的 push 调用点（见 design 参考脚注 1）。
 const KIND_DATA_TYPES: &[(&str, &[&str])] = &[
     ("metrics_host",    &["metrics"]),
     ("log_file",        &["logs"]),
     ("log_k8s_stdout",  &["logs"]),
     ("apm_otlp",        &["traces"]),
     ("ebpf_network",    &["ebpf_edges"]),
-    ("ebpf_tcp",        &["ebpf_edges"]),
+    ("ebpf_tcp",        &["metrics"]),   // 只出指标，不出边记录
     ("ebpf_process",    &["metrics"]),
     ("ebpf_syscall",    &["metrics"]),
 ];
 ```
+
+**`ebpf_tcp` 不是 `ebpf_edges`（真集群实测抓到）**：`EbpfItemKind::emits_edges()` 只对
+`Network` 为真 —— `ebpf_tcp` 与 `ebpf_network` 用不同的聚合 map（`TCP_AGG` vs `CONN_AGG`），
+若两边都发边记录，同一个 `record_id` 会被后写的覆盖（sqlite 主键覆盖写），两侧数据互相丢。
+
+初版把 `ebpf_tcp` 写成 `ebpf_edges`，在 2026-10-01 的 cloud3 验收中把一个**健康的**
+`ebpf_tcp` 采集项报成了 `not_reporting`（该采集项在 `metrics` 上 `accepted=11`）。
+现已加测试 `ebpf_kinds_follow_emits_edges_contract` 把这个表锚在代码契约上。
 
 注意 `ebpf_*` 还会往 `ebpf`（原始事件）写，但**原始事件是可选开关**（`raw_events_enabled`），
 把它纳入核验会把「刻意关掉原始事件」误判成采集故障，故**不纳入**。`accepted` 只看聚合/指标这两类。
