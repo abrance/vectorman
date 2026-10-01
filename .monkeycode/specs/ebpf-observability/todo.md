@@ -324,6 +324,34 @@ exec/exit/fork、以及新加的 syscall。**长期存在的 key 被严重少计
 
 - **验收**：P2 按需求 6/7 的验收标准；P3 按 tasklist 第 9 节。
 
+## 二·补 TODO-13（中）`agent_ebpf_capability` 只在采集器启动时上报一次，重启后 `/v1/ebpf/capability` 变空
+
+- **发现于** 2026-10-01 的 `vmctl agents doctor` 真集群验收（`vmctl-collect-chain` feature）。
+  该命令的「eBPF 能力」段读到 `reported: 0`，而四台 Agent 的 eBPF 采集项都在正常上报数据。
+- **实测证据**（cloud3，dataserver `v1.3.8`）：
+  - `GET /api/v1/query?query=agent_ebpf_capability` → **0 条序列**
+  - 同环境 `ebpf_process_exec_total` 300 条序列、`ebpf_edge_connections_total` 134 条序列
+    → 采集链路正常，只有能力指标缺失。
+- **根因**：Agent 侧 `capability_metric` 是**一次性上报**，注释明确写「可用性上报一次」
+  （`crates/gse-agent-core/src/collect/ebpf.rs:133` 与 `crates/gse-agent-ebpf/src/lib.rs:222`，
+  两处都在采集循环**之前**各发一次）。而 dataserver 的
+  `capability_report`（`crates/dataplane-apm/src/ebpf_metrics.rs:559`）是从**时序库**
+  按 7 天窗口查最新样本 —— 一次性写入的指标一旦因保留期清理、
+  或该时间点没有其它写入把它带过去，就查不到了。
+- **影响**：`/v1/ebpf/capability` 与 `/ebpf` 页的能力卡片会在「采集器启动后经过一段时间」
+  变空（表现为「reported: 0」而非「不可用」）；`vmctl agents doctor` 的能力段同理。
+  **不**影响采集本身 —— 数据照常上报，只是「eBPF 到底能不能用」这个自描述丢了。
+- **可选修法**（择一，需先确认哪条与「链路页据此区分不可用/没数据」的原意一致）：
+  1. **周期性重报**：把能力指标并入采集循环，按 `flush_interval_secs` 随每轮指标一起上报
+     （成本几乎为零，指标已带 `agent_id`/`item_id` 标签，重复写同序列）。
+  2. **dataserver 侧兜底**：`capability_report` 在窗口内查不到时，回退到
+     `agent_ebpf_capability` 之外的证据（例如该 Agent 有无任何 `ebpf*` 序列），
+     至少把「有数据但能力未知」与「完全没数据」区分开。
+  - 倾向 1：修在源头，且顺带让「采集项被停用后能力状态过期」这类问题一起消失。
+- **验收**：重启 dataserver（或等待超过保留期清理一轮）后，
+  `GET /v1/ebpf/capability` 仍在 `max(2 × flush_interval, 5 分钟)` 内恢复到
+  `reported=N`（N = 该环境的 eBPF 采集项数）；`vmctl agents doctor` 的该段不再输出 `reported: 0`。
+
 ## 三、工程缺口与维护约定
 
 ### TODO-12（高）前端测试不在 CI 里 —— ✅ 已完成

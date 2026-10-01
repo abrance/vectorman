@@ -252,3 +252,45 @@ item-…-3  metrics    497   reporting
 ### 环境现状
 
 集群仍运行 `v1.3.7`；PR #116 合入后需重发 `server/v1.3.8` 才算闭环。
+
+## 10. 修复后的真集群复验（2026-10-01，cloud3，`server/v1.3.8-a7f2be8`）
+
+PR #116 合入后重发并部署 `v1.3.8`，**四台 Agent 全部全绿**：
+
+| Agent | items | `agents status` 结论 | 退出码 |
+| --- | --- | --- | --- |
+| cloud2-agent | 1 | `summary: ok` | 0 |
+| debian12-agent | 1 | `summary: ok` | 0 |
+| ser539375215934 | 4 | `summary: ok` | 0 |
+| testbkee | 1 | `summary: ok` | 0 |
+
+`ser539375215934` 修复前后对比（同一台机、同一批采集项）：
+
+```
+修复前 (v1.3.7)                          修复后 (v1.3.8)
+item-…-0  ebpf_edges  25  reporting       item-…-0  ebpf_edges  33  reporting
+item-…-1  ebpf_edges   0  not_reporting   item-…-1  metrics     11  reporting  ← 修好
+item-…-2  metrics    621  reporting       item-…-2  metrics    630  reporting
+item-…-3  metrics    497  reporting       item-…-3  metrics    524  reporting
+summary: not reporting …                  summary: ok   (exit 0)
+```
+
+`agents doctor ser539375215934` 同样 `summary: ok`（退出码 0）。
+
+### 顺带发现（已记 `ebpf-observability/todo.md` 的 TODO-13，不在本 feature 修）
+
+`doctor` 的「eBPF 能力」段读到 `reported: 0`，但同环境 eBPF 数据在正常上报
+（`ebpf_process_exec_total` 300 条序列、`ebpf_edge_connections_total` 134 条序列，
+而 `agent_ebpf_capability` 为 **0 条**）。根因是能力指标**只在采集器启动时上报一次**，
+而 dataserver 是按 7 天窗口从时序库查 —— 一次性写入的样本会因保留期清理而查不到。
+
+这是**本 feature 之外**的既有问题（不改 Agent / dataserver），
+但正是新增的 `doctor` 命令把它暴露出来的 —— 已单开 TODO 并给出两个可选修法。
+
+### 部署过程的一个观察（运维注意）
+
+`kubectl set image` 滚动期间 dataserver 短暂不可用，Agent 日志出现
+`dataplane_addr unavailable: no online dataplane` 与
+`drop oldest batch data_type=… records=…`（缓冲淘汰）。
+恢复后 `status` 即回到全绿。**这意味着滚动重启 dataserver 会丢一批缓冲数据**，
+属既有的背压/淘汰行为，与本次改动无关，但升级窗口建议避开数据密集期。
