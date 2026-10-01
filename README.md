@@ -20,7 +20,7 @@
 | 采集链路 | Agent 注册与心跳、流索引、eBPF 能力状态；**跨 Agent 只读总览**（采集项与上报状态） | `/` |
 | Agent 配置中心 | 一台 Agent 一份 **spec**（运行参数 + 该 Agent 的采集项）：保存期望 → 手动下发 → 逐字段生效核验；`token` 轮换带双凭据宽限 | console：`/agent-configs`、`/agent-configs/:agent_id` |
 | 作业与台账 | Host/Agent/AccessPoint/DataPlane 台账、作业提交/查询/重做、模板、文件传输 | console：`/hosts` `/agents` `/jobs` … |
-| 运维 CLI | `dpc`（dataserver 全接口）、`vmctl`（gse-server 台账与作业 + **per-Agent spec 读写/下发与生效核验**） | — |
+| 运维 CLI | `vmctl`（gse-server 台账与作业 + **per-Agent spec 读写/下发与生效核验** + **dataserver 查询与运维 `data`**）、`dpc`（老的 dataserver 专用入口，与 `vmctl data` 同实现） | — |
 
 ## 组件
 
@@ -29,7 +29,7 @@ bins/dataserver   数据平面：接入 + 五类存储 + 查询（SQL HTTP / Pro
 bins/dpc          dataserver 运维命令行（health/sql/query/logs/ts/traces/edges/ebpf-events/…）
 bins/gse-server   GSE 调度端：Agent 会话、心跳、per-Agent spec 下发、作业与台账（RPC + HTTP 管理口）
 bins/gse-agent    GSE 执行端：部署在被观测机器，主动外连；spec 热加载（含 SIGHUP 重读本地配置）
-bins/vmctl        gse-server 的 HTTP 客户端 CLI（台账 / 作业 / spec 读写与生效核验）
+bins/vmctl        gse-server 的 HTTP 客户端 CLI（台账 / 作业 / spec 读写与生效核验 / dataserver 查询）
 bins/console      桌面门户（聚合其它组件入口）
 
 frontend/apps/dataplane   数据平面界面（采集链路/指标/日志/trace/拓扑/APM/eBPF/设置）
@@ -84,7 +84,21 @@ vmctl agents status agent-1
 
 # 4) 出问题看整条链路：台账 / spec / 采集项 / eBPF 能力 / 数据面连通性
 vmctl agents doctor agent-1
+
+# 5) 查数据本身：`data` 子命名空间（与 dpc 同一份实现，11 个子命令）
+vmctl --data-url http://127.0.0.1:8081 --prom-url http://127.0.0.1:9090 data health
+vmctl data query --expr 'cpu_usage{agent_id="agent-1"}'   # Prom 即时查询
+vmctl data logs  --agent-id agent-1 --limit 20             # 日志检索
+vmctl data edges --limit 20                                # 服务拓扑边
+vmctl data traces --status error --limit 20                # trace 列表 / data trace <id>
+vmctl data ebpf-capability                                 # eBPF 能力状态
+vmctl data ts stats                                        # 时序存储状态（基数/内存/WAL）
+vmctl data sql --stmt 'select 1'                           # SQL 口
 ```
+
+`vmctl data` 的命令与参数与 `dpc` **逐个对应**，只是从 `dpc --sql-url X …` 改成
+`vmctl --data-url X … data …`（`--sql-url` 仍作为 `--data-url` 的别名被接受）。
+`ts delete` 是其中唯一会改数据的命令。
 
 `agents status` 的输出与退出码（可直接接脚本）：
 
@@ -229,7 +243,9 @@ cargo run -p gse-agent-core --example render-upgrade-script -- /path/to/new-gse-
   关掉不算故障）；
 - gse-server 管理口鉴权**默认关闭**（`GSE_SERVER_ADMIN_PASSWORD` 空 = 不认证），
   未开启时 `vmctl --password` 无意义，`spec put` / `spec apply` 靠网络边界保护；
-- `vmctl` 没有 `data` 子命令（dataserver 查询仍用 `dpc`）—— 已评估过，见规格修订记录。
+- `vmctl` 与 `dpc` 都能查 dataserver：`vmctl data <子命令>` 与 `dpc <子命令>` 是**同一份实现**
+  （`dpc` crate 的 lib），参数名、输出、退出码一致；`dpc` 仍保留以便旧脚本平滑过渡。
+  唯一会**改数据**的是 `data ts delete`（按序列删历史点），其余只读。
 
 ## 数据路径
 

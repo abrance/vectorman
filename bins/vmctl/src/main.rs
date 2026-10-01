@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use vmctl::{
     Client, DataClient, JobRerunSpec, JobSubmitSpec, UreqTransport, WaitPolicy, DEFAULT_BASE_URL,
-    DEFAULT_DATA_URL,
+    DEFAULT_DATA_URL, DEFAULT_PROM_URL,
 };
 
 mod doctor;
@@ -25,9 +25,15 @@ struct Cli {
     #[arg(long)]
     password: Option<String>,
 
-    /// dataserver SQL 口根地址（仅 `agents status` / `agents doctor` 使用）
-    #[arg(long, default_value = DEFAULT_DATA_URL)]
+    /// dataserver SQL 口根地址（`agents status` / `agents doctor` / `data` 子命名空间使用）
+    ///
+    /// `--sql-url` 是别名，兼容 `dpc` 的写法 —— 同一个口只允许一个真源。
+    #[arg(long, alias = "sql-url", default_value = DEFAULT_DATA_URL)]
     data_url: String,
+
+    /// dataserver Prom 查询口根地址（仅 `data query` 使用）
+    #[arg(long, default_value = DEFAULT_PROM_URL)]
+    prom_url: String,
 
     #[command(subcommand)]
     command: Command,
@@ -51,6 +57,11 @@ enum Command {
     Jobs {
         #[command(subcommand)]
         cmd: Box<JobsCmd>,
+    },
+    /// dataserver 查询与运维（复用 `dpc` 的实现；`ts delete` 是唯一会改数据的子命令）
+    Data {
+        #[command(subcommand)]
+        cmd: dpc::Command,
     },
 }
 
@@ -270,6 +281,9 @@ fn cmd_spec_get<T: vmctl::Transport>(
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // `data` 分支要复用这两个地址（`dpc` 的 SQL 口就是这里的 `--data-url`），
+    // 而下面构造 `DataClient` 会把它们 move 走，所以先留一份。
+    let data_endpoints = dpc::Endpoints::new(cli.data_url.clone(), cli.prom_url.clone());
     // 环境变量兜底：密码不该出现在命令行（`ps` 可见）与 shell 历史里。
     let password = cli
         .password
@@ -311,6 +325,9 @@ fn main() -> ExitCode {
             AgentsCmd::Status { agent_id, .. } => status::run(&client, &data, &agent_id),
             AgentsCmd::Doctor { agent_id } => doctor::run(&client, &data, &agent_id),
         },
+        // 复用 `dpc` 的实现：透传输出与 `url=… reason=… code=…` 错误口径都由
+        // `dpc::dispatch` 负责（这里不能再包一层，否则双前缀），所以直接 `return`。
+        Command::Data { cmd } => return dpc::dispatch(&data_endpoints, &cmd),
         Command::Jobs { cmd } => match *cmd {
             JobsCmd::List {
                 agent_id,
@@ -465,16 +482,107 @@ mod tests {
     // ---- T1: `--help` 层级（需求 R1）----
 
     #[test]
-    fn top_level_has_exactly_four_subcommands() {
+    fn top_level_subcommands_are_fixed_set() {
         use clap::CommandFactory;
         let cmd = Cli::command();
         let mut names: Vec<&str> = cmd.get_subcommands().map(|c| c.get_name()).collect();
         names.sort_unstable();
+        // `data` 是 2026-10-01 规格修订加进来的（Requirement 9，复用 `dpc` 实现）；
+        // 除此之外**不再新增**顶层子命令 —— 尤其不能加 `agent` 单数（会与 `agents` 撞名）。
         assert_eq!(
             names,
-            vec!["agents", "health", "hosts", "jobs"],
-            "新增顶层子命令 = 违反 R1（agent 单数会与 agents 撞名）"
+            vec!["agents", "data", "health", "hosts", "jobs"],
+            "顶层子命令集合变了：确认这是规格修订过的，而不是随手加的"
         );
+    }
+
+    /// `data` 必须与 `dpc` 一一对应（Requirement 9）：名称与参数名一致，否则
+    /// 「把 dpc 的能力放进 vmctl」就变成了一份走样的影子实现。
+    #[test]
+    fn data_mirrors_all_dpc_subcommands() {
+        use clap::CommandFactory;
+        let vmctl_cmd = Cli::command();
+        let data = vmctl_cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "data")
+            .expect("data");
+        let mut ours: Vec<&str> = data.get_subcommands().map(|c| c.get_name()).collect();
+        ours.sort_unstable();
+
+        let dpc_cmd = <dpc::Cli as CommandFactory>::command();
+        let mut theirs: Vec<&str> = dpc_cmd.get_subcommands().map(|c| c.get_name()).collect();
+        theirs.sort_unstable();
+
+        assert_eq!(ours, theirs, "vmctl data 的子命令必须与 dpc 完全一致");
+        assert!(
+            ours.contains(&"ebpf-capability") && ours.contains(&"ts"),
+            "抽样确认：{ours:?}"
+        );
+    }
+
+    /// `--sql-url` 只能是 `--data-url` 的**别名**（同一个口一个真源）。
+    #[test]
+    fn sql_url_is_alias_of_data_url() {
+        let by_data = Cli::try_parse_from(["vmctl", "--data-url", "http://x:1", "health"])
+            .expect("--data-url");
+        let by_alias = Cli::try_parse_from(["vmctl", "--sql-url", "http://x:1", "health"])
+            .expect("--sql-url 应作为别名被接受");
+        assert_eq!(by_data.data_url, by_alias.data_url);
+        assert_eq!(by_alias.data_url, "http://x:1");
+    }
+
+    /// `data` 的参数绑定：可选参数省略、位置参数、`--prom-url` 缺省。
+    #[test]
+    fn data_subcommands_parse_arguments() {
+        let cli = Cli::try_parse_from([
+            "vmctl",
+            "--prom-url",
+            "http://p:9090",
+            "data",
+            "query",
+            "--expr",
+            "cpu_usage",
+        ])
+        .expect("data query");
+        match cli.command {
+            Command::Data {
+                cmd: dpc::Command::Query { expr, time },
+            } => {
+                assert_eq!(expr, "cpu_usage");
+                assert!(time.is_none(), "省略时间参数不应报错");
+            }
+            _ => panic!("解析成了别的子命令"),
+        }
+        assert_eq!(cli.prom_url, "http://p:9090");
+        assert_eq!(cli.data_url, DEFAULT_DATA_URL, "SQL 口用缺省值");
+
+        // 纯位置参数（`trace <trace_id>`）
+        let cli = Cli::try_parse_from(["vmctl", "data", "trace", "abc123"]).expect("data trace");
+        assert!(matches!(
+            cli.command,
+            Command::Data {
+                cmd: dpc::Command::Trace { .. }
+            }
+        ));
+
+        // 子命令 + 子子命令（`ts delete` 是唯一会改数据的命令）
+        let cli = Cli::try_parse_from([
+            "vmctl",
+            "data",
+            "ts",
+            "delete",
+            "--from-ts",
+            "1",
+            "--to-ts",
+            "2",
+        ])
+        .expect("data ts delete");
+        assert!(matches!(
+            cli.command,
+            Command::Data {
+                cmd: dpc::Command::Ts { .. }
+            }
+        ));
     }
 
     #[test]
