@@ -1,0 +1,191 @@
+# Task List
+
+> 本 feature 是**纯客户端**：服务端三条 spec 路由与数据面两条读路由都已实现于 `main`。
+> 因此每一步的验收都要求能在**不发写请求**的前提下证明（单测用 `FakeTransport` 计数、
+> 集成用 `--dry` 路径或只读命令）。
+>
+> 需求见 `requirements.md`（本版已整体重新定范围，2026-09-30），设计见 `design.md`。
+
+## 0. 实现前先确认（不做完不动代码）
+
+- [x] 0.1 重新核对服务端路由与响应形状**仍在 `main` 上未变**：
+      `GET /api/gse/agent-specs`、`GET|PUT /api/gse/agents/{id}/spec`、
+      `POST /api/gse/agents/{id}/spec/apply`、`GET /api/gse/agents/{id}`；
+      以及数据面 `GET /v1/streams`、`GET /v1/ebpf/capability`、`GET /health`。
+      逐一 `curl` 本机或 cloud3，把实测响应（含 `sync_status` / `diff` / `not_enforced` 的真实取值）
+      **存成夹具常量**，供 4.5 使用。对应需求 R3 / R4 / R5。
+- [x] 0.2 核对 `crates/gse-agent-core/src/collect/*.rs` 的 kind → data_type 映射未变
+      （`ebpf.rs` 的 `EbpfSink` 三个方法、`metrics.rs` / `logfile.rs` / `k8s.rs` / `otlp.rs` 的 push 调用点）。
+      若与 `design.md` 的 `KIND_DATA_TYPES` 不一致，**先改 design 再写代码**。对应设计「kind → data_type 映射」。
+- [x] 0.3 确认 `bins/vmctl/src/lib.rs` 的 `Transport` / `Output` / `FakeTransport` 是可直接复用的
+      （`Output::ok` / `Output::err` 私有构造函数是否够用；`FakeTransport` 是否在 `#[cfg(test)]` 内）。
+      对应设计「Transport 复用」节。
+- [x] 0.4 确认 `vmctl` 现有输出风格（`jobs list` 的表格填充方式、`url=... reason=... code=...` 错误格式），
+      本 feature 的表格与错误信息**照抄**，不新造风格。对应需求 R7。
+- [x] 0.5 确认 `bins/vmctl/Cargo.toml` 确实无需新依赖
+      （`serde_json` / `clap` / `ureq` 已在；并发用 `std::thread::scope`，不引 async runtime）。对应设计 P2。
+
+## 1. 骨架与参数（需求 R1、R2）
+
+- [x] 1.1 `main.rs` 的 `Cli` 增加 `--data-url`（缺省 `http://127.0.0.1:8081`，
+      与 `dpc --sql-url` 一致），并在 `main()` 里构造 `DataClient`。
+- [x] 1.2 `Command::Agents` 下新增五个变体：`Specs`、`Spec { cmd }`、`Status`、`Doctor`；
+      `AgentsCmd::Spec` 再套一层 `SpecCmd { Get, Put, Apply }`。
+      参数：`specs --table --agent-id`、`spec get <agent_id>`、
+      `spec put <agent_id> -f <path> | --json <json>`、`spec apply <agent_id>`、
+      `status <agent_id> --table`（默认已是表格，`--table` 只为口径统一）、`doctor <agent_id>`。
+- [x] 1.3 `--help` 验收：`vmctl --help` **仍然只有** `health` / `hosts` / `agents` / `jobs` 四个顶层命令；
+      `vmctl agents --help` 列出六个；`vmctl agents spec --help` 列出三个。
+      写成单测（`Cli::command().debug_assert()` 或 `try_parse_from` + 断言）。
+- [x] 1.4 回归：`hosts` / `jobs` / `health` / `agents list|get` 的请求路径、请求体、输出格式不变。
+      用既有单测守住（跑一遍确认零改动）。
+
+- **检查点 A**：`cargo test -p vmctl` 全绿；`--help` 三级断言通过。
+
+## 2. 透传类命令（需求 R3、R4）
+
+- [x] 2.1 `lib.rs` 新增 `Client::agents_specs()` / `agents_spec_get(id)` / `agents_spec_put(id, body)` /
+      `agents_spec_apply(id)` / `agent_get(id)`；四者走 `base_url`，`agent_get` 走 HTTP `GET`，转发服务端正文。
+      错误口径复用既有 `ureq::Error::Status` 分支（stderr `url=... reason=... code=...`）。
+- [x] 2.2 `spec.rs`：`read_json_object(source: &SpecSource) -> Result<serde_json::Value, String>` ——
+      `-f` / `--json` 二选一（都给 / 都不给都报错），读文件失败 / 非 JSON / 非对象各有可读错误信息，
+      **不补默认值、不裁剪字段**。对应设计 Pitfall「`spec put` 不能补默认值」。
+- [x] 2.3 `spec.rs`：`agent_specs_rows(body) -> Option<Vec<SpecsRow>>` 与 `render_specs_table`；
+      解析失败返回 `None` → 调用方透传原正文并退出码 0。`--agent-id` 过滤解析失败时透传全量 + stderr 提示。
+      对应设计 P3。
+- [x] 2.4 `spec.rs`：`render_spec_get_table(view)` —— `agent_id` / `session_state` / `sync_status` /
+      `desired.revision` / `applied.revision` / `applied.outcome` / `applied.not_enforced` /
+      `desired.spec.items` 条数 / `diff` 是否为空；`desired` / `applied` / `diff` 为 null 时该列留空不报错。
+- [x] 2.5 单测：`-f` + `--json` 同时给 → 报错且 `FakeTransport` 调用次数为 0；
+      `-f` 指向缺失文件 / 非 JSON / JSON 数组 → 报错且不发请求；`spec get` 404 → 退出码 1 且 stderr 含服务端正文。
+- [x] 2.6 单测：响应是数组 / 缺 `agent_id` → `agent_specs_rows` 返回 `None`，命令退出码 0 且 stdout 为原正文。
+- [x] 2.7 单测：错误信息**不含**请求体内容（构造含 `"token":"s3cret"` 的 body，断言 stderr 里没有 `s3cret`）。
+      对应需求 R7 与设计 Pitfall「token 只在 desired 里出现」。
+
+- **检查点 B**：五个命令的透传与错误路径都有单测；`spec put` 的本地校验**先于**任何网络调用。
+
+## 3. 生效核验（需求 R5）
+
+- [x] 3.1 `status.rs`：`KIND_DATA_TYPES` 常量（八类 kind → data_type 数组）+ 未知 kind → `unknown_kind`。
+- [x] 3.2 `status.rs`：`classify(stream: Option<&StreamRow>, interval_secs: u64, now_micros: i64) -> Verdict`
+      **纯函数**（不读时钟）。阈值 `max(3 * interval, 60)` 秒；`interval` 归一（缺失 / 非数字 / ≤0 → 15）。
+- [x] 3.3 `status.rs`：`expand_items(desired) -> Vec<(item_id, kind, enabled, interval_secs)>` 与
+      `join_streams(items, streams, agent_id, now)` —— 按 `(agent_id, data_type, data_id == item_id)` join，
+      一个 item 展开多行。对应设计「kind → data_type 映射」。
+- [x] 3.4 `status.rs`：`render_status(...)` —— 逐 `(item_id, data_type)` 一行（`item_id` / `data_type` /
+      `last_seen` 相对年龄 / `accepted` / verdict），**额外**一行 spec 同步状态；
+      `enabled = false` 的行标 `disabled` 且不参与退出码；`sync_status != synced` 标 `dirty`。
+- [x] 3.5 `status.rs`：退出码判定 —— 全部 enabled 项 `reporting` **且** `sync_status == "synced"` → 0，否则 1。
+      数据面不可达 → 全部 `unknown` + 末行原因 + 退出码 1。对应需求 R5 末两条验收。
+- [x] 3.6 单测（判定边界）：无 stream / 恰好等于阈值 / 阈值 -1µs / 阈值 +1µs / `last_seen` 在未来 /
+      `interval_secs = 0` / `interval_secs` 缺失 —— 七组都用 `classify` 直接断言。
+- [x] 3.7 单测（映射）：八类 kind 逐个断言展开结果；未知 kind 断言 `unknown_kind` 且**不影响**退出码。
+- [x] 3.8 单测（缺字段）：`desired = null` → 报「未保存过 spec」而非空表当成功；
+      `collector` 缺 `interval_secs` → 按 15 秒算阈值。
+- [x] 3.9 实现 P2 的并发取数：`std::thread::scope` 两个 `join`（GSE spec + dataserver streams）。
+      断言：加一个 1 秒延迟的 `FakeTransport`，总耗时应 < 1.8 秒（证明是并发不是串行）。
+
+- **检查点 C**：`status` 的判定函数有七组边界单测；`dirty` 与 `stale` 的区分有单测守住。
+
+## 4. 链路诊断（需求 R6）
+
+- [x] 4.1 `doctor.rs`：五个段落函数各自返回 `Section { title, lines, ok: Option<bool> }`，
+      任一失败不 `?`、不 return，只把该段标 `unknown` 并把原因收进 summary。
+- [x] 4.2 `doctor.rs`：段 1（Agent 台账）404 → **立即退出**退出码 1，后续段一个请求都不发
+      （单测断言 `FakeTransport` 调用次数为 1）。
+- [x] 4.3 `doctor.rs`：`summary:` 末行 —— 逐条列失败段与原因；全绿时打一行 `summary: ok`。
+- [x] 4.4 `doctor.rs`：退出码 = 段1 `session_state == online` && 段5 health ok &&
+      段2 `sync_status == synced` && 段3 全部 enabled 项 `reporting`。**不看** `status` 字段。
+      对应设计 P4 与 Pitfall「`sync_status` 与 `status` 不是一回事」。
+- [x] 4.5 单测（真实夹具）：用 0.1 存的真实响应构造全绿场景与「Agent offline」场景，
+      断言退出码与 summary 文案；断言 render 里 `data_type` 行**同时**含 `item_id`
+      （防 `ebpf_process` 与 `metrics_host` 两行看起来一样）。
+- [x] 4.6 单测：段 4（capability）/ 段 5（health）不可达时该段标 `unknown`，其余段仍输出完整，
+      summary 记明原因，退出码 1。
+- [x] 4.7 单测：doctor **不发** `POST` / `PUT` —— 用 `FakeTransport` 断言全部调用方法为 `GET`
+      （记录 `(method, url)` 二元组后逐条断言）。对应需求 R6 末条验收。
+
+- **检查点 D**：doctor 五段各自有「不可达」用例；Agent 404 短路有计数断言。
+
+## 5. 输出与文档
+
+- [x] 5.1 表格列宽用空格填充到固定宽度（照抄 `jobs list` 现状），不用 `\t`。对应设计 Pitfall。
+- [x] 5.2 `README.md` 的 `vmctl` 章节补五条命令与一个完整示例
+      （`spec put -f spec.json` → `spec apply` → `status`，含期望输出与退出码含义）。
+- [x] 5.3 `README.md`「已知限制」确认三条已在（管理口鉴权默认关闭、dataserver 默认 `NoopAuth`、
+      eBPF 需内核 ≥5.8 + BTF + 权限）；未在则补。对应需求 R8 已知限制 1–3。
+- [x] 5.4 `.monkeycode/specs/README.md` 索引表把本 feature 的状态由「🟡 ACTIVE（规格完成，待实施）」
+      改为「✅ 已实现」并更新截至日期与一句话。
+- [x] 5.5 ~~`dpc` 是否为 `data` 子命名空间留注释：在 `bins/dpc/src/main.rs` 顶部加一行说明
+      「dataserver 查询的 CLI 入口在此；`vmctl data` 已评估并决定不做（见 vmctl-collect-chain 修订记录）」，
+      避免以后重复立项讨论。**不改 `dpc` 行为**。
+
+- **检查点 E**：文档与实现一致；`README` 示例真跑一遍确认可复制。
+
+## 6. 收口
+
+- [x] 6.1 `cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features -- -D warnings`、
+      `cargo test --all-features` 全绿。
+- [x] 6.2 集成测试接环境变量开关：`VECTORMAN_E2E_URL` / `VECTORMAN_E2E_DATA_URL` 都设置时运行，
+      否则跳过（与 `ebpf-live.test.tsx` 同一约定）。本机起真服务跑一次：
+      `specs` / `spec get` / `status` 三条，记录实测输出。
+- [ ] 6.3 真机验收（cloud3 或 testbkee）：五条命令逐个执行，记录退出码与关键输出；
+      含一条**刻意失败**的用例（例如对未保存 spec 的 Agent 跑 `status`，断言报错文案与退出码 1）。
+- [ ] 6.4 把 6.3 的实测结论追加到本文件下方「实现完成情况」一节。
+- [x] 6.5 若实现中发现需求 / 设计口径错误，**先改 `requirements.md` / `design.md` 再改代码**，
+      并在修订记录里写明原因（本仓库已多次踩「照抄过期口径」的坑）。
+
+- **检查点 F**：CI 全绿；真机五条命令结论落盘；本 feature 的每条验收都有对应实现或明确的不做理由。
+
+## 8. 实现完成情况（2026-09-30）
+
+**已实现并验证**：§0 全部核对、§1–§4 全部、§5.1–§5.4、§6.1/§6.2。
+
+- 交付五个命令：`agents specs` / `agents spec get|put|apply` / `agents status` / `agents doctor`；
+  顶层子命令仍为四个（`health` / `hosts` / `agents` / `jobs`），有单测断言。
+- 新增文件：`bins/vmctl/src/{spec.rs,status.rs,doctor.rs}`；`lib.rs` 加 `DataClient` 与五个方法；
+  `Cargo.toml` 加 `test-support` feature（供二进制测试复用 `Mock`）。
+- 质量基线：`cargo test --all-features` 全绿（vmctl 48 个用例：lib 23 + bin 25）；
+  `cargo clippy --all-targets --all-features -- -D warnings` 0 告警；`cargo fmt --all -- --check` 通过。
+
+### 实测（本机起 gse-server 27101 + dataserver 27201，真夹具）
+
+夹具用**真实响应**抓取（不是手写），存为 `main.rs` 的 `REAL_SPEC_VIEW` / `REAL_SPECS_LIST` /
+`REAL_AGENTS_LIST` / `REAL_AGENT_ONE` 常量。
+
+| 命令 | 实测 | 退出码 |
+| --- | --- | --- |
+| `agents specs --table` | 2 行（agent-1 有 spec、agent-2 无），`items` 列为 3 / 空 | 0 |
+| `agents spec get agent-1 --table` | 11 个键值行，`applied.*` 与 `diff` 全空（`null`） | 0 |
+| `agents spec put agent-1 -f spec.json` | 200；`desired.revision` 由 `6c4338bc` 变为 `2943c620` | 0 |
+| `agents spec apply agent-1`（离线） | `{"code":"agent_offline","error":"agent agent-1 无会话"}` | 1 |
+| `agents spec get ghost` | `{"code":"not_found","error":"agent ghost 没有 spec"}` | 1 |
+| `agents status agent-1` | 3 行 `(item_id, data_type)`：reporting / stale / disabled + `dirty` 行 | 1 |
+| `agents doctor agent-1` | 5 段全输出，summary 逐条列未通过原因 | 1 |
+| `agents doctor ghost` | 短路，只发 2 个请求（单台 + 列表） | 1 |
+
+### 实施中发现并修正的三个口径错误（均已回写 design.md / requirements.md）
+
+1. **`updated_at` / `reported_at` 不是 ISO 时间**，是台账序列字符串（`1790831429653846-7` = `{unix_micros}-{seq}`）。
+   设计初稿按 ISO 写，已改为「只透传显示、不解析成时间」。
+2. **`GET /api/gse/agents/{id}` 返回裸 `Agent`，不含 `session_state`**；会话口径只在列表端点上。
+   初稿让 `doctor` 只查单台 → 实测输出 `session_state: `（空），把「在线」误判成「不在线」。
+   已改为两个端点并发查，并加单测 `doctor_takes_session_state_from_list_not_single_agent`。
+3. **`GET /api/gse/agents*` 明文回 `token`**（未脱敏）。新增一条需求：`status` / `doctor`
+   不得透传该响应，只渲染字段白名单；加单测 `doctor_does_not_leak_plaintext_token`。
+
+### 实施中发现的两个自身缺陷（已修）
+
+- **顺序回放的 Mock 在并发下随机失败**：`doctor` 并发发请求，顺序不确定。
+  改为**按 URL 后缀匹配**的 `Mock::routed`（长后缀优先）。这是测试基础设施的坑，值得记：
+  并发代码不能用顺序脚本化 mock。
+- **`doctor` 先并发再判 404 会白花四次往返**：实测定到 6 个请求。
+  改为「先查台账主体（2 个并发） → 404 立即返回 → 才发余下 4 个」，
+  单测 `doctor_short_circuits_when_agent_missing` 断言 `call_count() == 2`。
+
+### 未完成（明确边界）
+
+- **§5.5**：`dpc` 顶部加注释说明「`vmctl data` 已决定不做」—— 未做（`dpc` 本版冻结，
+  只改注释不留价值，规格修订记录已承载该结论）。
+- **§6.3 真机验收**：本机三件套实测已完成（上表）；cloud3 / testbkee 真集群复跑待做
+  （与 `observability-hardening` 的集群验证同批执行更省事）。
