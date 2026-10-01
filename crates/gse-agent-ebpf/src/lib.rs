@@ -254,9 +254,10 @@ pub async fn run_loop(
         // `capability_report` 是按 7 天窗口取每条序列的**最后一个样本**。只在启动时报一次的话，
         // 样本被保留期清掉后就只剩「没有数据」，分不清「eBPF 不可用」与「没数据」
         // （实测：`vmctl agents doctor` 的能力段读成 `reported: 0`，而 eBPF 数据照常上报）。
-        let mut records = stats_metrics(&agent_id, &item_id, &stats.snapshot());
-        records.push(capability_metric(&agent_id, &report, &item_id));
-        sink.metrics(&item_id, records);
+        sink.metrics(
+            &item_id,
+            interval_records(&agent_id, &item_id, &report, &stats),
+        );
         let bucket_ts = bucket_start(now_micros(), cfg.bucket_secs);
 
         let mut edges = Vec::new();
@@ -332,6 +333,7 @@ pub async fn run_process_loop(
     cfg: EbpfConfig,
     item_id: String,
     agent_id: String,
+    report: PreflightReport,
     stats: Arc<EbpfStats>,
 ) {
     let mut minute = ProcessMinuteAccumulator::default();
@@ -354,6 +356,12 @@ pub async fn run_process_loop(
         if limited > 0 {
             stats.rate_limited.fetch_add(limited, Ordering::Relaxed);
         }
+        // 无条件每轮上报：能力状态必须持续可见，自监控计数也才有时间序列
+        // （进程项此前只在有进程指标时才写点，能力状态因此会过期）。
+        sink.metrics(
+            &item_id,
+            interval_records(&agent_id, &item_id, &report, &stats),
+        );
         let bucket_ts = bucket_start(now_micros(), cfg.bucket_secs);
 
         for (key, per_cpu) in snapshot {
@@ -412,6 +420,7 @@ pub async fn run_syscall_loop(
     cfg: EbpfConfig,
     item_id: String,
     agent_id: String,
+    report: PreflightReport,
     stats: Arc<EbpfStats>,
 ) {
     let interval = Duration::from_secs(cfg.flush_interval_secs.max(1));
@@ -438,7 +447,7 @@ pub async fn run_syscall_loop(
         report_cpu(&mut cpu, &stats, &item_id, cfg.max_cpu_percent);
         sink.metrics(
             &item_id,
-            stats_metrics(&agent_id, &item_id, &stats.snapshot()),
+            interval_records(&agent_id, &item_id, &report, &stats),
         );
 
         let timestamp = now_micros();
@@ -758,6 +767,25 @@ fn report_cpu(
         ),
         _ => {}
     }
+}
+
+/// 每轮都要上报的通用记录：**能力状态** + 自监控计数。
+///
+/// 三个采集循环（连接 / 进程 / syscall）共用它，避免「只有连接循环重报能力」这类漏项 ——
+/// 能力状态是「状态」而非「事件」，dataserver 的 `capability_report` 按 7 天窗口取每条序列的
+/// **最后一个样本**；哪个循环漏报，那类采集项的能力就会随保留期清理而消失
+/// （实测：只有连接循环重报时，`/v1/ebpf/capability` 的 `reported` 从 4 掉到 2，
+/// 而环境里正好有 4 个采集项，其中 2 个是 `ebpf_process` / `ebpf_syscall`）。
+#[must_use]
+pub fn interval_records(
+    agent_id: &str,
+    item_id: &str,
+    report: &PreflightReport,
+    stats: &EbpfStats,
+) -> Vec<serde_json::Value> {
+    let mut records = stats_metrics(agent_id, item_id, &stats.snapshot());
+    records.push(capability_metric(agent_id, report, item_id));
+    records
 }
 
 /// 约束统计快照 → `agent_ebpf_*` 指标点（需求 12.3：统计算并输出每项限制的触发次数与被丢弃的数据量）。
@@ -1086,6 +1114,26 @@ mod tests {
         assert_eq!(
             raw_event_record("agent-1", &unknown, 0)["event_type"],
             "unknown_99"
+        );
+    }
+
+    /// **能力状态必须随每轮上报，且三个采集循环共用同一个构造**（回归：只修连接循环时，
+    /// `/v1/ebpf/capability` 的 `reported` 会随保留期清理从 4 掉到 2）。
+    #[test]
+    fn interval_records_always_include_capability() {
+        let stats = EbpfStats::default();
+        let records = interval_records("agent-1", "item-ebpf", &ok_report(), &stats);
+        let names: Vec<&str> = records
+            .iter()
+            .filter_map(|r| r["measurement"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"agent_ebpf_capability"),
+            "每轮必须带能力状态: {names:?}"
+        );
+        assert!(
+            names.contains(&"agent_ebpf_flushes_total"),
+            "每轮同时带自监控计数: {names:?}"
         );
     }
 

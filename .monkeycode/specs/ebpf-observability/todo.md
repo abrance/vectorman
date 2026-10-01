@@ -326,11 +326,23 @@ exec/exit/fork、以及新加的 syscall。**长期存在的 key 被严重少计
 
 ## 二·补 TODO-13（中）`agent_ebpf_capability` 只在采集器启动时上报一次，重启后 `/v1/ebpf/capability` 变空
 
-> ✅ **已修复（v1.3.9，2026-10-01）**：采「择一」的**方案 1（周期性重报）**。
-> 改法：`run_loop` 里把 `capability_metric` 并入每轮的 `stats_metrics`（同一次 `sink.metrics`）；
-> 前置校验失败的分支也改成周期重报（该分支不再采集，只重报状态）。
-> 回归测试：`loop_emits_edges_from_fake_snapshots` 增加「能力点至少 2 次」的断言
-> （去掉逐轮重报即失败：「实际只发了 1 次」）。
+> ✅ **已修复（v1.3.9 起，v1.3.12 才修完，2026-10-01）**：采「择一」的**方案 1（周期性重报）**。
+>
+> ⚠️ **v1.3.9 只修了一半**：改动只落在 `run_loop`（连接型采集项 `ebpf_network` / `ebpf_tcp`），
+> 而 `ebpf_process` / `ebpf_syscall` 走另外两个循环（`run_process_loop` / `run_syscall_loop`），
+> 仍然只在启动时报一次。表现是修完当天 `reported` 一度到 6，随后**随保留期清理往下掉**；
+> 验收时读到 `reported: 2` 而该环境正好有 4 个 eBPF 采集项 —— 才发现漏项。
+> **教训**：修「某处漏了」时先数清有几个入口（`grep` 三个 `run_*_loop`），
+> 别只改自己刚看过的那一个；这类「一个能力多个循环各自实现」的结构，
+> 修法应该是**抽一个共用的构造**，而不是在每个循环里各写一遍。
+>
+> v1.3.12 的修法：新增 `gse_agent_ebpf::interval_records(agent_id, item_id, report, stats)`
+> （能力状态 + 自监控计数），**三个采集循环统一调它**；`run_process_loop` / `run_syscall_loop`
+> 增加 `report` 参数（调用点原先写的是 `let _ = report;` —— 这正是「当时就没打算报」的痕迹）。
+> 回归测试：`interval_records_always_include_capability`（构造必须含能力点）+
+> `loop_emits_edges_from_fake_snapshots`（逐轮至少 2 次）。
+> 前置校验失败的分支仍保留自己的周期重报循环（它不进任何采集循环）。
+>
 > 下面保留问题分析，作为「状态型指标不能只上报一次」这个口径的记录。
 
 - **发现于** 2026-10-01 的 `vmctl agents doctor` 真集群验收（`vmctl-collect-chain` feature）。

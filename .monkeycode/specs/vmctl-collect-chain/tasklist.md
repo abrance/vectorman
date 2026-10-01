@@ -444,3 +444,20 @@ summary: ok
 **测试**：`cargo test -p vmctl --features test-support` 23 + 29 全绿（含新增的别名、参数绑定、
 命令树一致性 4 条）；`cargo test -p dpc` 5 条照旧；`cargo test --workspace --all-features` 全绿；
 clippy `-D warnings` 0 告警；fmt 干净。
+
+### 11.3 验收时发现的残留：能力状态仍会「掉项」（v1.3.12）
+
+§11.2 的验收表里 `reported: 6` 被当成「已修好」，**实际是半成品**：v1.3.9 只给连接型采集项
+（`ebpf_network` / `ebpf_tcp`，走 `run_loop`）加了逐轮重报，`ebpf_process` / `ebpf_syscall`
+（走 `run_process_loop` / `run_syscall_loop`）仍只在启动时报一次。
+
+- **暴露方式**：用发布包的 `vmctl data ebpf-capability` 复验时读到 `reported=2`，而该环境有 4 个 eBPF 采集项；
+  查 7 天窗口发现只有 `item-…-0` / `item-…-1` 两条序列还有样本 —— 另两条的启动期样本已被保留期清掉。
+  数字轨迹也从侧面印证：修复当天 6 → 之后 2（随清理单调下降）。
+- **修法**（v1.3.12）：新增 `gse_agent_ebpf::interval_records(agent_id, item_id, report, stats)`，
+  三个采集循环统一调用；`run_process_loop` / `run_syscall_loop` 补 `report` 参数
+  （调用点原先的 `let _ = report;` 就是漏报的痕迹）。
+- **验收**：升级后 `reported` 应稳定等于该环境的 eBPF 采集项数（cloud3 = 4），且**不再随天数下降**。
+
+> 给这套命令的教训也记在这里：`doctor` / `ebpf-capability` 这类「状态查询」要**隔一段时间再看一次**，
+> 单点读数会把「正在掉」的趋势当成正常值。
