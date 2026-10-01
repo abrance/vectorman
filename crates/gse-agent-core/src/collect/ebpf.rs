@@ -285,12 +285,10 @@ async fn run_loaded(
     };
     match kind {
         EbpfItemKind::Process => {
-            let _ = report;
-            run_process_loop(source, sink, config, item_id, agent_id, stats).await;
+            run_process_loop(source, sink, config, item_id, agent_id, report, stats).await;
         }
         EbpfItemKind::Syscall => {
-            let _ = report;
-            run_syscall_loop(source, sink, config, item_id, agent_id, stats).await;
+            run_syscall_loop(source, sink, config, item_id, agent_id, report, stats).await;
         }
         // network/tcp 走连接差分循环；`ebpf_tcp` 只出指标（边记录由 `emits_edges` 决定）。
         _ => {
