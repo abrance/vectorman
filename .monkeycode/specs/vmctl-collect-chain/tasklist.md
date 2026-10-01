@@ -461,3 +461,18 @@ clippy `-D warnings` 0 告警；fmt 干净。
 
 > 给这套命令的教训也记在这里：`doctor` / `ebpf-capability` 这类「状态查询」要**隔一段时间再看一次**，
 > 单点读数会把「正在掉」的趋势当成正常值。
+
+#### 11.3.1 修复后的复验（v1.3.12，2026-10-01）
+
+`agent/v1.3.12`（`v1.3.12`，镜像 `v1.3.12-3e44c79`），k8s 节点 `ctr` 换镜像、三台 VM 升级。
+
+```
+$ vmctl --data-url https://dataserver.xiaoyxq.top data ebpf-capability
+reported=4   items=['0','1','2','3']   unavailable=[]      ← 连查三次均为此值
+```
+
+对照：修复前 `reported=2`（只有 `item-…-0`/`…-1` 两条序列还有样本），且随保留期清理继续下降。
+现在 `reported` 与该环境的 eBPF 采集项数（4）一致，`unavailable` 为空。
+
+四台 Agent 全部 `1.3.12`（台账 `version` 自动跟随；`cloud2-agent` / `debian12-agent` / `testbkee`
+无 eBPF 采集项，升级只为版本对齐）。

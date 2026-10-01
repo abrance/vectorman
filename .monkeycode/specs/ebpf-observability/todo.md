@@ -343,6 +343,9 @@ exec/exit/fork、以及新加的 syscall。**长期存在的 key 被严重少计
 > `loop_emits_edges_from_fake_snapshots`（逐轮至少 2 次）。
 > 前置校验失败的分支仍保留自己的周期重报循环（它不进任何采集循环）。
 >
+> **复验（v1.3.12 上线后）**：`GET /v1/ebpf/capability` 的 `reported` 稳定为 **4**
+> （= 该环境 eBPF 采集项数），连查三次不变；`unavailable` 为空。
+>
 > 下面保留问题分析，作为「状态型指标不能只上报一次」这个口径的记录。
 
 - **发现于** 2026-10-01 的 `vmctl agents doctor` 真集群验收（`vmctl-collect-chain` feature）。
