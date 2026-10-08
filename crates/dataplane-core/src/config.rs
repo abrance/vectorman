@@ -15,6 +15,14 @@ data_path = "./data"
 # 自监控指标写回时序库的周期（秒）；0 关闭。
 self_metrics_interval_secs = 60
 
+# ---- 本地 KV（redb）：接入去重键与页缓存 ----
+# redb 页缓存上限（字节）；0 = 用内置缺省 64MiB。redb 自己的缺省是 1GiB，
+# 容器内存上限 2GiB 时光页缓存就占掉一半，数据一涨就 OOMKilled。
+kv_cache_bytes = 67108864
+# `ingest/{record_id}` 去重键保留期（天）；0 = 不清理。
+# 去重只防接入重试造成的重复，留几天足够；这些键只写不删会单调增长。
+ingest_dedup_retention_days = 3
+
 # ---- 时序聚合指标（ts_*）：网络/进程/syscall 指标与通用 metrics 都落在这里 ----
 # 全局保留窗口（天）；每个采集项更短的保留期由下面的定时删除任务补齐。
 ts_retention_days = 30
@@ -104,6 +112,17 @@ pub struct Config {
     pub metrics_http: HttpListenConfig,
     #[serde(default = "default_self_metrics_interval")]
     pub self_metrics_interval_secs: u64,
+    /// redb 页缓存上限（字节）；0 表示用内置缺省。
+    ///
+    /// redb 4.x 自己的缺省是 1GiB：容器内存上限 2GiB 时它一个就占掉一半，
+    /// 叠加数据文件增长（`ingest/` 去重键）会把进程顶到 OOMKilled。
+    #[serde(default = "default_kv_cache_bytes")]
+    pub kv_cache_bytes: usize,
+    /// `ingest/{record_id}` 去重键保留期（天）；0 表示不清理。
+    ///
+    /// 去重只防接入重试造成的重复，窗口留几天足够；不清理这些键会单调增长。
+    #[serde(default = "default_ingest_dedup_retention_days")]
+    pub ingest_dedup_retention_days: u32,
     /// 时序聚合指标的全局保留窗口（天）。0 表示不设窗口（需关闭执行）。
     #[serde(default = "default_ts_retention_days")]
     pub ts_retention_days: u32,
@@ -162,6 +181,8 @@ impl Default for Config {
             gse_admin_password: None,
             metrics_http: default_metrics_http(),
             self_metrics_interval_secs: default_self_metrics_interval(),
+            kv_cache_bytes: default_kv_cache_bytes(),
+            ingest_dedup_retention_days: default_ingest_dedup_retention_days(),
             ts_retention_days: default_ts_retention_days(),
             ts_retention_enforced: true,
             ts_cardinality_limit: default_ts_cardinality_limit(),
@@ -219,6 +240,16 @@ impl Config {
         if let Ok(v) = std::env::var("DP_SELF_METRICS_INTERVAL") {
             if let Ok(n) = v.parse() {
                 self.self_metrics_interval_secs = n;
+            }
+        }
+        if let Ok(v) = std::env::var("DATASERVER_KV_CACHE_BYTES") {
+            if let Ok(n) = v.parse() {
+                self.kv_cache_bytes = n;
+            }
+        }
+        if let Ok(v) = std::env::var("DATASERVER_INGEST_DEDUP_RETENTION_DAYS") {
+            if let Ok(n) = v.parse() {
+                self.ingest_dedup_retention_days = n;
             }
         }
         if let Ok(v) = std::env::var("DATASERVER_TS_RETENTION_DAYS") {
@@ -304,6 +335,14 @@ fn default_metrics_http() -> HttpListenConfig {
 
 fn default_self_metrics_interval() -> u64 {
     60
+}
+
+fn default_kv_cache_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
+fn default_ingest_dedup_retention_days() -> u32 {
+    3
 }
 
 fn default_ts_retention_days() -> u32 {
@@ -422,6 +461,20 @@ gse_admin_url = "   "
         let cfg = Config::default();
         assert_eq!(cfg.metrics_http.listen, "127.0.0.1:9091");
         assert_eq!(cfg.self_metrics_interval_secs, 60);
+    }
+
+    /// 内存与去重键保留的缺省值：它们直接决定容器会不会 OOM（见 2026-10-08 线上事故）。
+    #[test]
+    fn default_kv_cache_and_ingest_dedup_window() {
+        let cfg = Config::default();
+        assert_eq!(cfg.kv_cache_bytes, 64 * 1024 * 1024);
+        assert_eq!(cfg.ingest_dedup_retention_days, 3);
+
+        // 两个都可以显式关掉（0 = redb 内置缺省 / 不清理去重键）。
+        let cfg =
+            Config::from_toml("kv_cache_bytes = 0\ningest_dedup_retention_days = 0\n").unwrap();
+        assert_eq!(cfg.kv_cache_bytes, 0);
+        assert_eq!(cfg.ingest_dedup_retention_days, 0);
     }
 
     #[test]

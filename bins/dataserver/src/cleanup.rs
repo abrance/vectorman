@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dataplane_core::{DataplaneError, ErrorCode};
+use dataplane_ingest::INGEST_PREFIX;
 use dataplane_kv::KvStore;
 use dataplane_log::{LogFilter, LogStore};
 use dataplane_sql::RelationalStore;
@@ -341,6 +342,8 @@ pub struct CleanupReport {
     pub ts: TsCleanReport,
     /// 删除的 `ebpf_edges` 行数。
     pub ebpf_edges_deleted: u64,
+    /// 删除的 `ingest/` 去重键数（接入时间早于保留窗口）。
+    pub ingest_dedup_deleted: u64,
 }
 
 /// 连续零命中多少轮后提示一次。
@@ -527,6 +530,7 @@ pub async fn run_cleanup(
     gse_admin_url: Option<&str>,
     gse_admin_password: Option<&str>,
     global_ts_days: u32,
+    ingest_dedup_days: u32,
     now_micros: i64,
     tracker: &mut TsCleanTracker,
 ) -> Result<CleanupReport, DataplaneError> {
@@ -559,10 +563,18 @@ pub async fn run_cleanup(
     // 时序先于日志：`apply_retention` 会删除 `retain/` 键。
     let ts_report = apply_ts_retention(ts, kv, &live, global_ts_days, now_micros, tracker).await?;
     let retention = apply_retention(sql, log, kv, &live, now_micros).await?;
+    // 去重键只写不删会单调增长（线上 12 天 ~1GB）：按接入时间删旧键。
+    let ingest_dedup_deleted = if ingest_dedup_days > 0 {
+        let cutoff = now_micros.saturating_sub(i64::from(ingest_dedup_days) * MICROS_PER_DAY);
+        kv.prune_prefix_before(INGEST_PREFIX, cutoff).await?
+    } else {
+        0
+    };
     Ok(CleanupReport {
         log_deleted: retention.log_deleted,
         ts: ts_report,
         ebpf_edges_deleted: retention.ebpf_edges_deleted,
+        ingest_dedup_deleted,
     })
 }
 
@@ -997,5 +1009,64 @@ mod tests {
         assert!(!tracker.observe("item", 0), "同一段零命中只提示一次");
         assert!(!tracker.observe("item", 5), "有命中后清零");
         assert!(!tracker.observe("item", 0), "清零后重新计数");
+    }
+
+    #[tokio::test]
+    async fn run_cleanup_prunes_stale_ingest_keys_only() {
+        use dataplane_sql::{RelationalStore, SqliteRelationalStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let ts = store(dir.path());
+        let kv = dataplane_kv::RedbKvStore::new(dir.path().join("kv.redb")).unwrap();
+        let log = dataplane_log::TantivyLogStore::new(dir.path().join("logs")).unwrap();
+        let sql: std::sync::Arc<dyn RelationalStore> =
+            std::sync::Arc::new(SqliteRelationalStore::new(dir.path().join("sql.db")).unwrap());
+        dataplane_apm::bootstrap(sql.as_ref()).await.unwrap();
+
+        let now = now_micros();
+        let old = dataplane_ingest::ingest_key("old");
+        let fresh = dataplane_ingest::ingest_key("fresh");
+        kv.set(old.as_bytes(), &(now - 4 * MICROS_PER_DAY).to_le_bytes())
+            .await
+            .unwrap();
+        kv.set(fresh.as_bytes(), &(now - MICROS_PER_DAY).to_le_bytes())
+            .await
+            .unwrap();
+
+        let mut tracker = TsCleanTracker::default();
+        let report = run_cleanup(
+            sql.as_ref(),
+            &log,
+            &ts,
+            &kv,
+            None,
+            None,
+            30,
+            3,
+            now,
+            &mut tracker,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.ingest_dedup_deleted, 1, "只删超出 3 天窗口的键");
+        assert!(!kv.exists(old.as_bytes()).await.unwrap());
+        assert!(kv.exists(fresh.as_bytes()).await.unwrap());
+
+        // 0 = 关闭清理：过期键留着（旧行为可回退）。
+        let report = run_cleanup(
+            sql.as_ref(),
+            &log,
+            &ts,
+            &kv,
+            None,
+            None,
+            30,
+            0,
+            now,
+            &mut tracker,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.ingest_dedup_deleted, 0);
     }
 }
