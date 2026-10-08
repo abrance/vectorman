@@ -36,4 +36,12 @@ impl KvStore for RedisStore {
     async fn scan_prefix(&self, _prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DataplaneError> {
         Err(unimplemented_store())
     }
+
+    async fn prune_prefix_before(
+        &self,
+        _prefix: &[u8],
+        _cutoff_micros: i64,
+    ) -> Result<u64, DataplaneError> {
+        Err(unimplemented_store())
+    }
 }

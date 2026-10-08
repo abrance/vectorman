@@ -63,7 +63,7 @@ async fn main() -> ExitCode {
     }
 
     let file: Arc<dyn FileStore> = Arc::new(DirFileStore::new(paths.files.clone()));
-    let kv: Arc<dyn KvStore> = match RedbKvStore::new(&paths.kv) {
+    let kv: Arc<dyn KvStore> = match RedbKvStore::with_cache_size(&paths.kv, cfg.kv_cache_bytes) {
         Ok(s) => Arc::new(s),
         Err(e) => return exit_with("engine kv init failed", e),
     };
@@ -157,6 +157,7 @@ async fn main() -> ExitCode {
     let cleanup_state = state.clone();
     let cleanup_metrics = metrics.clone();
     let global_ts_days = cfg.ts_retention_days;
+    let ingest_dedup_days = cfg.ingest_dedup_retention_days;
     let clean_interval = cfg.ts_clean_interval_secs.max(60);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(clean_interval));
@@ -171,6 +172,7 @@ async fn main() -> ExitCode {
                 cleanup_state.gse_admin_url.as_deref(),
                 cleanup_state.gse_admin_password.as_deref(),
                 global_ts_days,
+                ingest_dedup_days,
                 now_micros(),
                 &mut ts_tracker,
             )
@@ -190,13 +192,20 @@ async fn main() -> ExitCode {
                             report.ebpf_edges_deleted as f64,
                         );
                     }
+                    if report.ingest_dedup_deleted > 0 {
+                        cleanup_metrics.inc_counter(
+                            "dataserver_ingest_dedup_pruned_total",
+                            report.ingest_dedup_deleted as f64,
+                        );
+                    }
                     println!(
-                        "retention cleanup: log_deleted={} ebpf_edges_deleted={} ts_items={} ts_matched_series={} ts_tombstones={}",
+                        "retention cleanup: log_deleted={} ebpf_edges_deleted={} ts_items={} ts_matched_series={} ts_tombstones={} ingest_dedup_deleted={}",
                         report.log_deleted,
                         report.ebpf_edges_deleted,
                         report.ts.items,
                         report.ts.matched_series,
-                        report.ts.tombstones_applied
+                        report.ts.tombstones_applied,
+                        report.ingest_dedup_deleted
                     );
                 }
                 Err(e) => {

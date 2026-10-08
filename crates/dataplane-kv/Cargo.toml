@@ -9,3 +9,6 @@ dataplane-core.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 redb = "4"
+
+[dev-dependencies]
+tempfile = "3"

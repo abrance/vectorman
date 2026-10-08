@@ -12,6 +12,14 @@ data_path = "./data"
 # 自监控指标写回时序库的周期（秒）；0 关闭。
 self_metrics_interval_secs = 60
 
+# ---- 本地 KV（redb）：接入去重键与页缓存 ----
+# redb 页缓存上限（字节）；0 = 用内置缺省 64MiB。redb 自己的缺省是 1GiB，
+# 容器内存上限 2GiB 时光页缓存就占掉一半，数据一涨就 OOMKilled。
+kv_cache_bytes = 67108864
+# `ingest/{record_id}` 去重键保留期（天）；0 = 不清理。
+# 去重只防接入重试造成的重复，留几天足够；这些键只写不删会单调增长。
+ingest_dedup_retention_days = 3
+
 # ---- 时序聚合指标（ts_*）：网络/进程/syscall 指标与通用 metrics 都落在这里 ----
 # 全局保留窗口（天）；每个采集项更短的保留期由下面的定时删除任务补齐。
 ts_retention_days = 30

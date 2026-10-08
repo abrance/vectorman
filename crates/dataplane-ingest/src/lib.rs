@@ -5,6 +5,7 @@
 //! `dataplane-apm`，本 crate 不依赖具体存储实现。
 
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use dataplane_core::{DataplaneError, ErrorCode};
 use dataplane_kv::KvStore;
@@ -152,9 +153,19 @@ pub struct LogSearchQuery {
     pub limit: Option<usize>,
 }
 
+/// `ingest/` 去重键的前缀。
+///
+/// 清理端（dataserver 保存周期任务）用 [`KvStore::prune_prefix_before`] 删过期去重键，
+/// 前缀只在这里定义一份。
+pub const INGEST_PREFIX: &[u8] = INGEST_PREFIX_STR.as_bytes();
+
+const INGEST_PREFIX_STR: &str = "ingest/";
+
 /// `ingest/{record_id}` 去重键。
+///
+/// 值 = 8 字节小端微秒（接入时间），供清理端判过期；**不是**空值。
 pub fn ingest_key(record_id: &str) -> String {
-    format!("ingest/{record_id}")
+    format!("{INGEST_PREFIX_STR}{record_id}")
 }
 
 /// `stream/{agent_id}/{data_type}/{data_id}` 流索引键。
@@ -481,9 +492,22 @@ async fn already_accepted(kv: &dyn KvStore, record_id: &str) -> Result<bool, App
 }
 
 async fn mark_ingested(kv: &dyn KvStore, record_id: &str) -> Result<(), ApplyRecordError> {
-    kv.set(ingest_key(record_id).as_bytes(), &[])
-        .await
-        .map_err(ApplyRecordError::Engine)
+    // 值写成接入时间的 8 字节小端微秒：`ingest/` 键只写不删会单调增长，
+    // 保存周期任务要靠这个时间戳删旧键（见 [`INGEST_PREFIX`]）。
+    kv.set(
+        ingest_key(record_id).as_bytes(),
+        &now_micros().to_le_bytes(),
+    )
+    .await
+    .map_err(ApplyRecordError::Engine)
+}
+
+/// 接入侧取当前时间（微秒）。
+fn now_micros() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
 }
 
 fn merge_envelope_tags(tags: &mut BTreeMap<String, String>, envelope: &DataEnvelope) {
@@ -640,6 +664,40 @@ mod tests {
             .unwrap();
         assert_eq!(found.result.len(), 1);
         assert_eq!(found.result[0].value.unwrap().1, 12.5);
+    }
+
+    /// 去重键要带接入时间，并且能被保存周期任务按前缀清掉 ——
+    /// 否则 `ingest/` 只写不删（线上 12 天涨到 ~1GB），清理也就无从下手。
+    #[tokio::test]
+    async fn ingest_key_carries_timestamp_and_is_prunable() {
+        let e = engines();
+        let env = envelope(
+            "metrics",
+            vec![json!({
+                "record_id": "m1",
+                "timestamp": 1_710_000_000_000_000i64,
+                "measurement": "cpu_usage",
+                "tags": {},
+                "field_name": "value",
+                "field_value": 1.0
+            })],
+        );
+        let reply = apply(env.clone(), &e.ts, &e.log, &e.kv).await.unwrap();
+        assert_eq!(reply.accepted, 1, "{reply:?}");
+        let key = ingest_key("m1");
+        assert!(key.starts_with(std::str::from_utf8(INGEST_PREFIX).unwrap()));
+        let value = e.kv.get(key.as_bytes()).await.unwrap();
+        assert_eq!(value.len(), 8, "值是 8 字节小端微秒");
+
+        // 所有键都早于 `now + 1` → 全删；删完同一条记录能重新接入（不会变成永久黑洞）。
+        let removed =
+            e.kv.prune_prefix_before(INGEST_PREFIX, now_micros() + 1)
+                .await
+                .unwrap();
+        assert_eq!(removed, 1);
+        assert!(!e.kv.exists(key.as_bytes()).await.unwrap());
+        apply(env, &e.ts, &e.log, &e.kv).await.unwrap();
+        assert!(e.kv.exists(key.as_bytes()).await.unwrap());
     }
 
     /// 只给 `ebpf_process_*` 补 service 的假 sink（记录调用次数，便于断言「不该调的不调」）。
