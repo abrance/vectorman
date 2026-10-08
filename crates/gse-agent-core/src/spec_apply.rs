@@ -166,7 +166,7 @@ impl RuntimeConfig {
     pub fn decay_report(&self) {
         let _ = self
             .pending_reports
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(1))
             });
     }
