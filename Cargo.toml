@@ -76,4 +76,4 @@ lto = "thin"
 # manifest 重试）。上游合并/发版后删掉这段、回到 crates.io 版本。
 #   issue/PR: https://github.com/aidlx/tsink/pull/19
 [patch.crates-io]
-tsink = { git = "https://github.com/abrance/tsink", rev = "d30c47cdddc68c813c0886f80135c1968d6674ed" }
+tsink = { git = "https://github.com/abrance/tsink", rev = "3b887ae58e7021400ddd7931d8db43e783014107" }

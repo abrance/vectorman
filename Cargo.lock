@@ -3149,7 +3149,7 @@ dependencies = [
 [[package]]
 name = "tsink"
 version = "0.10.2"
-source = "git+https://github.com/abrance/tsink?rev=d30c47cdddc68c813c0886f80135c1968d6674ed#d30c47cdddc68c813c0886f80135c1968d6674ed"
+source = "git+https://github.com/abrance/tsink?rev=3b887ae58e7021400ddd7931d8db43e783014107#3b887ae58e7021400ddd7931d8db43e783014107"
 dependencies = [
  "async-channel",
  "bincode",
