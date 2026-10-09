@@ -66,3 +66,14 @@ serde_json = "1"
 
 [profile.release]
 lto = "thin"
+
+# tsink 0.10.2 的分片 tombstone 存储有「写者换 manifest 并删旧分片 / 读者拿着旧
+# manifest 开旧分片」的竞态，读方会拿到 `IO error: No such file or directory`，
+# 表现为 `flush worker error: ...` 每几分钟一次、`background_errors_total` 累积、
+# `degraded` 常亮、WAL 一直涨（2026-10-08 cloud3 实测）。
+#
+# 上游 master 还没修；先 pin 到 fork 的修复分支（`load_tombstones` 遇 NotFound 重读
+# manifest 重试）。上游合并/发版后删掉这段、回到 crates.io 版本。
+#   issue/PR: https://github.com/aidlx/tsink/pull/19
+[patch.crates-io]
+tsink = { git = "https://github.com/abrance/tsink", rev = "d30c47cdddc68c813c0886f80135c1968d6674ed" }
