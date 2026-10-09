@@ -2881,7 +2881,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -3149,8 +3149,7 @@ dependencies = [
 [[package]]
 name = "tsink"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a782e4ecf47b98bf237253f0894dd34a1dcc601d5e777f87eb0b90048b7f0bb1"
+source = "git+https://github.com/abrance/tsink?rev=d30c47cdddc68c813c0886f80135c1968d6674ed#d30c47cdddc68c813c0886f80135c1968d6674ed"
 dependencies = [
  "async-channel",
  "bincode",
