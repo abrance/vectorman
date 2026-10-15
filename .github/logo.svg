@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 402 100" role="img" aria-label="vectorman lockup">
+  <defs>
+    <linearGradient id="vg" gradientUnits="userSpaceOnUse" x1="16" y1="20" x2="384" y2="86">
+      <stop offset="0" stop-color="#22D3EE"/>
+      <stop offset="1" stop-color="#2563EB"/>
+    </linearGradient>
+  </defs>
+  <!-- 图标：汇流拓扑（V6，手工缩放烘焙，无 transform） -->
+  <g fill="none" stroke="url(#vg)" stroke-width="2.5" stroke-linecap="round">
+    <path d="M32.2 44.8 Q20.2 36.2 13.3 27.6"/>
+    <path d="M42.6 44.8 Q54.6 36.2 61.5 27.6"/>
+    <path d="M37.4 56.9 L37.4 70.6"/>
+    <path d="M30.5 41.4 Q15.0 43.1 8.2 41.4" stroke-width="1.4" opacity="0.3"/>
+  </g>
+  <circle cx="37.4" cy="50" r="6" fill="url(#vg)"/>
+  <circle cx="11.6" cy="25.9" r="3" fill="#22D3EE"/>
+  <circle cx="63.2" cy="25.9" r="3" fill="#22D3EE"/>
+  <circle cx="37.4" cy="74.1" r="3" fill="#2563EB"/>
+  <circle cx="20.2" cy="33.7" r="1.7" fill="#2563EB" opacity="0.45"/>
+  <!-- wordmark：vectorman（手工烘焙绝对坐标） -->
+  <g fill="none" stroke="url(#vg)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M90 42 L96 66 L102 42"/>
+    <line x1="118" y1="54" x2="138" y2="54"/>
+    <path d="M142 54 A12 12 0 1 0 138.5 62.5"/>
+    <path d="M191.7 44.8 A12 12 0 1 0 191.7 63.2"/>
+    <line x1="207" y1="30" x2="207" y2="66"/>
+    <line x1="201" y1="40" x2="215" y2="40"/>
+    <circle cx="246" cy="54" r="12"/>
+    <line x1="271" y1="42" x2="271" y2="66"/>
+    <path d="M271 49 A7 7 0 0 1 285 49 L285 56"/>
+    <line x1="301" y1="42" x2="301" y2="66"/>
+    <path d="M301 48 A6 6 0 0 1 313 48 L313 66"/>
+    <path d="M313 48 A6 6 0 0 1 325 48 L325 66"/>
+    <circle cx="353" cy="54" r="12"/>
+    <line x1="365" y1="42" x2="365" y2="66"/>
+    <line x1="381" y1="42" x2="381" y2="66"/>
+    <path d="M381 49 A7 7 0 0 1 395 49 L395 66"/>
+  </g>
+</svg>

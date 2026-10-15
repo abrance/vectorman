@@ -1,5 +1,10 @@
 # vectorman
 
+<div align="center">
+  <img src=".github/logo.svg" alt="vectorman —— 汇流拓扑" width="340">
+  <p><em>采集 → 汇流 → 可观测：agent 到中心的服务汇聚</em></p>
+</div>
+
 可自托管的 aiops 平台：**采集 + 数据平面 + 查询 + 界面**闭环。采集端（GSE Agent/Server）负责纳管与取数，
 数据平面（dataserver）负责落库与查询，前端（dataplane / console）负责查看与配置。
 

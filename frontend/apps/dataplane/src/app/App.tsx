@@ -33,7 +33,10 @@ export function App() {
     <Layout style={{ minHeight: "100vh" }}>
       <ToastHost />
       <Layout.Sider theme="light" width={180}>
-        <div style={{ padding: 16, fontWeight: 600 }}>vectorman 数据面</div>
+        <div style={{ padding: 16, fontWeight: 600, display: "flex", alignItems: "center", gap: 8 }}>
+          <img src="/logo.svg" alt="vectorman" style={{ width: 20, height: 20, flex: "none" }} />
+          vectorman 数据面
+        </div>
         <Menu mode="inline" items={items} selectedKeys={[selectedKey]} />
       </Layout.Sider>
       <Layout.Content style={{ padding: 24 }}>
