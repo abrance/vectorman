@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" role="img" aria-label="vectorman">
+  <defs>
+    <linearGradient id="vg" gradientUnits="userSpaceOnUse" x1="16" y1="18" x2="84" y2="82">
+      <stop offset="0" stop-color="#22D3EE"/>
+      <stop offset="1" stop-color="#2563EB"/>
+    </linearGradient>
+  </defs>
+  <g fill="none" stroke="url(#vg)" stroke-width="2.5" stroke-linecap="round">
+    <path d="M44 44 Q30 34 22 24"/>
+    <path d="M56 44 Q70 34 78 24"/>
+    <path d="M50 58 L50 74"/>
+    <path d="M42 40 Q24 42 16 40" stroke-width="1.4" opacity="0.3"/>
+  </g>
+  <circle cx="50" cy="50" r="7" fill="url(#vg)"/>
+  <circle cx="20" cy="22" r="3.5" fill="#22D3EE"/>
+  <circle cx="80" cy="22" r="3.5" fill="#22D3EE"/>
+  <circle cx="50" cy="78" r="3.5" fill="#2563EB"/>
+  <circle cx="30" cy="31" r="2" fill="#2563EB" opacity="0.45"/>
+</svg>
