@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use dataplane_adapter_redis::{RedisConfig, RedisKvStore};
+use dataplane_adapter_victoriametrics::{VictoriaMetricsStore, VmConfig};
 use dataplane_core::{load_config, resolve_data_paths, DataplaneError, ErrorCode, NoopAuth};
 use dataplane_file::{DirFileStore, FileStore};
 use dataplane_kv::{KvStore, RedbKvStore};
@@ -63,9 +65,41 @@ async fn main() -> ExitCode {
     }
 
     let file: Arc<dyn FileStore> = Arc::new(DirFileStore::new(paths.files.clone()));
-    let kv: Arc<dyn KvStore> = match RedbKvStore::with_cache_size(&paths.kv, cfg.kv_cache_bytes) {
-        Ok(s) => Arc::new(s),
-        Err(e) => return exit_with("engine kv init failed", e),
+    let kv: Arc<dyn KvStore> = match cfg.kv_backend.as_str() {
+        "redb" => match RedbKvStore::with_cache_size(&paths.kv, cfg.kv_cache_bytes) {
+            Ok(s) => Arc::new(s),
+            Err(e) => return exit_with("engine kv init failed", e),
+        },
+        "redis" => {
+            if cfg.redis_url.trim().is_empty() {
+                return exit_with(
+                    "config error",
+                    DataplaneError::config_invalid(
+                        "kv_backend=redis requires redis_url (DATASERVER_REDIS_URL)",
+                    ),
+                );
+            }
+            let store = match RedisKvStore::new(RedisConfig {
+                url: cfg.redis_url.clone(),
+                password: cfg.redis_password.clone(),
+                prefix: cfg.redis_prefix.clone(),
+                ..RedisConfig::default()
+            })
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => return exit_with("engine kv init failed", e),
+            };
+            Arc::new(store)
+        }
+        other => {
+            return exit_with(
+                "config error",
+                DataplaneError::config_invalid(format!(
+                    "unsupported kv_backend {other:?} (expected redb|redis)"
+                )),
+            )
+        }
     };
     let sql: Arc<dyn RelationalStore> = match SqliteRelationalStore::new(&paths.sql) {
         Ok(s) => Arc::new(s),
@@ -82,9 +116,50 @@ async fn main() -> ExitCode {
         memory_limit_bytes: cfg.ts_memory_limit_bytes,
         wal_size_limit_bytes: cfg.ts_wal_size_limit_bytes,
     };
-    let ts: Arc<dyn TimeSeriesStore> = match TsinkTimeSeriesStore::new(&paths.ts, ts_retention) {
-        Ok(s) => Arc::new(s),
-        Err(e) => return exit_with("engine ts init failed", e),
+    // 外置后端要在退出前 flush 未提交的点，所以留一份具体句柄。
+    let mut vm_ts: Option<Arc<VictoriaMetricsStore>> = None;
+    let ts: Arc<dyn TimeSeriesStore> = match cfg.ts_backend.as_str() {
+        "tsink" => match TsinkTimeSeriesStore::new(&paths.ts, ts_retention) {
+            Ok(s) => Arc::new(s),
+            Err(e) => return exit_with("engine ts init failed", e),
+        },
+        "victoriametrics" => {
+            if cfg.vm_insert_url.trim().is_empty() || cfg.vm_select_url.trim().is_empty() {
+                return exit_with(
+                    "config error",
+                    DataplaneError::config_invalid(
+                        "ts_backend=victoriametrics requires vm_insert_url and vm_select_url \
+                         (DATASERVER_VM_INSERT_URL / DATASERVER_VM_SELECT_URL)",
+                    ),
+                );
+            }
+            let store = match VictoriaMetricsStore::new(VmConfig {
+                insert_url: cfg.vm_insert_url.clone(),
+                select_url: cfg.vm_select_url.clone(),
+                tenant: cfg.vm_tenant.clone(),
+                single_node: cfg.vm_single_node,
+                batch_size: cfg.vm_batch_size,
+                flush_interval: Duration::from_millis(cfg.vm_flush_interval_ms.max(1)),
+                queue_capacity: cfg.vm_queue_capacity,
+                retention_days: cfg.ts_retention_days,
+                delete_auth_key: cfg.vm_delete_auth_key.clone(),
+                whole_series_delete: cfg.vm_whole_series_delete,
+                ..VmConfig::default()
+            }) {
+                Ok(s) => Arc::new(s),
+                Err(e) => return exit_with("engine ts init failed", e),
+            };
+            vm_ts = Some(Arc::clone(&store));
+            store
+        }
+        other => {
+            return exit_with(
+                "config error",
+                DataplaneError::config_invalid(format!(
+                    "unsupported ts_backend {other:?} (expected tsink|victoriametrics)"
+                )),
+            )
+        }
     };
     let log: Arc<dyn LogStore> = match TantivyLogStore::new(&paths.logs) {
         Ok(s) => Arc::new(s),
@@ -477,10 +552,12 @@ async fn main() -> ExitCode {
     };
 
     println!(
-        "sql_http={} prom_http={} metrics_http={} ts_retention_days={} ts_retention_enforced={} apm_max_bytes={} apm_ingest_max_batches_per_sec={}",
+        "sql_http={} prom_http={} metrics_http={} kv_backend={} ts_backend={} ts_retention_days={} ts_retention_enforced={} apm_max_bytes={} apm_ingest_max_batches_per_sec={}",
         cfg.sql_http.listen,
         cfg.prom_http.listen,
         cfg.metrics_http.listen,
+        cfg.kv_backend,
+        cfg.ts_backend,
         cfg.ts_retention_days,
         cfg.ts_retention_enforced,
         cfg.apm_max_bytes,
@@ -490,6 +567,44 @@ async fn main() -> ExitCode {
     let sql_fut = axum::serve(sql_listener, sql_app);
     let prom_fut = axum::serve(prom_listener, prom_app);
     let metrics_fut = axum::serve(metrics_listener, metrics_app);
-    let _ = tokio::try_join!(sql_fut, prom_fut, metrics_fut);
+    // 收到 SIGTERM/SIGINT 时先把 VM 队列排空再退出：否则最多丢一个 flush 周期的点。
+    tokio::select! {
+        _ = async {
+            let _ = tokio::try_join!(sql_fut, prom_fut, metrics_fut);
+        } => {}
+        _ = shutdown_signal() => {}
+    }
+    if let Some(vm) = vm_ts {
+        match vm.flush().await {
+            Ok(()) => println!("victoriametrics: flushed pending points on shutdown"),
+            Err(e) => eprintln!(
+                "victoriametrics: final flush failed: {}: {}",
+                e.code.as_str(),
+                e.message
+            ),
+        }
+    }
     ExitCode::SUCCESS
+}
+
+/// 等 SIGTERM（容器停止）或 Ctrl-C。
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }

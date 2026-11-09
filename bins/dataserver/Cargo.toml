@@ -13,6 +13,8 @@ dataplane-ts.workspace = true
 dataplane-log.workspace = true
 dataplane-ingest.workspace = true
 dataplane-apm.workspace = true
+dataplane-adapter-redis = { path = "../../crates/dataplane-adapter-redis" }
+dataplane-adapter-victoriametrics = { path = "../../crates/dataplane-adapter-victoriametrics" }
 tokio.workspace = true
 clap = { version = "4", features = ["derive"] }
 axum = "0.8"
@@ -29,3 +31,5 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
 gse-server-core = { path = "../../crates/gse-server-core" }
+# 回放对比基准要直读 tsink（源 WAL），只在测试里用。
+tsink = { git = "https://github.com/abrance/tsink", rev = "c7a8754cbfb23db15b7550b51e2587dd9f11808e" }

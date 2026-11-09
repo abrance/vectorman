@@ -8,3 +8,9 @@ license.workspace = true
 dataplane-core.workspace = true
 dataplane-ts.workspace = true
 async-trait.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+ureq = "2"
+
+[dev-dependencies]
+axum = "0.8"

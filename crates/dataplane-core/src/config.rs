@@ -165,6 +165,48 @@ pub struct Config {
     /// 只写明细的耗时下限（微秒）；0 表示全部写明细。低于该值的 trace 只写摘要与聚合。
     #[serde(default)]
     pub apm_min_duration_micros_for_detail: i64,
+    /// KV 后端：`redb`（本地，缺省）或 `redis`（外置）。
+    #[serde(default = "default_kv_backend")]
+    pub kv_backend: String,
+    /// Redis 连接串（`redis://[:password@]host:port/0`）。
+    #[serde(default)]
+    pub redis_url: String,
+    /// Redis 独立密码；空/None 表示不带 `AUTH`。
+    #[serde(default)]
+    pub redis_password: Option<String>,
+    /// Redis 键前缀，避免与同库其它业务撞键。
+    #[serde(default = "default_redis_prefix")]
+    pub redis_prefix: String,
+    /// 时序后端：`tsink`（本地，缺省）或 `victoriametrics`（外置）。
+    #[serde(default = "default_ts_backend")]
+    pub ts_backend: String,
+    /// VM 集群版 vminsert 基址（单机版与 `vm_select_url` 相同）。
+    #[serde(default)]
+    pub vm_insert_url: String,
+    /// VM 集群版 vmselect 基址。
+    #[serde(default)]
+    pub vm_select_url: String,
+    /// VM 租户号；dataserver 无多租户，固定 `0`。
+    #[serde(default = "default_vm_tenant")]
+    pub vm_tenant: String,
+    /// `true` 表示单机版 VM（不带 `/insert|/select` 前缀）。
+    #[serde(default)]
+    pub vm_single_node: bool,
+    /// VM 单批点数上限。
+    #[serde(default = "default_vm_batch_size")]
+    pub vm_batch_size: usize,
+    /// VM 攒批最长等待（毫秒）。
+    #[serde(default = "default_vm_flush_interval_ms")]
+    pub vm_flush_interval_ms: u64,
+    /// VM 写入队列容量（点数）；满即背压。
+    #[serde(default = "default_vm_queue_capacity")]
+    pub vm_queue_capacity: usize,
+    /// VM 删除鉴权 key（vmselect 的 `-deleteAuthKey`）；空 = 不允许删除。
+    #[serde(default)]
+    pub vm_delete_auth_key: Option<String>,
+    /// 是否接受「按时间窗删除」退化成整序列删除（VM 删除接口不支持 start/end）。
+    #[serde(default)]
+    pub vm_whole_series_delete: bool,
 }
 
 impl Default for Config {
@@ -197,6 +239,20 @@ impl Default for Config {
             apm_clean_interval_secs: default_apm_clean_interval(),
             apm_ingest_max_batches_per_sec: 0,
             apm_min_duration_micros_for_detail: 0,
+            kv_backend: default_kv_backend(),
+            redis_url: String::new(),
+            redis_password: None,
+            redis_prefix: default_redis_prefix(),
+            ts_backend: default_ts_backend(),
+            vm_insert_url: String::new(),
+            vm_select_url: String::new(),
+            vm_tenant: default_vm_tenant(),
+            vm_single_node: false,
+            vm_batch_size: default_vm_batch_size(),
+            vm_flush_interval_ms: default_vm_flush_interval_ms(),
+            vm_queue_capacity: default_vm_queue_capacity(),
+            vm_delete_auth_key: None,
+            vm_whole_series_delete: false,
         }
     }
 }
@@ -318,13 +374,98 @@ impl Config {
                 self.ts_clean_interval_secs = n;
             }
         }
+        if let Ok(v) = std::env::var("DATASERVER_KV_BACKEND") {
+            self.kv_backend = v;
+        }
+        if let Ok(v) = std::env::var("DATASERVER_REDIS_URL") {
+            self.redis_url = v;
+        }
+        if let Ok(v) = std::env::var("DATASERVER_REDIS_PASSWORD") {
+            // 空串显式表示「Redis 没开密码」。
+            self.redis_password = if v.is_empty() { None } else { Some(v) };
+        }
+        if let Ok(v) = std::env::var("DATASERVER_REDIS_PREFIX") {
+            self.redis_prefix = v;
+        }
+        if let Ok(v) = std::env::var("DATASERVER_TS_BACKEND") {
+            self.ts_backend = v;
+        }
+        if let Ok(v) = std::env::var("DATASERVER_VM_INSERT_URL") {
+            self.vm_insert_url = v;
+        }
+        if let Ok(v) = std::env::var("DATASERVER_VM_SELECT_URL") {
+            self.vm_select_url = v;
+        }
+        if let Ok(v) = std::env::var("DATASERVER_VM_TENANT") {
+            self.vm_tenant = v;
+        }
+        if let Ok(v) = std::env::var("DATASERVER_VM_SINGLE_NODE") {
+            self.vm_single_node = v.eq_ignore_ascii_case("true") || v == "1";
+        }
+        if let Ok(v) = std::env::var("DATASERVER_VM_BATCH_SIZE") {
+            if let Ok(n) = v.parse() {
+                self.vm_batch_size = n;
+            }
+        }
+        if let Ok(v) = std::env::var("DATASERVER_VM_FLUSH_INTERVAL_MS") {
+            if let Ok(n) = v.parse() {
+                self.vm_flush_interval_ms = n;
+            }
+        }
+        if let Ok(v) = std::env::var("DATASERVER_VM_QUEUE_CAPACITY") {
+            if let Ok(n) = v.parse() {
+                self.vm_queue_capacity = n;
+            }
+        }
+        if let Ok(v) = std::env::var("DATASERVER_VM_DELETE_AUTH_KEY") {
+            self.vm_delete_auth_key = if v.is_empty() { None } else { Some(v) };
+        }
+        if let Ok(v) = std::env::var("DATASERVER_VM_WHOLE_SERIES_DELETE") {
+            self.vm_whole_series_delete = v.eq_ignore_ascii_case("true") || v == "1";
+        }
         self.normalize();
     }
 
     fn normalize(&mut self) {
         self.http_web_dir = self.http_web_dir.take().and_then(nonempty_opt);
         self.gse_admin_url = self.gse_admin_url.take().and_then(nonempty_opt);
+        self.kv_backend = self.kv_backend.trim().to_ascii_lowercase();
+        self.ts_backend = self.ts_backend.trim().to_ascii_lowercase();
+        if self.redis_prefix.is_empty() {
+            self.redis_prefix = default_redis_prefix();
+        }
+        if self.vm_tenant.is_empty() {
+            self.vm_tenant = default_vm_tenant();
+        }
     }
+}
+
+fn default_kv_backend() -> String {
+    "redb".to_string()
+}
+
+fn default_ts_backend() -> String {
+    "tsink".to_string()
+}
+
+fn default_redis_prefix() -> String {
+    "dp:".to_string()
+}
+
+fn default_vm_tenant() -> String {
+    "0".to_string()
+}
+
+fn default_vm_batch_size() -> usize {
+    5_000
+}
+
+fn default_vm_flush_interval_ms() -> u64 {
+    200
+}
+
+fn default_vm_queue_capacity() -> usize {
+    200_000
 }
 
 fn default_metrics_http() -> HttpListenConfig {

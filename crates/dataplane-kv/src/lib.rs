@@ -24,6 +24,29 @@ pub trait KvStore: Send + Sync {
     /// 键是否存在。
     async fn exists(&self, key: &[u8]) -> Result<bool, DataplaneError>;
 
+    /// 批量判存在性，结果与 `keys` 一一对应。
+    ///
+    /// 缺省实现逐键调 [`Self::exists`]；远端后端（Redis）**必须**覆写成一次往返。
+    /// 逐键判存在的成本是「每条记录一次 RTT」，接入去重 5.39M 条就是 5.39M 次往返
+    /// （实测 Redis 3.7k ops/s ≈ 24 分钟），批量化后同一批量只花 2 次往返。
+    async fn exists_many(&self, keys: &[Vec<u8>]) -> Result<Vec<bool>, DataplaneError> {
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            out.push(self.exists(key).await?);
+        }
+        Ok(out)
+    }
+
+    /// 批量覆盖写入。返回 `Ok` 表示整批已提交，实现不得只提交一部分。
+    ///
+    /// 缺省实现逐条调 [`Self::set`]；远端后端必须覆写成管道/`MSET`。
+    async fn set_many(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), DataplaneError> {
+        for (key, value) in pairs {
+            self.set(key, value).await?;
+        }
+        Ok(())
+    }
+
     /// 返回键以给定前缀开头的键值对。
     async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DataplaneError>;
 
@@ -186,6 +209,57 @@ impl KvStore for RedbKvStore {
         .await
     }
 
+    /// 一个读事务扫完整批：缺省实现是逐键开事务，批去重时开销随批次线性上涨。
+    async fn exists_many(&self, keys: &[Vec<u8>]) -> Result<Vec<bool>, DataplaneError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let db = self.db.clone();
+        let keys = keys.to_vec();
+        blocking(move || {
+            let read_txn = db.begin_read().map_err(|e| dp_err("begin read txn", e))?;
+            let table = read_txn
+                .open_table(TABLE)
+                .map_err(|e| dp_err("open kv table", e))?;
+            let mut out = Vec::with_capacity(keys.len());
+            for key in &keys {
+                out.push(
+                    table
+                        .get(key.as_slice())
+                        .map_err(|e| dp_err("get key", e))?
+                        .is_some(),
+                );
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// 一个写事务提交整批：`ingest/` 去重键是 512 条一批，逐条 commit 就是 512 次 fsync。
+    async fn set_many(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), DataplaneError> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let db = self.db.clone();
+        let pairs = pairs.to_vec();
+        blocking(move || {
+            let write_txn = db.begin_write().map_err(|e| dp_err("begin write txn", e))?;
+            {
+                let mut table = write_txn
+                    .open_table(TABLE)
+                    .map_err(|e| dp_err("open kv table", e))?;
+                for (key, value) in &pairs {
+                    table
+                        .insert(key.as_slice(), value.as_slice())
+                        .map_err(|e| dp_err("set key", e))?;
+                }
+            }
+            write_txn.commit().map_err(|e| dp_err("commit set", e))?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DataplaneError> {
         let db = self.db.clone();
         let prefix = prefix.to_vec();
@@ -261,6 +335,83 @@ mod tests {
 
     fn micros(ts: i64) -> Vec<u8> {
         ts.to_le_bytes().to_vec()
+    }
+
+    /// 批量接口与逐条接口必须等价（redb 覆写版本）。
+    #[tokio::test]
+    async fn set_many_exists_many_match_single_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = store(dir.path());
+
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..300u32)
+            .map(|i| (format!("ingest/b{i:04}").into_bytes(), micros(i as i64)))
+            .collect();
+        kv.set_many(&pairs).await.unwrap();
+        for (k, v) in &pairs {
+            assert_eq!(&kv.get(k).await.unwrap(), v);
+        }
+
+        let mut keys: Vec<Vec<u8>> = pairs.iter().map(|(k, _)| k.clone()).collect();
+        keys.push(b"ingest/missing".to_vec());
+        let hits = kv.exists_many(&keys).await.unwrap();
+        assert_eq!(hits.len(), keys.len());
+        assert!(hits[..300].iter().all(|h| *h));
+        assert!(!hits[300]);
+
+        // 空批是 no-op，并不是错误（调用方不必自己判空）。
+        assert!(kv.set_many(&[]).await.is_ok());
+        assert!(kv.exists_many(&[]).await.unwrap().is_empty());
+    }
+
+    /// 缺省实现（不覆写的后端）也要正确：批内重复键、后写覆盖前写。
+    #[tokio::test]
+    async fn default_batch_impls_are_equivalent() {
+        /// 只实现必需方法的包装，forced 走 trait 的缺省 `set_many`/`exists_many`。
+        struct Defaults(RedbKvStore);
+
+        #[async_trait]
+        impl KvStore for Defaults {
+            async fn get(&self, key: &[u8]) -> Result<Vec<u8>, DataplaneError> {
+                self.0.get(key).await
+            }
+            async fn set(&self, key: &[u8], value: &[u8]) -> Result<(), DataplaneError> {
+                self.0.set(key, value).await
+            }
+            async fn delete(&self, key: &[u8]) -> Result<(), DataplaneError> {
+                self.0.delete(key).await
+            }
+            async fn exists(&self, key: &[u8]) -> Result<bool, DataplaneError> {
+                self.0.exists(key).await
+            }
+            async fn scan_prefix(
+                &self,
+                prefix: &[u8],
+            ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DataplaneError> {
+                self.0.scan_prefix(prefix).await
+            }
+            async fn prune_prefix_before(
+                &self,
+                prefix: &[u8],
+                cutoff_micros: i64,
+            ) -> Result<u64, DataplaneError> {
+                self.0.prune_prefix_before(prefix, cutoff_micros).await
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let kv = Defaults(store(dir.path()));
+        let pairs = vec![
+            (b"ingest/a".to_vec(), micros(1)),
+            (b"ingest/b".to_vec(), micros(2)),
+            (b"ingest/a".to_vec(), micros(3)),
+        ];
+        kv.set_many(&pairs).await.unwrap();
+        assert_eq!(kv.get(b"ingest/a").await.unwrap(), micros(3));
+        let hits = kv
+            .exists_many(&[b"ingest/a".to_vec(), b"ingest/zz".to_vec()])
+            .await
+            .unwrap();
+        assert_eq!(hits, vec![true, false]);
     }
 
     #[tokio::test]

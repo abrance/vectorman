@@ -219,6 +219,9 @@ pub async fn apply_with_sinks(
 
     let mut accepted = 0u32;
     let mut failures = Vec::new();
+    // 去重键预取整批 + 批量落盘。逐条 `exists`/`set` 是每记录两次往返，远端 KV 上
+    // 就是「单次 RTT 决定吞吐」（实测 Redis 3.7k records/s，5.39M 条要 24 分钟）。
+    let mut dedup = IngestionDedup::new(kv, &envelope.records).await?;
 
     for raw in &envelope.records {
         let sinks = Sinks {
@@ -226,12 +229,17 @@ pub async fn apply_with_sinks(
             edge: edge_sink,
             metric: metric_sink,
         };
-        match apply_one(&envelope, raw, ts, log, kv, &sinks).await {
+        match apply_one(&envelope, raw, ts, log, &mut dedup, &sinks).await {
             Ok(()) => accepted += 1,
             Err(ApplyRecordError::Invalid(failure)) => failures.push(failure),
-            Err(ApplyRecordError::Engine(e)) => return Err(e),
+            Err(ApplyRecordError::Engine(e)) => {
+                // 明细写失败就中止；已写成功那些记录的去重键先落盘，避免重试把它们再写一遍。
+                let _ = dedup.flush().await;
+                return Err(e);
+            }
         }
     }
+    dedup.flush().await?;
 
     if accepted > 0 {
         upsert_stream(kv, &envelope, accepted).await?;
@@ -265,7 +273,7 @@ async fn apply_one(
     raw: &Value,
     ts: &dyn TimeSeriesStore,
     log: &dyn LogStore,
-    kv: &dyn KvStore,
+    dedup: &mut IngestionDedup<'_>,
     sinks: &Sinks<'_>,
 ) -> Result<(), ApplyRecordError> {
     let Sinks {
@@ -277,7 +285,7 @@ async fn apply_one(
         DataType::Metrics => {
             let rec: MetricsRecord = parse_record(raw)?;
             require_record_id(&rec.record_id, raw)?;
-            if already_accepted(kv, &rec.record_id).await? {
+            if dedup.is_duplicate(&rec.record_id) {
                 return Ok(());
             }
             let mut tags = rec.tags;
@@ -297,12 +305,12 @@ async fn apply_one(
             })
             .await
             .map_err(ApplyRecordError::Engine)?;
-            mark_ingested(kv, &rec.record_id).await
+            mark_ingested(dedup, &rec.record_id).await
         }
         DataType::Logs => {
             let rec: LogsRecord = parse_record(raw)?;
             require_record_id(&rec.record_id, raw)?;
-            if already_accepted(kv, &rec.record_id).await? {
+            if dedup.is_duplicate(&rec.record_id) {
                 return Ok(());
             }
             let mut labels = rec.labels;
@@ -318,12 +326,12 @@ async fn apply_one(
             })
             .await
             .map_err(ApplyRecordError::Engine)?;
-            mark_ingested(kv, &rec.record_id).await
+            mark_ingested(dedup, &rec.record_id).await
         }
         DataType::Apm => {
             let rec: ApmRecord = parse_record(raw)?;
             require_record_id(&rec.record_id, raw)?;
-            if already_accepted(kv, &rec.record_id).await? {
+            if dedup.is_duplicate(&rec.record_id) {
                 return Ok(());
             }
             let level = if rec.status.is_empty() {
@@ -354,12 +362,12 @@ async fn apply_one(
             })
             .await
             .map_err(ApplyRecordError::Engine)?;
-            mark_ingested(kv, &rec.record_id).await
+            mark_ingested(dedup, &rec.record_id).await
         }
         DataType::Ebpf => {
             let rec: EbpfRecord = parse_record(raw)?;
             require_record_id(&rec.record_id, raw)?;
-            if already_accepted(kv, &rec.record_id).await? {
+            if dedup.is_duplicate(&rec.record_id) {
                 return Ok(());
             }
             let mut labels = rec.labels;
@@ -377,7 +385,7 @@ async fn apply_one(
             })
             .await
             .map_err(ApplyRecordError::Engine)?;
-            mark_ingested(kv, &rec.record_id).await
+            mark_ingested(dedup, &rec.record_id).await
         }
         DataType::Traces => {
             if trace::exceeds_size_limit(raw) {
@@ -404,7 +412,7 @@ async fn apply_one(
                     message: reason,
                 }));
             }
-            if already_accepted(kv, &span.record_id).await? {
+            if dedup.is_duplicate(&span.record_id) {
                 return Ok(());
             }
             // 明细是可选的高成本数据：低于阈值时只走摘要与聚合（阈值由 sink 提供）。
@@ -424,7 +432,7 @@ async fn apply_one(
                     );
                 }
             }
-            mark_ingested(kv, &span.record_id).await
+            mark_ingested(dedup, &span.record_id).await
         }
         DataType::EbpfEdges => {
             let edge: edge::EbpfEdge = parse_record(raw)?;
@@ -437,7 +445,7 @@ async fn apply_one(
             }
             // 幂等：同 `record_id` 重发直接受理（边记录按 record_id 覆盖写，重放是安全的，
             // 但仍先挡一次，避免重复做反查与 sqlite 写）。
-            if already_accepted(kv, &edge.record_id).await? {
+            if dedup.is_duplicate(&edge.record_id) {
                 return Ok(());
             }
             if let Some(sink) = edge_sink {
@@ -450,7 +458,7 @@ async fn apply_one(
                     );
                 }
             }
-            mark_ingested(kv, &edge.record_id).await
+            mark_ingested(dedup, &edge.record_id).await
         }
     }
 }
@@ -485,21 +493,87 @@ fn require_record_id(record_id: &str, raw: &Value) -> Result<(), ApplyRecordErro
     }
 }
 
-async fn already_accepted(kv: &dyn KvStore, record_id: &str) -> Result<bool, ApplyRecordError> {
-    kv.exists(ingest_key(record_id).as_bytes())
-        .await
-        .map_err(ApplyRecordError::Engine)
+/// 一批记录的去重状态：一次 `exists_many` 预取，标记攒够一小批再 `set_many` 落盘。
+///
+/// 语义与逐条 `exists`/`set` 保持一致：已存在（含**本批内**已受理过的同 `record_id`）
+/// 一律跳过；标记在明细写成功**之后**才入账。唯一放宽的地方是落盘时机：
+/// 最多 [`DEDUP_FLUSH_BATCH`] 条标记还在内存里，此时进程被硬杀会让这些记录在重试时
+/// 再写一遍（去重键是「重复入库」防护，不是数据完整性保证）。
+struct IngestionDedup<'a> {
+    kv: &'a dyn KvStore,
+    /// 已存在 + 本批已保留的 `record_id`。
+    seen: std::collections::HashSet<String>,
+    pending: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
-async fn mark_ingested(kv: &dyn KvStore, record_id: &str) -> Result<(), ApplyRecordError> {
+/// 标记攒批条数：512 条 ≈ 一次 `MSET` 25KB，也把「硬杀丢标记」的窗口压到百条级。
+const DEDUP_FLUSH_BATCH: usize = 512;
+
+impl<'a> IngestionDedup<'a> {
+    async fn new(kv: &'a dyn KvStore, records: &[Value]) -> Result<Self, DataplaneError> {
+        let ids: Vec<String> = records.iter().filter_map(record_id_of).collect();
+        let mut seen = std::collections::HashSet::with_capacity(ids.len());
+        if !ids.is_empty() {
+            let keys: Vec<Vec<u8>> = ids.iter().map(|id| ingest_key(id).into_bytes()).collect();
+            let hits = kv.exists_many(&keys).await?;
+            for (id, hit) in ids.into_iter().zip(hits) {
+                if hit {
+                    seen.insert(id);
+                }
+            }
+        }
+        Ok(Self {
+            kv,
+            seen,
+            pending: Vec::with_capacity(DEDUP_FLUSH_BATCH),
+        })
+    }
+
+    /// 已接入过（含本批前面已保留的）返回 `true`；否则占位并返回 `false`。
+    fn is_duplicate(&mut self, record_id: &str) -> bool {
+        !self.seen.insert(record_id.to_string())
+    }
+
+    /// 明细写成功后记账；攒满 [`DEDUP_FLUSH_BATCH`] 条就落盘一次。
+    async fn mark(&mut self, record_id: &str) -> Result<(), DataplaneError> {
+        self.pending.push((
+            ingest_key(record_id).into_bytes(),
+            now_micros().to_le_bytes().to_vec(),
+        ));
+        if self.pending.len() >= DEDUP_FLUSH_BATCH {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<(), DataplaneError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let batch = std::mem::take(&mut self.pending);
+        self.kv.set_many(&batch).await
+    }
+}
+
+/// 记录里的 `record_id`（与 `parse_record` 反序列化的字段同名）。
+/// 缺失/空串的记录会在 `require_record_id` 处被判无效，不必预先判存在性。
+fn record_id_of(raw: &Value) -> Option<String> {
+    raw.get("record_id")
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+async fn mark_ingested(
+    dedup: &mut IngestionDedup<'_>,
+    record_id: &str,
+) -> Result<(), ApplyRecordError> {
     // 值写成接入时间的 8 字节小端微秒：`ingest/` 键只写不删会单调增长，
     // 保存周期任务要靠这个时间戳删旧键（见 [`INGEST_PREFIX`]）。
-    kv.set(
-        ingest_key(record_id).as_bytes(),
-        &now_micros().to_le_bytes(),
-    )
-    .await
-    .map_err(ApplyRecordError::Engine)
+    dedup
+        .mark(record_id)
+        .await
+        .map_err(ApplyRecordError::Engine)
 }
 
 /// 接入侧取当前时间（微秒）。
@@ -698,6 +772,147 @@ mod tests {
         assert!(!e.kv.exists(key.as_bytes()).await.unwrap());
         apply(env, &e.ts, &e.log, &e.kv).await.unwrap();
         assert!(e.kv.exists(key.as_bytes()).await.unwrap());
+    }
+
+    /// 去重必须走批量接口：整批一次 `exists_many`、标记走 `set_many`。
+    /// 逐条 `exists`+`set` 在远端 KV 上是每记录两次往返（实测 Redis 3.7k records/s）。
+    #[tokio::test]
+    async fn dedup_uses_batch_kv_calls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        #[derive(Default)]
+        struct Counts {
+            exists: AtomicUsize,
+            set: AtomicUsize,
+            exists_many: AtomicUsize,
+            exists_many_keys: AtomicUsize,
+            set_many: AtomicUsize,
+            set_many_pairs: AtomicUsize,
+        }
+
+        /// 只包装 redb，把批量接口记下来（批量接口用与缺省实现等价的循环，便于计数）。
+        struct CountingKv {
+            inner: RedbKvStore,
+            counts: Arc<Counts>,
+        }
+
+        #[async_trait::async_trait]
+        impl KvStore for CountingKv {
+            async fn get(&self, key: &[u8]) -> Result<Vec<u8>, DataplaneError> {
+                self.inner.get(key).await
+            }
+            async fn set(&self, key: &[u8], value: &[u8]) -> Result<(), DataplaneError> {
+                self.counts.set.fetch_add(1, Ordering::Relaxed);
+                self.inner.set(key, value).await
+            }
+            async fn delete(&self, key: &[u8]) -> Result<(), DataplaneError> {
+                self.inner.delete(key).await
+            }
+            async fn exists(&self, key: &[u8]) -> Result<bool, DataplaneError> {
+                self.counts.exists.fetch_add(1, Ordering::Relaxed);
+                self.inner.exists(key).await
+            }
+            async fn exists_many(&self, keys: &[Vec<u8>]) -> Result<Vec<bool>, DataplaneError> {
+                self.counts.exists_many.fetch_add(1, Ordering::Relaxed);
+                self.counts
+                    .exists_many_keys
+                    .fetch_add(keys.len(), Ordering::Relaxed);
+                let mut out = Vec::with_capacity(keys.len());
+                for key in keys {
+                    out.push(self.inner.exists(key).await?);
+                }
+                Ok(out)
+            }
+            async fn set_many(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), DataplaneError> {
+                self.counts.set_many.fetch_add(1, Ordering::Relaxed);
+                self.counts
+                    .set_many_pairs
+                    .fetch_add(pairs.len(), Ordering::Relaxed);
+                for (key, value) in pairs {
+                    self.inner.set(key, value).await?;
+                }
+                Ok(())
+            }
+            async fn scan_prefix(
+                &self,
+                prefix: &[u8],
+            ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DataplaneError> {
+                self.inner.scan_prefix(prefix).await
+            }
+            async fn prune_prefix_before(
+                &self,
+                prefix: &[u8],
+                cutoff_micros: i64,
+            ) -> Result<u64, DataplaneError> {
+                self.inner.prune_prefix_before(prefix, cutoff_micros).await
+            }
+        }
+
+        let e = engines();
+        let counts = Arc::new(Counts::default());
+        let kv = CountingKv {
+            inner: RedbKvStore::new(e._dir.path().join("counting.redb")).unwrap(),
+            counts: counts.clone(),
+        };
+
+        let metric = |id: &str| {
+            json!({
+                "record_id": id,
+                "timestamp": 1_710_000_000_000_000i64,
+                "measurement": "cpu_usage",
+                "tags": {},
+                "field_name": "value",
+                "field_value": 1.0
+            })
+        };
+        let env = envelope("metrics", vec![metric("m1"), metric("m1"), metric("m2")]);
+        let reply = apply(env.clone(), &e.ts, &e.log, &kv).await.unwrap();
+        // `accepted` 含重复记录（幂等重发也算受理，与改动前一致）；去重键只写 2 条。
+        assert_eq!(reply.accepted, 3, "{reply:?}");
+        assert_eq!(
+            counts.exists.load(Ordering::Relaxed),
+            0,
+            "逐条 exists 不应再出现在接入路径上"
+        );
+        assert_eq!(
+            counts.set.load(Ordering::Relaxed),
+            1,
+            "去重键不再逐条 set（这里只应剩 stream/ 流索引那一条）"
+        );
+        assert_eq!(counts.exists_many.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.set_many.load(Ordering::Relaxed), 1, "一批只落盘一次");
+        assert_eq!(counts.set_many_pairs.load(Ordering::Relaxed), 2);
+
+        // 重放同一批：全部命中已存在，不再写去重键。
+        let reply = apply(env, &e.ts, &e.log, &kv).await.unwrap();
+        assert_eq!(reply.accepted, 3);
+        assert_eq!(counts.set_many.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.exists_many.load(Ordering::Relaxed), 2);
+    }
+
+    /// 超过一批（512）的标记要分多次落盘，不能把整批攒在内存里。
+    #[tokio::test]
+    async fn dedup_flushes_in_bounded_chunks() {
+        let e = engines();
+        let records: Vec<Value> = (0..1200)
+            .map(|i| {
+                json!({
+                    "record_id": format!("b{i:04}"),
+                    "timestamp": 1_710_000_000_000_000i64 + i as i64,
+                    "measurement": "cpu_usage",
+                    "tags": {},
+                    "field_name": "value",
+                    "field_value": 1.0
+                })
+            })
+            .collect();
+        let reply = apply(envelope("metrics", records), &e.ts, &e.log, &e.kv)
+            .await
+            .unwrap();
+        assert_eq!(reply.accepted, 1200);
+        assert!(e.kv.exists(b"ingest/b0000").await.unwrap());
+        assert!(e.kv.exists(b"ingest/b1199").await.unwrap());
     }
 
     /// 只给 `ebpf_process_*` 补 service 的假 sink（记录调用次数，便于断言「不该调的不调」）。
