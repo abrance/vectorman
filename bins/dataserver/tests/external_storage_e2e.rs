@@ -148,6 +148,45 @@ async fn redis_kv_semantics_match_local_engine() {
 }
 
 #[tokio::test]
+async fn redis_batch_ops_match_single_ops() {
+    let Some(store) = redis_store().await else {
+        eprintln!("skip: DP_E2E_REDIS_URL not set");
+        return;
+    };
+
+    // 跨多个 chunk（默认 500）的批量：MSET/MGET 与逐条结果必须一致。
+    let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..1_200u32)
+        .map(|i| {
+            (
+                format!("e2e/batch/{i:05}").into_bytes(),
+                (i as i64).to_le_bytes().to_vec(),
+            )
+        })
+        .collect();
+    store.set_many(&pairs).await.unwrap();
+    for (key, value) in &pairs {
+        assert_eq!(&store.get(key).await.unwrap(), value);
+    }
+
+    let mut keys: Vec<Vec<u8>> = pairs.iter().map(|(k, _)| k.clone()).collect();
+    keys.push(b"e2e/batch/missing".to_vec());
+    let hits = store.exists_many(&keys).await.unwrap();
+    assert_eq!(hits.len(), keys.len());
+    assert!(hits[..1_200].iter().all(|h| *h), "写入的键都应命中");
+    assert!(!hits[1_200], "缺失键必须报 false，不是报错");
+
+    // 空批是 no-op（MGET/MSET 不接受零参数，适配器要自己挡）。
+    assert!(store.set_many(&[]).await.is_ok());
+    assert!(store.exists_many(&[]).await.unwrap().is_empty());
+
+    let removed = store
+        .prune_prefix_before(b"e2e/batch/", i64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(removed, 1_200);
+}
+
+#[tokio::test]
 async fn vm_write_query_delete_roundtrip() {
     let Some(store) = vm_store() else {
         eprintln!("skip: DP_E2E_VM_INSERT_URL not set");

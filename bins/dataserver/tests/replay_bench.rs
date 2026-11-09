@@ -23,7 +23,9 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use dataplane_adapter_redis::RedisKvStore;
 use dataplane_adapter_victoriametrics::{VictoriaMetricsStore, VmConfig};
+use dataplane_log::TantivyLogStore;
 use dataplane_ts::{TimeSeriesStore, TsPoint, TsRetentionConfig, TsinkTimeSeriesStore};
 use tsink::{Storage, StorageBuilder, TimestampPrecision, Value};
 
@@ -277,4 +279,373 @@ async fn bench_redis_kv_ops() {
         removed as f64 / prune_elapsed.as_secs_f64()
     );
     assert_eq!(removed, n as u64);
+}
+
+/// 一条 `metrics` 接入记录（字段与 `dataplane_ingest::MetricsRecord` 对齐）。
+fn record_json(p: &TsPoint, idx: usize) -> serde_json::Value {
+    serde_json::json!({
+        "record_id": format!("rp{idx:08}"),
+        "timestamp": p.timestamp,
+        "measurement": p.measurement,
+        "tags": p.tags,
+        "field_name": p.field_name,
+        "field_value": p.field_value,
+    })
+}
+
+/// 跑一个信封（最多 `chunk` 条记录），返回 (accepted, 该批耗时)。
+async fn apply_batch(
+    vm: &VictoriaMetricsStore,
+    log: &TantivyLogStore,
+    kv: &RedisKvStore,
+    records: Vec<serde_json::Value>,
+    seq: usize,
+) -> Result<(u64, Duration), dataplane_core::DataplaneError> {
+    use dataplane_ingest::{apply_with_sinks, DataEnvelope};
+    let envelope: DataEnvelope = serde_json::from_value(serde_json::json!({
+        "batch_id": format!("b{seq}"),
+        "data_type": "metrics",
+        "data_id": "bench",
+        "agent_id": "bench",
+        "host_id": "bench",
+        "sent_at_micros": now_micros(),
+        "records": records,
+    }))
+    .expect("envelope");
+    let started = Instant::now();
+    let reply = apply_with_sinks(envelope, vm, log, kv, None, None, None).await?;
+    Ok((u64::from(reply.accepted), started.elapsed()))
+}
+
+/// 进程峰值 RSS（kB），用来证明跑法是有界的。
+fn peak_rss_kb() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmHWM:"))
+                .and_then(|l| l.split_whitespace().nth(1).map(|v| v.to_string()))
+        })
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// 端到端补数回放：源 `ts/` 拷贝里的每个点 → 一条接入记录 → `apply_with_sinks`
+/// （Redis 去重 + VM 写入），量**接入墙钟**与 records/s。
+///
+/// 这是「去重键拖死迁移」的验收场景：改前每记录两次 Redis 往返。同一轮里还会用
+/// 逐条 `exists`+`set` 跑一个小样本，作为**同一实例上的改前天花板**对照。
+///
+/// **内存有界**：记录按 `chunk` 流式生成、逐批 apply，不把 539 万条记录攒在内存里
+/// （2026-11-10 第一版就是这么把 cloud3 打到 11.7GB / OOM 的）。生产节点上跑必须加
+/// 上限，peak RSS 会打在 SUMMARY 里：
+///
+/// ```text
+/// systemd-run --scope -p MemoryMax=6G -p MemorySwapMax=0 -- ./replay_bench \
+///   bench_ingest_replay_throughput --ignored --nocapture --test-threads=1
+/// ```
+///
+/// 环境变量：`DP_BENCH_INGEST_CHUNK`（信封大小，默认 1000）、
+/// `DP_BENCH_INGEST_LIMIT`（只跑前 N 条，0 = 全部）、
+/// `DP_BENCH_DEDUP_SINGLE_N`（改前口径样本，默认 20000）、
+/// `DP_BENCH_INGEST_KEEP=1`（跳过收尾清理）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "需要真实 cloud3 Redis/VM 与 tsink 数据目录拷贝"]
+async fn bench_ingest_replay_throughput() {
+    use dataplane_adapter_redis::{RedisConfig, RedisKvStore};
+    use dataplane_kv::KvStore;
+    use dataplane_log::TantivyLogStore;
+
+    let src = std::env::var("DP_BENCH_TS_SRC").expect("DP_BENCH_TS_SRC");
+    let redis_url = std::env::var("DP_BENCH_REDIS_URL").expect("DP_BENCH_REDIS_URL");
+    let insert = std::env::var("DP_BENCH_VM_INSERT_URL").expect("DP_BENCH_VM_INSERT_URL");
+    let select = std::env::var("DP_BENCH_VM_SELECT_URL").unwrap_or_else(|_| insert.clone());
+    let chunk = env_usize("DP_BENCH_INGEST_CHUNK", 1000).max(1);
+    let limit = env_usize("DP_BENCH_INGEST_LIMIT", 0);
+    let queue_capacity = env_usize("DP_BENCH_VM_QUEUE_CAPACITY", 500_000).max(chunk);
+    let prefix = format!("bench-in-{}-", std::process::id());
+
+    // 打开源 dir 会重放 WAL 并改写目录 —— 必须是拷贝，且这段不计入接入计时。
+    let (source, _) = open_source(&src);
+    let series = source.list_metrics_with_wal().expect("list series");
+    eprintln!("series total: {}", series.len());
+    let start = 1i64;
+    let end = now_micros() + 86_400_000_000;
+
+    let kv = RedisKvStore::new(RedisConfig {
+        url: redis_url,
+        password: None,
+        prefix: prefix.clone(),
+        ..RedisConfig::default()
+    })
+    .await
+    .expect("redis");
+    let vm = VictoriaMetricsStore::new(VmConfig {
+        insert_url: insert,
+        select_url: select,
+        tenant: "0".to_string(),
+        single_node: std::env::var("DP_BENCH_VM_SINGLE_NODE").is_ok(),
+        batch_size: 5000,
+        flush_interval: Duration::from_millis(50),
+        queue_capacity,
+        ..VmConfig::default()
+    })
+    .expect("vm store");
+    let log_dir = std::env::temp_dir().join(format!("bench-ingest-log-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&log_dir);
+    let log = TantivyLogStore::new(&log_dir).expect("log store");
+
+    // --- 流式：边读源点边凑信封，一次只有一个信封（chunk 条）在内存里 ---
+    let mut accepted = 0u64;
+    let mut apply_total = Duration::ZERO;
+    let mut seq = 0usize;
+    let mut idx = 0usize;
+    let mut buf: Vec<serde_json::Value> = Vec::with_capacity(chunk);
+    let mut error: Option<dataplane_core::DataplaneError> = None;
+
+    'outer: for chunk_series in series.chunks(200) {
+        let rows = source.select_many(chunk_series, start, end).expect("read");
+        for row in &rows {
+            for dp in &row.points {
+                let Some(p) = to_ts_point(&row.series, dp) else {
+                    continue;
+                };
+                if limit > 0 && idx >= limit {
+                    break 'outer;
+                }
+                buf.push(record_json(&p, idx));
+                idx += 1;
+                if buf.len() >= chunk {
+                    let batch = std::mem::take(&mut buf);
+                    match apply_batch(&vm, &log, &kv, batch, seq).await {
+                        Ok((n, elapsed)) => {
+                            accepted += n;
+                            apply_total += elapsed;
+                        }
+                        Err(e) => {
+                            error = Some(e);
+                            break 'outer;
+                        }
+                    }
+                    seq += 1;
+                }
+            }
+        }
+    }
+    if error.is_none() && !buf.is_empty() {
+        match apply_batch(&vm, &log, &kv, std::mem::take(&mut buf), seq).await {
+            Ok((n, elapsed)) => {
+                accepted += n;
+                apply_total += elapsed;
+            }
+            Err(e) => error = Some(e),
+        }
+    }
+    eprintln!("records read from source: {idx}, envelopes: {}", seq + 1);
+
+    let flush_started = Instant::now();
+    let flush_result = vm.flush().await;
+    let flush_elapsed = flush_started.elapsed();
+    let total = apply_total + flush_elapsed;
+    let rate = accepted as f64 / total.as_secs_f64();
+    eprintln!(
+        "ingest batch: {} records, apply {:.3}s + flush {:.3}s = {:.3}s = {:.0} records/s",
+        accepted,
+        apply_total.as_secs_f64(),
+        flush_elapsed.as_secs_f64(),
+        total.as_secs_f64(),
+        rate
+    );
+    let stats = vm.storage_stats().await;
+    if let Ok(stats) = &stats {
+        eprintln!(
+            "vm stats: background_errors={} degraded={}",
+            stats.background_errors_total, stats.degraded
+        );
+    }
+
+    // --- 改前口径：每记录两次往返，只打 Redis（同一实例、同一前缀） ---
+    let single_n = env_usize("DP_BENCH_DEDUP_SINGLE_N", 20_000).min(idx.max(1));
+    let single_started = Instant::now();
+    for i in 0..single_n {
+        let key = format!("single/{i:08}");
+        if let Ok(false) = kv.exists(key.as_bytes()).await {
+            let _ = kv.set(key.as_bytes(), &now_micros().to_le_bytes()).await;
+        }
+    }
+    let single_elapsed = single_started.elapsed();
+    eprintln!(
+        "dedup single-roundtrip (改前口径): {} records in {:.3}s = {:.0} records/s",
+        single_n,
+        single_elapsed.as_secs_f64(),
+        single_n as f64 / single_elapsed.as_secs_f64()
+    );
+    eprintln!(
+        "SUMMARY records={} batch_total={:.3}s batch_records_per_s={:.0} single_roundtrip_records_per_s={:.0} peak_rss_kb={}",
+        accepted,
+        total.as_secs_f64(),
+        rate,
+        single_n as f64 / single_elapsed.as_secs_f64(),
+        peak_rss_kb()
+    );
+
+    // --- 收尾：不管成功还是失败都清（第一版失败时跳过清理，在 Redis 里留了 2002 个键） ---
+    if std::env::var("DP_BENCH_INGEST_KEEP").is_err() {
+        let cleanup = Instant::now();
+        let removed = kv
+            .prune_prefix_before(b"ingest/", i64::MAX)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("cleanup ingest failed: {}: {}", e.code.as_str(), e.message);
+                0
+            });
+        let _ = kv.prune_prefix_before(b"single/", i64::MAX).await;
+        eprintln!(
+            "cleanup: {} ingest keys in {:.3}s",
+            removed,
+            cleanup.elapsed().as_secs_f64()
+        );
+    }
+
+    if let Some(e) = error {
+        panic!("ingest batch failed: {}: {}", e.code.as_str(), e.message);
+    }
+    flush_result.expect("vm flush");
+    let stats = stats.expect("vm stats");
+    assert!(!stats.degraded, "VM 写入有失败批次");
+    let _ = std::fs::remove_dir_all(&log_dir);
+}
+
+/// 全量规模的**合成**接入回放：不打开任何源目录，内存 ~百 MB，可在受限 cgroup 里跑。
+///
+/// 与 `bench_ingest_replay_throughput` 的口径一致（同一条 `apply_with_sinks` 路径、
+/// 同样的去重与 VM 写入），只是点集是生成的：`DP_BENCH_RECORDS` 条、`DP_BENCH_SERIES`
+/// 条序列、1s 间隔。用来在**不能碰 tsink 大目录**的机器上拿全量墙钟（539 万条）。
+///
+/// ```text
+/// systemd-run --scope -p MemoryMax=2G -p MemorySwapMax=0 -- ./replay_bench \
+///   bench_ingest_synthetic --ignored --nocapture --test-threads=1
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "需要真实 Redis/VM"]
+async fn bench_ingest_synthetic() {
+    use dataplane_adapter_redis::{RedisConfig, RedisKvStore};
+    use dataplane_kv::KvStore;
+    use dataplane_log::TantivyLogStore;
+
+    let redis_url = std::env::var("DP_BENCH_REDIS_URL").expect("DP_BENCH_REDIS_URL");
+    let insert = std::env::var("DP_BENCH_VM_INSERT_URL").expect("DP_BENCH_VM_INSERT_URL");
+    let select = std::env::var("DP_BENCH_VM_SELECT_URL").unwrap_or_else(|_| insert.clone());
+    let total_n = env_usize("DP_BENCH_RECORDS", 5_391_255);
+    let series_n = env_usize("DP_BENCH_SERIES", 3_342).max(1);
+    let chunk = env_usize("DP_BENCH_INGEST_CHUNK", 1000).max(1);
+    let prefix = format!("bench-in-{}-", std::process::id());
+
+    let kv = RedisKvStore::new(RedisConfig {
+        url: redis_url,
+        password: None,
+        prefix: prefix.clone(),
+        ..RedisConfig::default()
+    })
+    .await
+    .expect("redis");
+    let vm = VictoriaMetricsStore::new(VmConfig {
+        insert_url: insert,
+        select_url: select,
+        tenant: "0".to_string(),
+        single_node: std::env::var("DP_BENCH_VM_SINGLE_NODE").is_ok(),
+        batch_size: 5000,
+        flush_interval: Duration::from_millis(50),
+        queue_capacity: env_usize("DP_BENCH_VM_QUEUE_CAPACITY", 500_000).max(chunk),
+        ..VmConfig::default()
+    })
+    .expect("vm store");
+    let log_dir = std::env::temp_dir().join(format!("bench-ingest-log-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&log_dir);
+    let log = TantivyLogStore::new(&log_dir).expect("log store");
+
+    let base_ts = now_micros() - (total_n as i64 / series_n as i64).max(1) * 1_000_000;
+    let mut accepted = 0u64;
+    let mut apply_total = Duration::ZERO;
+    let mut seq = 0usize;
+    let mut error: Option<dataplane_core::DataplaneError> = None;
+    let mut buf: Vec<serde_json::Value> = Vec::with_capacity(chunk);
+
+    for i in 0..total_n {
+        let s = i % series_n;
+        buf.push(serde_json::json!({
+            "record_id": format!("rp{i:09}"),
+            "timestamp": base_ts + (i as i64 / series_n as i64) * 1_000_000,
+            "measurement": format!("bench_syn_{:03}", s % 64),
+            "tags": { "series": format!("s{s}"), "agent_id": "bench", "host_id": "bench", "item_id": "bench" },
+            "field_name": "value",
+            "field_value": (i % 1000) as f64,
+        }));
+        if buf.len() >= chunk {
+            match apply_batch(&vm, &log, &kv, std::mem::take(&mut buf), seq).await {
+                Ok((n, elapsed)) => {
+                    accepted += n;
+                    apply_total += elapsed;
+                }
+                Err(e) => {
+                    error = Some(e);
+                    break;
+                }
+            }
+            seq += 1;
+        }
+    }
+    if error.is_none() && !buf.is_empty() {
+        if let Ok((n, elapsed)) = apply_batch(&vm, &log, &kv, std::mem::take(&mut buf), seq).await {
+            accepted += n;
+            apply_total += elapsed;
+        }
+    }
+
+    let flush_started = Instant::now();
+    let flush_result = vm.flush().await;
+    let flush_elapsed = flush_started.elapsed();
+    let total = apply_total + flush_elapsed;
+    let rate = accepted as f64 / total.as_secs_f64();
+    let stats = vm.storage_stats().await;
+    eprintln!(
+        "ingest synthetic: {} records over {} series, apply {:.3}s + flush {:.3}s = {:.3}s = {:.0} records/s",
+        accepted,
+        series_n,
+        apply_total.as_secs_f64(),
+        flush_elapsed.as_secs_f64(),
+        total.as_secs_f64(),
+        rate
+    );
+    if let Ok(stats) = &stats {
+        eprintln!(
+            "vm stats: series={} background_errors={} degraded={}",
+            stats.series_count, stats.background_errors_total, stats.degraded
+        );
+    }
+    eprintln!(
+        "SUMMARY records={} total={:.3}s records_per_s={:.0} peak_rss_kb={}",
+        accepted,
+        total.as_secs_f64(),
+        rate,
+        peak_rss_kb()
+    );
+
+    if std::env::var("DP_BENCH_INGEST_KEEP").is_err() {
+        let cleanup = Instant::now();
+        let removed = kv
+            .prune_prefix_before(b"ingest/", i64::MAX)
+            .await
+            .unwrap_or(0);
+        eprintln!(
+            "cleanup: {} keys in {:.3}s",
+            removed,
+            cleanup.elapsed().as_secs_f64()
+        );
+    }
+    if let Some(e) = error {
+        panic!("ingest batch failed: {}: {}", e.code.as_str(), e.message);
+    }
+    flush_result.expect("vm flush");
+    let _ = std::fs::remove_dir_all(&log_dir);
 }

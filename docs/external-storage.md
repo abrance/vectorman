@@ -65,6 +65,24 @@ vm_whole_series_delete = false       # VM 只能整序列删；见 §6「删除�
 
 ## 2. 切换步骤
 
+0. **上线前先验 VM 去重窗口**（硬前置，§5）：同一条序列连写 `t`、`t+5s`、`t+40s`
+   三个点，range 查询必须回 **3 个点**。回 2 个 = vmstorage 的
+   `-dedup.minScrapeInterval` 不是 0，**停下，不要往下切**：
+
+   ```bash
+   P='bench_dedup_probe{src="cutover"}'
+   now=$(date +%s)
+   for off in 0 5 40; do
+     curl -s -X POST "$VM_INSERT/insert/0/prometheus/api/v1/import/prometheus" \
+       --data-binary "$P $off $(( (now+off)*1000 ))"
+   done
+   sleep 5
+   curl -s "$VM_SELECT/select/0/prometheus/api/v1/query_range" \
+     --data-urlencode "query=$P" \
+     --data-urlencode "start=$((now-60))" --data-urlencode "end=$((now+120))" \
+     --data-urlencode "step=1" | jq '.data.result[0].values | length'   # 必须是 3
+   ```
+
 1. **前置条件先满足**（§5，尤其 Redis 的 AOF 与容量）。前置没做完就切 = 重启丢
    `ingest/` 去重键、写满即硬失败。
 2. 先只切时序（风险小、可独立回滚）：
@@ -152,12 +170,15 @@ VM），不写 redb→Redis / tsink→VM 的迁移工具。**
 
 **两个必须知道的 VM 行为（实测）：**
 
-1. **`-dedup.minScrapeInterval=30s` 会让 1s 级数据在查询时被合并。**
-   实测：同序列写 `t`、`t+5s`、`t+40s` 三个点，range 查询只回 2 个（`t` 与 `t+5s`
-   合并成后写胜出的一个）。dataserver 的指标是秒级/分钟级自监控，30s 去重会**静默
-   丢样本**。要么把 vmstorage 的 `-dedup.minScrapeInterval` 调到 ≤ 最小采样间隔
-   （自监控是 1s~15s，建议 `0`），要么接受降采样 —— 这一条不解决，外置时序只能
-   承载「≥30s 分辨率」的数据。**这是切生产的阻塞项。**
+1. **`-dedup.minScrapeInterval` 必须是 `0` —— 这是硬前置条件，不是建议。**
+   非 0 时同序列落在窗口内的点会在**查询**时被合并（后写胜出）。实测
+   `=30s` 时：同序列写 `t`、`t+5s`、`t+40s` 三个点，range 查询只回 2 个
+   （`t` 与 `t+5s` 合并）。dataserver 写的是秒级数据 → **静默丢样本**，
+   而且写入侧、`vm_rows_inserted_total`、`background_errors_total` 全部正常，
+   只有查询时才看得出来。
+   现状（2026-11-10 由 tim 改并核对）：vmstorage args 已为
+   `--dedup.minScrapeInterval=0`。**任何人改回非 0 都等于把外置时序降成
+   ≥30s 分辨率**，上线巡检里有一步专门验证（§2 第 0 步）。
 2. **`-search.latencyOffset`（默认 30s）**：查询当前时间最近 30s 的数据看不到。
    排障时别把「刚写入查不到」当故障。
 3. **删除接口不接受 `start`/`end`**（实测 400：
@@ -180,7 +201,7 @@ tim 已在 `vectorman` ns 建 VM 删除 key 的副本（secret 不跨 ns），da
 | `scan_prefix` | 全量 `Vec` | 全量 `Vec`（`SCAN` 累积） | 只给有界集合用：`spec-live/`、`retain/`（采集项数）、`stream/`（千级）。**不要对 `ingest/` 用** |
 | `prune_prefix_before` | 范围流式 | `SCAN` + 批量 GET/DEL（流式） | 百万级键可用；`SCAN` 只保证「扫过的都处理」，期间新写入的键可能漏到下轮（下一轮会补） |
 | `delete_series` | 写墓碑，支持时间窗 | **只能整序列删**，且必须配 `delete_auth_key` | `whole_series_delete=false`（缺省）时按时间窗的删除请求被**明确拒绝**（`invalid_argument`）；设为 `true` 则整条序列删掉、窗口外的点一起没，并打 warn。**即使用 `true`，无 label matcher 的选择也会被拒绝** —— 那种请求等于「删掉整个指标」，APM 保留期就是这种入参 |
-| 采样分辨率 | 任意 | 受 vmstorage `-dedup.minScrapeInterval` 限制（cloud3 现为 30s） | 小于该间隔的点在查询时被合并 → 秒级数据静默丢样本。**阻塞项**，见 §5 |
+| 采样分辨率 | 任意 | 受 vmstorage `-dedup.minScrapeInterval` 限制 | 现为 `0`（= 不去重），秒级数据完整保留；改回非 0 会静默丢样本，见 §5 |
 | 一致性 | 单文件 | 无事务 | `retain/` 写入 + `spec-live/` 删除不是原子的；残留结果是「多留一天」，不丢数据 |
 
 ## 7. 实测对比（2026-11-10，cloud3）
@@ -242,12 +263,201 @@ tim 已在 `vectorman` ns 建 VM 删除 key 的副本（secret 不跨 ns），da
 | `prune_prefix_before`（SCAN + 批量 GET/DEL） | 2.59s / 20 万 = **77,113 keys/s** |
 | 内存 | 122 B/key（10 万键实测 11.6MB）→ 1M 键 ≈ 122MB；`kv.redb` 403MB 对应 Redis ≈ 400–500MB，`maxmemory 2gb` 够用 |
 
-**已知瓶颈（要评估，不在本次改）**：trait 是「一键一次往返」，所以接入路径的
-`exists` + `set`（去重键）在 1.5k 记录/s 以上就会顶到 Redis 的 RTT 上限，
-而本地 redb 是微秒级。当前实际接入量（5.39M 点/天 ≈ 62 点/s）远低于这个天花板，
-**但 WAL 重放/突发补数会被它卡住**。要提上去需要给 `KvStore` 加 `set_many` / `exists_many`
-批量方法（trait 变更，本次未做）。
+### 7.5 去重批量化（`set_many` / `exists_many`）实测（2026-11-10，cloud3 集群内）
+
+接入路径原来是每记录两次 Redis 往返（`exists` + `set`），5.39M 条补数会被 RTT 卡死。
+现在：整批一次 `exists_many`（`MGET`）、标记攒 512 条一次 `set_many`（`MSET`）。
+trait 的两个方法都有缺省实现（逐条循环），所以 redb 与现有调用方零改动；
+redb 侧覆写成「一个读事务 / 一个写事务」，Redis 侧覆写成 `MGET` / `MSET`。
+
+同一份 `ts/` 拷贝、同一实例（ClusterIP 直连，不经隧道），`bench_ingest_replay_throughput`：
+
+| 口径 | 样本 | 墙钟 | 速率 |
+|---|---|---|---|
+| **改后·全量**：合成点集（3342 序列 / 1s 间隔），信封 1000 条 | **5,391,255 条** | **101.256s**（apply 101.254 + flush 0.002） | **53,244 records/s** |
+| 改后·真实源（源 `ts/` 拷贝流式读出） | 200,000 条 | 6.112s（apply 6.105 + flush 0.007） | 32,722 records/s |
+| **改前**：逐条 `exists` + `set`（同一 Redis、同一前缀，只打 KV） | 20,000 条 | 9.930s | **2,014 records/s** |
+
+- **539 万条从「约 45 分钟」降到 101 秒**（按改前的 2,014 records/s 折算 5.39M ≈ 2,676s）。
+  改后两条路径都是 `background_errors_total=0`、`degraded=false`。
+- 53.2k records/s 仍低于 VM 直写的 113.8k 点/s，**新的瓶颈是接入路径自身**
+  （`serde_json::Value` → `MetricsRecord` 反序列化 + tags 克隆，约 19µs/条），不是 Redis，也不是 VM。
+  真实源那条 32.7k 更低，多出来的是从 tsink 逐点读取与转换的成本（迁移时才会遇到）。
+- `prune_prefix_before`：200,000 键 3.606s = 55.5k keys/s；539 万键 72.294s = **74.6k keys/s**。
+  去重键清理（每天一轮）不是瓶颈。
+- Redis 占用：20 万键 20.3MB → 约 **102 B/key**，539 万键 ≈ **550MB**（`maxmemory 2gb` 够，盯 `used_memory`）。
+- **跑法有硬性要求**：这条基准会把源 `ts/` 目录整个重放进内存做对照，必须在有内存上限的
+  cgroup 里跑（`systemd-run --scope -p MemoryMax=6G -p MemorySwapMax=0`），
+  `SUMMARY` 里的 `peak_rss_kb` 是自查字段。2026-11-10 第一版把 5.39M 条记录先攒进
+  `Vec<Value>`（峰值 11.7GB），在 15G 无 swap 的生产节点上触发节点级 OOM，
+  dataserver 被连带 OOMKilled —— 现已改为「边读源边凑信封、一次只持有一个信封」。
 
 **`SCAN MATCH` 是整键空间扫描**：`prune_prefix_before`/`scan_prefix` 每轮都会遍历
 整个 DB（COUNT 500），键越多越慢（77k keys/s 的量级下，百万键 ≈ 13s/轮）。
 清理周期（`ts_clean_interval`，默认 ≥60s）下可接受，但别把它放进请求路径。
+
+---
+
+## 8. 切换清单（可直接照敲）
+
+前提：镜像 `ghcr.io/abrance/vectorman-server:v1.3.15-<sha>` 已出（`server/v1.3.15` tag），
+`cops/apps/vectorman/k8s.yaml` 里的 dataserver 用的是它。
+
+### 8.1 切之前必须核过（任一条不过就停）
+
+```bash
+# ① VM 必须不去重：同序列 t / t+5s / t+40s 要回 3 个点（§2 第 0 步那段 curl，期望 3）
+sudo k3s kubectl -n victoria-metrics get sts \
+  vmcluster-victoria-metrics-cluster-vmstorage \
+  -o jsonpath='{.spec.template.spec.containers[0].args}' | tr ',' '\n' | grep dedup
+#   期望： "--dedup.minScrapeInterval=0"
+
+# ② 两个 secret 在 vectorman ns（secret 不跨 ns）：
+sudo k3s kubectl -n vectorman get secret dataserver-redis dataserver-vm
+
+# ③ Redis 持久化与容量（重启会丢 ingest/ 去重键 = 重复入库）
+sudo k3s kubectl -n redis-test exec redis-0 -- sh -c \
+  'redis-cli -a $REDIS_PASSWORD --no-auth-warning config get appendonly; \
+   redis-cli -a $REDIS_PASSWORD --no-auth-warning info memory | grep -E "used_memory_human|maxmemory_human|maxmemory_policy"; \
+   redis-cli -a $REDIS_PASSWORD --no-auth-warning dbsize'
+#   期望：appendonly yes、noeviction、used_memory 远小于 2G、dbsize=0（首次切换）
+
+# ④ 节点余量：切换本身几乎不占内存，但迁移回放会占 ~3G
+free -g   # available ≥ 8
+```
+
+### 8.2 完整 env 清单（`apps/vectorman/k8s.yaml` 的 dataserver 容器）
+
+```yaml
+          env:
+            - name: DP_DATA_PATH
+              value: /app/dataserver/data
+            # --- KV 后端：redb → Redis ---
+            - name: DATASERVER_KV_BACKEND
+              value: redis
+            - name: DATASERVER_REDIS_URL
+              value: redis://redis.redis-test.svc:6379/0
+            - name: DATASERVER_REDIS_PREFIX
+              value: "dp:"
+            - name: DATASERVER_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: dataserver-redis      # ns vectorman 里的副本
+                  key: REDIS_PASSWORD
+            # --- 时序后端：tsink → VictoriaMetrics ---
+            - name: DATASERVER_TS_BACKEND
+              value: victoriametrics
+            - name: DATASERVER_VM_INSERT_URL
+              value: http://vmcluster-victoria-metrics-cluster-vminsert.victoria-metrics.svc:8480
+            - name: DATASERVER_VM_SELECT_URL
+              value: http://vmcluster-victoria-metrics-cluster-vmselect.victoria-metrics.svc:8481
+            - name: DATASERVER_VM_TENANT
+              value: "0"
+            - name: DATASERVER_VM_SINGLE_NODE
+              value: "0"          # 集群版：URL 自带 /insert|/select 前缀
+            - name: DATASERVER_VM_BATCH_SIZE
+              value: "5000"       # 单批点数
+            - name: DATASERVER_VM_FLUSH_INTERVAL_MS
+              value: "200"        # 攒批最长等待
+            - name: DATASERVER_VM_QUEUE_CAPACITY
+              value: "500000"     # 回放/补数时 20 万会撞背压（实测 3349 次/5.39M），给到 50 万
+            - name: DATASERVER_VM_WHOLE_SERIES_DELETE
+              value: "0"          # 保持「按时间窗删除一律拒绝」
+            - name: DATASERVER_VM_DELETE_AUTH_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: dataserver-vm
+                  key: VM_DELETE_AUTH_KEY
+```
+
+`config.toml`（ConfigMap `dataserver-conf`）**不用改**：`data_path` 仍指向原目录
+（外置模式下 `ts/`、`kv.redb` 不再写入，但也不删）；`ts_memory_limit_bytes` /
+`ts_wal_size_limit_bytes` / `ts_cardinality_limit` 在外置模式下无效，留着无害。
+
+### 8.3 执行顺序（写中断约 6–9 分钟，Agent 侧有缓冲重试）
+
+```bash
+NS=vectorman
+# ① 停写（Recreate 策略，先缩到 0 再改配置，避免滚动期两个实例同时写）
+sudo k3s kubectl -n $NS scale deploy/dataserver --replicas=0
+sudo k3s kubectl -n $NS wait --for=delete pod -l app=dataserver --timeout=120s
+
+# ② 拷贝老的 tsink 目录（只拷，不打开；打开会重放并改写）
+SRC=/app/dataserver/data/ts           # PVC 上的路径，用一次临时 pod 挂同一个 PVC 更省事
+cp -a "$SRC" /tmp/migrate-ts-$(date +%H%M)
+
+# ③ 回放历史时序进 VM（直写 VM，不产生 ingest/ 去重键）
+#    在一台能连 vminsert 的机器上跑预编译的 replay_bench（无需 Rust 工具链）：
+systemd-run --scope -p MemoryMax=6G -p MemorySwapMax=0 -- \
+  ./replay_bench replay_local_vs_victoriametrics --ignored --nocapture --test-threads=1
+#    env：DP_BENCH_TS_SRC=/tmp/migrate-ts-<hhmm> DP_BENCH_SKIP_LOCAL=1
+#         DP_BENCH_VM_INSERT_URL=http://<vminsert>:8480 DP_BENCH_VM_SELECT_URL=http://<vmselect>:8481
+#    核对：vm_rows_inserted_total{type="prometheus"} 的差值 == 回放点数（§7.3 口径）
+
+# ④ 上新配置（env 见 8.2）
+sudo k3s kubectl -n $NS apply -f apps/vectorman/k8s.yaml
+sudo k3s kubectl -n $NS rollout status deploy/dataserver --timeout=600s   # 期望 <10s Ready
+```
+
+**`ingest/` 不迁移的后果**（已知并接受）：切换后 Redis 里没有任何去重键，Agent 重发窗口
+内的记录会被再受理一次 → VM 侧同 `(series, timestamp)` 覆盖写，**不产生重复点**；
+但 `stream/`、`retain/`、`spec-live/` 三类小集合要按 §4 用 `scan_prefix` + `set` 手工搬，
+否则 `/v1/streams` 面板在下次上报前是空的、已删采集项的数据会多留一天。
+
+### 8.4 部署后自检（命令 + 期望输出）
+
+```bash
+POD=$(sudo k3s kubectl -n vectorman get pod -l app=dataserver -o name | head -1)
+
+# ① 存活
+sudo k3s kubectl -n vectorman exec $POD -- curl -s localhost:8081/health
+#    {"status":"ok"}
+
+# ② 时序后端自报（关键：memory_used/wal 必须是 0，错误计数必须是 0）
+sudo k3s kubectl -n vectorman exec $POD -- curl -s localhost:8081/v1/ts/stats
+#    series_count>0  memory_used_bytes=0  wal_size_bytes=0
+#    background_errors_total=0   degraded=false   retention_days=30
+
+# ③ 写一条查一条（秒级，确认不被 dedup 压掉）
+NOW=$(date +%s)
+sudo k3s kubectl -n vectorman exec $POD -- curl -s -X POST localhost:8081/v1/ingest \
+  -d "{\"batch_id\":\"cutover-$NOW\",\"data_type\":\"metrics\",\"data_id\":\"cutover\",
+       \"agent_id\":\"cutover\",\"host_id\":\"cutover\",\"sent_at_micros\":$((NOW*1000000)),
+       \"records\":[{\"record_id\":\"cutover-$NOW\",\"timestamp\":$((NOW*1000000)),
+       \"measurement\":\"cutover_probe\",\"tags\":{\"src\":\"cutover\"},
+       \"field_name\":\"value\",\"field_value\":1}]}"
+#    {"accepted":1,"status":"ok","failures":[]}
+sleep 35   # 越过 vmselect 的 -search.latencyOffset（默认 30s）
+curl -s "$VM_SELECT/select/0/prometheus/api/v1/query?query=cutover_probe" | jq '.data.result|length'
+#    ≥1
+
+# ④ 去重仍然生效：同 record_id 再发一次 → accepted 计入，但 VM 点数不增
+#    （对比 /select/0/.../series?match[]=cutover_probe 的返回条数前后一致）
+
+# ⑤ 自监控：dataserver_ts_background_errors_total 增量必须是 0；degraded 会粘滞，不要看它
+sudo k3s kubectl -n vectorman exec $POD -- curl -s localhost:9091/metrics | grep -E "background_errors_total|dropped"
+```
+
+### 8.5 回滚
+
+```bash
+# ① 把 8.2 的两组 env 删掉（或把 BACKEND 改回 redb / tsink），重启即可
+sudo k3s kubectl -n vectorman set env deploy/dataserver DATASERVER_KV_BACKEND=redb DATASERVER_TS_BACKEND=tsink
+# ② 老数据目录全程没动，回滚后接着用；Redis 的键留着不用清（回滚后没人读）
+# ③ VM 里的数据**不要删**：再次切回外置可直接复用，只是切换窗口内本地新写的点缺失
+```
+
+回滚会丢掉「切换期间写进外置存储」的那部分：时序在 VM、去重键在 Redis，两边都没有反向
+导出工具（§4）。
+
+### 8.6 预期数字（2026-11-10 实测/推算，标注清楚）
+
+| 项 | 值 | 来源 |
+|---|---|---|
+| dataserver Ready（外置后端） | **<2s**（实测 0.76s），本地 tsink 是 340s | 实测 |
+| 接入吞吐（批量去重 + VM） | **53,244 records/s** | 实测 5,391,255 条（峰值 RSS 25MB） |
+| 其中 VM 直写上限 | 113,782 点/s | 实测 5.39M 点 |
+| 改前（逐条去重往返） | 2,014 records/s（5.39M 折算 ≈ 2,676s） | 实测 20k 条样本 |
+| Redis 键数/内存 | 5.39M 键 ≈ **550MB**（102 B/key 实测，`maxmemory 2gb` 够，需盯 `used_memory`） | 实测 20 万键 + 折算 |
+| VM 磁盘日增量 | 5.39M 点写入后 vmstorage 目录 2MB → 3MB（merge 未收敛，仅量级参考）；20Gi PVC 余量充足 | 实测（粗） |
+| 迁移回放耗时（5.39M 点） | 写入 **101s**；另加源目录重放（本机拷贝 100–240s，受宿主负载影响） | 实测（写入段） |

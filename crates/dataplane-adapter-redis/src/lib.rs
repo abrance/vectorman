@@ -245,6 +245,48 @@ impl KvStore for RedisKvStore {
         Ok(n > 0)
     }
 
+    /// `MGET` 一次往返。逐键 `EXISTS` 的往返次数 = 批大小，接入去重会被 RTT 卡死。
+    async fn exists_many(&self, keys: &[Vec<u8>]) -> Result<Vec<bool>, DataplaneError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.conn.clone();
+        let mut out = Vec::with_capacity(keys.len());
+        // 分批只是给单条命令封一个大小上限（与 `SCAN` 用同一个提示条数）。
+        for chunk in keys.chunks(self.scan_count.max(1)) {
+            let mut cmd = redis::cmd("MGET");
+            for key in chunk {
+                cmd.arg(self.key(key));
+            }
+            let values: Vec<Option<Vec<u8>>> =
+                tokio::time::timeout(self.timeout, cmd.query_async(&mut conn))
+                    .await
+                    .map_err(|_| io_err("mget", "timeout"))?
+                    .map_err(|e| map_redis_error("mget", e))?;
+            out.extend(values.into_iter().map(|v| v.is_some()));
+        }
+        Ok(out)
+    }
+
+    /// `MSET` 一次往返，原子提交整批（与 trait 的「不得只提交一部分」一致）。
+    async fn set_many(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), DataplaneError> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.clone();
+        for chunk in pairs.chunks(self.scan_count.max(1)) {
+            let mut cmd = redis::cmd("MSET");
+            for (key, value) in chunk {
+                cmd.arg(self.key(key)).arg(value.as_slice());
+            }
+            let _: () = tokio::time::timeout(self.timeout, cmd.query_async(&mut conn))
+                .await
+                .map_err(|_| io_err("mset", "timeout"))?
+                .map_err(|e| map_redis_error("mset", e))?;
+        }
+        Ok(())
+    }
+
     async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DataplaneError> {
         let mut conn = self.conn.clone();
         let pattern = glob_pattern(&self.key(prefix));
