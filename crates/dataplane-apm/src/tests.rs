@@ -1623,6 +1623,82 @@ async fn retention_expires_old_apm_data_and_keeps_other_types() {
     assert!(!remaining.contains(&"d-old".to_string()));
 }
 
+/// VM 后端（只能整系列删）：APM 聚合点墓碑必须整段跳过，不许每轮报错中断淘汰与回收。
+#[tokio::test]
+async fn retention_skips_ts_tombstone_when_backend_has_no_window_delete() {
+    use crate::retention::ApmRetention;
+    use dataplane_log::TantivyLogStore;
+
+    #[derive(Default)]
+    struct NoWindowTs {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl dataplane_ts::TimeSeriesStore for NoWindowTs {
+        async fn write(&self, _p: dataplane_ts::TsPoint) -> Result<(), DataplaneError> {
+            Ok(())
+        }
+        async fn query_instant(
+            &self,
+            _expr: &str,
+            _t: Option<i64>,
+        ) -> Result<dataplane_ts::PromResult, DataplaneError> {
+            Ok(dataplane_ts::PromResult::default())
+        }
+        async fn query_range(
+            &self,
+            _expr: &str,
+            _s: i64,
+            _e: i64,
+            _step: i64,
+        ) -> Result<dataplane_ts::PromResult, DataplaneError> {
+            Ok(dataplane_ts::PromResult::default())
+        }
+        async fn delete_series(
+            &self,
+            _sel: dataplane_ts::TsSeriesSelection,
+        ) -> Result<dataplane_ts::TsDeleteReport, DataplaneError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(DataplaneError::new(
+                dataplane_core::ErrorCode::InvalidArgument,
+                "victoriametrics 只能整序列删除（测试桩）",
+            ))
+        }
+        fn supports_time_window_delete(&self) -> bool {
+            false
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let sql = store(dir.path());
+    bootstrap(sql.as_ref()).await.unwrap();
+    let log = TantivyLogStore::new(dir.path().join("logs")).unwrap();
+    let ts = NoWindowTs::default();
+
+    let old = NOW - 10 * 86_400 * 1_000_000;
+    seed_trace_row(sql.as_ref(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", old).await;
+    seed_edge_row(sql.as_ref(), old).await;
+    seed_trace_detail(&log, "d-old", old).await;
+
+    let retention = ApmRetention::new(apm_retention_config(0));
+    let report = retention
+        .run(sql.as_ref(), &log, &ts, dir.path(), NOW)
+        .await
+        .expect("后端不支持时间窗删除时，APM 保留不许整体失败");
+
+    assert_eq!(
+        ts.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "不发任何带 from_ts/to_ts 的删除请求"
+    );
+    assert_eq!(report.ts_tombstoned, 0);
+    assert_eq!(report.summaries_deleted, 1, "SQL 侧过期删除照跑");
+    assert_eq!(report.edges_deleted, 1);
+    assert_eq!(report.details_deleted, 1);
+    assert_eq!(report.stopped_reason, None);
+}
+
 #[tokio::test]
 async fn retention_evicts_oldest_when_over_size_budget() {
     use crate::retention::ApmRetention;

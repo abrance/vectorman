@@ -236,6 +236,14 @@ pub trait TimeSeriesStore: Send + Sync {
         ))
     }
 
+    /// `delete_series` 是否尊重 `from_ts`/`to_ts` 时间窗（默认 `true`）。
+    ///
+    /// VM 的删除接口只接受 `match[]`：删的是**整条序列**，时间窗被忽略。清理路径
+    /// 据此跳过「按保留期裁掉序列尾部」的删除，避免每小时发一条注定被拒的请求。
+    fn supports_time_window_delete(&self) -> bool {
+        true
+    }
+
     /// 存储运行状态摘要（保留、基数、内存、WAL）。默认返回零值。
     async fn storage_stats(&self) -> Result<TsStorageStats, DataplaneError> {
         Ok(TsStorageStats::default())

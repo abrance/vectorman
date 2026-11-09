@@ -255,6 +255,12 @@ async fn main() -> ExitCode {
             {
                 Ok(report) => {
                     cleanup_metrics.inc_counter("dataserver_ts_clean_runs_total", 1.0);
+                    if report.failed_phases > 0 {
+                        cleanup_metrics.inc_counter(
+                            "dataserver_ts_clean_errors_total",
+                            report.failed_phases as f64,
+                        );
+                    }
                     if report.ts.tombstones_applied > 0 {
                         cleanup_metrics.inc_counter(
                             "dataserver_ts_tombstones_applied_total",
@@ -274,13 +280,16 @@ async fn main() -> ExitCode {
                         );
                     }
                     println!(
-                        "retention cleanup: log_deleted={} ebpf_edges_deleted={} ts_items={} ts_matched_series={} ts_tombstones={} ingest_dedup_deleted={}",
+                        "retention cleanup: log_deleted={} ebpf_edges_deleted={} ts_items={} ts_matched_series={} ts_tombstones={} ts_skipped_items={} ts_failed_items={} ingest_dedup_deleted={} failed_phases={}",
                         report.log_deleted,
                         report.ebpf_edges_deleted,
                         report.ts.items,
                         report.ts.matched_series,
                         report.ts.tombstones_applied,
-                        report.ingest_dedup_deleted
+                        report.ts.skipped_items,
+                        report.ts.failed_items,
+                        report.ingest_dedup_deleted,
+                        report.failed_phases
                     );
                 }
                 Err(e) => {

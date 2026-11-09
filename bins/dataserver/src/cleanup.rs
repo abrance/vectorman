@@ -325,6 +325,10 @@ pub struct TsCleanReport {
     pub items: u64,
     pub matched_series: u64,
     pub tombstones_applied: u64,
+    /// 因后端不支持时间窗删除（VM）而跳过的采集项数。
+    pub skipped_items: u64,
+    /// 删除失败、已计入 warn 并跳过（不中断本轮）的采集项数。
+    pub failed_items: u64,
 }
 
 /// `apply_retention` 的结果（时序部分由 `run_cleanup` 合并）。
@@ -344,6 +348,8 @@ pub struct CleanupReport {
     pub ebpf_edges_deleted: u64,
     /// 删除的 `ingest/` 去重键数（接入时间早于保留窗口）。
     pub ingest_dedup_deleted: u64,
+    /// 失败但未中断本轮的阶段数（时序保留 / 日志保留）。非 0 表示该阶段本轮作废。
+    pub failed_phases: u64,
 }
 
 /// 连续零命中多少轮后提示一次。
@@ -378,11 +384,14 @@ impl TsCleanTracker {
 /// 1. 采集项自己的 `retention_days` 比全局窗口短；
 /// 2. 已删除的采集项（`retain/{item_id}`）已到 `until_micros`。
 ///
+/// 两类都是「按时间窗裁掉尾部」的需求。后端不支持时间窗删除（VM 只能整系列删）时
+/// 整段跳过，计入 [`TsCleanReport::skipped_items`]，不发注定被拒的请求。
+///
 /// **不删除 `retain/` 键**：键的删除由 [`apply_retention`] 在日志清理后统一完成，
 /// 否则下一轮就看不到已删项的到期时间。
 ///
-/// 单个采集项删除失败不阻断其余项：错误直接返回给调用方，已完成的部分保留
-/// （删除是幂等的，下一轮继续）。
+/// 单个采集项删除失败不阻断其余项、也不阻断调用方后续阶段：错误转成 warn 并计入
+/// `failed_items`（删除是幂等的，下一轮继续）。
 pub async fn apply_ts_retention(
     ts: &dyn TimeSeriesStore,
     kv: &dyn KvStore,
@@ -393,6 +402,7 @@ pub async fn apply_ts_retention(
 ) -> Result<TsCleanReport, DataplaneError> {
     let mut report = TsCleanReport::default();
     let global_days = global_days.max(1);
+    let window_delete = ts.supports_time_window_delete();
 
     for item in live {
         let days = clamp_retention_days(item.retention_days);
@@ -404,10 +414,27 @@ pub async fn apply_ts_retention(
         if cutoff <= 0 {
             continue;
         }
+        if !window_delete {
+            report.skipped_items += 1;
+            continue;
+        }
         let started = std::time::Instant::now();
-        let r = ts
+        let r = match ts
             .delete_series(item_selection(&item.item_id, cutoff))
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                report.failed_items += 1;
+                eprintln!(
+                    "ts retention: item_id={} delete failed, skipping this item: {}: {}",
+                    item.item_id,
+                    e.code.as_str(),
+                    e.message
+                );
+                continue;
+            }
+        };
         report.items += 1;
         report.matched_series += r.matched_series;
         report.tombstones_applied += r.tombstones_applied;
@@ -442,12 +469,29 @@ pub async fn apply_ts_retention(
         if now_micros < meta.until_micros || meta.until_micros <= 0 {
             continue;
         }
-        let r = ts
+        if !window_delete {
+            report.skipped_items += 1;
+            continue;
+        }
+        match ts
             .delete_series(item_selection(item_id, meta.until_micros))
-            .await?;
-        report.items += 1;
-        report.matched_series += r.matched_series;
-        report.tombstones_applied += r.tombstones_applied;
+            .await
+        {
+            Ok(r) => {
+                report.items += 1;
+                report.matched_series += r.matched_series;
+                report.tombstones_applied += r.tombstones_applied;
+            }
+            Err(e) => {
+                report.failed_items += 1;
+                eprintln!(
+                    "ts retention: item_id={} (retain/) delete failed, skipping this item: {}: {}",
+                    item_id,
+                    e.code.as_str(),
+                    e.message
+                );
+            }
+        }
     }
     Ok(report)
 }
@@ -560,13 +604,53 @@ pub async fn run_cleanup(
         }
     }
     let live = live.unwrap_or_default();
+    let mut failed_phases = 0u64;
     // 时序先于日志：`apply_retention` 会删除 `retain/` 键。
-    let ts_report = apply_ts_retention(ts, kv, &live, global_ts_days, now_micros, tracker).await?;
-    let retention = apply_retention(sql, log, kv, &live, now_micros).await?;
+    //
+    // 三个阶段互相解耦：任何一个阶段失败只作废自己，不许把后两个阶段（日志/边保留、
+    // `ingest/` 去重键收敛）一起短路 —— 否则一个注定失败的时间窗删除会让去重键
+    // 无限增长直到撞上 Redis `maxmemory`。
+    let ts_report = match apply_ts_retention(ts, kv, &live, global_ts_days, now_micros, tracker)
+        .await
+    {
+        Ok(report) => report,
+        Err(e) => {
+            failed_phases += 1;
+            eprintln!(
+                "retention cleanup: ts retention failed, log retention and dedup prune continue: {}: {}",
+                e.code.as_str(),
+                e.message
+            );
+            TsCleanReport::default()
+        }
+    };
+    let retention = match apply_retention(sql, log, kv, &live, now_micros).await {
+        Ok(report) => report,
+        Err(e) => {
+            failed_phases += 1;
+            eprintln!(
+                "retention cleanup: log retention failed, dedup prune continues: {}: {}",
+                e.code.as_str(),
+                e.message
+            );
+            RetentionReport::default()
+        }
+    };
     // 去重键只写不删会单调增长（线上 12 天 ~1GB）：按接入时间删旧键。
     let ingest_dedup_deleted = if ingest_dedup_days > 0 {
         let cutoff = now_micros.saturating_sub(i64::from(ingest_dedup_days) * MICROS_PER_DAY);
-        kv.prune_prefix_before(INGEST_PREFIX, cutoff).await?
+        match kv.prune_prefix_before(INGEST_PREFIX, cutoff).await {
+            Ok(n) => n,
+            Err(e) => {
+                failed_phases += 1;
+                eprintln!(
+                    "retention cleanup: dedup prune failed: {}: {}",
+                    e.code.as_str(),
+                    e.message
+                );
+                0
+            }
+        }
     } else {
         0
     };
@@ -575,6 +659,7 @@ pub async fn run_cleanup(
         ts: ts_report,
         ebpf_edges_deleted: retention.ebpf_edges_deleted,
         ingest_dedup_deleted,
+        failed_phases,
     })
 }
 
@@ -847,7 +932,10 @@ mod ebpf_retention_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dataplane_ts::{TimeSeriesStore, TsPoint, TsRetentionConfig, TsinkTimeSeriesStore};
+    use dataplane_ts::{
+        PromResult, TimeSeriesStore, TsDeleteReport, TsPoint, TsRetentionConfig,
+        TsinkTimeSeriesStore,
+    };
 
     fn store(dir: &std::path::Path) -> TsinkTimeSeriesStore {
         TsinkTimeSeriesStore::new(
@@ -858,6 +946,137 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    /// 每次 `delete_series` 都报错的时序后端（复现 VM 后端下的删除失败）。
+    struct FailingDeleteTs;
+
+    #[async_trait::async_trait]
+    impl TimeSeriesStore for FailingDeleteTs {
+        async fn write(&self, _point: TsPoint) -> Result<(), DataplaneError> {
+            Err(DataplaneError::new(ErrorCode::Unimplemented, "test stub"))
+        }
+        async fn query_instant(
+            &self,
+            _expr: &str,
+            _eval_time: Option<i64>,
+        ) -> Result<PromResult, DataplaneError> {
+            Err(DataplaneError::new(ErrorCode::Unimplemented, "test stub"))
+        }
+        async fn query_range(
+            &self,
+            _expr: &str,
+            _start: i64,
+            _end: i64,
+            _step: i64,
+        ) -> Result<PromResult, DataplaneError> {
+            Err(DataplaneError::new(ErrorCode::Unimplemented, "test stub"))
+        }
+        async fn delete_series(
+            &self,
+            _selection: TsSeriesSelection,
+        ) -> Result<TsDeleteReport, DataplaneError> {
+            Err(DataplaneError::new(
+                ErrorCode::InvalidArgument,
+                "victoriametrics 只能整系列删除（测试桩）",
+            ))
+        }
+    }
+
+    /// 不支持时间窗删除的后端（VM），并记录被调用次数。
+    #[derive(Default)]
+    struct NoWindowDeleteTs {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl TimeSeriesStore for NoWindowDeleteTs {
+        async fn write(&self, _point: TsPoint) -> Result<(), DataplaneError> {
+            Ok(())
+        }
+        async fn query_instant(
+            &self,
+            _expr: &str,
+            _eval_time: Option<i64>,
+        ) -> Result<PromResult, DataplaneError> {
+            Ok(PromResult::default())
+        }
+        async fn query_range(
+            &self,
+            _expr: &str,
+            _start: i64,
+            _end: i64,
+            _step: i64,
+        ) -> Result<PromResult, DataplaneError> {
+            Ok(PromResult::default())
+        }
+        async fn delete_series(
+            &self,
+            _selection: TsSeriesSelection,
+        ) -> Result<TsDeleteReport, DataplaneError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(TsDeleteReport {
+                matched_series: 0,
+                tombstones_applied: 0,
+            })
+        }
+        fn supports_time_window_delete(&self) -> bool {
+            false
+        }
+    }
+
+    /// 线上故障的回归：单条时序删除报错不许变成整轮 Err（会拖死去重键清理）。
+    #[tokio::test]
+    async fn live_item_delete_failure_is_counted_not_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = dataplane_kv::RedbKvStore::new(dir.path().join("kv.redb")).unwrap();
+        let live = vec![LiveItem {
+            item_id: "item-ebpf".to_string(),
+            retention_days: 1,
+            kind: "ebpf_network".to_string(),
+        }];
+        let report = apply_ts_retention(
+            &FailingDeleteTs,
+            &kv,
+            &live,
+            30,
+            now_micros(),
+            &mut TsCleanTracker::default(),
+        )
+        .await
+        .expect("单条删除失败必须返回 Ok（删除是幂等的，下轮重试）");
+        assert_eq!(report.failed_items, 1, "失败项单独计数，不吞成 0");
+        assert_eq!(report.items, 0, "失败项不计入已执行删除");
+    }
+
+    /// VM 后端：per-item 与 `retain/` 两条时间窗删除路径都不发请求。
+    #[tokio::test]
+    async fn backend_without_window_delete_sends_no_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = dataplane_kv::RedbKvStore::new(dir.path().join("kv.redb")).unwrap();
+        let now = now_micros();
+        kv.set(
+            retain_key("item-gone").as_bytes(),
+            format!("{{\"until_micros\":{}}}", now - MICROS_PER_DAY).as_bytes(),
+        )
+        .await
+        .unwrap();
+        let ts = NoWindowDeleteTs::default();
+        let live = vec![LiveItem {
+            item_id: "item-short".to_string(),
+            retention_days: 1,
+            kind: "log_file".to_string(),
+        }];
+        let report = apply_ts_retention(&ts, &kv, &live, 30, now, &mut TsCleanTracker::default())
+            .await
+            .unwrap();
+        assert_eq!(report.items, 0);
+        assert_eq!(report.skipped_items, 2, "per-item + retain/ 两条路径都跳过");
+        assert_eq!(
+            ts.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "不发任何带 from_ts/to_ts 的删除请求"
+        );
     }
 
     async fn instant(ts: &dyn TimeSeriesStore, ts_micros: i64) -> usize {
@@ -1068,5 +1287,70 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(report.ingest_dedup_deleted, 0);
+    }
+
+    /// 端到端回归：时序删除失败时，日志保留与 `ingest/` 去重键清理照跑。
+    #[tokio::test]
+    async fn ts_failure_does_not_block_log_retention_or_dedup_prune() {
+        use dataplane_sql::{RelationalStore, SqliteRelationalStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let kv = dataplane_kv::RedbKvStore::new(dir.path().join("kv.redb")).unwrap();
+        let log = dataplane_log::TantivyLogStore::new(dir.path().join("logs")).unwrap();
+        let sql: std::sync::Arc<dyn RelationalStore> =
+            std::sync::Arc::new(SqliteRelationalStore::new(dir.path().join("sql.db")).unwrap());
+        dataplane_apm::bootstrap(sql.as_ref()).await.unwrap();
+
+        let now = now_micros();
+        // 已删采集项：`retain/` 已到期 → 时序删除会（在 VM 上）失败，日志/边/键必须照样清。
+        kv.set(
+            retain_key("item-gone").as_bytes(),
+            format!("{{\"until_micros\":{}}}", now - MICROS_PER_DAY).as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut labels = BTreeMap::new();
+        labels.insert("data_id".to_string(), "item-gone".to_string());
+        log.append(dataplane_log::LogRecord {
+            id: "old-log".to_string(),
+            timestamp: now - 5 * MICROS_PER_DAY,
+            level: "info".to_string(),
+            message: "old".to_string(),
+            labels,
+            payload: None,
+        })
+        .await
+        .unwrap();
+        let old = dataplane_ingest::ingest_key("old");
+        kv.set(old.as_bytes(), &(now - 4 * MICROS_PER_DAY).to_le_bytes())
+            .await
+            .unwrap();
+
+        let mut tracker = TsCleanTracker::default();
+        let report = run_cleanup(
+            sql.as_ref(),
+            &log,
+            &FailingDeleteTs,
+            &kv,
+            None,
+            None,
+            30,
+            3,
+            now,
+            &mut tracker,
+        )
+        .await
+        .expect("时序删除失败不许把整轮变成 Err");
+
+        assert_eq!(report.ts.failed_items, 1, "失败项单独计数");
+        assert_eq!(report.ts.items, 0);
+        assert_eq!(report.failed_phases, 0, "单条删除失败不是阶段失败");
+        assert_eq!(report.log_deleted, 1, "日志保留照跑");
+        assert_eq!(report.ingest_dedup_deleted, 1, "去重键照删");
+        assert!(!kv.exists(old.as_bytes()).await.unwrap());
+        assert!(
+            kv.get(retain_key("item-gone").as_bytes()).await.is_err(),
+            "到期 `retain/` 键仍被删除（不会被时序失败拖住）"
+        );
     }
 }
