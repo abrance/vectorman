@@ -57,9 +57,10 @@ vm_whole_series_delete = false       # VM 只能整序列删；见 §6「删除�
 - 外置模式下 `data_path/ts`、`data_path/kv.redb` **不再写入**（但也不会被删），
   `sql.sqlite` / `logs/` / `files/` 仍用本地目录 —— 这次只替换 KV 与时序。
 - `kv_cache_bytes` 只在 `kv_backend=redb` 生效。
-- `ts_retention_days` 在外置模式下只用于 `storage_stats` 上报；真正的保留由
+- `ts_retention_days` 在外置模式下用于 `storage_stats` 上报；真正的保留由
   vmstorage 的 `-retentionPeriod` 决定（两边要对齐，否则 `/v1/ts/stats` 会显示一个
-  与服务端不一致的值）。
+  与服务端不一致的值）。**注意：清理任务仍会按时窗调用 `delete_series`**，在 VM 后端
+  一律被拒绝，见 §9.2。
 - `ts_cardinality_limit` / `ts_memory_limit_bytes` / `ts_wal_size_limit_bytes` 在
   `ts_backend=victoriametrics` 下无效（这些是本地引擎的闩锁）。
 
@@ -92,8 +93,11 @@ vm_whole_series_delete = false       # VM 只能整序列删；见 §6「删除�
    - `dataserver_ts_background_errors_total`（自监控）不涨
    - VM 侧 `vm_rows_inserted_total` 随接入量增长
 4. 再切 KV：`DATASERVER_KV_BACKEND=redis` + `DATASERVER_REDIS_URL/PASSWORD`，重启。
-5. 验收：接入一条数据 → `/v1/prom/query` 查得到；`/v1/streams` 能列出；
-   等一轮清理（`ts_clean_interval`）看 `ingest_dedup_deleted` 有数。
+5. 验收：接入一条数据 → `/v1/prom/query` 查得到；`/v1/streams` 能列出。
+   **`ingest_dedup_deleted` 在外置时序后端下不会被更新**：清理周期会先被时序删除的
+   `invalid_argument` 打断（§9.2），去重键剪枝被跳过。验收这一项要看
+   `redis-cli info memory` 的 `used_memory` 与 `dbsize` 在 24h 后是否仍在上行，
+   不要只看日志里有没有 `ingest_dedup_deleted`。
 
 ## 3. 回滚步骤
 
@@ -101,41 +105,91 @@ vm_whole_series_delete = false       # VM 只能整序列删；见 §6「删除�
 
 - 老数据目录 `data_path/ts`、`data_path/kv.redb` 全程没被修改，回滚后接着用。
 - **回滚会丢掉「切换期间写进外置存储」的那部分数据**：时序在 VM 里，KV 的去重键在
-  Redis 里。若要无缝回滚，需要在回滚前把这两段补回本地（当前没有反向导出工具，
-  见 §4 的迁移取舍）。
+  Redis 里。无缝回滚需要在回滚前把这两段补回本地，当前没有反向导出工具（§4）。
+  外置模式下 `ts/` 从未被打开，所以回滚后的本地时序**停在切换时刻**。
 - 回滚前把 `vm_*` / `redis_*` 连接留在配置里不影响启动（后端未选中就不建连）。
 
-## 4. 迁移：为什么选「WAL 重放」而不是写一次性迁移工具
+## 4. 迁移：外置模式**不迁移**历史时序（回填工具当前不存在）
 
-结论：**选 WAL 重放（把 `ts/` 目录拷走，用新版 dataserver 冷启动把老 WAL 重放进
-VM），不写 redb→Redis / tsink→VM 的迁移工具。**
+结论：**切换只改后端选择，历史时序留在本地，新后端里一条都查不到。**
+之前写的「选 WAL 重放、用新版 dataserver 冷启动把老 WAL 重放进 VM」在代码里
+并不存在，按现状作废：
 
-理由：
+- `bins/dataserver/src/main.rs`（`ts_backend` 分支）按配置**只构造一个** store，
+  `tsink` / `victoriametrics` 二选一，互斥。
+- `crates/dataplane-adapter-victoriametrics` 从不打开 `ts/`，只走 vminsert / vmselect。
+- 全仓没有 replay / migrate / backfill 入口：
+  `rg 'fn (replay|migrate|backfill|import_from|dump)'` 只命中 gse-server 的 ledger
+  迁移与 agent 的 `spec_apply`。`bins/dataserver/tests/replay_bench.rs` 是**测试基准**，
+  不进产品二进制，也不在镜像的默认路径里。
 
-1. 回放已经降到分钟级（上一轮 `c7a8754`，O(series)→O(batch)，1,691,215 点 48.6s
-   引擎自报），一次性工具的开发+验证成本高于它省下的时间。
-2. 写迁移工具要再实现一遍「读 redb 全表 + 读 tsink 全部段 + 断点续传 + 幂等」，
-   等于把本地引擎的读路径再用一次，且没有第二个使用场景。
-3. `ingest/` 去重键**不需要迁移**：它的语义是「防接入重试重复」，重建代价是
-   **允许一次重复入库**，不是丢数据；窗口内重复的数据量远小于迁移工具的复杂度。
+线上实测后果（2026-11-10 切换后）：本地 4411 序列的历史留在 `data_path/ts/`
+（129MB WAL，未删未改），切换后 `/v1/prom/query` 只能查到**切换之后**写进 VM 的点。
 
-丢数据边界（必须接受）：
+丢数据边界（按实际行为，必须接受）：
 
-- 迁移窗口内（拷贝 `ts/` 之后到 VM 追平之前）新产生的点，走的是新后端，不受影响；
-  但 `ts/` 拷贝之后本地不再写入，所以**本地时序与 VM 之间会有一段只存在于 VM 的点**
-  —— 这就是「切换时刻」，需要按 §2 的顺序（先切时序、观察、再切 KV）把窗口压到
-  一次重启。
+- **切换时刻之前的所有历史点**：只在本地 `ts/` 里，VM 不可见，`/v1/prom/query`、
+  `/v1/ts/stats` 的 `series_count` 都看不到它们。数据**没丢**，但当前没有回填路径
+  （§4.2）。
+- 回滚到 `ts_backend=tsink` 能重新看到全部本地历史；但**切换期间写进 VM 的点
+tsink 里没有**，回滚后这段时间是空白（除非再做一次 VM→本地反向导出，同样未实现）。
 - `retain/` / `spec-live/` / `stream/` 这三类 KV **必须迁移或重建**，否则：
   `retain/` 丢了 → 已删采集项的数据不会被清理（多留，不丢）；
   `spec-live/` 丢了 → 下一轮清理会把所有采集项误判成「刚回来」，只影响一轮对齐；
   `stream/` 丢了 → `/v1/streams` 面板在下次上报前是空的（展示，不丢数据）。
   这三类都是**小集合**（`spec-live/`/`retain/` 是采集项数，`stream/` 是千级），
-  用 `scan_prefix` + `set` 逐条搬即可；这也是唯一建议手写脚本搬的部分。
-- `ingest/` 不迁移：接受一次重复入库窗口。
-- **时序保留不迁移**：VM 侧 `-retentionPeriod=30d` 与 `ts_retention_days=30` 已对齐，
-  外置模式下 dataserver **不再**自己算全局保留（`storage_stats.retention_*` 只做上报）；
-  唯一还在 dataserver 侧执行的是 `retain/{item_id}` 触发的「采集项删除 → 清数据」，
-  在 VM 后端退化为整序列删除（§6）。
+  用 `scan_prefix` + `set` 逐条搬即可；这是目前唯一可照做的搬迁。
+- `ingest/` 不迁移：接受一次重复入库窗口。切换后 Redis 里没有去重键，Agent 重发
+  窗口内的记录会被再受理一次，VM 侧同 `(series, timestamp)` 覆盖写，**不产生重复点**。
+- **时序保留不迁移**：VM 侧 `-retentionPeriod=30d` 与 `ts_retention_days=30` 已对齐。
+  但「dataserver 不再自己算全局保留」这句在代码里只对了一半，见 §9.2。
+
+### 4.1 操作含义（切换清单按这个口径）
+
+切换时**不要**执行任何「回放 `ts/` 进 VM」的动作 —— 没有这个能力，`replay_bench`
+只用于出基准数字。要么接受历史不可查，要么先做 §4.2 的回填工具。
+历史要不要保，属于业务决策（`ts/` 目录可以先拷一份备份，体积 129MB）。
+
+### 4.2 若要做回填：最小可行路径评估（**未实现，仅评估**）
+
+推荐路径：**新增一个独立 bin（`bins/ts-backfill`），不做进 dataserver**。
+
+1. 读侧：用 `dataplane-ts` 的 tsink 只读路径逐序列读出 `(measurement, tags, ts, value)`。
+   关键未验证点：tsink 的 `StorageBuilder::build()` 会**重放并可能改写** WAL，
+   回填必须在目录**拷贝**上跑（停写后拷，129MB 秒级），或确认 tsink 有只读打开能力。
+2. 写侧：直接复用 `dataplane-adapter-victoriametrics` 的 `write`（攒批 + 队列 + 背压
+   已有），或直接发 `/insert/{t}/prometheus/api/v1/import/prometheus`。
+3. 幂等：VM 对同 `(series, timestamp)` 是覆盖写，回填可重跑；配合「按 series 记录水位」
+   落一个本地文件即可断点续传。
+4. 窗口处理：回填只写 `ts <= 拷贝时刻` 的点，避免覆盖切换后新写入的同时间戳点。
+
+工作量（按现有代码估，未实施）：
+
+| 项 | 内容 | 估时 |
+|---|---|---|
+| 读侧 + 转换 | 已有 `replay_bench` 的实现可直接抄（§7.5 的流式版本） | 1 人日 |
+| 断点续传 / 水位 / `--dry-run` / 内存上限 | 新增 | 1 人日 |
+| 验证 | 线上 4411 序列 / 129MB WAL 全量回填 + 抽样对账（点数、时间范围、首尾值） | 1 人日 |
+| 合计 | | **约 3 人日** |
+
+吞吐预期：写入段已有实测 101s / 5.39M 点（53.2k records/s），历史规模（129MB WAL、
+4411 序列）比基准数据小，瓶颈在逐点读 tsink（基准里真实源 32.7k records/s），
+端到端量级是**分钟级，不是小时级**。
+
+能否复用 `dpc` 的 `ts` HTTP 接口：
+
+- `ts stats`：**可以**，用于回填前后核对 `series_count` 与时间边界。
+- `ts delete`：**不能当导入用**（删除 ≠ 导入）。只在「回填写脏了、要按 matcher 整序列删掉重来」
+  时有用，且要求 `vm_delete_auth_key` + 有 matcher（§6）。
+- `dpc` 没有 bulk import 端点；走 `/v1/ingest` 逐条导入会写 `ingest/` 去重键（污染前缀、
+  把历史混成新接入、无法与真实接入区分），不建议。
+
+### 4.3 Open questions
+
+- tsink 能否只读打开而不重放/改写 WAL？（决定回填是否必须先拷目录）
+- 回填后微秒→毫秒的精度损失实际影响多少点（同毫秒多点在 VM 侧覆盖，未测）。
+- 回填期间是否要限速（避免 VM 写入打满影响同集群的实时接入）。
+- 是否要把「历史不可查」在 UI 上显式提示（否则用户会当成数据丢失报障）。
 
 ## 5. cloud3 前置条件（运维 tim 负责，代码侧不自动改）
 
@@ -322,8 +376,8 @@ sudo k3s kubectl -n redis-test exec redis-0 -- sh -c \
    redis-cli -a $REDIS_PASSWORD --no-auth-warning dbsize'
 #   期望：appendonly yes、noeviction、used_memory 远小于 2G、dbsize=0（首次切换）
 
-# ④ 节点余量：切换本身几乎不占内存，但迁移回放会占 ~3G
-free -g   # available ≥ 8
+# ④ 节点余量：外置模式启动不回放 WAL，切换本身几乎不占内存（实测 Ready <2s、RSS ~16MB）
+free -g   # available ≥ 4（无需为 WAL 回放预留）
 ```
 
 ### 8.2 完整 env 清单（`apps/vectorman/k8s.yaml` 的 dataserver 容器）
@@ -374,7 +428,10 @@ free -g   # available ≥ 8
 （外置模式下 `ts/`、`kv.redb` 不再写入，但也不删）；`ts_memory_limit_bytes` /
 `ts_wal_size_limit_bytes` / `ts_cardinality_limit` 在外置模式下无效，留着无害。
 
-### 8.3 执行顺序（写中断约 6–9 分钟，Agent 侧有缓冲重试）
+### 8.3 执行顺序（写中断 <1 分钟：外置模式启动不回放 WAL）
+
+实测（2026-11-10 两次 rollout）：Killing → Started 都是秒级，合计约 **30s**。
+运维侧之前按「WAL 回放 4–6 分钟」估的停机是错的 —— 那是本地 tsink 后端的成本。
 
 ```bash
 NS=vectorman
@@ -382,19 +439,12 @@ NS=vectorman
 sudo k3s kubectl -n $NS scale deploy/dataserver --replicas=0
 sudo k3s kubectl -n $NS wait --for=delete pod -l app=dataserver --timeout=120s
 
-# ② 拷贝老的 tsink 目录（只拷，不打开；打开会重放并改写）
+# ② 备份老 tsink 目录（只拷，不打开；打开会重放并改写）。129MB，秒级。
+#    备份不是迁移：外置模式不会读它，回填工具当前也不存在（§4）。
 SRC=/app/dataserver/data/ts           # PVC 上的路径，用一次临时 pod 挂同一个 PVC 更省事
-cp -a "$SRC" /tmp/migrate-ts-$(date +%H%M)
+cp -a "$SRC" /tmp/backup-ts-$(date +%H%M)
 
-# ③ 回放历史时序进 VM（直写 VM，不产生 ingest/ 去重键）
-#    在一台能连 vminsert 的机器上跑预编译的 replay_bench（无需 Rust 工具链）：
-systemd-run --scope -p MemoryMax=6G -p MemorySwapMax=0 -- \
-  ./replay_bench replay_local_vs_victoriametrics --ignored --nocapture --test-threads=1
-#    env：DP_BENCH_TS_SRC=/tmp/migrate-ts-<hhmm> DP_BENCH_SKIP_LOCAL=1
-#         DP_BENCH_VM_INSERT_URL=http://<vminsert>:8480 DP_BENCH_VM_SELECT_URL=http://<vmselect>:8481
-#    核对：vm_rows_inserted_total{type="prometheus"} 的差值 == 回放点数（§7.3 口径）
-
-# ④ 上新配置（env 见 8.2）
+# ③ 上新配置（env 见 8.2）
 sudo k3s kubectl -n $NS apply -f apps/vectorman/k8s.yaml
 sudo k3s kubectl -n $NS rollout status deploy/dataserver --timeout=600s   # 期望 <10s Ready
 ```
@@ -460,4 +510,46 @@ sudo k3s kubectl -n vectorman set env deploy/dataserver DATASERVER_KV_BACKEND=re
 | 改前（逐条去重往返） | 2,014 records/s（5.39M 折算 ≈ 2,676s） | 实测 20k 条样本 |
 | Redis 键数/内存 | 5.39M 键 ≈ **550MB**（102 B/key 实测，`maxmemory 2gb` 够，需盯 `used_memory`） | 实测 20 万键 + 折算 |
 | VM 磁盘日增量 | 5.39M 点写入后 vmstorage 目录 2MB → 3MB（merge 未收敛，仅量级参考）；20Gi PVC 余量充足 | 实测（粗） |
-| 迁移回放耗时（5.39M 点） | 写入 **101s**；另加源目录重放（本机拷贝 100–240s，受宿主负载影响） | 实测（写入段） |
+| 迁移回放耗时（5.39M 点） | **不适用**：外置模式不迁移历史、无回填入口（§4）；上表 101s 是基准里的写入段，不是切换动作 | 实测（基准） |
+
+---
+
+## 9. 运维观察（2026-11-10 线上）
+
+### 9.1 外置模式启动不回放 WAL
+
+切换后 rollout 的 Killing → Started 是秒级（两次合计约 30s），Ready **<2s**，RSS 空载
+~16MB。**「重启要等 WAL 回放 4–6 分钟」只适用于 `ts_backend=tsink`。**
+
+### 9.2 每小时一条 `retention cleanup` / `apm retention failed`（不是纯噪音，要处理）
+
+现象：每小时各一条
+
+```
+retention cleanup: invalid_argument: victoriametrics 只能整序列删除（VM 删除接口不接受 start/end）；
+  命中 0 条序列，本次按时间窗 [0, ...) 的删除被拒绝。...
+apm retention failed: invalid_argument: victoriametrics 拒绝整序列删除无 label matcher 的选择...
+```
+
+来源（代码事实）：
+
+| 路径 | 入参 | 结果 |
+|---|---|---|
+| `cleanup::apply_ts_retention`（`bins/dataserver/src/cleanup.rs:386`） | 有 `item_id` matcher + 时间窗，`whole_series_delete=false` | 明确拒绝（`invalid_argument`） |
+| `dataplane_apm::retention` 的 ts 墓碑（`crates/dataplane-apm/src/retention.rs:197-199`） | 只有 `measurement`、无 matcher | 明确拒绝（无 matcher 一律拒绝，即使 `whole_series_delete=true`） |
+
+**关键：`ts_retention_enforced=false` 消不掉这两条。** 这个开关只作用于 tsink 的写入期
+保留校验（`main.rs` 把它塞进 `TsRetentionConfig` → `dataplane-ts` 的
+`with_retention_enforced`），清理任务的 `apply_ts_retention` 根本不读它。
+
+**真正的代价不是日志噪声**：`run_cleanup` 里 `apply_ts_retention(...)?` 是 `?` 传播
+（`cleanup.rs:564`），一旦这一项报错，**本轮后面的 `apply_retention`（日志/APM 保留）
+与 `ingest/` 去重键 `prune_prefix_before` 全部被跳过**（`cleanup.rs:565-569`）。
+在 VM 后端下，只要存在「采集项 `retention_days` < 全局 `ts_retention_days`」或任一
+到期的 `retain/{item_id}`，这个清理周期就会**永久空转**：日志不再清理、Redis 去重键
+不再收敛 → 长期趋向 `maxmemory 2gb` 写满（`noeviction` → 接入 5xx）。
+
+建议修法（由维护者定，本文只记评估）：在 VM 后端下直接跳过这两条时序删除路径
+（`apply_ts_retention` 的时序段 + APM 的 ts 墓碑），保留 SQL/日志/`retain/` 键的清理；
+同时把单条失败从 `?` 改成「记 warn、累到 report、继续后续步骤」，避免一个采集项
+的删除失败连带停掉整轮清理。
