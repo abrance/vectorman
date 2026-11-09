@@ -194,6 +194,12 @@ impl ApmRetention {
         report.edges_deleted +=
             delete_rows_older_than(sql, tables::EDGE_SUMMARY, "bucket_start", cutoff).await?;
 
+        // 聚合点的墓碑也是「按时间窗裁掉尾部」。后端只能整系列删（VM，且这里没有
+        // label matcher，整系列删会把共享聚合指标的历史全删光）时整段跳过，
+        // 否则每轮都报 invalid_argument 并中断本轮的容量淘汰与磁盘回收。
+        if !ts.supports_time_window_delete() {
+            return Ok(());
+        }
         for measurement in APM_MEASUREMENTS {
             let deletion = ts
                 .delete_series(TsSeriesSelection {

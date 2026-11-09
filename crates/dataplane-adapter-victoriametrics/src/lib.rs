@@ -797,6 +797,11 @@ impl TimeSeriesStore for VictoriaMetricsStore {
         parse_prom_result(&json)
     }
 
+    /// VM 的删除接口只吃 `match[]`：整条序列一起删，时间窗被忽略。
+    fn supports_time_window_delete(&self) -> bool {
+        false
+    }
+
     async fn delete_series(
         &self,
         selection: TsSeriesSelection,
@@ -1155,6 +1160,15 @@ mod tests {
         assert_eq!(
             single.delete_path(),
             "http://vm:8428/prometheus/api/v1/admin/tsdb/delete_series?authKey=k"
+        );
+    }
+
+    #[tokio::test]
+    async fn vm_backend_reports_no_time_window_delete() {
+        let store = test_store("http://127.0.0.1:1", 10, 10);
+        assert!(
+            !store.supports_time_window_delete(),
+            "VM 删除接口只吃 match[]，清理路径必须据此跳过按时间窗的删除"
         );
     }
 

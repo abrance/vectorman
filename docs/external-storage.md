@@ -59,8 +59,8 @@ vm_whole_series_delete = false       # VM 只能整序列删；见 §6「删除�
 - `kv_cache_bytes` 只在 `kv_backend=redb` 生效。
 - `ts_retention_days` 在外置模式下用于 `storage_stats` 上报；真正的保留由
   vmstorage 的 `-retentionPeriod` 决定（两边要对齐，否则 `/v1/ts/stats` 会显示一个
-  与服务端不一致的值）。**注意：清理任务仍会按时窗调用 `delete_series`**，在 VM 后端
-  一律被拒绝，见 §9.2。
+  与服务端不一致的值）。v1.3.16 起清理任务在 VM 后端**跳过**按时窗的 `delete_series`
+  （能力位 `supports_time_window_delete=false`），不再每小时报错，见 §9.2。
 - `ts_cardinality_limit` / `ts_memory_limit_bytes` / `ts_wal_size_limit_bytes` 在
   `ts_backend=victoriametrics` 下无效（这些是本地引擎的闩锁）。
 
@@ -94,10 +94,10 @@ vm_whole_series_delete = false       # VM 只能整序列删；见 §6「删除�
    - VM 侧 `vm_rows_inserted_total` 随接入量增长
 4. 再切 KV：`DATASERVER_KV_BACKEND=redis` + `DATASERVER_REDIS_URL/PASSWORD`，重启。
 5. 验收：接入一条数据 → `/v1/prom/query` 查得到；`/v1/streams` 能列出。
-   **`ingest_dedup_deleted` 在外置时序后端下不会被更新**：清理周期会先被时序删除的
-   `invalid_argument` 打断（§9.2），去重键剪枝被跳过。验收这一项要看
-   `redis-cli info memory` 的 `used_memory` 与 `dbsize` 在 24h 后是否仍在上行，
-   不要只看日志里有没有 `ingest_dedup_deleted`。
+   去重键剪枝与日志/边保留**不再受时序删除结果影响**（v1.3.16 起三阶段解耦，§9.2）。
+   验收这一项：日志里 `retention cleanup:` 行的 `ingest_dedup_deleted` 应该 >0，
+   同时 `failed_phases=0`；再看 `redis-cli info memory` 的 `used_memory` 与 `dbsize`
+   是否停止单调上行。
 
 ## 3. 回滚步骤
 
@@ -142,7 +142,8 @@ tsink 里没有**，回滚后这段时间是空白（除非再做一次 VM→本
 - `ingest/` 不迁移：接受一次重复入库窗口。切换后 Redis 里没有去重键，Agent 重发
   窗口内的记录会被再受理一次，VM 侧同 `(series, timestamp)` 覆盖写，**不产生重复点**。
 - **时序保留不迁移**：VM 侧 `-retentionPeriod=30d` 与 `ts_retention_days=30` 已对齐。
-  但「dataserver 不再自己算全局保留」这句在代码里只对了一半，见 §9.2。
+  v1.3.16 起 dataserver 在 VM 后端**完全不做**按时窗的时序删除（只跳过、不报错），
+  所以「采集项保留期短于全局保留期」这件事在外置时序后端下**不被强制执行**，见 §9.2。
 
 ### 4.1 操作含义（切换清单按这个口径）
 
@@ -521,9 +522,9 @@ sudo k3s kubectl -n vectorman set env deploy/dataserver DATASERVER_KV_BACKEND=re
 切换后 rollout 的 Killing → Started 是秒级（两次合计约 30s），Ready **<2s**，RSS 空载
 ~16MB。**「重启要等 WAL 回放 4–6 分钟」只适用于 `ts_backend=tsink`。**
 
-### 9.2 每小时一条 `retention cleanup` / `apm retention failed`（不是纯噪音，要处理）
+### 9.2 每小时一条 `retention cleanup` / `apm retention failed` —— 已修复（v1.3.16）
 
-现象：每小时各一条
+现象（v1.3.15，外置模式下每小时各一条）：
 
 ```
 retention cleanup: invalid_argument: victoriametrics 只能整序列删除（VM 删除接口不接受 start/end）；
@@ -533,23 +534,38 @@ apm retention failed: invalid_argument: victoriametrics 拒绝整序列删除无
 
 来源（代码事实）：
 
-| 路径 | 入参 | 结果 |
+| 路径 | 入参 | v1.3.15 结果 |
 |---|---|---|
-| `cleanup::apply_ts_retention`（`bins/dataserver/src/cleanup.rs:386`） | 有 `item_id` matcher + 时间窗，`whole_series_delete=false` | 明确拒绝（`invalid_argument`） |
-| `dataplane_apm::retention` 的 ts 墓碑（`crates/dataplane-apm/src/retention.rs:197-199`） | 只有 `measurement`、无 matcher | 明确拒绝（无 matcher 一律拒绝，即使 `whole_series_delete=true`） |
+| `cleanup::apply_ts_retention`（`bins/dataserver/src/cleanup.rs`） | 有 `item_id` matcher + 时间窗，`whole_series_delete=false` | 明确拒绝（`invalid_argument`） |
+| `dataplane_apm::retention` 的 ts 墓碑（`crates/dataplane-apm/src/retention.rs`） | 只有 `measurement`、无 matcher | 明确拒绝（无 matcher 一律拒绝，即使 `whole_series_delete=true`） |
 
-**关键：`ts_retention_enforced=false` 消不掉这两条。** 这个开关只作用于 tsink 的写入期
-保留校验（`main.rs` 把它塞进 `TsRetentionConfig` → `dataplane-ts` 的
-`with_retention_enforced`），清理任务的 `apply_ts_retention` 根本不读它。
+`ts_retention_enforced=false` **消不掉**这两条：它只作用于 tsink 的写入期保留校验
+（`main.rs` → `TsRetentionConfig` → `with_retention_enforced`），两条清理路径都不读它。
 
-**真正的代价不是日志噪声**：`run_cleanup` 里 `apply_ts_retention(...)?` 是 `?` 传播
-（`cleanup.rs:564`），一旦这一项报错，**本轮后面的 `apply_retention`（日志/APM 保留）
-与 `ingest/` 去重键 `prune_prefix_before` 全部被跳过**（`cleanup.rs:565-569`）。
-在 VM 后端下，只要存在「采集项 `retention_days` < 全局 `ts_retention_days`」或任一
-到期的 `retain/{item_id}`，这个清理周期就会**永久空转**：日志不再清理、Redis 去重键
-不再收敛 → 长期趋向 `maxmemory 2gb` 写满（`noeviction` → 接入 5xx）。
+v1.3.15 的真实代价（不是日志噪声）：`run_cleanup` 里 `apply_ts_retention(...)?` 是 `?`
+传播，一项报错就让同轮的 `apply_retention`（日志/边保留）与 `ingest/` 去重键
+`prune_prefix_before` 全部跳过。VM 后端下只要存在「采集项 `retention_days` < 全局
+`ts_retention_days`」或任一到期 `retain/{item_id}`，清理周期就**永久空转**：日志不清、
+去重键不收敛 → 趋近 `maxmemory 2gb`（`noeviction` → 接入 5xx）。线上 11 分钟
+`ingest/` 键 199 → 3942 就是这么来的。APM 侧同理会中断容量淘汰与磁盘回收。
 
-建议修法（由维护者定，本文只记评估）：在 VM 后端下直接跳过这两条时序删除路径
-（`apply_ts_retention` 的时序段 + APM 的 ts 墓碑），保留 SQL/日志/`retain/` 键的清理；
-同时把单条失败从 `?` 改成「记 warn、累到 report、继续后续步骤」，避免一个采集项
-的删除失败连带停掉整轮清理。
+**v1.3.16 修法**：
+
+1. `TimeSeriesStore` 新增能力位 `supports_time_window_delete()`（默认 `true`，tsink 及其它
+   后端行为不变），VM 适配器覆写为 `false`。
+2. 能力位为 `false` 时跳过所有「按时间窗裁尾部」的删除：`apply_ts_retention` 的
+   per-item 段与 `retain/` 段、`ApmRetention` 的聚合点墓碑。VM 上只保留真正可做的
+   整系列删除，不再每小时发注定被拒的请求。
+3. 单个采集项删除失败不再 `?` 传播：记 warn、计入 `TsCleanReport::failed_items`，
+   本轮继续。`run_cleanup` 的三个阶段（时序 / 日志+边 / 去重键）互相解耦，任一阶段
+   失败只作废自己，`CleanupReport::failed_phases` 如实计数（不再吞成 0）。
+4. 观测：`retention cleanup:` 行新增 `ts_skipped_items` / `ts_failed_items` /
+   `failed_phases`；`failed_phases > 0` 时计 `dataserver_ts_clean_errors_total`。
+
+回归覆盖：`cleanup::tests`（删除必错的后端下 `ingest/` 键真被删、日志保留照跑、返回
+`Ok` 且计数正确；无时间窗能力的后端零删除请求）与
+`apm::tests::retention_skips_ts_tombstone_when_backend_has_no_window_delete`。
+
+残余（需业务决定）：时间窗语义在 VM 上**本来就不存在**，跳过只是不再报错——VM 后端下
+「采集项保留期短于全局保留期」这件事不再被强制执行；要它生效得靠 VM 自身的
+`-retentionPeriod`，或等 tsink→VM 回填/整系列删除策略落地（见 §4.1）。
