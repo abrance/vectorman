@@ -8,3 +8,5 @@ license.workspace = true
 dataplane-core.workspace = true
 dataplane-kv.workspace = true
 async-trait.workspace = true
+tokio.workspace = true
+redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
