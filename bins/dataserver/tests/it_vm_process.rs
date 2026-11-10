@@ -21,6 +21,7 @@ use vectorman_test_support::{
 const BIN: &str = env!("CARGO_BIN_EXE_dataserver");
 const TIMEOUT: Duration = Duration::from_secs(60);
 const MEASUREMENT: &str = "ebpf_process_cpu_usage";
+const SYSCALL_MEASUREMENT: &str = "ebpf_syscall_duration_micros";
 /// 往前放 2 分钟：点在 VM instant 查询的回看窗口里，且不与别的用例抢同一个分钟。
 const AGE_SECS: i64 = 120;
 
@@ -71,6 +72,16 @@ fn process_metric_service_dimension_lands_in_victoriametrics() {
             7.0,
             ts,
         ),
+        // 第三个前缀 `ebpf_syscall_*` 与 `ebpf_process_*` 共用同一个判断
+        // （`SERVICE_MEASUREMENT_PREFIXES`），但只测前者的话数组里漏一个也发现不了。
+        data::metric_record(
+            &format!("{prefix}-r3"),
+            SYSCALL_MEASUREMENT,
+            [("process_name", process.as_str()), ("syscall", "openat")],
+            "value",
+            3.5,
+            ts,
+        ),
     ];
     ds.ingest_ok(&data::metrics_envelope(
         &format!("{prefix}-b1"),
@@ -97,6 +108,16 @@ fn process_metric_service_dimension_lands_in_victoriametrics() {
         format!("{MEASUREMENT}{{service=\"{unknown_service}\",process_name=\"{unmapped}\"}}");
     let miss_resp = wait_scalar(&vm, &miss, 7.0);
     assert_eq!(miss_resp.first().metric["service"], unknown_service);
+
+    // 2b) `ebpf_syscall_*` 走同一套补维度规则，不能被漏在数组外。
+    let syscall =
+        format!("{SYSCALL_MEASUREMENT}{{service=\"{service}\",process_name=\"{process}\"}}");
+    let sc = wait_scalar(&vm, &syscall, 3.5);
+    assert_eq!(
+        sc.first().metric["syscall"],
+        "openat",
+        "原始标签不能被补维度挤掉"
+    );
 
     // 3) 空服务维度：一条都查不到（补维度不能落成空串，否则前端「按服务聚合」会多一条空组）。
     let empty = vm.must_query(&format!("{MEASUREMENT}{{service=\"\"}}"), None);

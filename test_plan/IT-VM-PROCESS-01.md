@@ -18,7 +18,7 @@ VM 的序列身份包含全部标签：补不上就是另一条序列，前端�
 | APM | `apm_enabled = true`（`MetricSink` 只在 APM 打开时挂在接入路径上） |
 | 隔离前缀 | `tp-proc-{pid}`：`{p}-proc`（建别名的进程）、`{p}-svc`（映射到的服务）、`{p}-unmapped`（没建别名的进程） |
 | 别名 | `POST /v1/apm/service-aliases`：`match_kind=process_name`、`match_value={p}-proc`、`service={p}-svc` |
-| 写入内容 | 两条 `ebpf_process_cpu_usage`（必须这个前缀才触发补全）：进程名 `{p}-proc` 值 42.0；进程名 `{p}-unmapped` 值 7.0。时间戳 `floor_minute(now) - 120s` |
+| 写入内容 | 两条 `ebpf_process_cpu_usage`（必须这个前缀才触发补全）：进程名 `{p}-proc` 值 42.0；进程名 `{p}-unmapped` 值 7.0。另加一条 `ebpf_syscall_duration_micros`（`SERVICE_MEASUREMENT_PREFIXES` 的第二个前缀，走同一分支）：进程名 `{p}-proc`、`syscall=openat`、值 3.5。时间戳均为 `floor_minute(now) - 120s` |
 
 ## 执行步骤
 
@@ -40,7 +40,8 @@ VM 的序列身份包含全部标签：补不上就是另一条序列，前端�
 | 2 | 原始标签不被覆盖 | 同一点 `pid == "4242"` |
 | 3 | 未命中补 `unknown-<process_name>` | `{service="unknown-{p}-unmapped"}` 的值 == 7 |
 | 4 | 不落空服务维度 | `{service=""}` 结果为空 |
-| 5 | 两条记录两条序列 | `process_name=~"{p}-.*"` 的样本数 == 2 |
+| 5 | `ebpf_syscall_*` 与 `ebpf_process_*` 同一套补全规则 | `ebpf_syscall_duration_micros{service="{p}-svc",process_name="{p}-proc"}` 的值 == 3.5，且 `syscall == "openat"` 未被挤掉 |
+| 6 | 两条记录两条序列 | `ebpf_process_cpu_usage{process_name=~"{p}-.*"}` 的样本数 == 2 |
 
 **反向验证（落地时实测）**：把第 1 条的期望值从 `42.0` 改成 `43.0`，用例 60s 超时失败：
 
