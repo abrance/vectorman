@@ -46,6 +46,14 @@ pub fn put_json(url: &str, body: &str) -> Result<(u16, String), String> {
     }
 }
 
+pub fn delete(url: &str) -> Result<(u16, String), String> {
+    match agent().delete(url).call() {
+        Ok(resp) => Ok((resp.status(), resp.into_string().unwrap_or_default())),
+        Err(ureq::Error::Status(code, resp)) => Ok((code, resp.into_string().unwrap_or_default())),
+        Err(e) => Err(format!("DELETE {url} 传输失败: {e}")),
+    }
+}
+
 /// GET 并解析 JSON；非 2xx 直接 panic（带上 URL 与 body 尾部）。
 pub fn get_json_ok(url: &str) -> Value {
     let (status, body) = get(url).unwrap_or_else(|e| panic!("{e}"));
