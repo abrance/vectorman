@@ -174,4 +174,50 @@ fn dataserver_self_metrics_land_in_victoriametrics() {
         sample.metric.get("data_id").map(String::as_str),
         Some("self")
     );
+
+    // ---- 时序存储状态采样（`main.rs` 里跟着自监控周期跑的 `storage_stats()` 分支）
+    //
+    // 这一组此前只有「有没有被 flush」的隐含覆盖，一个断言都没有。VM 后端的口径是明确的：
+    // `memory_used_bytes` / `memory_budget_bytes` / `wal_size_bytes` 恒 0（内存与 WAL 是本地
+    // tsink 的概念），`background_errors_total` / `degraded` 在没故障时恒 0，`series_count`
+    // 是 VM 的**全实例** `totalSeries`——只断言「是一个 >= 1 的数字」，不锁绝对值（同一台 VM
+    // 上还有别的实例在写，锁死会假红）。
+    let text = fetch_metrics(&ds);
+    for (name, want) in [
+        ("dataserver_ts_series_count", None),
+        ("dataserver_ts_memory_used_bytes", Some(0.0)),
+        ("dataserver_ts_memory_budget_bytes", Some(0.0)),
+        ("dataserver_ts_wal_size_bytes", Some(0.0)),
+        ("dataserver_ts_background_errors_total", Some(0.0)),
+        ("dataserver_ts_degraded", Some(0.0)),
+    ] {
+        assert!(
+            text.lines().any(|l| l.starts_with(name)),
+            "/metrics 里没有 {name}：storage_stats 采样没跑（它跟自监控周期同一个 tick）"
+        );
+        // VM 侧按本实例过滤：同名序列在别的实例上也有。
+        let promql = format!(
+            "{name}{{instance=\"{}\"}}",
+            ds.base().trim_start_matches("http://")
+        );
+        let resp = vm.wait_query(&promql, None, TIMEOUT, |r| !r.is_empty());
+        let sample = resp.first();
+        match want {
+            Some(want) => assert!(
+                (sample.value - want).abs() < 1e-9,
+                "{name} 期望 {want}，VM 实际 {}: {}",
+                sample.value,
+                resp.raw
+            ),
+            None => assert!(
+                sample.value >= 1.0,
+                "{name} 是全实例基数，至少应为 1（本进程刚写过自监控）: {}",
+                resp.raw
+            ),
+        }
+    }
+    assert_eq!(
+        sample.metric.get("data_id").map(String::as_str),
+        Some("self")
+    );
 }
