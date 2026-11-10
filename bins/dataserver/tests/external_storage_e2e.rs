@@ -1,6 +1,8 @@
 //! 外置存储后端的 e2e：对着真实 Redis / VictoriaMetrics 跑。
 //!
-//! 默认跳过（未设置环境变量即 `return`），所以 `cargo test` 离线也全绿：
+//! **缺环境变量一律失败**（P0 修复：原先是 `eprintln!("skip: …"); return;` → 静默假绿，
+//! 离线跑 `cargo test` 永远是绿的，没人知道真实链路到底通没通）。缺哪个变量就在 panic
+//! 信息里点名。按 `test_plan/IT-EXT-REDIS-VM-01.md` 执行：
 //!
 //! ```text
 //! DP_E2E_REDIS_URL=redis://:pw@127.0.0.1:16379/0 \
@@ -43,8 +45,18 @@ fn point(name: &str, tags: &[(&str, &str)], ts: i64, value: f64) -> TsPoint {
     }
 }
 
-async fn redis_store() -> Option<RedisKvStore> {
-    let url = std::env::var("DP_E2E_REDIS_URL").ok()?;
+/// 缺变量 = 失败，不是跳过。返回的 panic 信息必须让执行者一眼看出该补哪个变量。
+fn require_env(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| {
+        panic!(
+            "缺少环境变量 {name}：本用例要求真实外置后端，不能静默跳过。\
+             按 test_plan/IT-EXT-REDIS-VM-01.md 起 Redis/VictoriaMetrics 后重跑"
+        )
+    })
+}
+
+async fn redis_store() -> RedisKvStore {
+    let url = require_env("DP_E2E_REDIS_URL");
     let store = RedisKvStore::new(RedisConfig {
         url,
         password: None,
@@ -53,34 +65,31 @@ async fn redis_store() -> Option<RedisKvStore> {
     })
     .await
     .expect("redis connect");
-    Some(store)
+    store
 }
 
-fn vm_store() -> Option<VictoriaMetricsStore> {
-    let insert = std::env::var("DP_E2E_VM_INSERT_URL").ok()?;
+fn vm_store() -> VictoriaMetricsStore {
+    let insert = require_env("DP_E2E_VM_INSERT_URL");
+    // 单机版 VM 只需一个基址；集群版要两个。不单独强求 SELECT 变量，
+    // 但连不上 VM 时下面的写入/查询会直接失败，仍然是「红」不是「绿」。
     let select = std::env::var("DP_E2E_VM_SELECT_URL").unwrap_or_else(|_| insert.clone());
-    Some(
-        VictoriaMetricsStore::new(VmConfig {
-            insert_url: insert,
-            select_url: select,
-            tenant: "0".to_string(),
-            single_node: std::env::var("DP_E2E_VM_SINGLE_NODE").is_ok(),
-            batch_size: 1_000,
-            flush_interval: std::time::Duration::from_millis(50),
-            delete_auth_key: std::env::var("DP_E2E_VM_DELETE_AUTH_KEY").ok(),
-            whole_series_delete: std::env::var("DP_E2E_VM_DELETE_ENABLED").is_ok(),
-            ..VmConfig::default()
-        })
-        .expect("vm store"),
-    )
+    VictoriaMetricsStore::new(VmConfig {
+        insert_url: insert,
+        select_url: select,
+        tenant: "0".to_string(),
+        single_node: std::env::var("DP_E2E_VM_SINGLE_NODE").is_ok(),
+        batch_size: 1_000,
+        flush_interval: std::time::Duration::from_millis(50),
+        delete_auth_key: std::env::var("DP_E2E_VM_DELETE_AUTH_KEY").ok(),
+        whole_series_delete: std::env::var("DP_E2E_VM_DELETE_ENABLED").is_ok(),
+        ..VmConfig::default()
+    })
+    .expect("vm store")
 }
 
 #[tokio::test]
 async fn redis_kv_semantics_match_local_engine() {
-    let Some(store) = redis_store().await else {
-        eprintln!("skip: DP_E2E_REDIS_URL not set");
-        return;
-    };
+    let store = redis_store().await;
 
     // 基本 CRUD + 错误口径
     assert!(store
@@ -149,10 +158,7 @@ async fn redis_kv_semantics_match_local_engine() {
 
 #[tokio::test]
 async fn redis_batch_ops_match_single_ops() {
-    let Some(store) = redis_store().await else {
-        eprintln!("skip: DP_E2E_REDIS_URL not set");
-        return;
-    };
+    let store = redis_store().await;
 
     // 跨多个 chunk（默认 500）的批量：MSET/MGET 与逐条结果必须一致。
     let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..1_200u32)
@@ -188,10 +194,7 @@ async fn redis_batch_ops_match_single_ops() {
 
 #[tokio::test]
 async fn vm_write_query_delete_roundtrip() {
-    let Some(store) = vm_store() else {
-        eprintln!("skip: DP_E2E_VM_INSERT_URL not set");
-        return;
-    };
+    let store = vm_store();
     // cloud3 的 vmstorage 带 `-dedup.minScrapeInterval=30s`：同序列 30s 内的点会在查询时
     // 合并成一个（后写胜出）。所以这里按 60s 间距写，验证的是「写入→可见→删除」链路，
     // 而不是分辨率。dedup 对 1s 级数据是**数据可见性**问题，见 docs/external-storage.md §5。
@@ -340,10 +343,7 @@ async fn vm_write_query_delete_roundtrip() {
 /// 同一批点写本地 tsink 与 VM，同 PromQL 的结果集一致（毫秒对齐后）。
 #[tokio::test]
 async fn local_tsink_and_vm_agree_on_same_points() {
-    let Some(vm) = vm_store() else {
-        eprintln!("skip: DP_E2E_VM_INSERT_URL not set");
-        return;
-    };
+    let vm = vm_store();
     let dir = tempfile::tempdir().expect("tempdir");
     let local = TsinkTimeSeriesStore::new(
         dir.path(),
@@ -458,14 +458,8 @@ async fn ingest_over_http_lands_in_redis_and_victoriametrics() {
     use dataplane_sql::{RelationalStore, SqliteRelationalStore};
     use dataserver::{prom_router, sql_router, AppState};
 
-    let Some(kv_store) = redis_store().await else {
-        eprintln!("skip: DP_E2E_REDIS_URL not set");
-        return;
-    };
-    let Some(vm) = vm_store() else {
-        eprintln!("skip: DP_E2E_VM_INSERT_URL not set");
-        return;
-    };
+    let kv_store = redis_store().await;
+    let vm = vm_store();
     let kv: std::sync::Arc<dyn KvStore> = std::sync::Arc::new(kv_store);
     let ts: std::sync::Arc<dyn TimeSeriesStore> = std::sync::Arc::new(vm);
 

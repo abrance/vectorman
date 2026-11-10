@@ -4,11 +4,27 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_CONFIG_TOML: &str = r#"# vectorman dataserver 配置示例（下面每一项的缺省值就是注释里写的值）
 #
 # 用法：复制为 config.toml（安装包布局为 <组件目录>/config.toml）。
-# 环境变量覆盖（DP_ 前缀）：
-#   DP_DATA_PATH / DP_SQL_HTTP_LISTEN / DP_PROM_HTTP_LISTEN / DP_METRICS_HTTP_LISTEN
-#   DP_AUTH_ENABLED / DP_SELF_METRICS_INTERVAL
-#   DATASERVER_HTTP_WEB_DIR（前端 dist 目录）/ DATASERVER_GSE_ADMIN_URL（GSE 管理口）
-#   DATASERVER_GSE_ADMIN_PASSWORD（GSE 管理口密码；gse-server 开了 admin_password 时必须一致）
+# 环境变量覆盖（优先级高于文件）：
+#   数据与监听：DP_DATA_PATH / DP_SQL_HTTP_LISTEN / DP_PROM_HTTP_LISTEN / DP_METRICS_HTTP_LISTEN
+#   鉴权与自监控：DP_AUTH_ENABLED / DP_SELF_METRICS_INTERVAL
+#   KV：DATASERVER_KV_BACKEND / DATASERVER_KV_CACHE_BYTES / DATASERVER_REDIS_URL /
+#       DATASERVER_REDIS_PASSWORD / DATASERVER_REDIS_PREFIX
+#   接入去重：DATASERVER_INGEST_DEDUP_RETENTION_DAYS
+#   时序：DATASERVER_TS_BACKEND / DATASERVER_TS_RETENTION_DAYS /
+#         DATASERVER_TS_RETENTION_ENFORCED / DATASERVER_TS_CARDINALITY_LIMIT /
+#         DATASERVER_TS_MEMORY_LIMIT_BYTES / DATASERVER_TS_WAL_SIZE_LIMIT_BYTES /
+#         DATASERVER_TS_CLEAN_INTERVAL
+#   VM：DATASERVER_VM_INSERT_URL / DATASERVER_VM_SELECT_URL / DATASERVER_VM_TENANT /
+#       DATASERVER_VM_SINGLE_NODE / DATASERVER_VM_BATCH_SIZE /
+#       DATASERVER_VM_FLUSH_INTERVAL_MS / DATASERVER_VM_QUEUE_CAPACITY /
+#       DATASERVER_VM_DELETE_AUTH_KEY / DATASERVER_VM_WHOLE_SERIES_DELETE
+#   APM：DATASERVER_APM_ENABLED / DATASERVER_APM_RETENTION_DAYS /
+#        DATASERVER_APM_ENDPOINT_RETENTION_DAYS / DATASERVER_APM_MAX_BYTES /
+#        DATASERVER_APM_CLEAN_INTERVAL / DATASERVER_APM_AGG_INTERVAL /
+#        DATASERVER_APM_INGEST_MAX_BATCHES_PER_SEC /
+#        DATASERVER_APM_MIN_DURATION_MICROS_FOR_DETAIL
+#   前端与 GSE：DATASERVER_HTTP_WEB_DIR / DATASERVER_GSE_ADMIN_URL /
+#                DATASERVER_GSE_ADMIN_PASSWORD
 
 # 数据目录：必须是目录（单文件仅支持 sqlite）。跨进程并发写同一目录不做文件锁。
 data_path = "./data"
@@ -51,6 +67,25 @@ apm_clean_interval_secs = 3600
 apm_ingest_max_batches_per_sec = 0
 # 只写明细的耗时下限（微秒）；0 = 全部写明细。高于该阈值的 span 才落 LogStore 明细。
 apm_min_duration_micros_for_detail = 0
+
+# ---- 外置后端（默认全本地，外置只在需要横向扩存储时开）----
+# KV 后端：redb（本地默认）| redis。切 redis 必须同时给 redis_url，否则启动即报错退出。
+kv_backend = "redb"
+# 时序后端：tsink（本地默认）| victoriametrics。切 VM 必须同时给 vm_insert_url 与
+# vm_select_url，否则启动即报错退出（单机版两个地址可以相同）。
+ts_backend = "tsink"
+# redis_url = "redis://127.0.0.1:6379/0"
+# redis_password = ""
+# redis_prefix = "dp:"
+# vm_insert_url = "http://127.0.0.1:8480"
+# vm_select_url = "http://127.0.0.1:8481"
+# vm_tenant = "0"
+# vm_single_node = true
+# vm_batch_size = 5000
+# vm_flush_interval_ms = 200
+# vm_queue_capacity = 200000
+# vm_delete_auth_key = ""
+# vm_whole_series_delete = false
 
 [sql_http]
 listen = "0.0.0.0:8081"
@@ -557,10 +592,10 @@ mod tests {
             .join("..")
             .join("..")
             .join("config.toml.example");
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            eprintln!("跳过：{} 不存在", path.display());
-            return;
-        };
+        // 文件缺失就是失败：原来的 `eprintln!("跳过"); return;` 是一条假绿
+        // （搬家/改名后这条测试永久静默通过）。
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("读不到 {}: {e}", path.display()));
         assert_eq!(
             text.trim_end(),
             DEFAULT_CONFIG_TOML.trim_end(),
@@ -568,6 +603,70 @@ mod tests {
         );
         // 示例必须能解析（防止写出非法 TOML）。
         Config::from_toml(&text).expect("示例配置必须能解析");
+    }
+
+    /// 配置示例漂移守卫：`config.toml.example` 必须覆盖 `Config` 的每个字段、
+    /// 以及 `apply_env` 读的每个环境变量名。
+    ///
+    /// 字段名与 env 名都**从源码本身**提取，不在这里维护第二份清单——第二份清单
+    /// 自己就会漂移。新增 Config 字段或新读一个 env 却忘了写进示例，这条就红。
+    ///
+    /// 背景：示例曾经漏了 `kv_backend`/`redis_*`/`ts_backend`/`vm_*` 共 14 个键，
+    /// 靠读示例根本不知道有外置后端这回事（与业务事故无关，纯文档漂移）。
+    #[test]
+    fn config_example_covers_every_field_and_env_var() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("config.toml.example");
+        let example = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("读不到 {}: {e}", path.display()));
+        let src = include_str!("config.rs");
+
+        // ---- 1. 字段集合 ----
+        let start = src
+            .find("pub struct Config {")
+            .expect("config.rs 里找不到 `pub struct Config {`");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}").expect("struct Config 没有结束大括号")];
+        let mut field_count = 0usize;
+        let mut missing_fields = Vec::new();
+        for (idx, _) in body.match_indices("    pub ") {
+            let rest = &body[idx + "    pub ".len()..];
+            let name = &rest[..rest.find(':').expect("字段声明里没有 `:`")];
+            field_count += 1;
+            if !example.contains(name) {
+                missing_fields.push(name.to_string());
+            }
+        }
+        // 提取逻辑失效（比如有人把字段改成非 `pub`）时不能静默通过。
+        assert!(
+            field_count >= 30,
+            "只从 `struct Config` 提取到 {field_count} 个字段，提取逻辑可能已经失效"
+        );
+        assert!(
+            missing_fields.is_empty(),
+            "config.toml.example 缺少这些 Config 字段：{missing_fields:?}"
+        );
+
+        // ---- 2. 环境变量名 ----
+        let mut missing_envs = Vec::new();
+        let mut env_count = 0usize;
+        for part in src.split("std::env::var(\"").skip(1) {
+            let name = &part[..part.find('"').expect("env 名没有闭合引号")];
+            env_count += 1;
+            if !example.contains(name) {
+                missing_envs.push(name.to_string());
+            }
+        }
+        assert!(
+            env_count >= 30,
+            "只从 config.rs 提取到 {env_count} 个环境变量名，提取逻辑可能已经失效"
+        );
+        assert!(
+            missing_envs.is_empty(),
+            "config.toml.example 没有记录这些环境变量：{missing_envs:?}"
+        );
     }
 
     #[test]

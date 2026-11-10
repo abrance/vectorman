@@ -1,11 +1,27 @@
 # vectorman dataserver 配置示例（下面每一项的缺省值就是注释里写的值）
 #
 # 用法：复制为 config.toml（安装包布局为 <组件目录>/config.toml）。
-# 环境变量覆盖（DP_ 前缀）：
-#   DP_DATA_PATH / DP_SQL_HTTP_LISTEN / DP_PROM_HTTP_LISTEN / DP_METRICS_HTTP_LISTEN
-#   DP_AUTH_ENABLED / DP_SELF_METRICS_INTERVAL
-#   DATASERVER_HTTP_WEB_DIR（前端 dist 目录）/ DATASERVER_GSE_ADMIN_URL（GSE 管理口）
-#   DATASERVER_GSE_ADMIN_PASSWORD（GSE 管理口密码；gse-server 开了 admin_password 时必须一致）
+# 环境变量覆盖（优先级高于文件）：
+#   数据与监听：DP_DATA_PATH / DP_SQL_HTTP_LISTEN / DP_PROM_HTTP_LISTEN / DP_METRICS_HTTP_LISTEN
+#   鉴权与自监控：DP_AUTH_ENABLED / DP_SELF_METRICS_INTERVAL
+#   KV：DATASERVER_KV_BACKEND / DATASERVER_KV_CACHE_BYTES / DATASERVER_REDIS_URL /
+#       DATASERVER_REDIS_PASSWORD / DATASERVER_REDIS_PREFIX
+#   接入去重：DATASERVER_INGEST_DEDUP_RETENTION_DAYS
+#   时序：DATASERVER_TS_BACKEND / DATASERVER_TS_RETENTION_DAYS /
+#         DATASERVER_TS_RETENTION_ENFORCED / DATASERVER_TS_CARDINALITY_LIMIT /
+#         DATASERVER_TS_MEMORY_LIMIT_BYTES / DATASERVER_TS_WAL_SIZE_LIMIT_BYTES /
+#         DATASERVER_TS_CLEAN_INTERVAL
+#   VM：DATASERVER_VM_INSERT_URL / DATASERVER_VM_SELECT_URL / DATASERVER_VM_TENANT /
+#       DATASERVER_VM_SINGLE_NODE / DATASERVER_VM_BATCH_SIZE /
+#       DATASERVER_VM_FLUSH_INTERVAL_MS / DATASERVER_VM_QUEUE_CAPACITY /
+#       DATASERVER_VM_DELETE_AUTH_KEY / DATASERVER_VM_WHOLE_SERIES_DELETE
+#   APM：DATASERVER_APM_ENABLED / DATASERVER_APM_RETENTION_DAYS /
+#        DATASERVER_APM_ENDPOINT_RETENTION_DAYS / DATASERVER_APM_MAX_BYTES /
+#        DATASERVER_APM_CLEAN_INTERVAL / DATASERVER_APM_AGG_INTERVAL /
+#        DATASERVER_APM_INGEST_MAX_BATCHES_PER_SEC /
+#        DATASERVER_APM_MIN_DURATION_MICROS_FOR_DETAIL
+#   前端与 GSE：DATASERVER_HTTP_WEB_DIR / DATASERVER_GSE_ADMIN_URL /
+#                DATASERVER_GSE_ADMIN_PASSWORD
 
 # 数据目录：必须是目录（单文件仅支持 sqlite）。跨进程并发写同一目录不做文件锁。
 data_path = "./data"
@@ -48,6 +64,25 @@ apm_clean_interval_secs = 3600
 apm_ingest_max_batches_per_sec = 0
 # 只写明细的耗时下限（微秒）；0 = 全部写明细。高于该阈值的 span 才落 LogStore 明细。
 apm_min_duration_micros_for_detail = 0
+
+# ---- 外置后端（默认全本地，外置只在需要横向扩存储时开）----
+# KV 后端：redb（本地默认）| redis。切 redis 必须同时给 redis_url，否则启动即报错退出。
+kv_backend = "redb"
+# 时序后端：tsink（本地默认）| victoriametrics。切 VM 必须同时给 vm_insert_url 与
+# vm_select_url，否则启动即报错退出（单机版两个地址可以相同）。
+ts_backend = "tsink"
+# redis_url = "redis://127.0.0.1:6379/0"
+# redis_password = ""
+# redis_prefix = "dp:"
+# vm_insert_url = "http://127.0.0.1:8480"
+# vm_select_url = "http://127.0.0.1:8481"
+# vm_tenant = "0"
+# vm_single_node = true
+# vm_batch_size = 5000
+# vm_flush_interval_ms = 200
+# vm_queue_capacity = 200000
+# vm_delete_auth_key = ""
+# vm_whole_series_delete = false
 
 [sql_http]
 listen = "0.0.0.0:8081"
