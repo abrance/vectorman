@@ -97,7 +97,7 @@ fn apm_service_red_lands_in_victoriametrics() {
     let at_secs = bucket as f64 / 1e6 + 120.0;
 
     // 4 条 span：3 条 server `GET /orders`（ok/ok/error，1000/3000/5000 微秒），
-    // 1 条 client `POST /downstream`（9000 微秒）。start 落在桶内 1/2/3/3.5 秒。
+    // 1 条 client `POST /downstream`（error，9000 微秒）。start 落在桶内 1/2/3/3.5 秒。
     let spans = vec![
         data::trace_span(
             1,
@@ -135,7 +135,7 @@ fn apm_service_red_lands_in_victoriametrics() {
             &service,
             "POST /downstream",
             "client",
-            "ok",
+            "error",
             bucket + 3_500_000,
             9_000,
         ),
@@ -242,6 +242,36 @@ fn apm_service_red_lands_in_victoriametrics() {
         calls.raw
     );
     assert_eq!(calls.first().metric["span_kind"], "server");
+
+    // 3c) 边上的错误数与耗时：那条 client span 是 error → 派生一条 `apm_edge_errors_total`；
+    //     耗时长只有 avg/p95 两个 field（`sum` 必须**查不到**，别拿它当断言）。
+    let edge_errors = vm.must_query(&edge_base("apm_edge_errors_total", None), Some(at_secs));
+    assert_eq!(
+        edge_errors.first().value,
+        1.0,
+        "error 的 client span 必须派生一条边级错误：{}",
+        edge_errors.raw
+    );
+    let edge_p95 = vm.must_query(
+        &edge_base("apm_edge_duration_micros", Some("p95")),
+        Some(at_secs),
+    );
+    assert_eq!(
+        edge_p95.first().value,
+        9_000.0,
+        "calls=1 时 p95 也等于那条 client span 的耗时：{}",
+        edge_p95.raw
+    );
+    let edge_sum = vm.must_query(
+        &edge_base("apm_edge_duration_micros", Some("sum")),
+        Some(at_secs),
+    );
+    assert!(
+        edge_sum.is_empty(),
+        "边耗时只有 avg/p95，没有 sum field：raw={}",
+        edge_sum.raw
+    );
+
     let sum = vm.wait_query(
         &edge_base("apm_edge_duration_micros", Some("avg")),
         Some(at_secs),

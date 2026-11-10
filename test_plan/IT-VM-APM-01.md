@@ -21,7 +21,7 @@ RED 指标是 APM 页面的唯一数据源，但它的三个口径都很容易�
 | APM | `apm_enabled = true`、`apm_agg_interval_secs = 1`（等一个 tick 即可，不用等自然分钟） |
 | 隔离前缀 | `util::unique_prefix("apm")` → `tp-apm-{pid}`，落在 `service` 标签上；并行/重复跑互不干扰 |
 | 分钟桶 | `bucket = floor_minute(now) - 300s`：桶一定「已关闭」，VM instant 查询也仍在回看窗口内 |
-| 写入内容 | 4 条 OTLP span（`collector=otlp`），service 均为 `{prefix}-svc`：`GET /orders` server ok/ok/error，duration 1000/3000/5000 微秒（start 在 bucket+1/2/3s）；`POST /downstream` client ok，duration 9000（start 在 bucket+3.5s） |
+| 写入内容 | 4 条 OTLP span（`collector=otlp`），service 均为 `{prefix}-svc`：`GET /orders` server ok/ok/error，duration 1000/3000/5000 微秒（start 在 bucket+1/2/3s）；`POST /downstream` client **error**，duration 9000（start 在 bucket+3.5s）——client 记 error 是为了让边级错误数也确实落到 VM（边的派生与 status 无关，calls 仍为 1） |
 | 查询时刻 | `time = bucket/1e6 + 120`（桶内第 120 秒） |
 
 ## 执行步骤
@@ -35,8 +35,10 @@ RED 指标是 APM 页面的唯一数据源，但它的三个口径都很容易�
 7. `apm_service_requests_total{service,operation="POST /downstream"}` 必须**查不到任何样本**（client span 不进服务 RED）。
 8. 同一条 client span 派生边：`apm_edge_requests_total{src_service={service},dst_service="unknown",span_kind="server",source="otlp"}` 等于 1（配对不到 server、也没有 `server.address`/`net.peer.*`，对端兜底 `unknown`，桶关闭后由 `flush()` 补落）。
 9. `apm_edge_duration_micros{同上,field="avg"}` 等于 9000：边只有 `avg`/`p95` 两个 field，calls=1 时 `avg` 就是那条 client span 的耗时。
-10. `query_range` 在 `start=end=bucket` 求值一次，必须取到 `p95` 的点——即三个 server span 合并成一个点、时间戳是桶起点（instant 查询回的是求值时刻，测不出这一层）。
-11. 断言子进程 stderr 里没有 `aggregate failed` / `observe_span failed`。
+10. 同上的 `field="p95"` 也等于 9000（calls=1 时 p95 退化成单样本）；而 `field="sum"` 必须**查不到样本**——aggregator 根本不写 `sum`，拿它做断言会永远为空。
+11. `apm_edge_errors_total{同上}` 等于 1：client span 记 error → 边级错误数一条。
+12. `query_range` 在 `start=end=bucket` 求值一次，必须取到 `p95` 的点——即三个 server span 合并成一个点、时间戳是桶起点（instant 查询回的是求值时刻，测不出这一层）。
+13. 断言子进程 stderr 里没有 `aggregate failed` / `observe_span failed`。
 
 ## 期望结果
 
@@ -50,9 +52,10 @@ RED 指标是 APM 页面的唯一数据源，但它的三个口径都很容易�
 | 6 | client span 不计入 | `operation="POST /downstream"` 的查询结果为空 |
 | 7 | 点标签可区分来源 | 点带 `source=otlp`、`span_kind=server` |
 | 8 | client span 派生边 | `apm_edge_requests_total{src_service=svc,dst_service="unknown",span_kind="server",source="otlp"}` == 1 |
-| 9 | 边耗时的 field 集合 | `apm_edge_duration_micros{同上,field="avg"}` == 9000（calls=1） |
-| 10 | 点写在分钟桶起点 | `start=end=bucket` 的 `query_range` 能取到点 |
-| 11 | 聚合无报错 | stderr 不含 `aggregate failed` / `observe_span failed` |
+| 9 | 边耗时 field 集合 | `apm_edge_duration_micros{同上}` 只有 `avg`/`p95`：`avg=p95=9000`，`field="sum"` 查不到任何样本 |
+| 10 | 边级错误数 | `apm_edge_errors_total{同上}` == 1（client span 是 error） |
+| 11 | 点写在分钟桶起点 | `start=end=bucket` 的 `query_range` 能取到点 |
+| 12 | 聚合无报错 | stderr 不含 `aggregate failed` / `observe_span failed` |
 
 **反向验证（落地时实测）**：把第 1 条的期望值从 `2` 改成 `3`，用例在 60s 超时后失败：
 
@@ -65,6 +68,10 @@ test apm_service_red_lands_in_victoriametrics ... FAILED
 
 边那条同理：把第 8 条的 `1` 改成 `2`（或把对端从 `unknown` 改成 `client`）→ 断言失败，
 证明边派生确实是断言在盯，而不是「查询返回空就算过」。
+
+另外四条也是改期望值实测变红的（红输出见 commit message）：`apm_edge_errors_total` 1→2、
+边 `p95` 9000→1000、`field="sum"` 的期望从「空」改成「非空」，三条都是 `left == right`
+或 `边耗时只有 avg/p95` 断言失败，还原后绿；服务侧 `p50` 3000→5000 则是 60s 超时失败。
 
 ## 清理方式
 
