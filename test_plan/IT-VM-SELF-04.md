@@ -59,6 +59,9 @@ test result: FAILED. 0 passed; 1 failed
 可达并已断言：`dataserver_ebpf_agg_points_total`、`dataserver_ebpf_last_agg_bucket`、
 `dataserver_ts_clean_runs_total`（3 条）。
 
+`dataserver_ebpf_edges_deleted_total` 也已可达：由独立场景 `IT-VM-SELF-07` 用真 `gse-server` 下发
+`ebpf_network` 采集项 + 过期边 + 真等一个 60s 清理周期覆盖（本用例没起 gse-server，所以这里不验）。
+
 不可达（**未覆盖**，不造假）：
 
 | 名字 | 原因 | 需要什么才能覆盖 |
@@ -66,7 +69,6 @@ test result: FAILED. 0 passed; 1 failed
 | `dataserver_ebpf_agg_errors_total` | VM 后端写点是排队 fire-and-forget，`run_once` 不返回错误；tsink 后端的 `point out of retention` 能真造错，但那种实例的自监控写 tsink，无法在 VM 侧断言 | 双后端开关或聚合错误注入 |
 | `dataserver_ts_clean_errors_total` | 只在「某个清理阶段整段失败」时 +1：ts 阶段要 `kv.scan_prefix` 失败、日志/边阶段要 `delete_matching` / `delete_edges_before` 失败、去重阶段要 `prune_prefix_before` 失败。健康后端上这些都不可达 | KV / 日志后端的故障注入开关 |
 | `dataserver_ts_tombstones_applied_total` | 需要 ts 后端支持**按时间窗删除**并回报墓碑：VM 后端 `supports_time_window_delete() = false`（VM 删除接口不吃 start/end），且共享 VM 不能开 `-deleteAuthKey` / `whole_series_delete`；tsink 后端能真删，但那种实例的自监控写 tsink，无法在 VM 侧断言 | 一个「自监控写 VM、业务时序写 tsink」的双后端形态 |
-| `dataserver_ebpf_edges_deleted_total` | 只有在 `apply_retention` 拿到 **live 采集项列表**（配 `gse_admin_url`，且该 item 的 `kind` 以 `ebpf` 开头）并对该 item 删边时才 +1；本用例没起 gse-server。可覆盖但需要 `Gse` 真进程链（夹具已有 `Gse::put_spec`），属于独立场景 | 一条新场景：fake gse-server 下发 eBPF 采集项 + 过期边 + `ts_clean=60` |
 | `dataserver_ingest_dedup_pruned_total` | 去重键按**接入时刻**落 KV，只有 `ingest/{record_id}` 的值早于 `ingest_dedup_retention_days`（默认 3 天）才会被删；接入时间无法回溯，等于要么等 3 天、要么直接往 KV 写旧键（没有对外 API） | KV 直写夹具，或可配置的「去重键 aging」注入 |
 
 `dataserver_ebpf_agg_errors_total` / `dataserver_ts_clean_errors_total` 用负向断言兜住：

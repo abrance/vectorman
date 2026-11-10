@@ -44,6 +44,14 @@ dataserver 的自监控除了暴露 `/metrics`，还会在 `self_metrics_interva
    `_background_errors_total`、`_degraded`。VM 后端下前三者的内存/WAL 口径恒 0（那是本地 tsink 的概念），
    后两者在没故障时恒 0；`_series_count` 是 VM 的**全实例** `totalSeries`，只断言 `>= 1`，不锁绝对值
    （同一台 VM 上还有别的实例在写，锁死会假红）。
+9. 断言 `SelfMetrics::new` **无条件注册**的进程指标与 HTTP 直方图也逐样本落 VM（这一组此前零断言，
+   但每一轮抓取都真实落库）：`vectorman_process_uptime_seconds`、
+   `vectorman_process_resident_memory_bytes`（均 > 0）、`vectorman_process_cpu_seconds_total`
+   （只在 `cpu > 0` 时累加，**只断言存在**、不锁值），以及本进程真发过 `GET /health` 后必然产生的
+   直方图三条：`vectorman_http_request_duration_seconds_count`（>= 1）、`_sum`（> 0）、
+   `_bucket`（至少一条样本，且每条都带非空 `le` 标签）。直方图的 `le` 在 VM 里是**标签**而不是字段
+   （`LocalTsSink` 只写 `measurement{tags}`，`field_name` 丢弃），所以它是多条独立序列；`le` 的取值集合
+   来自 `HTTP_BUCKETS`，用例不写死条数。
 
 ## 期望结果
 
@@ -55,6 +63,8 @@ dataserver 的自监控除了暴露 `/metrics`，还会在 `self_metrics_interva
 | 4 | 隔离标签正确 | `component=dataserver`、`data_id=self`、`instance=<SQL 口监听地址>` |
 | 5 | 没走本地 tsink | `<data_path>/ts` 不存在，或目录条目数 == 0 |
 | 6 | 时序存储状态采样 | 六条 `dataserver_ts_*` 均在本进程 `instance` 下查到；`memory_used_bytes`/`memory_budget_bytes`/`wal_size_bytes`/`background_errors_total`/`degraded` 精确等于 0（VM 后端口径），`series_count >= 1` |
+| 7 | 进程指标落 VM | `vectorman_process_uptime_seconds`、`vectorman_process_resident_memory_bytes` 在本进程 `instance` 下 > 0；`vectorman_process_cpu_seconds_total` 序列存在（不锁值） |
+| 8 | HTTP 直方图落 VM | `vectorman_http_request_duration_seconds_count{method="GET",path="/health"} >= 1`、`_sum > 0`；`_bucket` 至少一条样本且每条都带非空 `le`（不写死 `le` 条数） |
 
 **反向验证（写这条用例时实测）**：把等待条件里的期望值改成 `value + 1.0`
 （即「VM 里的值比 `/metrics` 多 1」），60s 超时红输出：
@@ -72,6 +82,19 @@ test result: FAILED. 0 passed; 1 failed
 ```
 还原后重跑通过（约 31s）。
 
+第三条反向验证（进程指标 + HTTP 直方图这一组，逐条改期望后各跑一次，全部变红再还原）：
+
+| 断言 | 改动 | 红输出（实测） |
+|---|---|---|
+| `vectorman_process_uptime_seconds > 0` | 期望改成 `> 1e12` | `/metrics 上 vectorman_process_uptime_seconds 应 > 0，实际 31.058789809` |
+| `vectorman_process_resident_memory_bytes > 0` | 数组只留 RSS 且期望改成 `> 1e12` | `/metrics 上 vectorman_process_resident_memory_bytes 应 > 0，实际 39190528` |
+| `vectorman_process_cpu_seconds_total` 存在 | 文本侧的指标名改成多了 `_missing` 的错名 | `/metrics 里没有 vectorman_process_cpu_seconds_total_missing{[]} 的样本` |
+| 直方图 `_count >= 1` | 期望改成 `>= 99` | `/metrics 上 GET /health 的直方图 count 应 >= 1（真发过请求），实际 4` |
+| 直方图 `_sum > 0` | 期望改成 `> 1e9` | `/metrics 上 GET /health 的直方图 sum 应 > 0，实际 0.000143247` |
+| 直方图 `_bucket` 带非空 `le` | 标签判断改成 `le.is_none()` | `每条直方图 bucket 样本都必须带非空 le 标签，实际标签: {... "le": "+Inf", ...}` |
+
+每条都 `test result: FAILED. 0 passed; 1 failed`（约 31s/次），还原后 `cargo test -p dataserver --test it_vm_self` 通过。
+
 ## 覆盖范围
 
 这条只覆盖「自监控文本 → VM」这条管道本身（含时序存储状态采样的六条 gauge）。APM / eBPF 聚合、
@@ -83,7 +106,10 @@ test result: FAILED. 0 passed; 1 failed
 「不可达项」表：`dataserver_apm_agg_errors_total`、`dataserver_apm_flush_errors_total`、
 `dataserver_apm_retention_errors_total`、`dataserver_ebpf_agg_errors_total`、
 `dataserver_ts_clean_errors_total`、`dataserver_ts_tombstones_applied_total`、
-`dataserver_ebpf_edges_deleted_total`、`dataserver_ingest_dedup_pruned_total`。
+`dataserver_ingest_dedup_pruned_total`。
+
+`dataserver_ebpf_edges_deleted_total` 原先也列在这里，现已由独立场景 `IT-VM-SELF-07` 覆盖
+（真 gse-server 下发 eBPF 采集项 + 过期边 + 真等一个 60s 清理周期），不再算不可达。
 
 ## 清理方式
 

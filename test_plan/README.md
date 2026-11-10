@@ -40,7 +40,7 @@ cargo test -p dataserver --test it_dedup -- --nocapture
 ```
 
 CI（`rust-ci.yml` 的 `rust-tests` 作业）用 service 容器起 Redis 7 + 单机版 VictoriaMetrics，
-喂满 `DP_E2E_*` 后跑 `cargo test --all-features`：本目录 25 条在 PR 上都是真跑。
+喂满 `DP_E2E_*` 后跑 `cargo test --all-features`：本目录 26 条在 PR 上都是真跑。
 
 ## 索引
 
@@ -71,3 +71,4 @@ CI（`rust-ci.yml` 的 `rust-tests` 作业）用 service 容器起 Redis 7 + 单
 | IT-VM-EBPF-PROC-01 | Agent 已关闭分钟桶的 `ebpf_process_{exec,exit,fork}_total` 经 `/v1/ingest` 落 VM：`pid`/`process_name` 维度保留、值逐个相等、全 0 的进程不产点 | 真实 VictoriaMetrics；夹具直接调产品 `ProcessMinuteAccumulator::drain_closed`，不手搓 JSON | `cargo test -p dataserver --test it_vm_ebpf_proc -- --nocapture`<br>场景：[IT-VM-EBPF-PROC-01.md](IT-VM-EBPF-PROC-01.md) | pit |
 | IT-VM-EBPF-SYSCALL-01 | `ebpf_syscall_duration_micros{field="avg"}` 与 `{field="p95"}` 的 `op` 维度、`ebpf_syscall_failures_total{op,errno}` 落 VM，值按产品 `duration_metrics`/`failure_metrics` 口径（p95 为最近秩） | 真实 VictoriaMetrics；夹具直接调产品产出函数 | `cargo test -p dataserver --test it_vm_ebpf_syscall -- --nocapture`<br>场景：[IT-VM-EBPF-SYSCALL-01.md](IT-VM-EBPF-SYSCALL-01.md) | pit |
 | IT-VM-EBPF-SELF-01 | Agent eBPF 自监控 13 条（`agent_ebpf_{flushes,edges,metric_points,filtered,idle_keys,read_errors,map_overflow_dropped,rate_limited,buffer_dropped,edges_skipped}_total`、`agent_ebpf_cpu_percent`、`agent_ebpf_degraded`）与 `agent_ebpf_capability` 落 VM：断言**真实降级形态**（`value=0`、`reason` 有值），并钉住 `field_name` 不进 VM、`available` 序列不存在 | 真实 VictoriaMetrics；夹具走产品 `interval_records`/`capability_metric`；内核态采集本身不可达（root+CAP_BPF） | `cargo test -p dataserver --test it_vm_ebpf_self -- --nocapture`<br>场景：[IT-VM-EBPF-SELF-01.md](IT-VM-EBPF-SELF-01.md) | pit |
+| IT-VM-SELF-07 | eBPF 边保留期清理自监控落 VM：真 `gse-server` 下发 `kind=ebpf_network` 采集项（`item_id` == 边记录的 `data_id`）→ ingest 一条 4 天前的边（> eBPF 缺省保留 3 天）→ 真等一个 60s 清理周期 → `dataserver_ebpf_edges_deleted_total{instance=…} >= 1`、同周期 `dataserver_ts_clean_runs_total >= 2`、边检索归零（计数是「删了几行」而不是「跑过一轮」的证据）；边检索必须显式给时间窗，接口缺省只查最近 1 小时 | 真实 VictoriaMetrics + 真 `gse-server`（`Gse::start`，临时目录 + 随机端口）；测试内自动 `cargo build -p gse-server -p gse-agent`；APM 必须打开（否则 `/v1/edges/search` 返回 503） | `cargo test -p dataserver --test it_vm_self_ebpf_edges -- --nocapture`<br>场景：[IT-VM-SELF-07.md](IT-VM-SELF-07.md) | mike |
