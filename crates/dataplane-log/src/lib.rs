@@ -7,6 +7,11 @@
 //! 但 `trace_id` / `service` / `data_id` 三个键会被提升为独立的索引字段，
 //! 供 [`LogStore::search_indexed`] 全倒排检索与按 `data_id` 的高效清理；
 //! 现有 v1 索引不会被原地改写，而是切换到相邻的 `*-v2` 目录重建。
+//!
+//! 索引版本 v5：`agent_id` / `host_id` 同样提升为索引字段。此前只用这两个键
+//! 过滤时没有索引可用，只能取前 `MAX_LIMIT` 条再 post-filter，结果在同样本
+//! 量下会静默丢数据。现在这两类查询走索引；真无法建索引的任意 `labels.*` 键
+//! 走按时间窗翻页的全量扫描，并在扫描预算耗尽时报错，而不是返回空列表。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -33,7 +38,11 @@ const DELETE_SCAN_LIMIT: usize = 100_000;
 /// v3 → v4：新增 **仅存储** 字段 `payload`，用于保存记录原文（trace span 的完整
 /// OTel JSON）。老的投影字段（labels/message）不足以还原 span 的耗时、attributes、
 /// events、links，瀑布图与 span 详情需要原文。
-const SCHEMA_VERSION: u32 = 4;
+///
+/// v4 → v5：新增索引字段 `agent_id` / `host_id`。没有它们时只给标签的查询只能
+/// 取前 `MAX_LIMIT` 条再 post-filter，命中集超过上限就静默丢数据（生产实测
+/// 1.5 万同分文档下查不到数据）。
+const SCHEMA_VERSION: u32 = 5;
 const SCHEMA_VERSION_FILE: &str = "schema_version";
 /// `search_indexed` 的默认与上限，trace 详情需要一次拉全一个 trace 的 span。
 const INDEXED_DEFAULT_LIMIT: usize = 100;
@@ -51,6 +60,13 @@ const FIELD_DATA_TYPE: &str = "data_type";
 const FIELD_PAYLOAD: &str = "payload";
 const FIELD_SERVICE: &str = "service";
 const FIELD_DATA_ID: &str = "data_id";
+const FIELD_AGENT_ID: &str = "agent_id";
+const FIELD_HOST_ID: &str = "host_id";
+/// 无索引标签查询的翻页窗口：每次取这么多条候选再 post-filter。
+const LABEL_SCAN_WINDOW: usize = 1_000;
+/// 无索引标签查询的扫描预算（候选文档总数）。预算耗尽时**报错**而不是返回
+/// 可能不完整的结果——「真没有」和「没查完」必须能区分。
+const LABEL_SCAN_BUDGET: usize = 200_000;
 
 /// 一条日志记录。
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -130,6 +146,10 @@ pub struct IndexedLogFilter {
     pub data_type: Option<String>,
     /// `data_id` 索引字段精确匹配（采集项 `item_id`）。
     pub data_id: Option<String>,
+    /// `agent_id` 索引字段精确匹配（v5 新增）。
+    pub agent_id: Option<String>,
+    /// `host_id` 索引字段精确匹配（v5 新增）。
+    pub host_id: Option<String>,
     /// `level` 精确匹配。
     pub level: Option<String>,
     /// message 关键词查询（jieba 分词后 AND）。
@@ -149,6 +169,8 @@ impl Default for IndexedLogFilter {
             data_type: None,
             service: None,
             data_id: None,
+            agent_id: None,
+            host_id: None,
             level: None,
             message_query: None,
             limit: INDEXED_DEFAULT_LIMIT,
@@ -194,6 +216,14 @@ pub trait LogStore: Send + Sync {
     async fn append(&self, record: LogRecord) -> Result<(), DataplaneError>;
 
     /// 按过滤条件检索日志记录。
+    ///
+    /// 全部条件都能落到索引字段时（`trace_id` / `data_type` / `service` /
+    /// `data_id` / `agent_id` / `host_id` / `level` / `message` / `timestamp`），
+    /// 结果精确且不受扫描上限影响。存在无法建索引的 `labels.*` 键时，按时间
+    /// 窗翻页取全部候选再 post-filter；扫描预算耗尽会返回错误而不是截断结果
+    /// （「真没有」返回空列表，「没查完」返回 `QueryFailed`）。
+    ///
+    /// 结果按时间**降序**返回（与 post-filter 翻页的游标同一顺序，保证可重现）。
     async fn search(&self, filter: LogFilter) -> Result<Vec<LogRecord>, DataplaneError>;
 
     /// 全倒排检索（索引版本 v2）：条件全部走索引字段，无 post-filter。
@@ -254,6 +284,8 @@ struct LogFields {
     data_type: Field,
     service: Field,
     data_id: Field,
+    agent_id: Field,
+    host_id: Field,
     payload: Field,
 }
 
@@ -308,6 +340,9 @@ fn build_schema() -> tantivy::schema::Schema {
     b.add_text_field(FIELD_DATA_TYPE, STRING | STORED);
     b.add_text_field(FIELD_SERVICE, STRING | STORED);
     b.add_text_field(FIELD_DATA_ID, STRING | STORED);
+    // v5：只给标签也必须查得到（agent_id / host_id 是接入侧最常用的两个维度）。
+    b.add_text_field(FIELD_AGENT_ID, STRING | STORED);
+    b.add_text_field(FIELD_HOST_ID, STRING | STORED);
     // 仅存储、不建倒排：原文只用于回读，不参与检索。
     b.add_text_field(FIELD_PAYLOAD, STORED);
     b.build()
@@ -365,6 +400,8 @@ impl TantivyLogStore {
             data_type: index.schema().get_field(FIELD_DATA_TYPE).map_err(dp_err)?,
             service: index.schema().get_field(FIELD_SERVICE).map_err(dp_err)?,
             data_id: index.schema().get_field(FIELD_DATA_ID).map_err(dp_err)?,
+            agent_id: index.schema().get_field(FIELD_AGENT_ID).map_err(dp_err)?,
+            host_id: index.schema().get_field(FIELD_HOST_ID).map_err(dp_err)?,
             payload: index.schema().get_field(FIELD_PAYLOAD).map_err(dp_err)?,
         };
 
@@ -420,6 +457,8 @@ impl LogStore for TantivyLogStore {
             doc.add_text(fields.data_type, promoted(&record.labels, "data_type"));
             doc.add_text(fields.service, promoted(&record.labels, "service"));
             doc.add_text(fields.data_id, promoted(&record.labels, "data_id"));
+            doc.add_text(fields.agent_id, promoted(&record.labels, "agent_id"));
+            doc.add_text(fields.host_id, promoted(&record.labels, "host_id"));
             if let Some(payload) = &record.payload {
                 doc.add_text(fields.payload, payload);
             }
@@ -435,10 +474,7 @@ impl LogStore for TantivyLogStore {
         let fields = self.fields.clone();
         let mut tokenizer = self.tokenizer.clone();
         blocking(move || {
-            let limit = clamp_log_limit(filter.limit);
-            let mut hits = collect_hits(&reader, &fields, &mut tokenizer, &filter, MAX_LIMIT)?;
-            hits.truncate(limit);
-            Ok(hits)
+            collect_hits_paged(&reader, &fields, &mut tokenizer, &filter, LABEL_SCAN_BUDGET)
         })
         .await
     }
@@ -567,11 +603,13 @@ fn indexed_top_docs(
             std::ops::Bound::Included(upper),
         )),
     ));
-    let exact: [(&Field, &Option<String>); 5] = [
+    let exact: [(&Field, &Option<String>); 7] = [
         (&fields.trace_id, &filter.trace_id),
         (&fields.data_type, &filter.data_type),
         (&fields.service, &filter.service),
         (&fields.data_id, &filter.data_id),
+        (&fields.agent_id, &filter.agent_id),
+        (&fields.host_id, &filter.host_id),
         (&fields.level, &filter.level),
     ];
     for (field, value) in exact {
@@ -668,10 +706,129 @@ fn to_indexed_filter(filter: &LogFilter) -> Option<IndexedLogFilter> {
             "data_type" => out.data_type = Some(value.clone()),
             "service" => out.service = Some(value.clone()),
             "data_id" => out.data_id = Some(value.clone()),
+            "agent_id" => out.agent_id = Some(value.clone()),
+            "host_id" => out.host_id = Some(value.clone()),
             _ => return None,
         }
     }
     Some(out)
+}
+
+/// 构造前置查询：时间范围 + 能落索引的条件（`level` / `message` / 已提升的 label）。
+fn base_query(
+    fields: &LogFields,
+    tokenizer: &mut JiebaTokenizer,
+    filter: &LogFilter,
+) -> BooleanQuery {
+    let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
+    let lower = Term::from_field_i64(fields.timestamp, filter.from_ts.unwrap_or(i64::MIN));
+    let upper = Term::from_field_i64(fields.timestamp, filter.to_ts.unwrap_or(i64::MAX));
+    clauses.push((
+        Occur::Must,
+        Box::new(RangeQuery::new(
+            std::ops::Bound::Included(lower),
+            std::ops::Bound::Included(upper),
+        )),
+    ));
+    if let Some(level) = &filter.level {
+        clauses.push((
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(fields.level, level),
+                IndexRecordOption::Basic,
+            )),
+        ));
+    }
+    if let Some(message_query) = &filter.message_query {
+        let mut stream = tokenizer.token_stream(message_query);
+        while stream.advance() {
+            let term = Term::from_field_text(fields.message, &stream.token().text);
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+            ));
+        }
+    }
+    let promoted_fields: [(&Field, &str); 6] = [
+        (&fields.trace_id, "trace_id"),
+        (&fields.data_type, "data_type"),
+        (&fields.service, "service"),
+        (&fields.data_id, "data_id"),
+        (&fields.agent_id, "agent_id"),
+        (&fields.host_id, "host_id"),
+    ];
+    for (field, key) in promoted_fields {
+        if let Some(value) = filter.labels.get(key) {
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(*field, value),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+    }
+    BooleanQuery::new(clauses)
+}
+
+/// 按时间倒序窗口翻页扫候选集，对无法建索引的 `labels.*` 键做 post-filter。
+///
+/// 候选集扫到底 => 结果完整（空列表即「真没有」）；扫描预算 `max_docs` 耗尽
+/// => 返回错误，不得静默截断成空结果或部分结果。
+fn collect_hits_paged(
+    reader: &IndexReader,
+    fields: &LogFields,
+    tokenizer: &mut JiebaTokenizer,
+    filter: &LogFilter,
+    max_docs: usize,
+) -> Result<Vec<LogRecord>, DataplaneError> {
+    let limit = clamp_log_limit(filter.limit);
+    let bq = base_query(fields, tokenizer, filter);
+    reader.reload().map_err(dp_err)?;
+    let searcher = reader.searcher();
+    let mut out: Vec<LogRecord> = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let remaining = max_docs.saturating_sub(offset);
+        if remaining == 0 {
+            break;
+        }
+        let window = LABEL_SCAN_WINDOW.min(remaining);
+        let top_docs = searcher
+            .search(
+                &bq,
+                &TopDocs::with_limit(window)
+                    .and_offset(offset)
+                    .order_by_fast_field::<i64>(FIELD_TIMESTAMP, Order::Desc),
+            )
+            .map_err(dp_err)?;
+        if top_docs.is_empty() {
+            return Ok(out);
+        }
+        for (_ts, addr) in &top_docs {
+            let record = doc_to_record(&searcher, fields, *addr)?;
+            if filter
+                .labels
+                .iter()
+                .all(|(k, v)| record.labels.get(k) == Some(v))
+            {
+                out.push(record);
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+        }
+        offset += top_docs.len();
+        if top_docs.len() < window {
+            return Ok(out);
+        }
+    }
+    Err(DataplaneError::new(
+        ErrorCode::QueryFailed,
+        format!(
+            "label filter needs a full scan: scanned {offset} candidate documents without exhausting matches (budget {max_docs}); narrow the time range or filter on an indexed label (agent_id / host_id / trace_id / service / data_id / data_type)"
+        ),
+    ))
 }
 
 fn collect_hits(
@@ -891,7 +1048,13 @@ mod tests {
     }
 
     /// 批量直写：绕过 `append` 的每记录 commit，用于需要大量文档的用例。
-    fn bulk_append(store: &TantivyLogStore, start: usize, count: usize, data_id: &str) {
+    fn bulk_append(
+        store: &TantivyLogStore,
+        start: usize,
+        count: usize,
+        data_id: &str,
+        extra: &[(&str, &str)],
+    ) {
         let mut guard = store.writer.lock().unwrap();
         for i in start..start + count {
             let mut doc = TantivyDocument::new();
@@ -900,15 +1063,123 @@ mod tests {
             doc.add_text(store.fields.message, "bulk");
             let mut labels = BTreeMap::new();
             labels.insert("data_id".to_string(), data_id.to_string());
+            for (k, v) in extra {
+                labels.insert((*k).to_string(), (*v).to_string());
+            }
             doc.add_text(
                 store.fields.labels_json,
                 serde_json::to_string(&labels).unwrap(),
             );
             doc.add_text(store.fields.id, format!("d{i}"));
             doc.add_text(store.fields.data_id, data_id);
+            doc.add_text(store.fields.agent_id, promoted(&labels, "agent_id"));
+            doc.add_text(store.fields.host_id, promoted(&labels, "host_id"));
             guard.add_document(doc).unwrap();
         }
         guard.commit().unwrap();
+    }
+
+    /// P0 回归：命中集远超旧 post-filter 上限（1000）时，只给 `agent_id`
+    /// 也必须能查到目标文档。旧实现取前 1000 条按 score 再过滤 -> 空列表。
+    #[tokio::test]
+    async fn label_only_agent_id_hits_doc_beyond_scan_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TantivyLogStore::new(dir.path()).unwrap();
+        // 2000 条同分、同 data_id、同 level 的文档（同分是旧 bug 的触发条件）。
+        bulk_append(&store, 0, 2000, "item-noise", &[]);
+        bulk_append(&store, 5_000, 1, "item-noise", &[("agent_id", "agent-target")]);
+
+        let mut labels = BTreeMap::new();
+        labels.insert("agent_id".to_string(), "agent-target".to_string());
+        let hits = store
+            .search(LogFilter {
+                labels,
+                ..LogFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "只给 agent_id 必须命中，不得被截断成空");
+        assert_eq!(hits[0].id, "d5000");
+        assert_eq!(hits[0].labels["agent_id"], "agent-target");
+    }
+
+    /// 同上，但 `host_id`。
+    #[tokio::test]
+    async fn label_only_host_id_hits_doc_beyond_scan_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TantivyLogStore::new(dir.path()).unwrap();
+        bulk_append(&store, 0, 2000, "item-noise", &[]);
+        bulk_append(&store, 9_000, 1, "item-noise", &[("host_id", "host-target")]);
+
+        let mut labels = BTreeMap::new();
+        labels.insert("host_id".to_string(), "host-target".to_string());
+        let hits = store
+            .search(LogFilter {
+                labels,
+                ..LogFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "只给 host_id 必须命中");
+        assert_eq!(hits[0].id, "d9000");
+    }
+
+    /// 无法建索引的任意 `labels.*` 键：需要翻页扫到候选集尽头，而不是只看前 1000 条。
+    #[tokio::test]
+    async fn unindexed_label_found_beyond_scan_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TantivyLogStore::new(dir.path()).unwrap();
+        bulk_append(&store, 0, 2_500, "item-noise", &[("pod_name", "noise")]);
+        // 时间戳落在最旧端，按降序翻页必须一直翻到窗口末尾才能遇见它。
+        bulk_append(&store, 1, 1, "item-noise", &[("pod_name", "target-pod")]);
+
+        let mut labels = BTreeMap::new();
+        labels.insert("pod_name".to_string(), "target-pod".to_string());
+        let hits = store
+            .search(LogFilter {
+                labels,
+                ..LogFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "未索引 label 也必须翻页查到");
+        assert_eq!(hits[0].labels["pod_name"], "target-pod");
+    }
+
+    /// 扫描预算耗尽时必须报错，不能返回空列表冒充「真没有」。
+    #[tokio::test]
+    async fn label_scan_budget_exhaustion_is_an_error_not_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TantivyLogStore::new(dir.path()).unwrap();
+        bulk_append(&store, 0, 2_500, "item-noise", &[("pod_name", "noise")]);
+
+        let mut labels = BTreeMap::new();
+        labels.insert("pod_name".to_string(), "absent".to_string());
+        let filter = LogFilter {
+            labels,
+            ..LogFilter::default()
+        };
+        let mut tokenizer = store.tokenizer.clone();
+        let err = collect_hits_paged(&store.reader, &store.fields, &mut tokenizer, &filter, 1_000)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::QueryFailed);
+        assert!(
+            err.message.contains("full scan"),
+            "错误需说明是没查完而不是没有数据: {}",
+            err.message
+        );
+
+        // 预算足够时同一查询返回空列表 = 真没有。
+        let mut tokenizer = store.tokenizer.clone();
+        let ok = collect_hits_paged(
+            &store.reader,
+            &store.fields,
+            &mut tokenizer,
+            &filter,
+            LABEL_SCAN_BUDGET,
+        )
+        .unwrap();
+        assert!(ok.is_empty(), "扫到底且无命中时报空");
     }
 
     #[tokio::test]
@@ -916,7 +1187,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = TantivyLogStore::new(dir.path()).unwrap();
         // 超过旧 post-filter 路径的 MAX_LIMIT(1000)，验证索引路径无扫描上限。
-        bulk_append(&store, 0, 1200, "item-bulk");
+        bulk_append(&store, 0, 1200, "item-bulk", &[]);
         store
             .append(rec("keep", 9_999, "keep", "item-keep"))
             .await
