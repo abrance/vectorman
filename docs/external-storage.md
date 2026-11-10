@@ -7,7 +7,8 @@
 | KvStore（`ingest/` 去重键、`retain/`、`spec-live/`、`stream/`） | redb `kv.redb` | Redis（`redis-test` ns） |
 | TimeSeriesStore | tsink `ts/`（WAL + 段文件） | VictoriaMetrics 集群版（`victoria-metrics` ns） |
 
-切换只改环境变量/配置，**数据目录不动**，所以回滚就是改回来重启。
+切换只改环境变量/配置，代码侧不搬数据；回滚是改回来重启，但**不恢复历史时序**
+（`ts/` 已于 2026-11-10 删除且不回填，见 §3 / §4）。
 
 ---
 
@@ -103,15 +104,22 @@ vm_whole_series_delete = false       # VM 只能整序列删；见 §6「删除�
 
 改回 `DATASERVER_TS_BACKEND=tsink` / `DATASERVER_KV_BACKEND=redb` 并重启即可。
 
-- 老数据目录 `data_path/ts`、`data_path/kv.redb` 全程没被修改，回滚后接着用。
+- **2026-11-10 起 `data_path/ts` 已删除（原 786MB），无备份。** 回滚到 tsink 后端是
+  **从空库启动**，本地时序从零重新记；切换前的历史**不可恢复**（不回填，§4）。
+- `data_path/kv.redb` 全程没被修改，回滚后照旧可用；切换期间写进 Redis 的
+  `retain/` / `spec-live/` / `stream/` 与 `ingest/` 不自动回灌。
 - **回滚会丢掉「切换期间写进外置存储」的那部分数据**：时序在 VM 里，KV 的去重键在
   Redis 里。无缝回滚需要在回滚前把这两段补回本地，当前没有反向导出工具（§4）。
-  外置模式下 `ts/` 从未被打开，所以回滚后的本地时序**停在切换时刻**。
+  外置模式下 `ts/` 从未被打开过，它也没了，所以回滚后本地时序只剩「回滚之后」。
 - 回滚前把 `vm_*` / `redis_*` 连接留在配置里不影响启动（后端未选中就不建连）。
 
-## 4. 迁移：外置模式**不迁移**历史时序（回填工具当前不存在）
+## 4. 迁移：外置模式**不迁移**历史时序，且**决定不回填**
 
-结论：**切换只改后端选择，历史时序留在本地，新后端里一条都查不到。**
+**决策（2026-11-10）：不回填历史时序。** 旧的 tsink WAL 目录 `data_path/ts`
+（786MB / 32436 文件，最后写入 11-09 20:54）已于同日删除，历史数据**不保留、不可恢复**。
+§4.2 的回填评估保留作技术记录，**不是待办、不在计划里**。
+
+结论：**切换只改后端选择，历史时序不迁移，新后端里一条都查不到，旧数据也不再留着。**
 之前写的「选 WAL 重放、用新版 dataserver 冷启动把老 WAL 重放进 VM」在代码里
 并不存在，按现状作废：
 
@@ -123,16 +131,16 @@ vm_whole_series_delete = false       # VM 只能整序列删；见 §6「删除�
   迁移与 agent 的 `spec_apply`。`bins/dataserver/tests/replay_bench.rs` 是**测试基准**，
   不进产品二进制，也不在镜像的默认路径里。
 
-线上实测后果（2026-11-10 切换后）：本地 4411 序列的历史留在 `data_path/ts/`
-（129MB WAL，未删未改），切换后 `/v1/prom/query` 只能查到**切换之后**写进 VM 的点。
+线上实测后果（2026-11-10 切换后）：本地 4411 序列的历史原本只在 `data_path/ts/`
+（129MB WAL），`ts/` 已于同日删除，切换后 `/v1/prom/query` 只能查到**切换之后**
+写进 VM 的点，切换前的点全部丢弃。
 
 丢数据边界（按实际行为，必须接受）：
 
-- **切换时刻之前的所有历史点**：只在本地 `ts/` 里，VM 不可见，`/v1/prom/query`、
-  `/v1/ts/stats` 的 `series_count` 都看不到它们。数据**没丢**，但当前没有回填路径
-  （§4.2）。
-- 回滚到 `ts_backend=tsink` 能重新看到全部本地历史；但**切换期间写进 VM 的点
-tsink 里没有**，回滚后这段时间是空白（除非再做一次 VM→本地反向导出，同样未实现）。
+- **切换时刻之前的所有历史点**：`data_path/ts/` 删除后**已丢弃**——VM 里没有、本地也没有，
+  `/v1/prom/query`、`/v1/ts/stats` 的 `series_count` 都不含它们（§4.2 仅留评估）。
+- 回滚到 `ts_backend=tsink` 是**空库起步**：`ts/` 已不存在，历史不会回来；**切换期间写进
+  VM 的点** tsink 里也没有，回滚后两边都查不到（VM→本地反向导出同样未实现）。
 - `retain/` / `spec-live/` / `stream/` 这三类 KV **必须迁移或重建**，否则：
   `retain/` 丢了 → 已删采集项的数据不会被清理（多留，不丢）；
   `spec-live/` 丢了 → 下一轮清理会把所有采集项误判成「刚回来」，只影响一轮对齐；
@@ -148,12 +156,15 @@ tsink 里没有**，回滚后这段时间是空白（除非再做一次 VM→本
 ### 4.1 操作含义（切换清单按这个口径）
 
 切换时**不要**执行任何「回放 `ts/` 进 VM」的动作 —— 没有这个能力，`replay_bench`
-只用于出基准数字。要么接受历史不可查，要么先做 §4.2 的回填工具。
-历史要不要保，属于业务决策（`ts/` 目录可以先拷一份备份，体积 129MB）。
+只用于出基准数字。历史按决策**直接丢弃**，§4.2 的回填方案已评估、**未采用**。
+`ts/` 已删除且**无备份**：再切一次后端也不会凭空多出历史，回滚同样不恢复历史时序。
 
-### 4.2 若要做回填：最小可行路径评估（**未实现，仅评估**）
+### 4.2 回填最小可行路径评估（**已评估、未采用**，2026-11-10 决策关闭）
 
-推荐路径：**新增一个独立 bin（`bins/ts-backfill`），不做进 dataserver**。
+以下只作技术记录保留：**不是待办，不在计划里，`bins/ts-backfill` 不实现**，
+且源数据（`ts/`）已删除，现在连回填的输入都没有了。
+
+当初的推荐路径：**新增一个独立 bin（`bins/ts-backfill`），不做进 dataserver**。
 
 1. 读侧：用 `dataplane-ts` 的 tsink 只读路径逐序列读出 `(measurement, tags, ts, value)`。
    关键未验证点：tsink 的 `StorageBuilder::build()` 会**重放并可能改写** WAL，
@@ -187,10 +198,11 @@ tsink 里没有**，回滚后这段时间是空白（除非再做一次 VM→本
 
 ### 4.3 Open questions
 
-- tsink 能否只读打开而不重放/改写 WAL？（决定回填是否必须先拷目录）
-- 回填后微秒→毫秒的精度损失实际影响多少点（同毫秒多点在 VM 侧覆盖，未测）。
-- 回填期间是否要限速（避免 VM 写入打满影响同集群的实时接入）。
-- 是否要把「历史不可查」在 UI 上显式提示（否则用户会当成数据丢失报障）。
+- ~~tsink 能否只读打开而不重放/改写 WAL（决定回填是否必须先拷目录）~~ —— **随决策关闭**（不回填）。
+- ~~回填后微秒→毫秒的精度损失实际影响多少点~~ —— **随决策关闭**（不回填）。
+- ~~回填期间是否要限速（避免 VM 写入打满影响实时接入）~~ —— **随决策关闭**（不回填）。
+- 「历史不可查」是否要在 UI 上显式提示（否则用户会当成数据丢失报障）—— 仍然有效，
+  且现在历史是真丢了（§4），更容易被报成故障。
 
 ## 5. cloud3 前置条件（运维 tim 负责，代码侧不自动改）
 
@@ -261,7 +273,8 @@ tim 已在 `vectorman` ns 建 VM 删除 key 的副本（secret 不跨 ns），da
 
 ## 7. 实测对比（2026-11-10，cloud3）
 
-数据源：`/opt/vectorman-k8s/dataserver/ts` 的 117MB WAL（`ts/wal`）拷贝。
+数据源：`/opt/vectorman-k8s/dataserver/ts` 的 117MB WAL（`ts/wal`）拷贝
+（源目录已于 2026-11-10 删除，本次用的是当时拷出来的副本；§4）。
 命令与口径见 `bins/dataserver/tests/replay_bench.rs`。
 
 | 指标 | 本地 tsink | 外置 VM |
@@ -440,10 +453,11 @@ NS=vectorman
 sudo k3s kubectl -n $NS scale deploy/dataserver --replicas=0
 sudo k3s kubectl -n $NS wait --for=delete pod -l app=dataserver --timeout=120s
 
-# ② 备份老 tsink 目录（只拷，不打开；打开会重放并改写）。129MB，秒级。
-#    备份不是迁移：外置模式不会读它，回填工具当前也不存在（§4）。
-SRC=/app/dataserver/data/ts           # PVC 上的路径，用一次临时 pod 挂同一个 PVC 更省事
-cp -a "$SRC" /tmp/backup-ts-$(date +%H%M)
+# ② ts/ 备份：本环境已删除该目录且无备份（2026-11-10 决定不回填），此步跳过。
+#    老环境首切（ts/ 还在）可先拷一份，只拷不打开（打开会重放并改写），129MB 秒级；
+#    但备份不是迁移：外置模式不读它，回填工具也不存在（§4）。
+# SRC=/app/dataserver/data/ts         # PVC 上的路径，用临时 pod 挂同一个 PVC 更省事
+# cp -a "$SRC" /tmp/backup-ts-$(date +%H%M)
 
 # ③ 上新配置（env 见 8.2）
 sudo k3s kubectl -n $NS apply -f apps/vectorman/k8s.yaml
@@ -494,10 +508,12 @@ sudo k3s kubectl -n vectorman exec $POD -- curl -s localhost:9091/metrics | grep
 ```bash
 # ① 把 8.2 的两组 env 删掉（或把 BACKEND 改回 redb / tsink），重启即可
 sudo k3s kubectl -n vectorman set env deploy/dataserver DATASERVER_KV_BACKEND=redb DATASERVER_TS_BACKEND=tsink
-# ② 老数据目录全程没动，回滚后接着用；Redis 的键留着不用清（回滚后没人读）
-# ③ VM 里的数据**不要删**：再次切回外置可直接复用，只是切换窗口内本地新写的点缺失
+# ② ts/ 已删除（2026-11-10，无备份）：tsink 后端从空库启动，历史时序不恢复
+# ③ kv.redb 全程没动，回滚后接着用；Redis 的键留着不用清（回滚后没人读）
+# ④ VM 里的数据**不要删**：再次切回外置可直接复用，只是切换窗口内本地新写的点缺失
 ```
 
+回滚到 `tsink` 只恢复「能继续往本地写」，**不恢复历史**（`ts/` 已删、不回填，§3 / §4）。
 回滚会丢掉「切换期间写进外置存储」的那部分：时序在 VM、去重键在 Redis，两边都没有反向
 导出工具（§4）。
 
@@ -568,4 +584,4 @@ v1.3.15 的真实代价（不是日志噪声）：`run_cleanup` 里 `apply_ts_re
 
 残余（需业务决定）：时间窗语义在 VM 上**本来就不存在**，跳过只是不再报错——VM 后端下
 「采集项保留期短于全局保留期」这件事不再被强制执行；要它生效得靠 VM 自身的
-`-retentionPeriod`，或等 tsink→VM 回填/整系列删除策略落地（见 §4.1）。
+`-retentionPeriod`，或整系列删除策略落地（回填已否决，见 §4.1）。
