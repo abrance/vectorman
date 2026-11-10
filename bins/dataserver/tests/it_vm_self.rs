@@ -16,7 +16,7 @@ use std::time::Duration;
 use vectorman_test_support::{
     http,
     proc::{Dataserver, Options},
-    vm,
+    self_metrics, vm,
 };
 
 const BIN: &str = env!("CARGO_BIN_EXE_dataserver");
@@ -220,4 +220,100 @@ fn dataserver_self_metrics_land_in_victoriametrics() {
         sample.metric.get("data_id").map(String::as_str),
         Some("self")
     );
+
+    // ---- 进程指标与 HTTP 直方图（`SelfMetrics::new` 无条件注册的 5 个 family）
+    //
+    // 这一组此前同样零断言：`/metrics` 上一直有值、也一直逐样本落 VM，但「值对不对」和
+    // 「直方图有没有被拆成 bucket/sum/count」没人验。直方图的 `le` 是**标签**
+    // （`LocalTsSink` 只写 `measurement{tags}`，`field_name` 丢弃），所以 VM 里是三条独立
+    // 序列而不是一个字段。全部按 `instance` 过滤，禁止跨实例断言。
+    let text = fetch_metrics(&ds);
+
+    // uptime / RSS：存在且 > 0（刚起进程也该有非零运行时长与常驻内存）。
+    for name in [
+        "vectorman_process_uptime_seconds",
+        "vectorman_process_resident_memory_bytes",
+    ] {
+        let (_, value) = self_metrics::find(&text, name, &[]);
+        assert!(value > 0.0, "/metrics 上 {name} 应 > 0，实际 {value}");
+        let got = vm.wait_query(
+            &self_metrics::selector(&ds, name, &[]),
+            None,
+            TIMEOUT,
+            |r| !r.is_empty() && r.first().value > 0.0,
+        );
+        assert!(
+            got.first().value > 0.0,
+            "VM 上 {name} 应 > 0，实际 {}: {}",
+            got.first().value,
+            got.raw
+        );
+    }
+
+    // CPU 累计值只在 `cpu > 0` 时累加（`refresh_process`），第一次采样前完全可能是 0：
+    // 只断言「序列存在」，不锁值。
+    self_metrics::find(&text, "vectorman_process_cpu_seconds_total", &[]);
+    self_metrics::wait_present(
+        &vm,
+        &self_metrics::selector(&ds, "vectorman_process_cpu_seconds_total", &[]),
+        TIMEOUT,
+    );
+
+    // HTTP 直方图：本进程真发过 `GET /health`（上面 3 次），所以 count/sum/bucket 都必须有。
+    let http = [("method", "GET"), ("path", "/health")];
+    let (_, count) = self_metrics::find(
+        &text,
+        "vectorman_http_request_duration_seconds_count",
+        &http,
+    );
+    assert!(
+        count >= 1.0,
+        "/metrics 上 GET /health 的直方图 count 应 >= 1（真发过请求），实际 {count}"
+    );
+    self_metrics::wait_at_least(
+        &vm,
+        &self_metrics::selector(&ds, "vectorman_http_request_duration_seconds_count", &http),
+        1.0,
+        TIMEOUT,
+    );
+
+    let (_, sum) = self_metrics::find(&text, "vectorman_http_request_duration_seconds_sum", &http);
+    assert!(
+        sum > 0.0,
+        "/metrics 上 GET /health 的直方图 sum 应 > 0，实际 {sum}"
+    );
+    let sum_sel = self_metrics::selector(&ds, "vectorman_http_request_duration_seconds_sum", &http);
+    let got = vm.wait_query(&sum_sel, None, TIMEOUT, |r| {
+        !r.is_empty() && r.first().value > 0.0
+    });
+    assert!(
+        got.first().value > 0.0,
+        "VM 上 {sum_sel} 应 > 0，实际 {}: {}",
+        got.first().value,
+        got.raw
+    );
+
+    // bucket：`le` 的值集合来自 `HTTP_BUCKETS`，这里不写死数量，只断言「至少一条带非空 le」。
+    self_metrics::find(
+        &text,
+        "vectorman_http_request_duration_seconds_bucket",
+        &http,
+    );
+    let bucket_sel =
+        self_metrics::selector(&ds, "vectorman_http_request_duration_seconds_bucket", &http);
+    let buckets = self_metrics::wait_present(&vm, &bucket_sel, TIMEOUT);
+    assert!(
+        !buckets.samples.is_empty(),
+        "VM 上 {bucket_sel} 应至少一条样本: {}",
+        buckets.raw
+    );
+    for sample in &buckets.samples {
+        let le = sample.metric.get("le");
+        assert!(
+            le.is_some_and(|v| !v.is_empty()),
+            "每条直方图 bucket 样本都必须带非空 le 标签，实际标签: {:?}: {}",
+            sample.metric,
+            buckets.raw
+        );
+    }
 }
