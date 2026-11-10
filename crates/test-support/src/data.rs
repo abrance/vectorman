@@ -190,6 +190,47 @@ pub fn ebpf_edge(
     duration_max_micros: u64,
     latency_hist: Vec<u64>,
 ) -> Value {
+    ebpf_edge_tcp(
+        agent_id,
+        bucket_start_micros,
+        src,
+        dst,
+        protocol,
+        connections,
+        bytes_sent,
+        bytes_recv,
+        failures,
+        failure_reason,
+        duration_sum_micros,
+        duration_max_micros,
+        latency_hist,
+        0,
+        0,
+    )
+}
+
+/// 同 `ebpf_edge`，额外给出 `tcp_retrans` / `tcp_resets`（`ebpf_edge` 固定写 0）。
+///
+/// 聚合侧对这两个字段的规则是「`> 0` 才产出点」，0 值边在 VM 里**没有序列**；
+/// 想造非零样本就必须用这个函数，`ebpf_edge` 的语义保持不动（已有用例依赖它）。
+#[allow(clippy::too_many_arguments)]
+pub fn ebpf_edge_tcp(
+    agent_id: &str,
+    bucket_start_micros: i64,
+    src: (&str, u16, &str),
+    dst: (&str, u16, &str),
+    protocol: &str,
+    connections: u64,
+    bytes_sent: u64,
+    bytes_recv: u64,
+    failures: u64,
+    failure_reason: &str,
+    duration_sum_micros: u64,
+    duration_max_micros: u64,
+    latency_hist: Vec<u64>,
+    tcp_retrans: u64,
+    tcp_resets: u64,
+) -> Value {
     let (src_ip, src_port, src_service) = src;
     let (dst_ip, dst_port, dst_service) = dst;
     json!({
@@ -213,8 +254,8 @@ pub fn ebpf_edge(
         "bytes_recv": bytes_recv,
         "duration_micros_sum": duration_sum_micros,
         "duration_micros_max": duration_max_micros,
-        "tcp_retrans": 0,
-        "tcp_resets": 0,
+        "tcp_retrans": tcp_retrans,
+        "tcp_resets": tcp_resets,
         "failures": failures,
         "failure_reason": failure_reason,
         "latency_hist": latency_hist,
