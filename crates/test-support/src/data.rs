@@ -286,3 +286,30 @@ pub fn logs_envelope(
 ) -> String {
     envelope("logs", batch_id, data_id, agent_id, host_id, records)
 }
+
+/// 带自定义标签的日志记录。
+///
+/// `log_record` 的 `labels` 固定为空；检索契约里的 `trace_id` / 任意 `labels` 过滤需要记录自带标签
+/// （`trace_id` 会被 `LogStore` 提升为索引字段，其余键走 `labels_json` post-filter）。
+/// 信封公共标签（`data_type` / `agent_id` / `data_id` / `host_id`）由接入侧另行补全，
+/// 因此这里只放记录级标签。
+pub fn log_record_with_labels(
+    record_id: &str,
+    timestamp: i64,
+    level: &str,
+    message: &str,
+    labels: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+) -> Value {
+    let labels: serde_json::Map<String, Value> = labels
+        .into_iter()
+        .map(|(k, v)| (k.into(), Value::String(v.into())))
+        .collect();
+    json!({
+        "record_id": record_id,
+        "timestamp": timestamp,
+        "level": level,
+        "message": message,
+        "source": "tp",
+        "labels": labels,
+    })
+}
