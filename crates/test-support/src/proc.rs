@@ -76,6 +76,8 @@ pub struct Options {
     pub apm_enabled: bool,
     /// 0 = 关闭聚合任务（测试断言 RED/边指标时必须 >0）。
     pub apm_agg_interval_secs: u64,
+    /// 自监控快照写入时序库的周期；0（默认）= 关闭，与 `self_metrics_interval_secs = 0` 一致。
+    pub self_metrics_interval_secs: u64,
     /// 配了就经 dataserver 反代 gse 台账（IT-CHAIN 类场景需要）。
     pub gse_admin_url: Option<String>,
     /// 追加/覆盖顶层键；值按**原始 TOML 片段**写入（字符串要自己带引号）。
@@ -116,6 +118,12 @@ impl Options {
     /// 台账地址：dataserver 的 `/v1/gse/*` 反代到 gse-server 管理口（IT-CHAIN / IT-VM-AGENT 需要）。
     pub fn with_gse_admin(mut self, url: &str) -> Self {
         self.gse_admin_url = Some(url.to_string());
+        self
+    }
+
+    /// 打开自监控快照：每 `secs` 秒把 `/metrics` 的全量样本写进时序后端（IT-VM-SELF 需要）。
+    pub fn with_self_metrics(mut self, secs: u64) -> Self {
+        self.self_metrics_interval_secs = secs;
         self
     }
 
@@ -349,7 +357,10 @@ impl Dataserver {
                 "data_path",
                 toml_string(&data.to_string_lossy()).to_string(),
             );
-            push("self_metrics_interval_secs", "0".into());
+            push(
+                "self_metrics_interval_secs",
+                self.opts.self_metrics_interval_secs.to_string(),
+            );
             push("ts_clean_interval_secs", "3600".into());
             push("apm_enabled", self.opts.apm_enabled.to_string());
             push(
