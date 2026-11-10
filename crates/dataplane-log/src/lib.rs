@@ -1087,7 +1087,13 @@ mod tests {
         let store = TantivyLogStore::new(dir.path()).unwrap();
         // 2000 条同分、同 data_id、同 level 的文档（同分是旧 bug 的触发条件）。
         bulk_append(&store, 0, 2000, "item-noise", &[]);
-        bulk_append(&store, 5_000, 1, "item-noise", &[("agent_id", "agent-target")]);
+        bulk_append(
+            &store,
+            5_000,
+            1,
+            "item-noise",
+            &[("agent_id", "agent-target")],
+        );
 
         let mut labels = BTreeMap::new();
         labels.insert("agent_id".to_string(), "agent-target".to_string());
@@ -1109,7 +1115,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = TantivyLogStore::new(dir.path()).unwrap();
         bulk_append(&store, 0, 2000, "item-noise", &[]);
-        bulk_append(&store, 9_000, 1, "item-noise", &[("host_id", "host-target")]);
+        bulk_append(
+            &store,
+            9_000,
+            1,
+            "item-noise",
+            &[("host_id", "host-target")],
+        );
 
         let mut labels = BTreeMap::new();
         labels.insert("host_id".to_string(), "host-target".to_string());
