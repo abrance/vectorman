@@ -78,6 +78,13 @@ pub struct Options {
     pub apm_agg_interval_secs: u64,
     /// 自监控快照写入时序库的周期；0（默认）= 关闭，与 `self_metrics_interval_secs = 0` 一致。
     pub self_metrics_interval_secs: u64,
+    /// trace 接入的每秒批次上限；0（默认）= 不限流（与配置缺省一致）。
+    pub apm_ingest_max_batches_per_sec: u64,
+    /// APM 保留期任务的周期；0（默认）= 不挂该任务（与改动前的硬编码 `apm_clean_interval_secs = 0` 一致）。
+    pub apm_clean_interval_secs: u64,
+    /// 全局清理（ts/日志/边保留 + 去重键收敛）的周期；0 按改动前的硬编码 3600s 跑。
+    /// 产品侧有 `max(60)` 下限，所以小于 60 的值实际按 60s 跑。
+    pub ts_clean_interval_secs: u64,
     /// 配了就经 dataserver 反代 gse 台账（IT-CHAIN 类场景需要）。
     pub gse_admin_url: Option<String>,
     /// 追加/覆盖顶层键；值按**原始 TOML 片段**写入（字符串要自己带引号）。
@@ -124,6 +131,24 @@ impl Options {
     /// 打开自监控快照：每 `secs` 秒把 `/metrics` 的全量样本写进时序后端（IT-VM-SELF 需要）。
     pub fn with_self_metrics(mut self, secs: u64) -> Self {
         self.self_metrics_interval_secs = secs;
+        self
+    }
+
+    /// trace 接入限流：每秒最多 `max_per_sec` 批，超出回 429（IT-VM-SELF 限流自监控需要）。
+    pub fn with_apm_ingest_limit(mut self, max_per_sec: u64) -> Self {
+        self.apm_ingest_max_batches_per_sec = max_per_sec;
+        self
+    }
+
+    /// APM 保留期任务周期（产品侧有 `max(60)` 下限，`secs < 60` 实际按 60s 跑）。
+    pub fn with_apm_clean(mut self, secs: u64) -> Self {
+        self.apm_clean_interval_secs = secs;
+        self
+    }
+
+    /// 全局清理周期（产品侧有 `max(60)` 下限，`secs < 60` 实际按 60s 跑）。
+    pub fn with_ts_clean(mut self, secs: u64) -> Self {
+        self.ts_clean_interval_secs = secs;
         self
     }
 
@@ -361,13 +386,28 @@ impl Dataserver {
                 "self_metrics_interval_secs",
                 self.opts.self_metrics_interval_secs.to_string(),
             );
-            push("ts_clean_interval_secs", "3600".into());
+            // 默认值保持改动前的硬编码：ts 清理 3600s、APM 保留任务不挂（0）。
+            push(
+                "ts_clean_interval_secs",
+                if self.opts.ts_clean_interval_secs == 0 {
+                    "3600".to_string()
+                } else {
+                    self.opts.ts_clean_interval_secs.to_string()
+                },
+            );
             push("apm_enabled", self.opts.apm_enabled.to_string());
             push(
                 "apm_agg_interval_secs",
                 self.opts.apm_agg_interval_secs.to_string(),
             );
-            push("apm_clean_interval_secs", "0".into());
+            push(
+                "apm_clean_interval_secs",
+                self.opts.apm_clean_interval_secs.to_string(),
+            );
+            push(
+                "apm_ingest_max_batches_per_sec",
+                self.opts.apm_ingest_max_batches_per_sec.to_string(),
+            );
             push("apm_min_duration_micros_for_detail", "0".into());
             push("kv_backend", toml_string(&self.opts.kv_backend).to_string());
             push("ts_backend", toml_string(&self.opts.ts_backend).to_string());

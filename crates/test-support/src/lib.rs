@@ -31,5 +31,6 @@ pub mod gse;
 pub mod http;
 pub mod proc;
 pub mod prom;
+pub mod self_metrics;
 pub mod util;
 pub mod vm;
