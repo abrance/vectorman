@@ -27,6 +27,7 @@
 
 pub mod apm;
 pub mod data;
+pub mod gse;
 pub mod http;
 pub mod proc;
 pub mod prom;

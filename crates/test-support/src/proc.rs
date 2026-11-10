@@ -113,6 +113,12 @@ impl Options {
         self
     }
 
+    /// 台账地址：dataserver 的 `/v1/gse/*` 反代到 gse-server 管理口（IT-CHAIN / IT-VM-AGENT 需要）。
+    pub fn with_gse_admin(mut self, url: &str) -> Self {
+        self.gse_admin_url = Some(url.to_string());
+        self
+    }
+
     pub fn with_kv(mut self, backend: &str, url: &str) -> Self {
         self.kv_backend = backend.into();
         self.extra.push(("redis_url".into(), format!("\"{url}\"")));
