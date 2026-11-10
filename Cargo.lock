@@ -3437,6 +3437,9 @@ name = "vectorman-test-support"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "ebpf-abi",
+ "gse-agent-core",
+ "gse-agent-ebpf",
  "libc",
  "serde_json",
  "tempfile",

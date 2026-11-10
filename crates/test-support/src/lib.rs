@@ -25,6 +25,7 @@
 //! assert_eq!(got.value_sum(), 1.0);
 //! ```
 
+pub mod agent;
 pub mod apm;
 pub mod data;
 pub mod gse;
