@@ -40,7 +40,7 @@ cargo test -p dataserver --test it_dedup -- --nocapture
 ```
 
 CI（`rust-ci.yml` 的 `rust-tests` 作业）用 service 容器起 Redis 7 + 单机版 VictoriaMetrics，
-喂满 `DP_E2E_*` 后跑 `cargo test --all-features`：本目录 15 条在 PR 上都是真跑。
+喂满 `DP_E2E_*` 后跑 `cargo test --all-features`：本目录 17 条在 PR 上都是真跑。
 
 ## 索引
 
@@ -61,3 +61,5 @@ CI（`rust-ci.yml` 的 `rust-tests` 作业）用 service 容器起 Redis 7 + 单
 | IT-VM-APM-01 | OTLP **server** span → `apm_service_requests_total` / `apm_service_duration_micros` 直查 VM：计数按 `status` 拆分、`avg`/`max`/`p95` 与 `aggregator` 口径一致（`p95` 是最近秩 `ceil(p/100*n)`）、client span **不**进 `apm_service_*`、同桶三 span 合并成一个点且时间戳 = 桶起点 | 真实 VictoriaMetrics（`DP_E2E_VM_INSERT_URL` + `DP_E2E_VM_SINGLE_NODE`） | `cargo test -p dataserver --test it_vm_apm -- --nocapture`<br>场景：[IT-VM-APM-01.md](IT-VM-APM-01.md) | pit |
 | IT-VM-EBPF-01 | eBPF 边台账 → `ebpf_edge_connections_total` / `ebpf_edge_bytes_total`（sent/recv 分开）/ `ebpf_tcp_failures_total` 与 APM 侧 `apm_edge_*`（`source=ebpf`、无 `span_kind`）直查 VM；边界：原始 `ebpf` 事件只进日志引擎，不派生新边、不改已聚合指标 | 真实 VictoriaMetrics | `cargo test -p dataserver --test it_vm_ebpf -- --nocapture`<br>场景：[IT-VM-EBPF-01.md](IT-VM-EBPF-01.md) | pit |
 | IT-VM-PROCESS-01 | 进程指标按 `process_name` 别名补 `service` 维度后落 VM：命中别名补服务名、未命中补 `unknown-<process_name>`、原始 `pid` 标签不被挤掉、`service=""` 一条都不产生 | 真实 VictoriaMetrics | `cargo test -p dataserver --test it_vm_process -- --nocapture`<br>场景：[IT-VM-PROCESS-01.md](IT-VM-PROCESS-01.md) | pit |
+| IT-VM-EBPF-TCP-01 | eBPF 边的 `tcp_retrans`/`tcp_resets` 落 VM：同桶多条边累加、**每个桶各自求和**（不是跨桶累加的 counter，桶 2 断言 4 而非 10+4）、标签集只含 `src_service`/`dst_service`、全 0 值的边在聚合侧 `if > 0` 被跳过 → VM 里**查不到序列**（不是查到 0） | 真实 VictoriaMetrics | `cargo test -p dataserver --test it_vm_ebpf_tcp -- --nocapture`<br>场景：[IT-VM-EBPF-TCP-01.md](IT-VM-EBPF-TCP-01.md) | mike |
+| IT-VM-SELF-01 | dataserver 自身 `/metrics` 经 `flush_loop` → `LocalTsSink` 逐样本写进 VM：VM 里的值等于 `/metrics` 文本值、标签集与文本逐项一致（多一个少一个都算错）、`instance` 是本次 SQL 口监听地址、`component=dataserver`/`data_id=self`、`<data_path>/ts` 条目数为 0（证明没回落本地 tsink） | 真实 VictoriaMetrics；`with_self_metrics(1)` 打开自监控快照（默认 0 = 关闭） | `cargo test -p dataserver --test it_vm_self -- --nocapture`<br>场景：[IT-VM-SELF-01.md](IT-VM-SELF-01.md) | mike |
