@@ -30,11 +30,11 @@ HTTP 200 只代表「收下了」，不代表「发出去了」。`it_chain` / `
 ## 执行步骤
 
 1. `Vm::require()` 读环境变量并 `wait_ready`（`/health`，20s 上限）；缺变量直接失败点名。
-2. 起真 `dataserver`，等到 `/health` `status=ok`；记录 `GET /v1/ts/stats` 的 `series_count` 作为基线。
+2. 起真 `dataserver`，等到 `/health` `status=ok`。
 3. `POST /v1/ingest` 一次写入 5 条记录（`data::metric_series`），信封里 `agent_id` / `data_id`(=item) / `host_id` 都是本用例唯一值。
 4. 轮询 VM 原生口 `query=<metric>&time=<ts+1s>`，直到样本数 `== 5`（60s 上限）。
 5. 比较 dataserver 代理口 `GET /api/v1/query?query=<metric>&time=<ts+1s>` 与 VM 原生口的结果。
-6. 轮询 `/v1/ts/stats`，等 `series_count` 增量达到 5，再断言**恰好等于 5**。
+6. 轮询 `count by (idx) (<唯一 measurement>)`，断言本用例的序列数**恰好 5**（每条记录一个 `idx`）。
 7. 查一个从未写入的指标名，期望 0 样本。
 8. 同批 `record_id` 换 `batch_id` 重发一次。
 9. `SIGTERM` → 退出码 0 → 同 `data_path` 重启（`Dataserver::restart()` 内部断言退出码），再查 VM。
@@ -48,18 +48,19 @@ HTTP 200 只代表「收下了」，不代表「发出去了」。`it_chain` / `
 | 3 | 值集合正确 | 排序后值向量 **逐点等于** `[1,2,3,4,5]` |
 | 4 | 标签补全正确 | 每个样本的 `agent_id` / `item_id` / `host_id` 等于信封值，且记录自带 `idx` 标签保留 |
 | 5 | 两个查询口一致 | 代理口与 VM 的「标签集合 + 值」排序后**完全相同** |
-| 6 | 序列数按实际增量增长 | `/v1/ts/stats` 的 `series_count` 增量 **== 5** |
+| 6 | 序列数 = 记录数 | `count by (idx) (<唯一 measurement>)` 的样本数 **== 5** |
 | 7 | 没写过的名字查不到 | 未写入指标名样本数 `== 0` |
-| 8 | 重复投递不重复入库 | 重发后 VM 样本数与快照不变、`series_count` 不变 |
+| 8 | 重复投递不重复入库 | 重发后 VM 样本数与快照不变、同口径序列数仍为 5 |
 | 9 | 重启不影响已落库数据 | `SIGTERM` 退出码 0；重启后 VM 快照与重启前**逐点相同** |
 
 **关于 `accepted`**：重复记录**仍会** `+1`（`apply_one` 里去重命中走 `Ok(())`），所以第 8 条
 只把 `accepted` 当作「请求被受理」的旁证，去重的硬证据是 VM 样本数/序列数不变。
 
-**关于第 6 条的口径**：VM 的 `series_count` 是 `status/tsdb` 的 `totalSeries`，**整个实例**的
-总量，不是本用例窗口内的量。所以这条 `== 5` 成立的前提是「同一个测试二进制里没有第二个往
-同一台 VM 写序列的用例」（cargo 按 target 串行跑，二进制之间不并发）。以后往 `it_vm_ingest.rs`
-里加用例时必须串起来考虑，否则这条会因别的序列而假红。
+**关于第 6 条的口径（已修正）**：这条原本断言 `GET /v1/ts/stats` 的 `series_count` 增量 `== 5`，
+但该字段是 VM `status/tsdb` 的 `totalSeries`——**整个 VM 实例**的基数，不是本用例窗口内的量。
+只要有别的用例同时对同一台 VM 写入（`cargo test --all-features` 下就会发生），增量就变成
+15 之类的数，断言必假红。现在改成按本用例唯一的 measurement 自己数序列：
+`count by (idx) (<metric>)` 的样本数 `== 5`，与库里其它序列完全无关。
 
 **反向验证（写这条用例时实测过）**：把写入条数从 5 改成 6（`metric_series(..., COUNT + 1, ...)`），
 立即失败：

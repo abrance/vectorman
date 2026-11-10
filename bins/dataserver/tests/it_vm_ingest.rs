@@ -20,17 +20,6 @@ const ITEM_ID: &str = "item-it-vm-ingest";
 const HOST_ID: &str = "host-it-vm-ingest";
 const TIMEOUT: Duration = Duration::from_secs(60);
 
-/// `/v1/ts/stats` 的 `series_count`（VM 后端下是 VM `/status/tsdb` 的 totalSeries）。
-fn series_count(ds: &Dataserver) -> u64 {
-    let (status, body) = ds.get("/v1/ts/stats");
-    assert_eq!(status, 200, "/v1/ts/stats 失败: {body}");
-    let stats: serde_json::Value =
-        serde_json::from_str(&body).unwrap_or_else(|e| panic!("stats 非 JSON（{e}）: {body}"));
-    stats["series_count"]
-        .as_u64()
-        .unwrap_or_else(|| panic!("series_count 缺失: {body}"))
-}
-
 /// 把响应压成「标签集合 + 值」的排序快照，用来比对两个查询口的结果是否完全一致。
 fn snapshot(resp: &prom::Response) -> Vec<(Vec<(String, String)>, String)> {
     let mut out: Vec<(Vec<(String, String)>, String)> = resp
@@ -70,7 +59,6 @@ fn it_vm_ingest_points_land_in_victoriametrics() {
     );
 
     // ---- 1. 一次写入 5 条（1..5，同一时刻、不同 idx 标签 = 5 条序列）
-    let series_before = series_count(&ds);
     let records = data::metric_series(&prefix, &metric, COUNT, 1.0, ts, 0);
     let unique_ids: Vec<String> = records
         .iter()
@@ -129,15 +117,21 @@ fn it_vm_ingest_points_land_in_victoriametrics() {
         "dataserver 代理口与 VM 原生口结果不一致（说明代理走了缓存或没真读 VM）"
     );
 
-    // ---- 4. `/v1/ts/stats` 的序列数增量恰好等于本次写入的序列数
-    let after = util::wait_until("VM 序列数增量达到 5", TIMEOUT, || {
-        let now = series_count(&ds);
-        (now.saturating_sub(series_before) >= COUNT as u64).then_some(now)
-    });
+    // ---- 4. 序列数恰好 5：**只数本用例的 measurement**。
+    //   不用 `/v1/ts/stats` 的 `series_count`——它是 VM 全实例的 `totalSeries`
+    //   （`status/tsdb` 全局基数），任何并行写这台 VM 的用例都会污染它，
+    //   `cargo test --all-features` 下必假红。
+    let scoped = vm.wait_query(
+        &format!("count by (idx) ({metric})"),
+        Some(query_time),
+        TIMEOUT,
+        |r| r.len() == COUNT,
+    );
     assert_eq!(
-        after - series_before,
-        COUNT as u64,
-        "序列数增量应恰好是 {COUNT}（本用例独占一批序列；同一测试二进制里不允许再加第二个写 VM 的用例，否则 totalSeries 会被别的序列污染）"
+        scoped.samples.len(),
+        COUNT,
+        "本用例的 {metric} 应恰好 {COUNT} 条序列（每条记录一个 idx）: raw={}",
+        scoped.raw
     );
 
     // ---- 5. 没写过的指标名查不到
@@ -171,8 +165,10 @@ fn it_vm_ingest_points_land_in_victoriametrics() {
         "重复投递不应改变任何样本"
     );
     assert_eq!(
-        series_count(&ds) - series_before,
-        COUNT as u64,
+        vm.must_query(&format!("count by (idx) ({metric})"), Some(query_time))
+            .samples
+            .len(),
+        COUNT,
         "重复投递不应新增序列"
     );
 
