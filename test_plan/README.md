@@ -10,6 +10,14 @@
 2. **禁止静默跳过**：不用 `#[ignore]`、不用 feature gate、不缺前置条件就 `return`。
    缺什么必须**失败**并点名缺的是哪个变量/哪个文件——静默跳过等于假绿。
 3. **禁止恒真断言**：断言必须有可能挂。「返回 200 就算过」「数组非空就算过」不叫覆盖。
+4. **不碰前端**：用例只走 HTTP / 真进程接口，不跑 `frontend` 的 dev server、不依赖浏览器、
+   不把前端渲染结果当断言依据。查询口径就是 `/api/v1/query`、`/v1/logs/search`、
+   `/v1/traces/search`、`/v1/edges/search` 这些后端契约。
+5. **共用一套夹具**：起 dataserver、造 metrics / traces / eBPF 边 / 日志记录、查 Prom/VM，
+   统一用 `crates/test-support`（`vectorman-test-support`）。测试里不再复制 `free_port`、
+   写 toml、拼 envelope；新场景只写自己的断言。
+6. **「落进 VM」只认 VM 原生查询口**：`vm.query(...)`（`{select}/prometheus/api/v1/query`）
+   才算证据，dataserver 的 `/api/v1/query` 是代理读、会掩盖「写没进 VM」的问题。
 
 ## 跑法
 

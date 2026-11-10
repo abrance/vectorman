@@ -854,6 +854,7 @@ dependencies = [
  "tsink",
  "ureq",
  "vectorman-metrics",
+ "vectorman-test-support",
  "vectorman-version",
 ]
 
@@ -3429,6 +3430,17 @@ dependencies = [
  "prometheus",
  "tokio",
  "tower",
+]
+
+[[package]]
+name = "vectorman-test-support"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
+ "tempfile",
+ "ureq",
+ "urlencoding",
 ]
 
 [[package]]

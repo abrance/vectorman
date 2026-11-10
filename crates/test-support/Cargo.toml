@@ -1,0 +1,12 @@
+[package]
+name = "vectorman-test-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+tempfile = "3"
+libc = "0.2"
+ureq = "2"
+urlencoding = "2"
