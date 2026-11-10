@@ -17,9 +17,7 @@ fn agent() -> &'static ureq::Agent {
 pub fn get(url: &str) -> Result<(u16, String), String> {
     match agent().get(url).call() {
         Ok(resp) => Ok((resp.status(), resp.into_string().unwrap_or_default())),
-        Err(ureq::Error::Status(code, resp)) => {
-            Ok((code, resp.into_string().unwrap_or_default()))
-        }
+        Err(ureq::Error::Status(code, resp)) => Ok((code, resp.into_string().unwrap_or_default())),
         Err(e) => Err(format!("GET {url} 传输失败: {e}")),
     }
 }
@@ -31,9 +29,7 @@ pub fn post_json(url: &str, body: &str) -> Result<(u16, String), String> {
         .send_string(body)
     {
         Ok(resp) => Ok((resp.status(), resp.into_string().unwrap_or_default())),
-        Err(ureq::Error::Status(code, resp)) => {
-            Ok((code, resp.into_string().unwrap_or_default()))
-        }
+        Err(ureq::Error::Status(code, resp)) => Ok((code, resp.into_string().unwrap_or_default())),
         Err(e) => Err(format!("POST {url} 传输失败: {e}")),
     }
 }
@@ -45,9 +41,7 @@ pub fn put_json(url: &str, body: &str) -> Result<(u16, String), String> {
         .send_string(body)
     {
         Ok(resp) => Ok((resp.status(), resp.into_string().unwrap_or_default())),
-        Err(ureq::Error::Status(code, resp)) => {
-            Ok((code, resp.into_string().unwrap_or_default()))
-        }
+        Err(ureq::Error::Status(code, resp)) => Ok((code, resp.into_string().unwrap_or_default())),
         Err(e) => Err(format!("PUT {url} 传输失败: {e}")),
     }
 }

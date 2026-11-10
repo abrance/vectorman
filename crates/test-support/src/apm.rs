@@ -19,16 +19,20 @@ const WATERMARK_KEY: &str = "ebpf_metrics_watermark";
 
 /// 等到聚合器写出首个游标（即第一轮 tick 已经跑过）。
 pub fn wait_watermark(ds: &Dataserver) {
-    wait_until("eBPF 聚合游标初始化", std::time::Duration::from_secs(20), || {
-        let rows = ds.sql(
-            &format!("SELECT value FROM {META_TABLE} WHERE key = ?1"),
-            &[json!(WATERMARK_KEY)],
-        );
-        rows["rows"]
-            .as_array()
-            .is_some_and(|rows| !rows.is_empty())
-            .then_some(())
-    });
+    wait_until(
+        "eBPF 聚合游标初始化",
+        std::time::Duration::from_secs(20),
+        || {
+            let rows = ds.sql(
+                &format!("SELECT value FROM {META_TABLE} WHERE key = ?1"),
+                &[json!(WATERMARK_KEY)],
+            );
+            rows["rows"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty())
+                .then_some(())
+        },
+    );
 }
 
 /// 把 eBPF 聚合游标拨到 `to_micros`，让 `bucket_start > to_micros` 的边在下一轮被聚合。
@@ -55,7 +59,8 @@ pub fn create_alias(ds: &Dataserver, match_kind: &str, match_value: &str, servic
     });
     let (status, resp) = ds.post("/v1/apm/service-aliases", &body.to_string());
     assert_eq!(
-        status, 201,
+        status,
+        201,
         "建别名失败（{status}）: {}",
         crate::http::tail(&resp)
     );

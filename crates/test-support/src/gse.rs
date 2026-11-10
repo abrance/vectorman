@@ -258,8 +258,7 @@ impl Gse {
             self.logs
         );
         self.wait_for(format!("台账里 dataplane {service_id} online"), |gse| {
-            let (status, value) =
-                gse.get_json(&format!("/api/gse/dataplanes/{service_id}"))?;
+            let (status, value) = gse.get_json(&format!("/api/gse/dataplanes/{service_id}"))?;
             if status != 200 {
                 return Err(format!("查 dataplane 返回 {status}: {value}"));
             }
@@ -272,7 +271,10 @@ impl Gse {
 
     /// 写该 Agent 的期望 spec（整体覆盖，`spec` 就是 `PUT .../spec` 的 body）。
     pub fn put_spec(&self, agent_id: &str, spec: &Value) {
-        let (status, body) = self.put_json(&format!("/api/gse/agents/{agent_id}/spec"), &spec.to_string());
+        let (status, body) = self.put_json(
+            &format!("/api/gse/agents/{agent_id}/spec"),
+            &spec.to_string(),
+        );
         assert!(
             (200..300).contains(&status),
             "写 spec 失败: {status} {body}\n{}",
@@ -346,7 +348,9 @@ impl Gse {
             if agent_status == "online" && !heartbeat.is_empty() {
                 Ok(())
             } else {
-                Err(format!("status={agent_status:?} last_heartbeat_at={heartbeat:?}"))
+                Err(format!(
+                    "status={agent_status:?} last_heartbeat_at={heartbeat:?}"
+                ))
             }
         });
     }

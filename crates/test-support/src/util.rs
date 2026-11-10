@@ -51,7 +51,13 @@ pub fn wait_until<T>(what: &str, timeout: Duration, mut f: impl FnMut() -> Optio
 pub fn metric_name(prefix: &str, suffix: &str) -> String {
     let mut name: String = format!("{prefix}_{suffix}")
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == ':' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == ':' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if name.starts_with(|c: char| c.is_ascii_digit()) {
         name.insert(0, 'm');

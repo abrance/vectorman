@@ -298,7 +298,11 @@ impl Dataserver {
 
     pub fn logs_block(&self) -> String {
         let (out, err) = self.logs();
-        format!("--- stdout ---\n{}\n--- stderr ---\n{}", tail_text(&out), tail_text(&err))
+        format!(
+            "--- stdout ---\n{}\n--- stderr ---\n{}",
+            tail_text(&out),
+            tail_text(&err)
+        )
     }
 
     fn spawn(&mut self) {
@@ -395,16 +399,18 @@ impl Dataserver {
 
     fn wait_healthy(&mut self) {
         let base = self.base.clone();
-        wait_until("dataserver /health 就绪", Duration::from_secs(40), || {
-            match http::get(&format!("{base}/health")) {
+        wait_until(
+            "dataserver /health 就绪",
+            Duration::from_secs(40),
+            || match http::get(&format!("{base}/health")) {
                 Ok((200, body)) if body.contains("\"status\":\"ok\"") => Some(()),
                 Ok((code, body)) if code == 200 => panic!(
                     "/health 返回 200 但 body 不含 status=ok: {}",
                     http::tail(&body)
                 ),
                 _ => None,
-            }
-        });
+            },
+        );
     }
 
     fn join_drainers(&mut self) {

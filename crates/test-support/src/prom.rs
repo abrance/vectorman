@@ -99,10 +99,14 @@ pub fn wait_query(
     timeout: Duration,
     pred: impl Fn(&Response) -> bool,
 ) -> Response {
-    wait_until(&format!("Prom 查询 {promql} 满足断言"), timeout, || {
-        let resp = query_at(base, promql, time_secs).unwrap_or_else(|e| panic!("{e}"));
-        pred(&resp).then_some(resp)
-    })
+    wait_until(
+        &format!("Prom 查询 {promql} 满足断言"),
+        timeout,
+        || {
+            let resp = query_at(base, promql, time_secs).unwrap_or_else(|e| panic!("{e}"));
+            pred(&resp).then_some(resp)
+        },
+    )
 }
 
 fn as_f64(value: &Value) -> Option<f64> {
