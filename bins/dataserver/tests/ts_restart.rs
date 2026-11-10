@@ -14,6 +14,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
+use vectorman_test_support::util::free_port;
 
 const BIN: &str = env!("CARGO_BIN_EXE_dataserver");
 
@@ -64,11 +65,6 @@ const CONFIG_ENV_VARS: &[&str] = &[
 /// 写入的样本数（每条测量）。时间戳是「当下整秒往前退 SAMPLE_COUNT 秒」，
 /// 整秒是为了让 `query_range` 的秒粒度 step 刚好踩中每个点。
 const SAMPLE_COUNT: i64 = 5;
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    l.local_addr().expect("local_addr").port()
-}
 
 fn now_micros() -> i64 {
     SystemTime::now()

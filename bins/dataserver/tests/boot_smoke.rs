@@ -12,6 +12,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
+use vectorman_test_support::util::free_port;
 
 const BIN: &str = env!("CARGO_BIN_EXE_dataserver");
 
@@ -58,13 +59,6 @@ const CONFIG_ENV_VARS: &[&str] = &[
     "DATASERVER_VM_DELETE_AUTH_KEY",
     "DATASERVER_VM_WHOLE_SERIES_DELETE",
 ];
-
-/// 拿一个当前空闲的端口。绑定后立刻释放，存在极小的被抢占窗口；
-/// 冒烟测试用它足够，失败信息会明确说是 bind 失败。
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    l.local_addr().expect("local_addr").port()
-}
 
 fn now_micros() -> i64 {
     SystemTime::now()

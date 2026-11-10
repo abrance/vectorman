@@ -24,6 +24,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dataplane_kv::{KvStore, RedbKvStore};
 use serde_json::{json, Value};
+use vectorman_test_support::util::free_port;
 
 const BIN: &str = env!("CARGO_BIN_EXE_dataserver");
 
@@ -79,11 +80,6 @@ const CONFIG_ENV_VARS: &[&str] = &[
     "DATASERVER_VM_DELETE_AUTH_KEY",
     "DATASERVER_VM_WHOLE_SERIES_DELETE",
 ];
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    l.local_addr().expect("local_addr").port()
-}
 
 fn now_micros() -> i64 {
     SystemTime::now()
