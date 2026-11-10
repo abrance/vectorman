@@ -457,6 +457,24 @@ fn drain<R: std::io::Read + Send + 'static>(
     })
 }
 
+/// 在同一进程里托管一个 `axum::Router`，返回 `http://host:port`。
+///
+/// 端口由内核分配（先 `bind:0` 再 `local_addr`），不存在「先取端口再绑」的抢占窗口，
+/// 也不需要一个会泄漏的后台清理机制：任务随 runtime 结束。
+///
+/// 适用「只想要一个能打的 HTTP 口」的用例（如 `e2e` / `external_storage_e2e`）；
+/// 要连带验证 `--config` 解析与后端装配的，用 [`Dataserver`] 起真进程。
+pub async fn serve_router(app: axum::Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind 127.0.0.1:0");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
 fn toml_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }

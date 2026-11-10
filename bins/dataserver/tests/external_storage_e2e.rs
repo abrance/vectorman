@@ -457,6 +457,7 @@ async fn ingest_over_http_lands_in_redis_and_victoriametrics() {
     use dataplane_log::{LogStore, TantivyLogStore};
     use dataplane_sql::{RelationalStore, SqliteRelationalStore};
     use dataserver::{prom_router, sql_router, AppState};
+    use vectorman_test_support::proc::serve_router;
 
     let kv_store = redis_store().await;
     let vm = vm_store();
@@ -493,16 +494,8 @@ async fn ingest_over_http_lands_in_redis_and_victoriametrics() {
         apm_detail_min_duration_micros: 0,
     };
 
-    async fn spawn(app: axum::Router) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        format!("http://{addr}")
-    }
-    let ds_url = spawn(sql_router(state.clone(), None)).await;
-    let prom_url = spawn(prom_router(state)).await;
+    let ds_url = serve_router(sql_router(state.clone(), None)).await;
+    let prom_url = serve_router(prom_router(state)).await;
 
     // VM 的 `-search.latencyOffset`（默认 30s）：用 2 分钟前的时间戳，避免「刚写入查不到」。
     let ts_us = ((now_micros() / 1_000) - 120_000) / 60_000 * 60_000 * 1_000;

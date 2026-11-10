@@ -15,8 +15,6 @@
 //!   子进程的 stdout/stderr，避免「假绿」。
 //! - 子进程由夹具的 `Drop` 回收（kill + wait）。
 
-use std::time::Duration;
-
 use serde_json::Value;
 use vectorman_test_support::gse::Gse;
 use vectorman_test_support::http;

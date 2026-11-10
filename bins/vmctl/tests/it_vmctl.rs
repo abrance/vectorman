@@ -25,6 +25,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use vectorman_test_support::util::free_port;
+
 const AGENT_ID: &str = "agent-it-vmctl";
 const HOST_ID: &str = "host-it-vmctl";
 const TOKEN: &str = "it-vmctl-token";
@@ -210,14 +212,6 @@ impl Chain {
 }
 
 // ---------------------------------------------------------------- 工具
-
-/// 现取一个回环空端口（与进程启动之间的毫秒级竞态不可避免，冲突会以端口占用失败）。
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    port
-}
 
 fn now_micros() -> i64 {
     SystemTime::now()

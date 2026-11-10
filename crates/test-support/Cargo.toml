@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 serde_json.workspace = true
+# `proc::serve_router` 在同一进程里托管 axum Router（进程内路由场景，不需要真二进制）。
+axum = "0.8"
+tokio.workspace = true
 tempfile = "3"
 libc = "0.2"
 ureq = "2"

@@ -3436,9 +3436,11 @@ dependencies = [
 name = "vectorman-test-support"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "libc",
  "serde_json",
  "tempfile",
+ "tokio",
  "ureq",
  "urlencoding",
 ]
@@ -3463,6 +3465,7 @@ dependencies = [
  "serde_json",
  "ureq",
  "urlencoding",
+ "vectorman-test-support",
  "vectorman-version",
 ]
 

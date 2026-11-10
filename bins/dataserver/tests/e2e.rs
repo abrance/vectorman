@@ -12,6 +12,7 @@ use dataplane_sql::{RelationalStore, SqliteRelationalStore};
 use dataplane_ts::{TimeSeriesStore, TsRetentionConfig, TsinkTimeSeriesStore};
 use dataserver::{prom_router, sql_router, AppState};
 use gse_server_core::{http_router, probe_once, AdminState, Agent, DataplaneService, Ledger};
+use vectorman_test_support::proc::serve_router;
 
 /// 与测试内上报一致的时间戳（微秒），保证 Prom 即时查询能命中。
 const TS: i64 = 1_710_000_000_000_000;
@@ -21,18 +22,6 @@ fn tmp_db(tag: &str) -> String {
         .join(format!("dataserver-e2e-{}-{tag}.db", std::process::id()))
         .to_string_lossy()
         .into_owned()
-}
-
-/// 在随机端口托管路由，返回 `http://host:port`。
-async fn spawn(app: axum::Router) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    format!("http://{addr}")
 }
 
 /// 阻塞 HTTP 调用放到 blocking 线程，避免在 current-thread runtime 上死锁。
@@ -92,7 +81,7 @@ async fn register_probe_collect_ingest_and_query() {
     // 2. GSE 控制面：台账 + HTTP 管理端口。
     let ledger = Arc::new(Ledger::new(&tmp_db("chain")).expect("ledger"));
     ledger.init().await.expect("init");
-    let gse_url = spawn(http_router(
+    let gse_url = serve_router(http_router(
         AdminState {
             ledger: ledger.clone(),
             registry: None,
@@ -126,8 +115,8 @@ async fn register_probe_collect_ingest_and_query() {
         apm_limiter: None,
         apm_detail_min_duration_micros: 0,
     };
-    let ds_url = spawn(sql_router(state.clone(), None)).await;
-    let prom_url = spawn(prom_router(state)).await;
+    let ds_url = serve_router(sql_router(state.clone(), None)).await;
+    let prom_url = serve_router(prom_router(state)).await;
 
     // 4. 登记 dataserver 并探活 → online，选路命中。
     ledger
@@ -289,7 +278,7 @@ async fn ebpf_edge_ingest_validates_and_lands() {
         apm_limiter: None,
         apm_detail_min_duration_micros: 0,
     };
-    let ds_url = spawn(sql_router(state, None)).await;
+    let ds_url = serve_router(sql_router(state, None)).await;
 
     let edge = |record_id: &str, connections: u64, failures: u64, hist: serde_json::Value| {
         serde_json::json!({
