@@ -80,3 +80,48 @@ VM 上的序列带 `<pid>` 后缀，不清理也不与其它用例冲突。
 - 与 `IT-VM-INGEST-01` 互补：那条验手造记录落 VM，这条验真 agent 采集落 VM。
 - 指标名不能带 `-`（VM 会 400）；`cpu_usage` 是产品固定名，隔离只能靠标签，
   这也是本用例用 `<pid>` 后缀拼 `agent_id` / `item_id` 的原因。
+
+## 补充场景：`mem_usage`（同文件第二个测试）
+
+`命令: cargo test -p dataserver --test it_vm_agent it_vm_agent_mem_usage -- --nocapture`
+
+`cpu_usage` 绿只证明 `/proc/stat` 那条路通。`mem_usage` 是同一轮里**独立**的一次
+`/proc/meminfo` 解析（`MemTotal` / `MemAvailable` → `(total-available)/total*100`，
+`crates/gse-agent-core/src/collect/metrics.rs:135`），漏了它，「内存使用率」在 VM 里就是空图，
+而 CPU 用例照样绿。第三个标签 `host_id` 单独断，是因为它由台账下发、经 `dataplane_addr` 回包
+写进 `CollectShared`，与采集本身无关：`host_id` 丢了，按主机聚合的内存图同样会空。
+
+### 前置数据（差异部分）
+
+| 项 | 值 |
+|---|---|
+| agent / 采集项 / 主机 | `agent-it-vm-agent-mem-<pid>` / `item-it-vm-agent-mem-<pid>` / `host-it-vm-agent-mem-<pid>` |
+| 链路 | 与上面完全相同：真 `gse-server` + 真 `dataserver`（VM 后端 + gse 反代）+ 真 `gse-agent`，1s 一轮 `metrics_host` |
+| 查询 | `mem_usage{agent_id="…",item_id="…",host_id="…"}` —— 三个标签一个都不能少 |
+
+### 执行步骤（差异部分）
+
+1. 起同一条真链路（台账登记时 `host_id` 用上面的唯一值）。
+2. 轮询 VM 原生口该 PromQL 到非空，断言**恰好 1 条**序列。
+3. 逐标签断言 `host_id` / `agent_id` / `item_id` 等于台账里的值（`==`，不是「非空」）。
+4. 断言值落在 `0..=100`（百分比）。
+5. 三个子进程仍活着。
+
+### 期望结果（差异部分）
+
+| # | 断言 | 判定方式 |
+|---|---|---|
+| 9 | `mem_usage` 落进 VM | VM 原生口该 PromQL 恰好 1 条序列 |
+| 10 | 三个标签齐全 | `agent_id` / `item_id` / `host_id` 均等于台账值 |
+| 11 | 值域正确 | 值落在 `0..=100` |
+
+**反向验证（落地时实测）**：把值域断言从 `0..=100` 改成 `0..=0`：
+
+```
+thread 'it_vm_agent_mem_usage_lands_in_victoriametrics' panicked at bins/dataserver/tests/it_vm_agent.rs:196:5:
+mem_usage 是百分比，必须在 0..=100，实际 46.9784697897: [{"metric":{"__name__":"mem_usage","agent_id":"agent-it-vm-agent-mem-1750681","host_id":"host-it-vm-agent-mem-1750681","item_id":"item-it-vm-agent-mem-1750681"},"value":[1794340392,"46.9784697897"]}]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 33.28s
+```
+
+改回 `0..=100` 后恢复绿色。同一批输出也证明 `host_id` 真的落进了 VM（标签里在），
+所以 `host_id` 那条断言不是恒真。

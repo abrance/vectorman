@@ -13,3 +13,8 @@ tempfile = "3"
 libc = "0.2"
 ureq = "2"
 urlencoding = "2"
+# `agent::*` 生成器直接调产品入口（`metrics_record` / `drain_closed` / `duration_metrics` /
+# `interval_records`），让 TP 断言的是「Agent 真会发什么」而不是手搓的 JSON。
+gse-agent-core.workspace = true
+gse-agent-ebpf.workspace = true
+ebpf-abi.workspace = true

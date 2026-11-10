@@ -141,3 +141,68 @@ fn it_vm_agent_host_metrics_land_in_victoriametrics() {
     // ---- 7. 三个进程全程没有异常退出
     gse.check_alive();
 }
+
+/// `mem_usage` 也必须整条链路落到 VM，并且带 `host_id`。
+///
+/// `cpu_usage` 绿只证明 `/proc/stat` 那条路通；`mem_usage` 是同一轮里**独立**的一次
+/// `/proc/meminfo` 解析（`MemTotal` / `MemAvailable`）与百分比换算。漏了它，「内存使用率」
+/// 在 VM 里就是空图，而 CPU 用例照样绿。`host_id` 单独断，是因为它是台账下发、
+/// 由 `dataplane_addr` 回包塞进 `CollectShared` 的，与采集本身无关。
+#[test]
+fn it_vm_agent_mem_usage_lands_in_victoriametrics() {
+    let vm = vm::Vm::require();
+    vm.wait_ready(Duration::from_secs(20));
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+
+    let agent_id = format!("agent-it-vm-agent-mem-{}", std::process::id());
+    let item_id = format!("item-it-vm-agent-mem-{}", std::process::id());
+    let host_id = format!("host-it-vm-agent-mem-{}", std::process::id());
+    let token = format!("it-vm-agent-mem-token-{}", std::process::id());
+
+    let mut gse = Gse::start(root.join("gse"));
+    let ds = Dataserver::start(
+        root.join("ds"),
+        Options::local()
+            .with_vm(&vm)
+            .with_gse_admin(gse.admin_url()),
+        env!("CARGO_BIN_EXE_dataserver"),
+    );
+
+    gse.register_agent(&agent_id, &host_id, &token);
+    gse.register_dataplane("ds-it-vm-agent-mem", ds.base(), ds.prom());
+    gse.put_host_metrics_spec(&agent_id, &item_id, "it-vm-agent mem", 1);
+    gse.start_agent(&agent_id, &token);
+    gse.wait_agent_online(&agent_id);
+    gse.wait_spec_synced(&agent_id, &item_id);
+
+    // 三个标签都进选择器：少一个（尤其是台账下发的 host_id）都说明这条序列不可按主机聚合。
+    let query =
+        format!("mem_usage{{agent_id=\"{agent_id}\",item_id=\"{item_id}\",host_id=\"{host_id}\"}}");
+    let got = vm.wait_query(&query, None, TIMEOUT, |r| !r.is_empty());
+    assert_eq!(
+        got.samples.len(),
+        1,
+        "期望恰好 1 条序列（{query}），实际 {}: raw={}",
+        got.samples.len(),
+        got.raw
+    );
+    let sample = got.first();
+    assert_eq!(sample.metric.get("host_id"), Some(&host_id), "{}", got.raw);
+    assert_eq!(
+        sample.metric.get("agent_id"),
+        Some(&agent_id),
+        "{}",
+        got.raw
+    );
+    assert_eq!(sample.metric.get("item_id"), Some(&item_id), "{}", got.raw);
+    assert!(
+        (0.0..=100.0).contains(&sample.value),
+        "mem_usage 是百分比，必须在 0..=100，实际 {}: {}",
+        sample.value,
+        got.raw
+    );
+
+    gse.check_alive();
+}
