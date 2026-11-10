@@ -40,7 +40,7 @@ cargo test -p dataserver --test it_dedup -- --nocapture
 ```
 
 CI（`rust-ci.yml` 的 `rust-tests` 作业）用 service 容器起 Redis 7 + 单机版 VictoriaMetrics，
-喂满 `DP_E2E_*` 后跑 `cargo test --all-features`：本目录 6 条在 PR 上都是真跑。
+喂满 `DP_E2E_*` 后跑 `cargo test --all-features`：本目录 12 条在 PR 上都是真跑。
 
 ## 索引
 
@@ -52,3 +52,9 @@ CI（`rust-ci.yml` 的 `rust-tests` 作业）用 service 容器起 Redis 7 + 单
 | IT-VMCTL-01 | 真 `vmctl` 二进制 × 真 gse-server 台账 × 真 dataserver 流索引：`agents doctor` / `agents status` 的字段解析直接对台账断言，不碰手写 JSON 夹具；定点覆盖 `4a91826`（`ebpf_tcp` 只出 `metrics`，不是 `ebpf_edges`） | 无外部中间件（gse-server 临时 sqlite + redb/tsink，端口与目录全部临时生成）；测试内自动 `cargo build -p gse-server -p gse-agent -p dataserver` | `cargo test -p vmctl --test it_vmctl -- --nocapture`<br>场景：[IT-VMCTL-01.md](IT-VMCTL-01.md) | pit |
 | IT-TS-RESTART-01 | 本地时序后端重启一致性：写入 → 真 **SIGTERM** 优雅停机（退出码 0）→ 同一 `data_path` 重开 → 序列数与点集**逐点等价**，即时查询与标签保留，重启后仍可写且不改动历史点 | 无外部中间件（redb + tsink，端口与目录全部临时生成） | `cargo test -p dataserver --test ts_restart -- --nocapture`<br>场景：[IT-TS-RESTART-01.md](IT-TS-RESTART-01.md) | mike |
 | IT-DEDUP-01 | 接入去重（`ingest/{record_id}`）的键数上界与清理路径：同一批 record 5 轮重发 → 点数/序列数不增长 → 真 **SIGTERM** 停机 → 用 `dataplane_kv` 直读同一个 `kv.redb`，`scan_prefix("ingest/")` 键数**恰好等于唯一 record 数**且 `record_id` 逐个对得上 → `prune_prefix_before("ingest/")` 删除数 == 键数、删完为 0、不越界删 `stream/` | 无外部中间件（redb + tsink，端口与目录全部临时生成） | `cargo test -p dataserver --test it_dedup -- --nocapture`<br>场景：[IT-DEDUP-01.md](IT-DEDUP-01.md) | mike |
+| IT-VM-INGEST-01 | `ts_backend = victoriametrics` 时接入的 metrics 真的到了 VM：VM 原生口样本数与值集合、`agent_id`/`item_id`/`host_id` 标签补全、代理口与 VM 逐点一致、`/v1/ts/stats` 序列数增量、同 record 换 batch 重发不增点（`accepted` 不算证据）、**SIGTERM 重启后仍在** | 真实 VictoriaMetrics（`DP_E2E_VM_INSERT_URL` + `DP_E2E_VM_SINGLE_NODE`） | `cargo test -p dataserver --test it_vm_ingest -- --nocapture`<br>场景：[IT-VM-INGEST-01.md](IT-VM-INGEST-01.md) | mike |
+| IT-VM-AGENT-01 | 补齐「真 agent 自采 → dataserver 以 VM 为 ts 后端写出」这段：真 gse-server 台账 + 真 gse-agent 按 `metrics_host` 采集项上报，VM 原生口按 `agent_id`/`item_id` 查到 `cpu_usage` 且值域合法，代理口同序列一致，`<data_path>/ts` 为空（证明没回落到本地 tsink） | 真实 VictoriaMetrics；测试内自动 `cargo build -p gse-server -p gse-agent` | `cargo test -p dataserver --test it_vm_agent -- --nocapture`<br>场景：[IT-VM-AGENT-01.md](IT-VM-AGENT-01.md) | mike |
+| IT-API-SQL-01 | `POST /v1/sql` 的契约：建表 → 占位参数写入 → 回读的列名/顺序与类型往返（INTEGER 不变成字符串、REAL 回浮点、NULL 保持 null），以及三条错误路径（缺字段/非法参数 400、SQL 语法错 422） | 无（redb + sqlite 本地后端，临时目录） | `cargo test -p dataserver --test it_api_sql -- --nocapture`<br>场景：[IT-API-SQL-01.md](IT-API-SQL-01.md) | mike |
+| IT-API-LOGS-01 | `POST /v1/logs/search` 八个过滤维度逐个生效（`data_type`/`agent_id`/`level`/`message_query`/`trace_id`/时间窗/`labels`/`limit` 截断），空结果返回 `records: []` 且**没有 `total` 字段**（接口本来就没有，口径以 `records` 为准） | 无（redb + tsink + tantivy 本地后端，临时目录） | `cargo test -p dataserver --test it_api_logs -- --nocapture`<br>场景：[IT-API-LOGS-01.md](IT-API-LOGS-01.md) | mike |
+| IT-API-TRACES-01 | `POST /v1/traces/search` 的摘要聚合与服务/状态/耗时过滤、排序、分页不重不漏，`GET /v1/traces/{id}` 详情拉全父子 span；口径按代码断言：`duration_micros = max_end_ts - start_ts`（整条跨度，不是根 span）、任一 span error 即 `error`、不存在 404、非 32 位 hex 400 | 无（redb + tsink + tantivy + sqlite，APM 打开，临时目录） | `cargo test -p dataserver --test it_api_traces -- --nocapture`<br>场景：[IT-API-TRACES-01.md](IT-API-TRACES-01.md) | mike |
+| IT-API-APM-01 | `GET /v1/apm/services` 清单从端点半表读出且重复请求稳定；`/v1/apm/service-aliases` 的 CRUD：重复 POST 是**覆盖（仍 201，不是 409）**、PUT 不能改 `match_kind`/`match_value`（400）、删除后 404 | 无（redb + tsink + tantivy + sqlite，APM 打开，临时目录） | `cargo test -p dataserver --test it_api_apm -- --nocapture`<br>场景：[IT-API-APM-01.md](IT-API-APM-01.md) | mike |
