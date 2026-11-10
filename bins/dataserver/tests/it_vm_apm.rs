@@ -152,6 +152,9 @@ fn apm_service_red_lands_in_victoriametrics() {
     let base = format!(
         "apm_service_requests_total{{service=\"{service}\",operation=\"GET /orders\",span_kind=\"server\",source=\"otlp\""
     );
+    let dur = format!(
+        "apm_service_duration_micros{{service=\"{service}\",operation=\"GET /orders\",span_kind=\"server\",source=\"otlp\""
+    );
     let ok = wait_scalar(&vm, &format!("{base},status=\"ok\"}}"), at_secs, 2.0);
     assert_eq!(ok.first().metric["source"], "otlp", "点必须带 source=otlp");
     assert_eq!(
@@ -162,11 +165,38 @@ fn apm_service_red_lands_in_victoriametrics() {
     let err = wait_scalar(&vm, &format!("{base},status=\"error\"}}"), at_secs, 1.0);
     assert_eq!(err.first().metric["status"], "error");
 
+    // 1b) error 还有一条**独立 measurement**：`apm_service_errors_total`（聚合时对 status=error
+    //     额外写一条），不是 requests_total 的别名，也不是 sum by 就能推出来的。
+    let err_total = wait_scalar(
+        &vm,
+        &format!(
+            "apm_service_errors_total{{service=\"{service}\",operation=\"GET /orders\",span_kind=\"server\",source=\"otlp\",status=\"error\"}}"
+        ),
+        at_secs,
+        1.0,
+    );
+    assert_eq!(err_total.first().metric["status"], "error");
+
+    // 1c) 耗时 measurement 的 `field` 集合是封闭的：avg/p50/p95/p99/max 五个，多一个少一个
+    //     都会让 APM 页面的分位图取不到点（p50/p99 用同一个 percentile，但名字写错没人拦）。
+    let all_fields = vm.must_query(&format!("{dur}}}"), Some(at_secs));
+    let mut fields: Vec<String> = all_fields
+        .samples
+        .iter()
+        .filter_map(|s| s.metric.get("field").cloned())
+        .collect();
+    fields.sort();
+    assert_eq!(
+        fields,
+        vec!["avg", "max", "p50", "p95", "p99"],
+        "耗时 field 集合应为 avg/p50/p95/p99/max：raw={}",
+        all_fields.raw
+    );
+    // 中位秩：nearest-rank ceil(0.50*3)=2 → 排序后的第 2 个 = 3000（与 max/p95 的 5000 区分）。
+    wait_scalar(&vm, &format!("{dur},field=\"p50\"}}"), at_secs, 3_000.0);
+
     // 2) 耗时：avg = (1000+3000+5000)/3、max = 5000、
     //    p95 = 最近秩 ceil(0.95*3)=3 → 排序后的第 3 个 = 5000（与 aggregator 的 percentile() 同口径）。
-    let dur = format!(
-        "apm_service_duration_micros{{service=\"{service}\",operation=\"GET /orders\",span_kind=\"server\",source=\"otlp\""
-    );
     let avg = wait_scalar(&vm, &format!("{dur},field=\"avg\"}}"), at_secs, 3_000.0);
     assert_eq!(avg.first().metric["field"], "avg");
     let max = wait_scalar(&vm, &format!("{dur},field=\"max\"}}"), at_secs, 5_000.0);
