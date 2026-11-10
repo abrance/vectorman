@@ -230,16 +230,21 @@ fn now_micros() -> i64 {
 /// 缺任何一个都是硬失败 —— 不跳过。
 fn it_bins() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     let vmctl = PathBuf::from(env!("CARGO_BIN_EXE_vmctl"));
-    let dir = vmctl
-        .parent()
-        .expect("vmctl bin dir")
-        .to_path_buf();
+    let dir = vmctl.parent().expect("vmctl bin dir").to_path_buf();
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     // cargo test 只构建 vmctl 自己；gse-server / gse-agent / dataserver 要显式构建。
     let status = Command::new(&cargo)
         .current_dir(&root)
-        .args(["build", "-p", "gse-server", "-p", "gse-agent", "-p", "dataserver"])
+        .args([
+            "build",
+            "-p",
+            "gse-server",
+            "-p",
+            "gse-agent",
+            "-p",
+            "dataserver",
+        ])
         .status()
         .unwrap_or_else(|e| {
             panic!("执行 `cargo build -p gse-server -p gse-agent -p dataserver` 失败：{e}")
@@ -289,7 +294,11 @@ fn http(method: &str, url: &str, body: Option<&str>) -> Result<(u16, String), St
     }
 }
 
-fn http_json(method: &str, url: &str, body: Option<&str>) -> Result<(u16, serde_json::Value), String> {
+fn http_json(
+    method: &str,
+    url: &str,
+    body: Option<&str>,
+) -> Result<(u16, serde_json::Value), String> {
     let (status, text) = http(method, url, body)?;
     let value = serde_json::from_str(&text)
         .map_err(|e| format!("{method} {url} 返回非 JSON: {e}: {text}"))?;
@@ -656,43 +665,51 @@ fn it_vmctl_status_and_doctor_agree_with_gse_ledger() {
     // ---- 9. agent 解析并生效下发 spec（回执经心跳落库 → synced）。
     //         注意：eBPF 项在本机可能前置校验失败（非 root / 无 BTF），agent 会**只降级该项**，
     //         不影响 spec 生效，也不影响其它采集项 —— 这正是要覆盖的现场条件。
-    wait_for(&mut chain, "spec synced（agent 已生效下发采集项）", |_| {
-        let (status, value) = http_json(
-            "GET",
-            &format!("{gse_admin_url}/api/gse/agents/{AGENT_ID}/spec"),
-            None,
-        )?;
-        if status != 200 {
-            return Err(format!("查 spec 返回 {status}: {value}"));
-        }
-        let sync = value["sync_status"].as_str().unwrap_or("");
-        let applied: Vec<&str> = value["applied"]["spec"]["items"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|i| i.get("item_id").and_then(|x| x.as_str()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if sync == "synced" && applied.len() == 4 {
-            Ok(())
-        } else {
-            Err(format!("sync_status={sync:?} applied_items={applied:?}"))
-        }
-    });
+    wait_for(
+        &mut chain,
+        "spec synced（agent 已生效下发采集项）",
+        |_| {
+            let (status, value) = http_json(
+                "GET",
+                &format!("{gse_admin_url}/api/gse/agents/{AGENT_ID}/spec"),
+                None,
+            )?;
+            if status != 200 {
+                return Err(format!("查 spec 返回 {status}: {value}"));
+            }
+            let sync = value["sync_status"].as_str().unwrap_or("");
+            let applied: Vec<&str> = value["applied"]["spec"]["items"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|i| i.get("item_id").and_then(|x| x.as_str()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if sync == "synced" && applied.len() == 4 {
+                Ok(())
+            } else {
+                Err(format!("sync_status={sync:?} applied_items={applied:?}"))
+            }
+        },
+    );
 
     // ---- 10. 流索引：真 agent 上报的 metrics_host 必须落到 dataserver
-    wait_for(&mut chain, "dataserver 里出现 metrics_host 的流", |_| {
-        let streams = ledger_streams(&ds_sql_url)?;
-        if streams
-            .iter()
-            .any(|s| s.data_type == "metrics" && s.data_id == ITEM_METRICS)
-        {
-            Ok(())
-        } else {
-            Err(format!("streams={streams:?}"))
-        }
-    });
+    wait_for(
+        &mut chain,
+        "dataserver 里出现 metrics_host 的流",
+        |_| {
+            let streams = ledger_streams(&ds_sql_url)?;
+            if streams
+                .iter()
+                .any(|s| s.data_type == "metrics" && s.data_id == ITEM_METRICS)
+            {
+                Ok(())
+            } else {
+                Err(format!("streams={streams:?}"))
+            }
+        },
+    );
 
     // ---- 11. 走 dataserver 真实接入路径补两条 eBPF 流：ebpf_tcp 只发 metrics（与真实现一致），
     //         ebpf_network 发 ebpf_edges。**故意不给 ebpf_tcp 发 ebpf_edges** —— 这就是
@@ -770,11 +787,7 @@ fn it_vmctl_status_and_doctor_agree_with_gse_ledger() {
 
     wait_for(&mut chain, "dataserver 里出现两条 eBPF 流", |_| {
         let streams = ledger_streams(&ds_sql_url)?;
-        let has = |dt: &str, id: &str| {
-            streams
-                .iter()
-                .any(|s| s.data_type == dt && s.data_id == id)
-        };
+        let has = |dt: &str, id: &str| streams.iter().any(|s| s.data_type == dt && s.data_id == id);
         if has("metrics", ITEM_TCP) && has("ebpf_edges", ITEM_NET) {
             Ok(())
         } else {
@@ -827,13 +840,10 @@ fn it_vmctl_status_and_doctor_agree_with_gse_ledger() {
         out.contains("session_state: online"),
         "doctor 没把台账里的会话状态解析出来\n{out}"
     );
-    assert!(
-        out.contains("summary: ok"),
-        "doctor 汇总不是 ok\n{out}"
-    );
+    assert!(out.contains("summary: ok"), "doctor 汇总不是 ok\n{out}");
     // 会话口径与台账一致（不是「默认 online」）
-    let (status, agents) = http_json("GET", &format!("{gse_admin_url}/api/gse/agents"), None)
-        .expect("read agents");
+    let (status, agents) =
+        http_json("GET", &format!("{gse_admin_url}/api/gse/agents"), None).expect("read agents");
     assert_eq!(status, 200, "{agents}");
     let ledger_session = agents
         .as_array()

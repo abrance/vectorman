@@ -28,10 +28,11 @@ cargo test -p dataserver --test boot_smoke
 cargo test -p dataserver --test it_chain -- --nocapture
 cargo test -p dataserver --test ts_restart -- --nocapture
 cargo test -p vmctl --test it_vmctl -- --nocapture
+cargo test -p dataserver --test it_dedup -- --nocapture
 ```
 
 CI（`rust-ci.yml` 的 `rust-tests` 作业）用 service 容器起 Redis 7 + 单机版 VictoriaMetrics，
-喂满 `DP_E2E_*` 后跑 `cargo test --all-features`：本目录 5 条在 PR 上都是真跑。
+喂满 `DP_E2E_*` 后跑 `cargo test --all-features`：本目录 6 条在 PR 上都是真跑。
 
 ## 索引
 
