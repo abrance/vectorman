@@ -185,6 +185,46 @@ fn apm_service_red_lands_in_victoriametrics() {
         got.raw
     );
 
+    // 3b) 同一条 client span 不进服务侧聚合，但**必须**派生出一条 `apm_edge_*{source=otlp}`：
+    //     没有 server 对端时按桶关闭兜底，对端落 `unknown`（`edge.rs` 的 `fallback_dst`），
+    //     `span_kind` 记的是**被调用侧**，所以是 `server` 而不是 `client`。
+    let edge_base = |name: &str, field: Option<&str>| {
+        let mut q = format!(
+            "{name}{{src_service=\"{service}\",dst_service=\"unknown\",span_kind=\"server\",source=\"otlp\""
+        );
+        if let Some(f) = field {
+            q.push_str(&format!(",field=\"{f}\""));
+        }
+        q.push('}');
+        q
+    };
+    let calls = vm.wait_query(
+        &edge_base("apm_edge_requests_total", None),
+        Some(at_secs),
+        TIMEOUT,
+        |r| !r.is_empty(),
+    );
+    assert_eq!(
+        calls.first().value,
+        1.0,
+        "otlp client span 必须派生出一条边（{}），实际: {}",
+        edge_base("apm_edge_requests_total", None),
+        calls.raw
+    );
+    assert_eq!(calls.first().metric["span_kind"], "server");
+    let sum = vm.wait_query(
+        &edge_base("apm_edge_duration_micros", Some("avg")),
+        Some(at_secs),
+        TIMEOUT,
+        |r| !r.is_empty(),
+    );
+    assert_eq!(
+        sum.first().value,
+        9_000.0,
+        "边只有 avg/p95 两个 field，calls=1 时 avg 应等于那条 client span 的 9000 微秒: {}",
+        sum.raw
+    );
+
     // 4) 顺带核对「分钟桶」这个口径：只在桶起点上求值一次；能取到点就说明点写在桶起点，
     //    而不是每个 span 一个点（instant 查询回的是求值时刻，误差看不出这一层）。
     let dur_p95 = format!("{dur},field=\"p95\"}}");
