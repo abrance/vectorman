@@ -26,6 +26,7 @@ scripts/test-integration.sh
 ```bash
 cargo test -p dataserver --test boot_smoke
 cargo test -p dataserver --test it_chain -- --nocapture
+cargo test -p dataserver --test ts_restart -- --nocapture
 ```
 
 CI（`rust-ci.yml` 的 `rust-tests` 作业）用 service 容器起 Redis 7 + 单机版 VictoriaMetrics，
@@ -38,3 +39,4 @@ CI（`rust-ci.yml` 的 `rust-tests` 作业）用 service 容器起 Redis 7 + 单
 | IT-DS-BOOT-01 | dataserver **真进程**启动链路：`--config` → 后端装配 → `GET /health` → `POST /v1/ingest` → `/v1/ts/stats` 与 `/api/v1/query` 回读；另含 3 种非法后端配置必须非 0 退出且 stderr 点名变量 | 无（redb + tsink 本地后端，随机端口 + 临时目录） | `cargo test -p dataserver --test boot_smoke`<br>场景：[IT-DS-BOOT-01.md](IT-DS-BOOT-01.md) | mike |
 | IT-EXT-REDIS-VM-01 | 外置存储后端：Redis KV 语义与本地引擎一致、VictoriaMetrics 写入/查询/删除、tsink 与 VM 同点同结果、`POST /v1/ingest` 经真实 Redis+VM 落库后 `/api/v1/query` 回读；缺 `DP_E2E_*` 必须失败 | 真实 Redis + VictoriaMetrics（`scripts/test-integration.sh` 做连通性前置） | `cargo test -p dataserver --test external_storage_e2e`<br>场景：[IT-EXT-REDIS-VM-01.md](IT-EXT-REDIS-VM-01.md) | mike |
 | IT-CHAIN-01 | 三**真进程**链路：gse-agent → gse-server → dataserver，agent 注册并心跳上线 → 下发采集项在 agent 侧生效 → metrics 入时序库 → Prom 即时查询回读带 `agent_id`/`item_id` 标签的点 | 无外部中间件（redb + tsink，端口与目录全部临时生成）；测试内自动 `cargo build -p gse-server -p gse-agent` | `cargo test -p dataserver --test it_chain -- --nocapture`<br>场景：[IT-CHAIN-01.md](IT-CHAIN-01.md) | pit |
+| IT-TS-RESTART-01 | 本地时序后端重启一致性：写入 → 真 **SIGTERM** 优雅停机（退出码 0）→ 同一 `data_path` 重开 → 序列数与点集**逐点等价**，即时查询与标签保留，重启后仍可写且不改动历史点 | 无外部中间件（redb + tsink，端口与目录全部临时生成） | `cargo test -p dataserver --test ts_restart -- --nocapture`<br>场景：[IT-TS-RESTART-01.md](IT-TS-RESTART-01.md) | mike |

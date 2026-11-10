@@ -30,6 +30,8 @@ async-trait.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
+# IT-TS-RESTART-01 要发真 SIGTERM 验优雅停机路径，不能用 Child::kill()（SIGKILL）。
+libc = "0.2"
 gse-server-core = { path = "../../crates/gse-server-core" }
 # 回放对比基准要直读 tsink（源 WAL），只在测试里用。
 tsink = { git = "https://github.com/abrance/tsink", rev = "c7a8754cbfb23db15b7550b51e2587dd9f11808e" }
