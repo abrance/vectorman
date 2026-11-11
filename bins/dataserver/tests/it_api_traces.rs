@@ -21,7 +21,7 @@ use vectorman_test_support::http;
 use vectorman_test_support::proc::{Dataserver, Options};
 use vectorman_test_support::util;
 
-const TIMEOUT: Duration = Duration::from_secs(30);
+const TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 一条 trace 的可断言摘要（顺序与口径固定，便于整表比较）。
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -12,7 +12,7 @@ jobs:
     uses: abrance/yoc/.github/workflows/rust-ci.yml@v1.0.0
     with:
       working-directory: .
-      rust-toolchain: stable
+      rust-toolchain: 1.99.0
       # 测试挪到下面的 rust-tests：`uses:` 作业不允许声明 services
       # （只认 name/uses/with/secrets/needs/if/concurrency/permissions），
       # 而 external_storage_e2e 那 5 条必须对着真实 Redis / VictoriaMetrics 跑，
@@ -45,7 +45,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: 1.99.0
 
       # 缓存键与复用 workflow 保持一致：复用作业已经编过一遍，这里直接复用它的 target。
       - name: Cache cargo registry
