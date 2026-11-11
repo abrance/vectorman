@@ -58,10 +58,13 @@ pub fn host_metric_records(
 ///
 /// 桶起点取 `now` 之前那个整分钟（`drain_closed` 只吐已关闭的桶），三条指标的 `value` 为 0 时
 /// 产品侧不产出点，所以每条计数都要给非零值才会落库。
+/// 单条 eBPF 进程采样：`(pid, cgroup_id, process_name, (exec, exit, fork))`。
+type EbpfProcessSample<'a> = (u32, u64, &'a str, (u64, u64, u64));
+
 pub fn ebpf_process_records(
     agent_id: &str,
     now_micros: i64,
-    samples: &[(u32, u64, &str, (u64, u64, u64))],
+    samples: &[EbpfProcessSample<'_>],
 ) -> Vec<Value> {
     let bucket = crate::util::floor_minute(now_micros) - 60_000_000;
     let mut acc = ProcessMinuteAccumulator::default();

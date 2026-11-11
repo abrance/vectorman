@@ -455,7 +455,7 @@ impl Dataserver {
             Duration::from_secs(40),
             || match http::get(&format!("{base}/health")) {
                 Ok((200, body)) if body.contains("\"status\":\"ok\"") => Some(()),
-                Ok((code, body)) if code == 200 => panic!(
+                Ok((200, body)) => panic!(
                     "/health 返回 200 但 body 不含 status=ok: {}",
                     http::tail(&body)
                 ),

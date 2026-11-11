@@ -330,11 +330,9 @@ fn range_samples(
 }
 
 /// `(series_count, 两条测量的样本向量)` —— 重启前后的等价性就比对这一个快照。
-fn snapshot(
-    server: &Server,
-    start_us: i64,
-    end_us: i64,
-) -> (u64, Vec<(i64, f64)>, Vec<(i64, f64)>) {
+type Snapshot = (u64, Vec<(i64, f64)>, Vec<(i64, f64)>);
+
+fn snapshot(server: &Server, start_us: i64, end_us: i64) -> Snapshot {
     let (st, body) = server.get("/v1/ts/stats");
     assert_eq!(st, 200, "[{}] /v1/ts/stats 失败: {body}", server.label);
     let stats: Value = serde_json::from_str(&body).expect("stats json");

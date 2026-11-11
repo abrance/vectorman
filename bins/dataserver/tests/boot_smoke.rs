@@ -325,7 +325,12 @@ fn boot_with_local_backends_serves_health_and_roundtrips_a_point() {
 #[test]
 fn invalid_backend_config_exits_nonzero_and_names_the_variable() {
     // (场景, 配置追加项, stderr 必须包含的片段)
-    let cases: Vec<(&str, Vec<(&str, &str)>, Vec<&str>)> = vec![
+    type Case = (
+        &'static str,
+        Vec<(&'static str, &'static str)>,
+        Vec<&'static str>,
+    );
+    let cases: Vec<Case> = vec![
         (
             "kv_backend 非法",
             vec![("kv_backend", "mysql")],

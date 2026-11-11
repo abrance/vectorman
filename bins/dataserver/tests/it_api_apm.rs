@@ -129,10 +129,7 @@ fn it_api_apm_services_and_alias_crud() {
     // ---- 1. 服务清单：轮询到本用例服务出现（端点是每秒 flush 的派生数据）
     let page = util::wait_until("服务清单出现本用例服务", TIMEOUT, || {
         let page = get_services(&f.ds);
-        service_names(&page)
-            .iter()
-            .any(|s| *s == f.service)
-            .then_some(page)
+        service_names(&page).contains(&f.service).then_some(page)
     });
     let row = page["services"]
         .as_array()
