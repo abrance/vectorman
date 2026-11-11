@@ -75,6 +75,22 @@ fn err_json(status: StatusCode, e: GseError) -> Response {
     (status, Json(json!({"error": e.message, "code": e.code}))).into_response()
 }
 
+/// 409：body 里带上当前 revision，前端可直接用来提示「已被他人修改（rev X → Y）」。
+fn revision_conflict(expected: &str, current: Option<&str>) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": format!(
+                "配置已被他人修改：期望 revision {expected}，当前 {}，请重新加载后再保存",
+                current.unwrap_or("<无>")
+            ),
+            "code": "revision_conflict",
+            "current_revision": current,
+        })),
+    )
+        .into_response()
+}
+
 fn created<T: serde::Serialize>(value: &T) -> Response {
     (StatusCode::CREATED, Json(value)).into_response()
 }
@@ -1018,7 +1034,7 @@ fn validate_spec(admin: &AdminState, spec: &gse_proto::AgentSpecWire) -> Result<
 /// 非敏感字段是**整体覆盖**（缺失回落到内置默认值），只有 `token` / `otlp_token`
 /// 是「保持原值」语义 —— 因为前端读回来的永远是脱敏占位值。
 #[derive(serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct SpecParamsInput {
     heartbeat_interval_secs: u64,
     allowed_interpreters: Vec<String>,
@@ -1061,11 +1077,18 @@ impl Default for SpecParamsInput {
     }
 }
 
-#[derive(serde::Deserialize, Default)]
-#[serde(default)]
+/// `params` / `items` 必填：缺一个就不是「整体覆盖」，而是把整份配置静默重置成默认值
+/// （见 README 回滚示例：GET 的响应直接 PUT 回来就会走这条路）。
+/// `deny_unknown_fields`：形状差一点（多余键、把整个 GET 响应 PUT 回来）必须在写库前 400。
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SpecPutBody {
     params: SpecParamsInput,
     items: Vec<SpecItemInput>,
+    /// 乐观并发：带上读到的 `desired.revision`，不一致即 409。
+    /// 本版可选（不传即不校验），console 会先补发该字段，之后再升必填。
+    #[serde(default)]
+    expect_revision: Option<String>,
 }
 
 /// 同步状态：描述「期望值与生效值是否一致」。
@@ -1235,6 +1258,14 @@ async fn put_agent_spec(
         Ok(v) => v,
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
+
+    // 乐观并发：比对必须在任何写入之前（400/409 都是原子拒绝，不污染 desired）。
+    if let Some(expected) = body.expect_revision.as_deref() {
+        let current = existing.as_ref().map(|e| e.revision.clone());
+        if current.as_deref() != Some(expected) {
+            return revision_conflict(expected, current.as_deref());
+        }
+    }
 
     let params = match body
         .params
@@ -2140,6 +2171,15 @@ mod tests {
         builder.body(Body::empty()).expect("request")
     }
 
+    /// 件1 之后 `params` / `items` 必填。老用例只关心其中一半，这里补齐另一半。
+    fn put_body(body: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(body).expect("json");
+        let obj = v.as_object_mut().expect("object");
+        obj.entry("params").or_insert_with(|| json!({}));
+        obj.entry("items").or_insert_with(|| json!([]));
+        v.to_string()
+    }
+
     #[tokio::test]
     async fn health_returns_ok() {
         let (mut app, _ledger) = app_ledger("health").await;
@@ -2399,7 +2439,7 @@ mod tests {
                 .await
                 .expect("seed agent");
         }
-        let put = |body: &str| req("PUT", "/api/gse/agents/a-1/spec", Some(body));
+        let put = |body: &str| req("PUT", "/api/gse/agents/a-1/spec", Some(&put_body(body)));
 
         // 非法 kind。
         let (status, body) = send(
@@ -2407,7 +2447,9 @@ mod tests {
             req(
                 "PUT",
                 "/api/gse/agents/a-1/spec",
-                Some(r#"{"items":[{"name":"x","kind":"nope","collector":{}}]}"#),
+                Some(&put_body(
+                    r#"{"items":[{"name":"x","kind":"nope","collector":{}}]}"#,
+                )),
             ),
         )
         .await;
@@ -2420,7 +2462,9 @@ mod tests {
             req(
                 "PUT",
                 "/api/gse/agents/a-1/spec",
-                Some(r#"{"items":[{"kind":"metrics_host","collector":{}}]}"#),
+                Some(&put_body(
+                    r#"{"items":[{"kind":"metrics_host","collector":{}}]}"#,
+                )),
             ),
         )
         .await;
@@ -2433,7 +2477,9 @@ mod tests {
             req(
                 "PUT",
                 "/api/gse/agents/a-1/spec",
-                Some(r#"{"items":[{"name":"x","kind":"log_file","collector":{}}]}"#),
+                Some(&put_body(
+                    r#"{"items":[{"name":"x","kind":"log_file","collector":{}}]}"#,
+                )),
             ),
         )
         .await;
@@ -2647,6 +2693,112 @@ mod tests {
             let (status, _) = send(&mut app, req("GET", path, None)).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{path} 应当已删除");
         }
+    }
+
+    #[tokio::test]
+    async fn agent_spec_put_rejects_bad_shape_and_stale_revision() {
+        let (mut app, ledger) = app_ledger("spec-put-strict").await;
+        ledger
+            .upsert_agent(&Agent {
+                agent_id: "a-1".to_string(),
+                host_id: "h-1".to_string(),
+                access_point_id: None,
+                token: "tok".to_string(),
+                version: String::new(),
+                install_path: String::new(),
+                status: "unknown".to_string(),
+                last_heartbeat_at: None,
+                registered_at: ledger_stamp(),
+            })
+            .await
+            .expect("seed agent");
+        let put = |body: &str| req("PUT", "/api/gse/agents/a-1/spec", Some(body));
+
+        // 先落一份真配置，作为后面「失败不得污染」的基准。
+        let (status, resp) = send(
+            &mut app,
+            put(r#"{"params":{"heartbeat_interval_secs":15},"items":[]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let base: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        let base_rev = base["desired"]["revision"]
+            .as_str()
+            .expect("rev")
+            .to_string();
+        assert_eq!(
+            base["desired"]["spec"]["params"]["heartbeat_interval_secs"],
+            15
+        );
+
+        // 多余键（典型：把 GET 的整个响应 PUT 回来）→ 400，不是 200 静默默认化。
+        let (status, body) = send(
+            &mut app,
+            put(r#"{"agent_id":"a-1","params":{"heartbeat_interval_secs":15},"items":[]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("unknown field"), "{body}");
+
+        // params 里多键同样拒绝。
+        let (status, body) = send(
+            &mut app,
+            put(r#"{"params":{"heartbeat_interval_secs":15,"drift":1},"items":[]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("unknown field"), "{body}");
+
+        // params / items 缺失 → 400 且点名缺哪个（以前是 200 + 整份回落默认值）。
+        let (status, body) = send(&mut app, put(r#"{"items":[]}"#)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("params"), "{body}");
+        let (status, body) = send(
+            &mut app,
+            put(r#"{"params":{"heartbeat_interval_secs":15}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("items"), "{body}");
+
+        // 上面全部失败后，台账必须原样（原子拒绝）。
+        let unchanged = ledger
+            .get_agent_spec("a-1")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(unchanged.revision, base_rev);
+        assert_eq!(unchanged.spec.params.heartbeat_interval_secs, 15);
+
+        // 期望 revision 过期 → 409，且 body 带当前 revision 供前端提示。
+        let (status, body) = send(
+            &mut app,
+            put(r#"{"params":{"heartbeat_interval_secs":20},"items":[],"expect_revision":"deadbeef"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let conflict: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(conflict["code"], "revision_conflict");
+        assert_eq!(conflict["current_revision"], base_rev.as_str());
+        let still = ledger
+            .get_agent_spec("a-1")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(still.revision, base_rev, "409 不得写库");
+
+        // 期望 revision 命中 → 200。
+        let body = format!(
+            r#"{{"params":{{"heartbeat_interval_secs":20}},"items":[],"expect_revision":"{base_rev}"}}"#
+        );
+        let (status, resp) = send(&mut app, put(&body)).await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let saved: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(
+            saved["desired"]["spec"]["params"]["heartbeat_interval_secs"],
+            20
+        );
+        assert_ne!(saved["desired"]["revision"], base_rev.as_str());
     }
 
     #[tokio::test]

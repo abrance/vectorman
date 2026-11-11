@@ -125,8 +125,12 @@ summary: not reporting: i-ebpf-proc (metrics)=stale
   一行一个 `(item_id, data_type)`。
 - **`dirty`（未下发）与 `stale`（已下发未上报）是两件事**：保存过 spec 但没 `apply` 时
   stream 不可能更新，输出会显式标 `dirty`，别误判成采集故障。
-- `spec put` **不补默认值**：请求体原样转发。服务端用「字段缺失 = 不修改」区分于「显式 null = 清空」，
-  所以只写你要改的字段即可；`token` / `otlp_token` 也只在写时下发，读回时恒为脱敏值。
+- `spec put` 是**整体覆盖**：`params` 与 `items` 都必填（缺一个、或多带未知键，服务端直接 400，
+  不会替你回落成出厂默认值）；`params` 里省略的字段回落内置默认，只有 `token` / `otlp_token` 是
+  「缺省或空串 = 保持原值，显式 `null` = 清空」。写之前请先 `spec get`，在返回的 `desired.spec`
+  上改，再把 `{params, items}` 原样 PUT 回去。
+- **并发保护**：PUT 可带 `expect_revision`（`desired.revision`），与当前不一致返回 409 +
+  `current_revision`，避免两个标签页/脚本回放互相静默覆盖；不带则不校验（本版兼容）。
 - **`spec put` 之后必须 `spec apply`** —— 保存不等于生效。
 
 管理端口默认只监听回环、不认证；对外暴露时用环境变量加密码（空 = 不认证）：

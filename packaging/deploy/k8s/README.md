@@ -153,7 +153,10 @@ agent_ebpf_cpu_percent
 
 ```bash
 # 方式一：把该节点的 spec 里对应采集项 disable 或删掉，再下发
-#   先取当前 spec：curl -sS "$GSE/api/gse/agents/<node>/spec"
+#   ⚠ PUT 只接受 {"params","items"}（+ 可选 expect_revision），不接受 GET 的整个响应；
+#     用 jq 从 GET 的 desired.spec 里取，顺手带上 revision 防并发覆盖：
+#   curl -sS "$GSE/api/gse/agents/<node>/spec" \
+#     | jq '.desired.spec + {expect_revision: .desired.revision}' > spec.json
 #   改完（items[].enabled=false 或移除该条）后 PUT 回去，再 POST 下发：
 #   curl -sS -X PUT "$GSE/api/gse/agents/<node>/spec" -H 'Content-Type: application/json' -d @spec.json
 #   curl -sS -X POST "$GSE/api/gse/agents/<node>/spec/apply"
