@@ -38,7 +38,10 @@ export class JsonErrorMapper implements ErrorMapper {
             : typeof rec.message === "string"
               ? rec.message
               : rec.code;
-        return { code: rec.code, message };
+        // 只在真有该字段时才带，避免给所有错误加上 undefined 属性。
+        const currentRevision =
+          typeof rec.current_revision === "string" ? rec.current_revision : undefined;
+        return currentRevision ? { code: rec.code, message, currentRevision } : { code: rec.code, message };
       }
     }
 

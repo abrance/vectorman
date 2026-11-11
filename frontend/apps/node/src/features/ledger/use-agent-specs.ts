@@ -1,7 +1,7 @@
 import { useCallback } from "react";
 import type { AgentSpecPutBody, AgentSpecView } from "@vectorman/adapters";
 import { toAppError } from "./errors";
-import { useQueryRecord } from "./use-query";
+import { outcomeMeta } from "./spec-diff";import { useQueryRecord } from "./use-query";
 import { useRuntime } from "../../app/runtime";
 
 const LIST = "agentSpecs.list";
@@ -62,7 +62,7 @@ export function useAgentSpecs() {
           `已下发，但有未实现字段：${(result.ack.not_enforced ?? []).join("、")}`,
         );
       } else {
-        notifier.success(`已下发（${outcome || "ok"}）`);
+        notifier.success(`已下发（${outcomeMeta(outcome).label}）`);
       }
       await refresh();
       return result;

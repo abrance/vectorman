@@ -2,6 +2,7 @@ import {
   Alert,
   Button,
   Card,
+  Checkbox,
   Descriptions,
   Form,
   Input,
@@ -15,7 +16,7 @@ import {
   Tag,
   Typography,
 } from "antd";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
   COLLECT_KINDS,
@@ -36,7 +37,9 @@ import {
   defaultParams,
   itemChanges,
   notEnforcedLabel,
+  outcomeMeta,
   paramDiffRows,
+  sessionStateMeta,
   syncStatusMeta,
 } from "../features/ledger/spec-diff";
 import { useAgentSpecs } from "../features/ledger/use-agent-specs";
@@ -87,16 +90,28 @@ export function AgentConfigPage() {
   const [tab, setTab] = useState("form");
   const [itemOpen, setItemOpen] = useState(false);
   const [editingItemId, setEditingItemId] = useState<string | null>(null);
+  /// 409（期望 revision 过期）的上下文：横幅一直挂到重载或保存成功。
+  const [conflict, setConflict] = useState<{ current?: string; expected: string } | null>(null);
+  /// 勾选后请求体带 `otlp_token: null`（显式 null = 清空，与「缺省/空串 = 保持原值」区分）。
+  const [clearOtlpToken, setClearOtlpToken] = useState(false);
+  const reloadBtn = useRef<HTMLButtonElement>(null);
   const itemKind = (Form.useWatch("kind", itemForm) ?? "metrics_host") as string;
 
   const load = useCallback(async () => {
     setLoading(true);
+    setConflict(null);
+    setClearOtlpToken(false);
     try {
       const v = await getOne(agentId);
       setView(v);
       // 没有期望 spec 时用 Agent 上报的本地生效值预填：运维通常是在现状上改。
       const params = v.desired?.spec.params ?? v.applied?.spec.params ?? defaultParams();
-      form.setFieldsValue(params);
+      // 脱敏占位不能当输入框的值：留空（空串写回也是「保持原值」），设置与否看 placeholder。
+      form.setFieldsValue({
+        ...params,
+        otlp_token: params.otlp_token === MASK ? "" : params.otlp_token,
+        token: params.token === MASK ? "" : params.token,
+      });
       setItems(v.desired?.spec.items ?? v.applied?.spec.items ?? []);
     } catch (e) {
       notifier.error(toAppError(e));
@@ -110,20 +125,38 @@ export function AgentConfigPage() {
   }, [load]);
 
   const save = async (body: AgentSpecPutBody) => {
+    // 乐观并发：带上页面读到的基线 revision。没有期望 spec（unspecified）时无从比对，不带。
+    const expectRevision = view?.sync_status === "unspecified" ? undefined : view?.desired?.revision;
     setSaving(true);
     try {
-      const saved = await put(agentId, body);
+      const saved = await put(
+        agentId,
+        expectRevision ? { ...body, expect_revision: expectRevision } : body,
+      );
       setView(saved);
       setItems(saved.desired?.spec.items ?? []);
+      setConflict(null);
+      setClearOtlpToken(false);
     } catch (e) {
-      notifier.error(toAppError(e));
+      const err = toAppError(e);
+      if (err.code === "revision_conflict") {
+        // 409 走页面横幅而不是 toast：toast 一闪而过，用户会以为保存成功。
+        setConflict({ current: err.currentRevision, expected: expectRevision ?? "" });
+        return;
+      }
+      notifier.error(err);
     } finally {
       setSaving(false);
     }
   };
 
-  const saveForm = () =>
-    void save({ params: form.getFieldsValue() as SpecParams, items });
+  const saveForm = () => {
+    const params = { ...form.getFieldsValue() } as SpecParams;
+    if (clearOtlpToken) {
+      params.otlp_token = null;
+    }
+    void save({ params, items });
+  };
 
   const confirmApply = () => {
     Modal.confirm({
@@ -203,6 +236,17 @@ export function AgentConfigPage() {
   const status = view?.sync_status ?? "unknown";
   const meta = syncStatusMeta(status);
   const notEnforced = view?.applied?.not_enforced ?? [];
+  const sessionState = view?.session_state ? sessionStateMeta(view.session_state) : null;
+  const appliedOutcome = view?.applied ? outcomeMeta(view.applied.outcome) : null;
+  // 服务端读出 `***` 表示已设置，空串表示没有 —— 这是唯一可靠的判断依据。
+  const serverParams = view?.desired?.spec.params ?? view?.applied?.spec.params;
+  const otlpTokenSet = (serverParams?.otlp_token ?? "") !== "";
+
+  useEffect(() => {
+    if (conflict) {
+      reloadBtn.current?.focus();
+    }
+  }, [conflict]);
 
   return (
     <Space direction="vertical" style={{ width: "100%" }} size="middle">
@@ -212,8 +256,32 @@ export function AgentConfigPage() {
           {agentId}
         </Typography.Title>
         <Tag color={meta.color}>{meta.label}</Tag>
-        {view?.session_state ? <Tag>会话 {view.session_state}</Tag> : null}
+        {sessionState ? <Tag color={sessionState.color}>会话 {sessionState.label}</Tag> : null}
       </Space>
+
+      {conflict ? (
+        <Alert
+          type="error"
+          showIcon
+          message="配置已被他人修改"
+          description={`当前版本 rev ${conflict.current ?? "未知"}，你的基线 rev ${conflict.expected || "未知"}。重新加载后再保存，避免覆盖他人改动。`}
+          action={
+            <Space direction="vertical">
+              <Button
+                ref={reloadBtn}
+                type="primary"
+                onClick={() => {
+                  setConflict(null);
+                  void load();
+                }}
+              >
+                重新加载最新
+              </Button>
+              <Button onClick={() => setTab("diff")}>查看差异</Button>
+            </Space>
+          }
+        />
+      ) : null}
 
       <Descriptions size="small" column={3} bordered>
         <Descriptions.Item label="期望 revision">
@@ -226,7 +294,9 @@ export function AgentConfigPage() {
             {view?.applied?.revision ? view.applied.revision.slice(0, 8) : "（本地基线）"}
           </Typography.Text>
         </Descriptions.Item>
-        <Descriptions.Item label="生效结果">{view?.applied?.outcome ?? "—"}</Descriptions.Item>
+        <Descriptions.Item label="生效结果">
+          {appliedOutcome ? appliedOutcome.label : "—"}
+        </Descriptions.Item>
         <Descriptions.Item label="期望更新于">{formatTimestamp(view?.updated_at)}</Descriptions.Item>
         <Descriptions.Item label="生效上报于">{formatTimestamp(view?.reported_at)}</Descriptions.Item>
         <Descriptions.Item label="host_id">{view?.host_id || "—"}</Descriptions.Item>
@@ -249,10 +319,10 @@ export function AgentConfigPage() {
       ) : null}
 
       <Space>
-        <Button type="primary" loading={saving} onClick={saveForm}>
+        <Button type="primary" loading={saving} disabled={!!conflict} onClick={saveForm}>
           保存期望配置
         </Button>
-        <Button loading={applying} disabled={!view?.desired} onClick={confirmApply}>
+        <Button loading={applying} disabled={!view?.desired || !!conflict} onClick={confirmApply}>
           下发到该 Agent
         </Button>
         <Button onClick={() => void load()}>刷新</Button>
@@ -308,7 +378,20 @@ export function AgentConfigPage() {
                     label="OTLP Bearer token"
                     extra={`读出为 ${MASK} 表示已设置；原样保留即不修改`}
                   >
-                    <Input.Password style={{ width: 320 }} />
+                    <Input.Password
+                      style={{ width: 320 }}
+                      placeholder={otlpTokenSet ? "已设置" : ""}
+                      disabled={clearOtlpToken}
+                    />
+                  </Form.Item>
+                  <Form.Item>
+                    <Checkbox
+                      checked={clearOtlpToken}
+                      disabled={!otlpTokenSet}
+                      onChange={(e) => setClearOtlpToken(e.target.checked)}
+                    >
+                      清除已设置的 token（保存后生效）
+                    </Checkbox>
                   </Form.Item>
                   <Form.Item name="otlp_allowed_cidrs" label="来源网段白名单">
                     <Select mode="tags" style={{ width: "100%" }} placeholder="10.0.0.0/8" />
@@ -472,7 +555,7 @@ export function AgentConfigPage() {
               <Space direction="vertical" style={{ width: "100%" }}>
                 <Space>
                   <Button onClick={openJson}>载入当前值</Button>
-                  <Button type="primary" loading={saving} onClick={saveJson}>
+                  <Button type="primary" loading={saving} disabled={!!conflict} onClick={saveJson}>
                     按 JSON 保存
                   </Button>
                   <Typography.Text type="secondary">

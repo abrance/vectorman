@@ -30,6 +30,40 @@ export function syncStatusMeta(status: SyncStatus): {
   }
 }
 
+export type Meta = { label: string; color: string };
+
+/// 会话状态（`session_state`）的展示口径：一律中文，未知值永远回落「未知」。
+///
+/// 直出英文枚举会让运维在页面上看到 `online` / `unchanged`，与同一行的「已同步」混排。
+export function sessionStateMeta(state?: string | null): Meta {
+  switch (state) {
+    case "online":
+      return { label: "在线", color: "green" };
+    case "offline":
+      return { label: "离线", color: "red" };
+    default:
+      return { label: "未知", color: "default" };
+  }
+}
+
+/// 生效结果（`applied.outcome`）的展示口径，同样不回落英文原值。
+export function outcomeMeta(outcome?: string | null): Meta {
+  switch (outcome) {
+    case "ok":
+      return { label: "已生效", color: "green" };
+    case "unchanged":
+      return { label: "无变化", color: "default" };
+    case "partial":
+      return { label: "部分生效", color: "orange" };
+    case "rejected":
+      return { label: "被拒绝", color: "red" };
+    case "pending":
+      return { label: "待生效", color: "blue" };
+    default:
+      return { label: "未知", color: "default" };
+  }
+}
+
 /// 值 → 可读文本（差异表用）。
 export function formatValue(value: unknown): string {
   if (value === null || value === undefined) {
