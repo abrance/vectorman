@@ -1,6 +1,8 @@
 export type AppError = {
   code: string;
   message: string;
+  /// 409 `revision_conflict` 带上服务端当前 revision，页面直接用来提示「基线 rev X，当前 rev Y」。
+  currentRevision?: string;
 };
 
 export function isAppError(value: unknown): value is AppError {

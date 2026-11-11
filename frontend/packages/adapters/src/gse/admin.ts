@@ -101,10 +101,14 @@ export type AgentSpecView = {
   diff?: SpecDiff | null;
 };
 
-/// PUT spec 的请求体。非敏感字段整体覆盖，`token`/`otlp_token` 缺省或空串表示保持原值。
+/// PUT spec 的请求体（整体覆盖：`params` 与 `items` 都必填）。
+///
+/// `token`/`otlp_token`：缺省或空串 = 保持原值，显式 `null` = 清空。
+/// `expect_revision`：乐观并发，带上读到的 `desired.revision`，不一致服务端回 409。
 export type AgentSpecPutBody = {
-  params?: Partial<SpecParams>;
-  items?: (Partial<SpecItem> & { item_id?: string })[];
+  params: Partial<SpecParams>;
+  items: (Partial<SpecItem> & { item_id?: string })[];
+  expect_revision?: string;
 };
 
 export type AgentSpecAck = {

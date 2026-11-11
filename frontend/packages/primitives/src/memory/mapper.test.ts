@@ -33,6 +33,17 @@ describe("JsonErrorMapper", () => {
     expect(mapper.map({ error: new SyntaxError("bad json") }).code).toBe("invalid_argument");
   });
 
+  it("carries current_revision on 409 revision_conflict", () => {
+    const err = mapper.map({
+      status: 409,
+      body: { code: "revision_conflict", error: "配置已被他人修改", current_revision: "abc123" },
+    });
+    expect(err.code).toBe("revision_conflict");
+    expect(err.currentRevision).toBe("abc123");
+    // 其它错误不得多出该字段（页面据此区分是否弹并发横幅）。
+    expect(mapper.map({ status: 400, body: { code: "invalid_argument" } }).currentRevision).toBeUndefined();
+  });
+
   it("maps http status without body", () => {
     expect(mapper.map({ status: 404 }).code).toBe("not_found");
     expect(mapper.map({ status: 400 }).code).toBe("invalid_argument");

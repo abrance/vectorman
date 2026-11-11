@@ -8,7 +8,7 @@ import {
 import { formatTimestamp } from "@vectorman/primitives";
 import { useRuntime } from "../app/runtime";
 import { toAppError } from "../features/ledger/errors";
-import { syncStatusMeta } from "../features/ledger/spec-diff";
+import { sessionStateMeta, syncStatusMeta } from "../features/ledger/spec-diff";
 import { useAgentSpecs } from "../features/ledger/use-agent-specs";
 
 const kindLabel = (kind: string) => COLLECT_KINDS.find((k) => k.value === kind)?.label ?? kind;
@@ -64,8 +64,10 @@ export function AgentConfigsPage() {
           {
             title: "会话",
             dataIndex: "session_state",
-            render: (state: string) =>
-              state === "online" ? <Tag color="green">online</Tag> : <Tag>{state || "—"}</Tag>,
+            render: (state: string) => {
+              const session = sessionStateMeta(state);
+              return <Tag color={session.color}>{session.label}</Tag>;
+            },
           },
           {
             title: "同步状态",

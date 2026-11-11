@@ -5,11 +5,33 @@ import {
   defaultParams,
   itemChanges,
   notEnforcedLabel,
+  outcomeMeta,
   paramDiffRows,
+  sessionStateMeta,
   syncStatusMeta,
   hasUnappliedChanges,
   isSecretSet,
 } from "./spec-diff";
+
+describe("sessionStateMeta / outcomeMeta", () => {
+  it("会话状态一律中文", () => {
+    expect(sessionStateMeta("online").label).toBe("在线");
+    expect(sessionStateMeta("offline").label).toBe("离线");
+    expect(sessionStateMeta(undefined).label).toBe("未知");
+    expect(sessionStateMeta(null).label).toBe("未知");
+  });
+
+  it("生效结果一律中文，未知值不回落英文原值", () => {
+    expect(outcomeMeta("ok").label).toBe("已生效");
+    expect(outcomeMeta("unchanged").label).toBe("无变化");
+    expect(outcomeMeta("partial").label).toBe("部分生效");
+    expect(outcomeMeta("rejected").label).toBe("被拒绝");
+    expect(outcomeMeta("pending").label).toBe("待生效");
+    // 出现过的不认识的值不能直接显示在页面上。
+    expect(outcomeMeta("something_new").label).toBe("未知");
+    expect(sessionStateMeta("absent").label).toBe("未知");
+  });
+});
 
 describe("syncStatusMeta", () => {
   it("区分「没配」与「配了没回音」", () => {
