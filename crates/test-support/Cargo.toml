@@ -1,0 +1,20 @@
+[package]
+name = "vectorman-test-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+# `proc::serve_router` 在同一进程里托管 axum Router（进程内路由场景，不需要真二进制）。
+axum = "0.8"
+tokio.workspace = true
+tempfile = "3"
+libc = "0.2"
+ureq = "2"
+urlencoding = "2"
+# `agent::*` 生成器直接调产品入口（`metrics_record` / `drain_closed` / `duration_metrics` /
+# `interval_records`），让 TP 断言的是「Agent 真会发什么」而不是手搓的 JSON。
+gse-agent-core.workspace = true
+gse-agent-ebpf.workspace = true
+ebpf-abi.workspace = true

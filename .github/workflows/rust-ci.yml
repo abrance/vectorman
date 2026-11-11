@@ -12,7 +12,87 @@ jobs:
     uses: abrance/yoc/.github/workflows/rust-ci.yml@v1.0.0
     with:
       working-directory: .
-      rust-toolchain: stable
+      rust-toolchain: 1.99.0
+      # 测试挪到下面的 rust-tests：`uses:` 作业不允许声明 services
+      # （只认 name/uses/with/secrets/needs/if/concurrency/permissions），
+      # 而 external_storage_e2e 那 5 条必须对着真实 Redis / VictoriaMetrics 跑，
+      # 缺 DP_E2E_* 即 panic（P0：不静默跳过）。
+      run-tests: false
+
+  # 真外置后端（Redis 7 + 单机版 VictoriaMetrics）下的全量测试。
+  # 这两个 service 就是 P0 要的真链路：缺变量会失败而不是 skip，所以这里把变量喂满。
+  rust-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+      victoriametrics:
+        # 版本未钉：这里只要「单机版 VM 能起、/health 通」，语义由用例自己断言。
+        # 等发布流程需要可复现时再钉 digest（见 test_plan/IT-EXT-REDIS-VM-01.md）。
+        image: victoriametrics/victoria-metrics:latest
+        ports: ["8428:8428"]
+    env:
+      TEST_ENV: ci
+      DP_E2E_REDIS_URL: redis://127.0.0.1:6379/0
+      DP_E2E_VM_INSERT_URL: http://127.0.0.1:8428
+      DP_E2E_VM_SELECT_URL: http://127.0.0.1:8428
+      DP_E2E_VM_SINGLE_NODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+
+      # 缓存键与复用 workflow 保持一致：复用作业已经编过一遍，这里直接复用它的 target。
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-rust-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-registry-
+
+      - name: Cache cargo git index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-rust-git-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-git-
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-rust-target-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-target-
+
+      # service 容器「running」不等于「可连接」：显式等端口和 /health，别让用例自己超时。
+      - name: Wait for Redis and VictoriaMetrics
+        run: |
+          set -euo pipefail
+          wait_port() {
+            for _ in $(seq 1 60); do
+              if timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$1" 2>/dev/null; then
+                return 0
+              fi
+              sleep 1
+            done
+            echo "等待 127.0.0.1:$1 超时" >&2
+            return 1
+          }
+          wait_port 6379
+          wait_port 8428
+          curl -fsS --retry 30 --retry-delay 1 --retry-connrefused http://127.0.0.1:8428/health
+          echo "Redis 6379 / VictoriaMetrics 8428 已就绪"
+
+      - name: Run tests
+        run: cargo test --all-features
 
   # 文档相对链接存在性检查（md 死链会让源码注释里的 spec 引用静默腐烂）。
   doc-links:

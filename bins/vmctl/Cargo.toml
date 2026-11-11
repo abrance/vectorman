@@ -14,6 +14,10 @@ ureq = "2"
 urlencoding = "2"
 vectorman-version.workspace = true
 
+[dev-dependencies]
+# IT-VMCTL-01 与其它场景共用 `free_port` / 资源生成器，不再各自复制。
+vectorman-test-support = { path = "../../crates/test-support" }
+
 [features]
 # 让二进制的测试模块也能复用 lib 的脚本化 transport（Mock）。
 test-support = []

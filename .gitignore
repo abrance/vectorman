@@ -10,3 +10,6 @@ frontend/**/.vite
 gse-server.db
 gse-server.db.job-files/
 .pi/
+
+# 集成测试本机环境（模板见 .env.integration.example）
+.env.integration
