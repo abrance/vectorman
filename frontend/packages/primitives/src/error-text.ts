@@ -38,6 +38,12 @@ const RULES: Rule[] = [
     match: /heartbeat_interval_secs 不得大于 (\d+)/,
     render: (m) => `心跳周期不得超过 ${m[1]} 秒（由服务端判活窗口决定）`,
   },
+  // 作业超时越界：`timeout_secs must be within 1..=3600`
+  // 上限由服务端 config 的 job_max_timeout_secs 决定，所以从 message 里取，不写死。
+  {
+    match: /timeout_secs must be within 1\.\.=(\d+)/,
+    render: (m) => `超时时间必须在 1 到 ${m[1]} 秒之间`,
+  },
   // 数据面没配管理口：`gse_admin_url is not configured`
   {
     match: /gse_admin_url is not configured/,

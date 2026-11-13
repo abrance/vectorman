@@ -66,4 +66,20 @@ describe("toUserMessage：服务端原文不直出", () => {
       "配置已被他人修改，请重新加载后再保存",
     );
   });
+
+  it("作业超时越界 → 点名上限，且上限从 message 取（不写死 3600）", () => {
+    // 服务端原文（crates/gse-server-core/src/server.rs:302 同一句，三处调用点共用）：
+    //   timeout_secs must be within 1..={job_max_timeout_secs}
+    expect(toUserMessage(err("invalid_argument", "timeout_secs must be within 1..=3600"))).toBe(
+      "超时时间必须在 1 到 3600 秒之间",
+    );
+    // 上限来自服务端 config: job_max_timeout_secs，改值后文案跟着变，不会说谎。
+    expect(toUserMessage(err("invalid_argument", "timeout_secs must be within 1..=7200"))).toBe(
+      "超时时间必须在 1 到 7200 秒之间",
+    );
+    // 不能直出内部键名（前端表单字段叫「超时时间（秒）」）。
+    expect(toUserMessage(err("invalid_argument", "timeout_secs must be within 1..=3600"))).not.toMatch(
+      /timeout_secs/,
+    );
+  });
 });
