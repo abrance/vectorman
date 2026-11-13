@@ -1,7 +1,7 @@
 import { Button, Form, Input, Modal, Space, Table, Tag, Typography } from "antd";
 import { useState } from "react";
 import type { Agent } from "@vectorman/adapters";
-import { formatTimestamp } from "@vectorman/primitives";
+import { formatTimestamp, toUserMessage } from "@vectorman/primitives";
 import { useRuntime } from "../app/runtime";
 import { toAppError } from "../features/ledger/errors";
 import { useAgents } from "../features/ledger/use-agents";
@@ -70,7 +70,7 @@ export function AgentsPage() {
       setHeartbeat(agent.last_heartbeat_at ?? "");
       form.setFieldsValue(agent);
     } catch (e) {
-      setMissing(toAppError(e).message);
+      setMissing(toUserMessage(toAppError(e)));
     }
   };
 
@@ -112,7 +112,7 @@ export function AgentsPage() {
         rowKey="agent_id"
         loading={list.status === "loading"}
         dataSource={list.data ?? []}
-        locale={{ emptyText: list.error?.message ?? "暂无数据" }}
+        locale={{ emptyText: list.error ? toUserMessage(list.error) : "暂无数据" }}
         columns={[
           { title: "agent_id", dataIndex: "agent_id" },
           { title: "host_id", dataIndex: "host_id" },

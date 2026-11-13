@@ -1,5 +1,6 @@
 export type { AppError } from "./error";
 export { asAppError, isAppError } from "./error";
+export { toUserMessage } from "./error-text";
 export type {
   ErrorMapper,
   HttpClient,

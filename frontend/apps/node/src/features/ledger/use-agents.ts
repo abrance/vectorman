@@ -1,6 +1,7 @@
 import { useCallback, useEffect } from "react";
 import type { Agent } from "@vectorman/adapters";
 import { toAppError } from "./errors";
+import { toUserMessage } from "@vectorman/primitives";
 import { useQueryRecord } from "./use-query";
 import { useRuntime } from "../../app/runtime";
 
@@ -22,7 +23,7 @@ export function useAgents(opts: { poll: boolean }) {
       } catch (e) {
         const err = toAppError(e);
         if (silent) {
-          notifier.warning(err.message);
+          notifier.warning(toUserMessage(err));
         } else {
           query.setError(LIST, err);
           notifier.error(err);

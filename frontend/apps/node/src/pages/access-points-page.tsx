@@ -1,6 +1,7 @@
 import { Button, Form, Input, InputNumber, Modal, Space, Table } from "antd";
 import { useEffect, useState } from "react";
 import type { AccessPoint } from "@vectorman/adapters";
+import { toUserMessage } from "@vectorman/primitives";
 import { useRuntime } from "../app/runtime";
 import { toAppError } from "../features/ledger/errors";
 import { useAccessPoints } from "../features/ledger/use-access-points";
@@ -34,7 +35,7 @@ export function AccessPointsPage() {
     try {
       form.setFieldsValue(await getOne(id));
     } catch (e) {
-      setMissing(toAppError(e).message);
+      setMissing(toUserMessage(toAppError(e)));
     }
   };
 
@@ -71,7 +72,7 @@ export function AccessPointsPage() {
         rowKey="id"
         loading={list.status === "loading"}
         dataSource={list.data ?? []}
-        locale={{ emptyText: list.error?.message ?? "暂无数据" }}
+        locale={{ emptyText: list.error ? toUserMessage(list.error) : "暂无数据" }}
         columns={[
           { title: "id", dataIndex: "id" },
           { title: "name", dataIndex: "name" },

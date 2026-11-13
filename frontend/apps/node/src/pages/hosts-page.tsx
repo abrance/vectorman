@@ -1,6 +1,7 @@
 import { Button, Form, Input, Modal, Space, Table } from "antd";
 import { useEffect, useState } from "react";
 import type { Host } from "@vectorman/adapters";
+import { toUserMessage } from "@vectorman/primitives";
 import { useRuntime } from "../app/runtime";
 import { useHosts } from "../features/ledger/use-hosts";
 import { LedgerDrawer, type DrawerMode } from "../ui/ledger-drawer";
@@ -34,7 +35,7 @@ export function HostsPage() {
     try {
       form.setFieldsValue(await getOne(id));
     } catch (e) {
-      setMissing(toAppError(e).message);
+      setMissing(toUserMessage(toAppError(e)));
     }
   };
 
@@ -46,7 +47,7 @@ export function HostsPage() {
     try {
       form.setFieldsValue(await getOne(id));
     } catch (e) {
-      setMissing(toAppError(e).message);
+      setMissing(toUserMessage(toAppError(e)));
     }
   };
 
@@ -89,7 +90,7 @@ export function HostsPage() {
         rowKey="host_id"
         loading={list.status === "loading"}
         dataSource={list.data ?? []}
-        locale={{ emptyText: list.error?.message ?? "暂无数据" }}
+        locale={{ emptyText: list.error ? toUserMessage(list.error) : "暂无数据" }}
         columns={[
           { title: "host_id", dataIndex: "host_id" },
           { title: "inner_ip", dataIndex: "inner_ip" },

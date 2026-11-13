@@ -627,19 +627,20 @@ async fn delete_dataplane(
 
 // ---- agent spec ----
 
+const ITEM_KINDS: &[&str] = &[
+    "metrics_host",
+    "log_file",
+    "log_k8s_stdout",
+    "apm_otlp",
+    "ebpf_network",
+    "ebpf_tcp",
+    "ebpf_process",
+    "ebpf_syscall",
+];
+
 /// 采集项类型白名单。服务端校验与前端下拉共用同一份清单。
 fn is_item_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "metrics_host"
-            | "log_file"
-            | "log_k8s_stdout"
-            | "apm_otlp"
-            | "ebpf_network"
-            | "ebpf_tcp"
-            | "ebpf_process"
-            | "ebpf_syscall"
-    )
+    ITEM_KINDS.contains(&kind)
 }
 
 /// 列表与详情共用的视图。
@@ -661,6 +662,18 @@ struct AgentSpecView {
     desired: Option<SpecRevisionView>,
     applied: Option<AppliedView>,
     diff: Option<crate::spec::SpecDiff>,
+    /// 服务端能接受的取值边界。
+    ///
+    /// 不下发这一项时，前端只能把上限硬编码进辅助文案 —— 运维改了判活窗口，
+    /// 页面上的数字就和真正的校验脱节了（拦合法值 / 放过非法值）。
+    limits: LimitsView,
+}
+
+/// 与校验共用的边界值，保证「页面说能填多少」和「服务端收多少」是同一个数。
+#[derive(serde::Serialize)]
+struct LimitsView {
+    /// `heartbeat_interval_secs` 的上限（判活窗口的 1/3）。
+    heartbeat_interval_secs_max: u64,
 }
 
 #[derive(serde::Serialize)]
@@ -1112,6 +1125,7 @@ fn sync_status(
 
 /// 组装一台 Agent 的视图。`session_state` 由调用方给出（列表一次取全量注册表）。
 fn spec_view(
+    admin: &AdminState,
     agent_id: &str,
     host_id: String,
     session_state: String,
@@ -1136,7 +1150,32 @@ fn spec_view(
             not_enforced: s.not_enforced.clone(),
             detail: s.detail.clone(),
         }),
-        diff: state.map(|s| s.diff.clone()),
+        diff: read_time_diff(desired, state),
+        limits: LimitsView {
+            heartbeat_interval_secs_max: heartbeat_limit_secs(admin),
+        },
+    }
+}
+
+/// 读时的差异：**按当前的期望与生效重算**，而不是回放 ack 时刻的落库快照。
+///
+/// 落库那份 diff 只描述「下发那一刻差在哪」。保存了新期望但还没下发时，
+/// `sync_status` 已经是 `stale`，可那快照仍是上一次下发时的空 diff —— 页面就会
+/// 出现自相矛盾的「未同步 / 差异（0）」，点开是一张空白表。
+///
+/// 重算失败（序列化异常）时回落到落库快照：宁可显示旧差异，也不要因为一处
+/// 编码问题让整个 spec 接口 500。
+fn read_time_diff(
+    desired: Option<&crate::ledger::AgentSpec>,
+    state: Option<&crate::ledger::AgentSpecState>,
+) -> Option<crate::spec::SpecDiff> {
+    let state = state?;
+    match desired {
+        Some(d) => crate::spec::diff(&d.spec, &state.applied)
+            .ok()
+            .or_else(|| Some(state.diff.clone())),
+        // 没有期望 spec：Agent 跑本地基线，无从谈差异。
+        None => Some(crate::spec::SpecDiff::default()),
     }
 }
 
@@ -1171,7 +1210,14 @@ async fn list_agent_specs(State(admin): State<AdminState>) -> Response {
             let d = desired.iter().find(|d| d.agent_id == a.agent_id);
             let s = states.iter().find(|s| s.agent_id == a.agent_id);
             // 占位：session_state 需要 await，下面统一填。
-            spec_view(&a.agent_id, a.host_id.clone(), "absent".to_string(), d, s)
+            spec_view(
+                &admin,
+                &a.agent_id,
+                a.host_id.clone(),
+                "absent".to_string(),
+                d,
+                s,
+            )
         })
         .collect();
     for (view, agent) in views.iter_mut().zip(agents.iter()) {
@@ -1184,6 +1230,7 @@ async fn list_agent_specs(State(admin): State<AdminState>) -> Response {
         }
         let s = states.iter().find(|s| s.agent_id == d.agent_id);
         views.push(spec_view(
+            &admin,
             &d.agent_id,
             String::new(),
             session_state_of(&admin, &d.agent_id).await,
@@ -1218,6 +1265,7 @@ async fn get_agent_spec(State(admin): State<AdminState>, Path(agent_id): Path<St
     }
     let session_state = session_state_of(&admin, &agent_id).await;
     ok(&spec_view(
+        &admin,
         &agent_id,
         host_id,
         session_state,
@@ -1322,6 +1370,7 @@ async fn put_agent_spec(
     }
 
     ok(&spec_view(
+        &admin,
         &agent_id,
         existing_agent.map(|a| a.host_id).unwrap_or_default(),
         session_state_of(&admin, &agent_id).await,
@@ -2799,6 +2848,104 @@ mod tests {
             20
         );
         assert_ne!(saved["desired"]["revision"], base_rev.as_str());
+    }
+
+    /// stale 态必须能读出非空 diff：保存了新期望但还没下发时，落库那份 diff 仍是
+    /// 上一次 ack 的空快照，页面会显示自相矛盾的「未同步 / 差异（0）」。这条守的是
+    /// `spec_view` 的接线（读时重算），纯 `crate::spec::diff` 的单测覆盖不到。
+    #[tokio::test]
+    async fn spec_view_recomputes_diff_when_desired_is_ahead_of_applied() {
+        let (mut app, ledger) = app_ledger("spec-view-stale-diff").await;
+        ledger
+            .upsert_agent(&Agent {
+                agent_id: "a-1".to_string(),
+                host_id: "h-1".to_string(),
+                access_point_id: None,
+                token: "tok".to_string(),
+                version: String::new(),
+                install_path: String::new(),
+                status: "unknown".to_string(),
+                last_heartbeat_at: None,
+                registered_at: ledger_stamp(),
+            })
+            .await
+            .expect("seed agent");
+
+        // Agent 已下发并回执的 v1：desired 与 applied 一致，diff 因此为空。
+        let applied = gse_proto::AgentSpecWire {
+            params: gse_proto::SpecParams {
+                heartbeat_interval_secs: 15,
+                ..Default::default()
+            },
+            items: Vec::new(),
+        };
+        let v1 = crate::ledger::AgentSpec {
+            agent_id: "a-1".to_string(),
+            revision: crate::spec::revision(&applied).expect("revision"),
+            spec: applied.clone(),
+            updated_at: ledger_stamp(),
+        };
+        ledger
+            .upsert_agent_spec(&v1)
+            .await
+            .expect("seed desired v1");
+        ledger
+            .upsert_agent_spec_state(&crate::ledger::AgentSpecState {
+                agent_id: "a-1".to_string(),
+                revision: v1.revision.clone(),
+                applied: applied.clone(),
+                // 关键：落库 diff 是空的（ack 时刻确实没差异）。
+                diff: crate::spec::diff(&v1.spec, &applied).expect("diff"),
+                not_enforced: Vec::new(),
+                outcome: "applied".to_string(),
+                detail: String::new(),
+                reported_at: ledger_stamp(),
+            })
+            .await
+            .expect("seed state");
+
+        // 同步态：diff 为空是正确结果。
+        let (status, body) = send(&mut app, req("GET", "/api/gse/agents/a-1/spec", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let synced: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(synced["sync_status"], "synced", "{body}");
+        assert!(synced["diff"]["params"]
+            .as_object()
+            .expect("params")
+            .is_empty());
+
+        // 保存新期望但不下发 → stale，且 diff 必须立刻反映「差了哪个字段」。
+        let body = format!(
+            r#"{{"params":{{"heartbeat_interval_secs":20}},"items":[],"expect_revision":"{}"}}"#,
+            v1.revision
+        );
+        let (status, resp) = send(
+            &mut app,
+            req("PUT", "/api/gse/agents/a-1/spec", Some(&body)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let saved: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(saved["sync_status"], "stale", "{resp}");
+        assert_eq!(
+            saved["diff"]["params"]["heartbeat_interval_secs"]["desired"], 20,
+            "stale 时 diff 不得为空：{resp}"
+        );
+        assert_eq!(
+            saved["diff"]["params"]["heartbeat_interval_secs"]["applied"], 15,
+            "{resp}"
+        );
+
+        // 落库那份快照仍然是空 diff —— 这条守着「读时重算」而不是「写时回填」。
+        let stored = ledger
+            .get_agent_spec_state("a-1")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert!(
+            stored.diff.is_empty(),
+            "落库 diff 应保持 ack 时刻快照：{stored:?}"
+        );
     }
 
     #[tokio::test]
