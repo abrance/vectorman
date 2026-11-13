@@ -1210,7 +1210,14 @@ async fn list_agent_specs(State(admin): State<AdminState>) -> Response {
             let d = desired.iter().find(|d| d.agent_id == a.agent_id);
             let s = states.iter().find(|s| s.agent_id == a.agent_id);
             // 占位：session_state 需要 await，下面统一填。
-            spec_view(&admin, &a.agent_id, a.host_id.clone(), "absent".to_string(), d, s)
+            spec_view(
+                &admin,
+                &a.agent_id,
+                a.host_id.clone(),
+                "absent".to_string(),
+                d,
+                s,
+            )
         })
         .collect();
     for (view, agent) in views.iter_mut().zip(agents.iter()) {
@@ -2878,7 +2885,10 @@ mod tests {
             spec: applied.clone(),
             updated_at: ledger_stamp(),
         };
-        ledger.upsert_agent_spec(&v1).await.expect("seed desired v1");
+        ledger
+            .upsert_agent_spec(&v1)
+            .await
+            .expect("seed desired v1");
         ledger
             .upsert_agent_spec_state(&crate::ledger::AgentSpecState {
                 agent_id: "a-1".to_string(),
@@ -2899,7 +2909,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let synced: serde_json::Value = serde_json::from_str(&body).expect("json");
         assert_eq!(synced["sync_status"], "synced", "{body}");
-        assert!(synced["diff"]["params"].as_object().expect("params").is_empty());
+        assert!(synced["diff"]["params"]
+            .as_object()
+            .expect("params")
+            .is_empty());
 
         // 保存新期望但不下发 → stale，且 diff 必须立刻反映「差了哪个字段」。
         let body = format!(
