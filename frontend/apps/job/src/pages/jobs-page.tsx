@@ -101,17 +101,17 @@ export function JobsPage() {
         dataSource={list.data ?? []}
         locale={{ emptyText: list.error?.message ?? "暂无作业" }}
         columns={[
-          { title: "job_id", dataIndex: "job_id" },
+          { title: "作业 ID", dataIndex: "job_id" },
           {
             title: "种类",
             dataIndex: "kind",
             render: (k?: string) => (k === "file_transfer" ? "文件传输" : "脚本"),
           },
-          { title: "agent_id", dataIndex: "agent_id" },
-          { title: "interpreter", dataIndex: "interpreter" },
-          { title: "status", dataIndex: "status", render: (s: JobStatus) => <JobStatusTag status={s} /> },
-          { title: "timeout_secs", dataIndex: "timeout_secs" },
-          { title: "created_at", dataIndex: "created_at", render: (v: string) => formatTimestamp(v) },
+          { title: "Agent", dataIndex: "agent_id" },
+          { title: "解释器", dataIndex: "interpreter" },
+          { title: "状态", dataIndex: "status", render: (s: JobStatus) => <JobStatusTag status={s} /> },
+          { title: "超时时间（秒）", dataIndex: "timeout_secs" },
+          { title: "创建时间", dataIndex: "created_at", render: (v: string) => formatTimestamp(v) },
           {
             title: "操作",
             render: (_, row) => (
