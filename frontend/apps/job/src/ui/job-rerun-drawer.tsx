@@ -150,7 +150,7 @@ export function JobRerunDrawer({
             <Form.Item name="argsText" label="参数" tooltip="以空格分隔">
               <Input placeholder="arg1 arg2" />
             </Form.Item>
-            <Form.Item name="envText" label="env" tooltip="每行 KEY=VALUE">
+            <Form.Item name="envText" label="环境变量" tooltip="每行 KEY=VALUE">
               <Input.TextArea rows={3} placeholder="KEY=VALUE" />
             </Form.Item>
             <Form.Item name="timeout_secs" label="timeout_secs">
