@@ -627,19 +627,20 @@ async fn delete_dataplane(
 
 // ---- agent spec ----
 
+const ITEM_KINDS: &[&str] = &[
+    "metrics_host",
+    "log_file",
+    "log_k8s_stdout",
+    "apm_otlp",
+    "ebpf_network",
+    "ebpf_tcp",
+    "ebpf_process",
+    "ebpf_syscall",
+];
+
 /// 采集项类型白名单。服务端校验与前端下拉共用同一份清单。
 fn is_item_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "metrics_host"
-            | "log_file"
-            | "log_k8s_stdout"
-            | "apm_otlp"
-            | "ebpf_network"
-            | "ebpf_tcp"
-            | "ebpf_process"
-            | "ebpf_syscall"
-    )
+    ITEM_KINDS.contains(&kind)
 }
 
 /// 列表与详情共用的视图。
@@ -1149,10 +1150,32 @@ fn spec_view(
             not_enforced: s.not_enforced.clone(),
             detail: s.detail.clone(),
         }),
-        diff: state.map(|s| s.diff.clone()),
+        diff: read_time_diff(desired, state),
         limits: LimitsView {
             heartbeat_interval_secs_max: heartbeat_limit_secs(admin),
         },
+    }
+}
+
+/// 读时的差异：**按当前的期望与生效重算**，而不是回放 ack 时刻的落库快照。
+///
+/// 落库那份 diff 只描述「下发那一刻差在哪」。保存了新期望但还没下发时，
+/// `sync_status` 已经是 `stale`，可那快照仍是上一次下发时的空 diff —— 页面就会
+/// 出现自相矛盾的「未同步 / 差异（0）」，点开是一张空白表。
+///
+/// 重算失败（序列化异常）时回落到落库快照：宁可显示旧差异，也不要因为一处
+/// 编码问题让整个 spec 接口 500。
+fn read_time_diff(
+    desired: Option<&crate::ledger::AgentSpec>,
+    state: Option<&crate::ledger::AgentSpecState>,
+) -> Option<crate::spec::SpecDiff> {
+    let state = state?;
+    match desired {
+        Some(d) => crate::spec::diff(&d.spec, &state.applied)
+            .ok()
+            .or_else(|| Some(state.diff.clone())),
+        // 没有期望 spec：Agent 跑本地基线，无从谈差异。
+        None => Some(crate::spec::SpecDiff::default()),
     }
 }
 
