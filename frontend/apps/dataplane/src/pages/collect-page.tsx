@@ -2,7 +2,7 @@ import { Alert, Button, Space, Table, Tag, Tooltip, Typography } from "antd";
 import { useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { COLLECT_KINDS, type AgentSpecView } from "@vectorman/adapters";
-import { formatTimestamp } from "@vectorman/primitives";
+import { formatTimestamp, toUserMessage } from "@vectorman/primitives";
 import {
   summarizeStreams,
   useSpecCatalog,
@@ -99,7 +99,7 @@ export function CollectPage() {
           只读总览：采集项属于各台 Agent 的 spec，配置编辑在 console「Agent 配置」页。
         </Typography.Text>
       </Space>
-      {specs.error ? <Alert type="error" showIcon message={specs.error.message} /> : null}
+      {specs.error ? <Alert type="error" showIcon message={toUserMessage(specs.error)} /> : null}
       <Table
         rowKey="key"
         loading={specs.status === "loading"}

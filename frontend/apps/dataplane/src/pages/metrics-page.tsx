@@ -3,7 +3,7 @@ import type { Dayjs } from "dayjs";
 import dayjs from "dayjs";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import type { QueryRecord } from "@vectorman/primitives";
+import { toUserMessage, type QueryRecord } from "@vectorman/primitives";
 import type { PromEnvelope } from "@vectorman/adapters";
 import { latestValue, metricExpr, promSeries, rangeParams } from "../features/prom";
 import { useSpecCatalog } from "../features/use-collect";
@@ -284,7 +284,7 @@ function MetricChart({
   emptyText?: string;
 }) {
   if (result.status === "error") {
-    return <div className="metric-panel__error">{result.error?.message ?? "查询失败"}</div>;
+    return <div className="metric-panel__error">{result.error ? toUserMessage(result.error) : "查询失败"}</div>;
   }
   if (result.status === "loading" && !result.data) {
     return (

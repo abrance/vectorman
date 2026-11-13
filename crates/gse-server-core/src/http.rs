@@ -661,6 +661,18 @@ struct AgentSpecView {
     desired: Option<SpecRevisionView>,
     applied: Option<AppliedView>,
     diff: Option<crate::spec::SpecDiff>,
+    /// 服务端能接受的取值边界。
+    ///
+    /// 不下发这一项时，前端只能把上限硬编码进辅助文案 —— 运维改了判活窗口，
+    /// 页面上的数字就和真正的校验脱节了（拦合法值 / 放过非法值）。
+    limits: LimitsView,
+}
+
+/// 与校验共用的边界值，保证「页面说能填多少」和「服务端收多少」是同一个数。
+#[derive(serde::Serialize)]
+struct LimitsView {
+    /// `heartbeat_interval_secs` 的上限（判活窗口的 1/3）。
+    heartbeat_interval_secs_max: u64,
 }
 
 #[derive(serde::Serialize)]
@@ -1112,6 +1124,7 @@ fn sync_status(
 
 /// 组装一台 Agent 的视图。`session_state` 由调用方给出（列表一次取全量注册表）。
 fn spec_view(
+    admin: &AdminState,
     agent_id: &str,
     host_id: String,
     session_state: String,
@@ -1137,6 +1150,9 @@ fn spec_view(
             detail: s.detail.clone(),
         }),
         diff: state.map(|s| s.diff.clone()),
+        limits: LimitsView {
+            heartbeat_interval_secs_max: heartbeat_limit_secs(admin),
+        },
     }
 }
 
@@ -1171,7 +1187,7 @@ async fn list_agent_specs(State(admin): State<AdminState>) -> Response {
             let d = desired.iter().find(|d| d.agent_id == a.agent_id);
             let s = states.iter().find(|s| s.agent_id == a.agent_id);
             // 占位：session_state 需要 await，下面统一填。
-            spec_view(&a.agent_id, a.host_id.clone(), "absent".to_string(), d, s)
+            spec_view(&admin, &a.agent_id, a.host_id.clone(), "absent".to_string(), d, s)
         })
         .collect();
     for (view, agent) in views.iter_mut().zip(agents.iter()) {
@@ -1184,6 +1200,7 @@ async fn list_agent_specs(State(admin): State<AdminState>) -> Response {
         }
         let s = states.iter().find(|s| s.agent_id == d.agent_id);
         views.push(spec_view(
+            &admin,
             &d.agent_id,
             String::new(),
             session_state_of(&admin, &d.agent_id).await,
@@ -1218,6 +1235,7 @@ async fn get_agent_spec(State(admin): State<AdminState>, Path(agent_id): Path<St
     }
     let session_state = session_state_of(&admin, &agent_id).await;
     ok(&spec_view(
+        &admin,
         &agent_id,
         host_id,
         session_state,
@@ -1322,6 +1340,7 @@ async fn put_agent_spec(
     }
 
     ok(&spec_view(
+        &admin,
         &agent_id,
         existing_agent.map(|a| a.host_id).unwrap_or_default(),
         session_state_of(&admin, &agent_id).await,

@@ -1,4 +1,5 @@
 import type { AppError } from "../error";
+import { toUserMessage } from "../error-text";
 import type { Notice, NoticeLevel, Notifier } from "../notifier";
 
 const QUEUE_LIMIT = 50;
@@ -17,7 +18,8 @@ export class MemoryNotifier implements Notifier {
   }
 
   error(error: AppError): void {
-    this.push("error", error.message);
+    // 服务端的 message 是给开发者看的（内部键名、serde 长句），toast 上必须是翻好的中文。
+    this.push("error", toUserMessage(error));
   }
 
   subscribe(listener: (notice: Notice) => void): () => void {

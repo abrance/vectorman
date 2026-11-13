@@ -4,7 +4,7 @@ import dayjs from "dayjs";
 import { useCallback, useEffect } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import type { LogSearchRequest } from "@vectorman/adapters";
-import { formatTimestamp } from "@vectorman/primitives";
+import { formatTimestamp, toUserMessage } from "@vectorman/primitives";
 import { useLogs } from "../features/use-logs";
 
 type LogFormValues = {
@@ -109,7 +109,7 @@ export function LogsPage() {
         size="small"
         loading={result.status === "loading"}
         dataSource={result.data ?? []}
-        locale={{ emptyText: result.error?.message ?? "暂无记录" }}
+        locale={{ emptyText: result.error ? toUserMessage(result.error) : "暂无记录" }}
         columns={[
           {
             title: "时间",
