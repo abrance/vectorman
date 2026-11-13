@@ -144,7 +144,7 @@ export function JobRerunDrawer({
             <Form.Item name="interpreter" label="解释器" rules={[{ required: true }]}>
               <Select options={JOB_INTERPRETERS.map((i) => ({ value: i, label: i }))} />
             </Form.Item>
-            <Form.Item name="script" label="script" rules={[{ required: true, message: "请输入脚本" }]}>
+            <Form.Item name="script" label="脚本" rules={[{ required: true, message: "请输入脚本" }]}>
               <Input.TextArea rows={6} />
             </Form.Item>
             <Form.Item name="argsText" label="args" tooltip="以空格分隔">
