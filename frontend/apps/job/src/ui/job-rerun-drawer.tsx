@@ -117,7 +117,7 @@ export function JobRerunDrawer({
       >
         <Form.Item
           name="agent_id"
-          label={job?.kind === "file_transfer" ? "目标 Agent" : "agent_id"}
+          label={job?.kind === "file_transfer" ? "目标 Agent" : "Agent"}
           rules={[{ required: true, message: "请选择 Agent" }]}
         >
           <Select
