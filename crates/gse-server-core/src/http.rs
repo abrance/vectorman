@@ -2843,6 +2843,98 @@ mod tests {
         assert_ne!(saved["desired"]["revision"], base_rev.as_str());
     }
 
+    /// stale 态必须能读出非空 diff：保存了新期望但还没下发时，落库那份 diff 仍是
+    /// 上一次 ack 的空快照，页面会显示自相矛盾的「未同步 / 差异（0）」。这条守的是
+    /// `spec_view` 的接线（读时重算），纯 `crate::spec::diff` 的单测覆盖不到。
+    #[tokio::test]
+    async fn spec_view_recomputes_diff_when_desired_is_ahead_of_applied() {
+        let (mut app, ledger) = app_ledger("spec-view-stale-diff").await;
+        ledger
+            .upsert_agent(&Agent {
+                agent_id: "a-1".to_string(),
+                host_id: "h-1".to_string(),
+                access_point_id: None,
+                token: "tok".to_string(),
+                version: String::new(),
+                install_path: String::new(),
+                status: "unknown".to_string(),
+                last_heartbeat_at: None,
+                registered_at: ledger_stamp(),
+            })
+            .await
+            .expect("seed agent");
+
+        // Agent 已下发并回执的 v1：desired 与 applied 一致，diff 因此为空。
+        let applied = gse_proto::AgentSpecWire {
+            params: gse_proto::SpecParams {
+                heartbeat_interval_secs: 15,
+                ..Default::default()
+            },
+            items: Vec::new(),
+        };
+        let v1 = crate::ledger::AgentSpec {
+            agent_id: "a-1".to_string(),
+            revision: crate::spec::revision(&applied).expect("revision"),
+            spec: applied.clone(),
+            updated_at: ledger_stamp(),
+        };
+        ledger.upsert_agent_spec(&v1).await.expect("seed desired v1");
+        ledger
+            .upsert_agent_spec_state(&crate::ledger::AgentSpecState {
+                agent_id: "a-1".to_string(),
+                revision: v1.revision.clone(),
+                applied: applied.clone(),
+                // 关键：落库 diff 是空的（ack 时刻确实没差异）。
+                diff: crate::spec::diff(&v1.spec, &applied).expect("diff"),
+                not_enforced: Vec::new(),
+                outcome: "applied".to_string(),
+                detail: String::new(),
+                reported_at: ledger_stamp(),
+            })
+            .await
+            .expect("seed state");
+
+        // 同步态：diff 为空是正确结果。
+        let (status, body) = send(&mut app, req("GET", "/api/gse/agents/a-1/spec", None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let synced: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(synced["sync_status"], "synced", "{body}");
+        assert!(synced["diff"]["params"].as_object().expect("params").is_empty());
+
+        // 保存新期望但不下发 → stale，且 diff 必须立刻反映「差了哪个字段」。
+        let body = format!(
+            r#"{{"params":{{"heartbeat_interval_secs":20}},"items":[],"expect_revision":"{}"}}"#,
+            v1.revision
+        );
+        let (status, resp) = send(
+            &mut app,
+            req("PUT", "/api/gse/agents/a-1/spec", Some(&body)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let saved: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(saved["sync_status"], "stale", "{resp}");
+        assert_eq!(
+            saved["diff"]["params"]["heartbeat_interval_secs"]["desired"], 20,
+            "stale 时 diff 不得为空：{resp}"
+        );
+        assert_eq!(
+            saved["diff"]["params"]["heartbeat_interval_secs"]["applied"], 15,
+            "{resp}"
+        );
+
+        // 落库那份快照仍然是空 diff —— 这条守着「读时重算」而不是「写时回填」。
+        let stored = ledger
+            .get_agent_spec_state("a-1")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert!(
+            stored.diff.is_empty(),
+            "落库 diff 应保持 ack 时刻快照：{stored:?}"
+        );
+    }
+
     #[tokio::test]
     async fn web_dir_serves_static_and_spa_fallback() {
         let dir = std::env::temp_dir().join(format!("gse-http-web-{}", std::process::id()));
