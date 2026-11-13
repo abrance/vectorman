@@ -1,7 +1,7 @@
 import { Button, Drawer, Form, Input, InputNumber, Select, Space, Typography } from "antd";
 import { useEffect } from "react";
 import type { Job, JobRerunRequest } from "@vectorman/adapters";
-import { JOB_INTERPRETERS, parseArgs } from "./job-submit-drawer";
+import { JOB_INTERPRETERS, JOB_MAX_TIMEOUT_SECS, parseArgs } from "./job-submit-drawer";
 
 export type JobRerunFormValues = {
   agent_id: string;
@@ -130,8 +130,13 @@ export function JobRerunDrawer({
             <Form.Item name="dest_path" label="目标路径">
               <Input placeholder="覆盖目标路径，可选" />
             </Form.Item>
-            <Form.Item name="timeout_secs" label="timeout_secs">
-              <InputNumber min={1} style={{ width: "100%" }} placeholder="默认 300" />
+            <Form.Item name="timeout_secs" label="超时时间（秒）">
+              <InputNumber
+                min={1}
+                max={JOB_MAX_TIMEOUT_SECS}
+                style={{ width: "100%" }}
+                placeholder={`默认 300，上限 ${JOB_MAX_TIMEOUT_SECS}`}
+              />
             </Form.Item>
           </>
         ) : (
