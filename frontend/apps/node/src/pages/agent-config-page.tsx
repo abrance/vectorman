@@ -241,6 +241,10 @@ export function AgentConfigPage() {
   // 服务端读出 `***` 表示已设置，空串表示没有 —— 这是唯一可靠的判断依据。
   const serverParams = view?.desired?.spec.params ?? view?.applied?.spec.params;
   const otlpTokenSet = (serverParams?.otlp_token ?? "") !== "";
+  // 上限跟服务端下发的 limits 走：硬编码 30 一旦判活窗口改了，页面就会拦合法值或在文案上骗人。
+  // 拿不到 limits（老服务端 / 请求失败）时退回内置缺省，文案写明这是缺省值。
+  const heartbeatMax = view?.limits?.heartbeat_interval_secs_max;
+  const heartbeatMaxIsDefault = heartbeatMax === undefined;
 
   useEffect(() => {
     if (conflict) {
@@ -344,9 +348,13 @@ export function AgentConfigPage() {
                   <Form.Item
                     name="heartbeat_interval_secs"
                     label="心跳周期（秒）"
-                    extra="受服务端判活窗口限制：不得超过 heartbeat_timeout_secs / 3（缺省 30 秒），否则会被拒绝"
+                    extra={
+                      heartbeatMaxIsDefault
+                        ? "受服务端判活窗口限制：不得超过 heartbeat_timeout_secs / 3（当前未知，缺省 30 秒），否则会被拒绝"
+                        : `受服务端判活窗口限制：不得超过 ${heartbeatMax} 秒（判活窗口 heartbeat_timeout_secs / 3），否则会被拒绝`
+                    }
                   >
-                    <InputNumber min={1} style={{ width: 200 }} />
+                    <InputNumber min={1} max={heartbeatMax} style={{ width: 200 }} />
                   </Form.Item>
                 </Card>
                 <Card size="small" title="作业执行" style={{ marginBottom: 12 }}>

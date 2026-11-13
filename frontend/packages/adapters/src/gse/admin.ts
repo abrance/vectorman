@@ -99,7 +99,14 @@ export type AgentSpecView = {
     detail: string;
   } | null;
   diff?: SpecDiff | null;
+  /// 服务端校验边界的镜像：页面上的上限/文案跟着它走，不硬编码。
+  limits?: AgentSpecLimits | null;
 };
+
+/// 与 PUT 校验共用的边界值（服务端在 view 里下发同一个数）。
+///
+/// `heartbeat_interval_secs_max` = 判活窗口 / 3，超过即被 `validate_spec` 拒绝。
+export type AgentSpecLimits = { heartbeat_interval_secs_max: number };
 
 /// PUT spec 的请求体（整体覆盖：`params` 与 `items` 都必填）。
 ///
