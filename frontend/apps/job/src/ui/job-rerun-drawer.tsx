@@ -153,8 +153,13 @@ export function JobRerunDrawer({
             <Form.Item name="envText" label="环境变量" tooltip="每行 KEY=VALUE">
               <Input.TextArea rows={3} placeholder="KEY=VALUE" />
             </Form.Item>
-            <Form.Item name="timeout_secs" label="timeout_secs">
-              <InputNumber min={1} style={{ width: "100%" }} placeholder="默认 300" />
+            <Form.Item name="timeout_secs" label="超时时间（秒）">
+              <InputNumber
+                min={1}
+                max={JOB_MAX_TIMEOUT_SECS}
+                style={{ width: "100%" }}
+                placeholder={`默认 300，上限 ${JOB_MAX_TIMEOUT_SECS}`}
+              />
             </Form.Item>
             <Form.Item name="working_dir" label="working_dir">
               <Input placeholder="可选" />
