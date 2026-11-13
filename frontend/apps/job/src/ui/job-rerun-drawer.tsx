@@ -147,7 +147,7 @@ export function JobRerunDrawer({
             <Form.Item name="script" label="脚本" rules={[{ required: true, message: "请输入脚本" }]}>
               <Input.TextArea rows={6} />
             </Form.Item>
-            <Form.Item name="argsText" label="args" tooltip="以空格分隔">
+            <Form.Item name="argsText" label="参数" tooltip="以空格分隔">
               <Input placeholder="arg1 arg2" />
             </Form.Item>
             <Form.Item name="envText" label="env" tooltip="每行 KEY=VALUE">
