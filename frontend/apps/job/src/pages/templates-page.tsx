@@ -60,10 +60,10 @@ export function TemplatesPage() {
         dataSource={list.data ?? []}
         locale={{ emptyText: list.error?.message ?? "暂无模板" }}
         columns={[
-          { title: "name", dataIndex: "name" },
-          { title: "interpreter", dataIndex: "interpreter" },
-          { title: "timeout_secs", dataIndex: "timeout_secs" },
-          { title: "updated_at", dataIndex: "updated_at", render: (v: string) => formatTimestamp(v) },
+          { title: "模板名称", dataIndex: "name" },
+          { title: "解释器", dataIndex: "interpreter" },
+          { title: "超时时间（秒）", dataIndex: "timeout_secs" },
+          { title: "更新时间", dataIndex: "updated_at", render: (v: string) => formatTimestamp(v) },
           {
             title: "操作",
             render: (_, row) => (
