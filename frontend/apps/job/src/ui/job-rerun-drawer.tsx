@@ -1,7 +1,7 @@
 import { Button, Drawer, Form, Input, InputNumber, Select, Space, Typography } from "antd";
 import { useEffect } from "react";
 import type { Job, JobRerunRequest } from "@vectorman/adapters";
-import { JOB_INTERPRETERS, parseArgs } from "./job-submit-drawer";
+import { JOB_INTERPRETERS, JOB_MAX_TIMEOUT_SECS, parseArgs } from "./job-submit-drawer";
 
 export type JobRerunFormValues = {
   agent_id: string;
@@ -117,7 +117,7 @@ export function JobRerunDrawer({
       >
         <Form.Item
           name="agent_id"
-          label={job?.kind === "file_transfer" ? "目标 Agent" : "agent_id"}
+          label={job?.kind === "file_transfer" ? "目标 Agent" : "Agent"}
           rules={[{ required: true, message: "请选择 Agent" }]}
         >
           <Select
@@ -130,28 +130,38 @@ export function JobRerunDrawer({
             <Form.Item name="dest_path" label="目标路径">
               <Input placeholder="覆盖目标路径，可选" />
             </Form.Item>
-            <Form.Item name="timeout_secs" label="timeout_secs">
-              <InputNumber min={1} style={{ width: "100%" }} placeholder="默认 300" />
+            <Form.Item name="timeout_secs" label="超时时间（秒）">
+              <InputNumber
+                min={1}
+                max={JOB_MAX_TIMEOUT_SECS}
+                style={{ width: "100%" }}
+                placeholder={`默认 300，上限 ${JOB_MAX_TIMEOUT_SECS}`}
+              />
             </Form.Item>
           </>
         ) : (
           <>
-            <Form.Item name="interpreter" label="interpreter" rules={[{ required: true }]}>
+            <Form.Item name="interpreter" label="解释器" rules={[{ required: true }]}>
               <Select options={JOB_INTERPRETERS.map((i) => ({ value: i, label: i }))} />
             </Form.Item>
-            <Form.Item name="script" label="script" rules={[{ required: true, message: "请输入脚本" }]}>
+            <Form.Item name="script" label="脚本" rules={[{ required: true, message: "请输入脚本" }]}>
               <Input.TextArea rows={6} />
             </Form.Item>
-            <Form.Item name="argsText" label="args" tooltip="以空格分隔">
+            <Form.Item name="argsText" label="参数" tooltip="以空格分隔">
               <Input placeholder="arg1 arg2" />
             </Form.Item>
-            <Form.Item name="envText" label="env" tooltip="每行 KEY=VALUE">
+            <Form.Item name="envText" label="环境变量" tooltip="每行 KEY=VALUE">
               <Input.TextArea rows={3} placeholder="KEY=VALUE" />
             </Form.Item>
-            <Form.Item name="timeout_secs" label="timeout_secs">
-              <InputNumber min={1} style={{ width: "100%" }} placeholder="默认 300" />
+            <Form.Item name="timeout_secs" label="超时时间（秒）">
+              <InputNumber
+                min={1}
+                max={JOB_MAX_TIMEOUT_SECS}
+                style={{ width: "100%" }}
+                placeholder={`默认 300，上限 ${JOB_MAX_TIMEOUT_SECS}`}
+              />
             </Form.Item>
-            <Form.Item name="working_dir" label="working_dir">
+            <Form.Item name="working_dir" label="工作目录">
               <Input placeholder="可选" />
             </Form.Item>
           </>

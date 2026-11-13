@@ -1,7 +1,7 @@
 import { Button, Drawer, Form, Input, InputNumber, Select, Space } from "antd";
 import { useEffect } from "react";
 import type { JobTemplate, TemplateInput } from "@vectorman/adapters";
-import { JOB_INTERPRETERS, parseArgs } from "./job-submit-drawer";
+import { JOB_INTERPRETERS, JOB_MAX_TIMEOUT_SECS, parseArgs } from "./job-submit-drawer";
 
 export type TemplateFormValues = {
   name: string;
@@ -81,29 +81,36 @@ export function TemplateFormDrawer({
         initialValues={{ interpreter: "bash", timeout_secs: 300 }}
         onFinish={(v) => onSubmit(buildTemplateInput(v))}
       >
-        <Form.Item name="name" label="name" rules={[{ required: true, message: "请输入模板名称" }]}>
+        <Form.Item name="name" label="模板名称" rules={[{ required: true, message: "请输入模板名称" }]}>
           <Input placeholder="collect-logs" />
         </Form.Item>
-        <Form.Item name="description" label="description">
+        <Form.Item name="description" label="描述">
           <Input placeholder="可选" />
         </Form.Item>
-        <Form.Item name="interpreter" label="interpreter" rules={[{ required: true }]}>
+        <Form.Item name="interpreter" label="解释器" rules={[{ required: true }]}>
           <Select options={JOB_INTERPRETERS.map((i) => ({ value: i, label: i }))} />
         </Form.Item>
-        <Form.Item name="script" label="script" rules={[{ required: true, message: "请输入脚本" }]}>
+        <Form.Item name="script" label="脚本" rules={[{ required: true, message: "请输入脚本" }]}>
           <Input.TextArea rows={6} placeholder="echo ${name}" />
         </Form.Item>
-        <Form.Item name="argsText" label="args" tooltip="以空格分隔">
+        <Form.Item name="argsText" label="参数" tooltip="以空格分隔">
           <Input placeholder="arg1 arg2" />
         </Form.Item>
         <Form.Item
           name="timeout_secs"
-          label="timeout_secs"
-          rules={[{ type: "number", min: 1, max: 3600, message: "超时需在 1..3600 秒" }]}
+          label="超时时间（秒）"
+          rules={[
+            { type: "number", min: 1, max: JOB_MAX_TIMEOUT_SECS, message: `超时需在 1..${JOB_MAX_TIMEOUT_SECS} 秒` },
+          ]}
         >
-          <InputNumber min={1} max={3600} style={{ width: "100%" }} placeholder="默认 300" />
+          <InputNumber
+            min={1}
+            max={JOB_MAX_TIMEOUT_SECS}
+            style={{ width: "100%" }}
+            placeholder={`默认 300，上限 ${JOB_MAX_TIMEOUT_SECS}`}
+          />
         </Form.Item>
-        <Form.Item name="working_dir" label="working_dir">
+        <Form.Item name="working_dir" label="工作目录">
           <Input placeholder="可选" />
         </Form.Item>
       </Form>
