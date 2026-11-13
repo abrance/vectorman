@@ -82,7 +82,7 @@ export function JobDetailDrawer({
                 <Descriptions.Item label="文件名">{job.file_name ?? "-"}</Descriptions.Item>
                 <Descriptions.Item label="字节">{job.file_bytes ?? "-"}</Descriptions.Item>
                 <Descriptions.Item label="SHA-256">{job.file_sha256 ?? "-"}</Descriptions.Item>
-                <Descriptions.Item label="file_id">{job.file_id ?? "-"}</Descriptions.Item>
+                <Descriptions.Item label="临时文件 ID">{job.file_id ?? "-"}</Descriptions.Item>
               </>
             ) : (
               <>
