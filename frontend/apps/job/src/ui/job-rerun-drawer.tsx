@@ -161,7 +161,7 @@ export function JobRerunDrawer({
                 placeholder={`默认 300，上限 ${JOB_MAX_TIMEOUT_SECS}`}
               />
             </Form.Item>
-            <Form.Item name="working_dir" label="working_dir">
+            <Form.Item name="working_dir" label="工作目录">
               <Input placeholder="可选" />
             </Form.Item>
           </>
