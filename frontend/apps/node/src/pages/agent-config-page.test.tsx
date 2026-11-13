@@ -63,3 +63,30 @@ describe("AgentConfigPage 心跳上限", () => {
     expect(screen.getByText(/当前未知，缺省 30 秒/)).toBeTruthy();
   });
 });
+
+describe("AgentConfigPage 同步状态接线", () => {
+  it("sync_status=stale 时渲染「未同步」标签与下发提示", async () => {
+    // 接线层：spec-diff 的单测只证明 syncStatusMeta 返回什么，
+    // 这里证明页面真的把它印在标签和提示条上（改错 label 必须变红）。
+    renderPage({ ...baseView, sync_status: "stale" });
+
+    await waitFor(() => {
+      expect(screen.getByText("未同步")).toBeTruthy();
+    });
+    expect(
+      screen.getByText("有改动未下发，或 Agent 未按期望生效 —— 点「下发」"),
+    ).toBeTruthy();
+    // 反向：stale 绝不能印成「已同步」，否则运维会以为配置已生效。
+    expect(screen.queryByText("已同步")).toBeNull();
+  });
+
+  it("sync_status=synced 时渲染「已同步」，与 stale 不是同一句", async () => {
+    renderPage({ ...baseView, sync_status: "synced" });
+
+    await waitFor(() => {
+      expect(screen.getByText("已同步")).toBeTruthy();
+    });
+    expect(screen.getByText("期望值与 Agent 生效值一致")).toBeTruthy();
+    expect(screen.queryByText("未同步")).toBeNull();
+  });
+});
