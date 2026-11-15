@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::Multipart;
 use axum::extract::{Path, Query, Request, State};
@@ -23,6 +24,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use gse_proto::GseError;
 use serde_json::json;
+use tokio_util::io::ReaderStream;
 use tower_http::services::{ServeDir, ServeFile};
 use vectorman_metrics::SelfMetrics;
 
@@ -168,7 +170,7 @@ fn ledger_routes(admin: AdminState) -> Router {
             post(submit_job_template),
         )
         // 作业文件上传走 multipart，body 上限提高到配置里的 `job_max_file_bytes`
-        // （默认 64MB）。axum 的 `DefaultBodyLimit` 默认只有 2MB，不覆盖它会让
+        // （默认 1GiB）。axum 的 `DefaultBodyLimit` 默认只有 2MB，不覆盖它会让
         // 上传在 2MB 处被截断，且报错是「multipart 解析失败」，看不出是限额。
         .route(
             "/job-files",
@@ -1960,8 +1962,8 @@ async fn download_job_file(
     let Some((store, _)) = require_file_store(&admin) else {
         return file_store_unavailable();
     };
-    match store.get(&file_id) {
-        Ok((meta, data)) => {
+    match store.open_reader(&file_id).await {
+        Ok((meta, file)) => {
             let disp = format!(
                 "attachment; filename=\"{}\"",
                 meta.file_name.replace(['\\', '"'], "_")
@@ -1971,10 +1973,20 @@ async fn download_job_file(
                 axum::http::header::CONTENT_TYPE,
                 axum::http::HeaderValue::from_static("application/octet-stream"),
             );
+            headers.insert(
+                axum::http::header::CONTENT_LENGTH,
+                axum::http::HeaderValue::from(meta.size_bytes),
+            );
             if let Ok(v) = axum::http::HeaderValue::from_str(&disp) {
                 headers.insert(axum::http::header::CONTENT_DISPOSITION, v);
             }
-            (StatusCode::OK, headers, data).into_response()
+            // 流式发送：`ReaderStream` 按块读，峰值 O(chunk) 而不是 2×文件大小。
+            (
+                StatusCode::OK,
+                headers,
+                Body::from_stream(ReaderStream::new(file)),
+            )
+                .into_response()
         }
         Err(e) => err_json(job_status(&e.code), e),
     }
@@ -3564,7 +3576,7 @@ mod tests {
 
     #[tokio::test]
     async fn job_files_upload_accepts_payload_above_axum_default_limit() {
-        // 回归：axum 的 DefaultBodyLimit 默认 2MB，而 job_max_file_bytes 是 64MB。
+        // 回归：axum 的 DefaultBodyLimit 默认 2MB，而 job_max_file_bytes 缺省是 1GiB。
         // 不覆盖时 2MB 以上的上传会被截断，且报错是「multipart 解析失败」，
         // 看不出是限额 —— 用 3MB 钉住这个行为。
         let (mut app, _ledger) = app_with_jobs("job-files-big").await;

@@ -144,6 +144,18 @@ impl JobFileStore {
         Ok((meta, data))
     }
 
+    /// 打开内容文件的读句柄，供下载接口流式发送（不整文件驻留内存）。
+    pub async fn open_reader(
+        &self,
+        file_id: &str,
+    ) -> Result<(JobFileMeta, tokio::fs::File), GseError> {
+        let meta = self.head(file_id)?;
+        let file = tokio::fs::File::open(self.content_path(file_id)?)
+            .await
+            .map_err(|e| GseError::new("rpc_error", e.to_string()))?;
+        Ok((meta, file))
+    }
+
     pub fn delete(&self, file_id: &str) -> Result<(), GseError> {
         let dir = self.dir(file_id)?;
         if !dir.exists() {

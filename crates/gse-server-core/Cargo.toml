@@ -15,6 +15,8 @@ dataplane-core.workspace = true
 dataplane-sql.workspace = true
 axum = { version = "0.8", features = ["multipart"] }
 tower-http = { version = "0.6", features = ["fs"] }
+# 下载接口用 `ReaderStream` 把文件读句柄转成 body 流（不整文件入内存）。
+tokio-util = { version = "0.7", features = ["io"] }
 ureq = "2"
 vectorman-metrics.workspace = true
 async-trait.workspace = true
