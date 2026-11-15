@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,8 @@ pub const WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
+/// 流式上传/下载的分块大小（字节）。
+const MULTIPART_CHUNK: usize = 64 * 1024;
 
 /// CLI 输出：2xx 正文进 stdout，错误进 stderr。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +90,16 @@ pub trait Transport {
             String::from_utf8_lossy(&resp.body).into_owned(),
         ))
     }
+
+    /// 直接写盘的大响应体；默认实现走 `exchange`（Mock 用），
+    /// 实现方应覆写成流式以免整个 body 驻留内存。
+    fn download_to(&self, method: &str, url: &str, dest: &Path) -> Result<(), String> {
+        let resp = self.exchange(method, url, RequestBody::Empty)?;
+        if !(200..300).contains(&resp.status) {
+            return Err(String::from_utf8_lossy(&resp.body).into_owned());
+        }
+        std::fs::write(dest, &resp.body).map_err(|e| format!("write {}: {e}", dest.display()))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,7 +109,7 @@ pub enum RequestBody<'a> {
     MultipartFile {
         field: &'a str,
         filename: &'a str,
-        data: &'a [u8],
+        path: &'a Path,
     },
 }
 
@@ -154,10 +167,29 @@ impl Transport for UreqTransport {
             RequestBody::MultipartFile {
                 field,
                 filename,
-                data,
+                path,
             } => {
-                let (content_type, bytes) = encode_multipart(field, filename, data);
-                req.set("Content-Type", &content_type).send_bytes(&bytes)
+                let file = match std::fs::File::open(path) {
+                    Ok(f) => f,
+                    Err(e) => return Err(format!("read {}: {e}", path.display())),
+                };
+                let file_len = match file.metadata() {
+                    Ok(m) => m.len(),
+                    Err(e) => return Err(format!("stat {}: {e}", path.display())),
+                };
+                let (content_type, prefix, suffix, total) =
+                    multipart_plan(field, filename, file_len);
+                let body = MultipartBody {
+                    prefix,
+                    suffix,
+                    file,
+                    remaining: file_len,
+                    buf: vec![0u8; MULTIPART_CHUNK],
+                };
+                // 显式 `Content-Length`，否则 ureq 会退化成 chunked 并再包一层。
+                req.set("Content-Type", &content_type)
+                    .set("Content-Length", &total.to_string())
+                    .send(body)
             }
         };
         match result {
@@ -165,6 +197,40 @@ impl Transport for UreqTransport {
             Err(ureq::Error::Status(code, resp)) => read_ureq_response(code, resp),
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    fn download_to(&self, method: &str, url: &str, dest: &Path) -> Result<(), String> {
+        let mut req = self.agent.request(method, url);
+        if let Some(pw) = self.password.as_deref() {
+            req = req.set("Authorization", &format!("Bearer {pw}"));
+        }
+        let resp = match req.call() {
+            Ok(resp) => resp,
+            Err(ureq::Error::Status(_, resp)) => resp,
+            Err(e) => return Err(e.to_string()),
+        };
+        let status = resp.status();
+        if !(200..300).contains(&status) {
+            let mut body = Vec::new();
+            let _ = resp.into_reader().read_to_end(&mut body);
+            return Err(String::from_utf8_lossy(&body).into_owned());
+        }
+        // 分块拷贝：不把响应体读进 `Vec`，峰值 O(chunk)。
+        let mut reader = resp.into_reader();
+        let mut file =
+            std::fs::File::create(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
+        let mut buf = vec![0u8; MULTIPART_CHUNK];
+        loop {
+            let n = reader
+                .read(&mut buf)
+                .map_err(|e| format!("read response: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n])
+                .map_err(|e| format!("write {}: {e}", dest.display()))?;
+        }
+        Ok(())
     }
 }
 
@@ -323,7 +389,47 @@ fn basename_or_upload(path: &str) -> String {
         .unwrap_or_else(|| "upload.bin".to_string())
 }
 
-fn encode_multipart(field: &str, filename: &str, data: &[u8]) -> (String, Vec<u8>) {
+/// 流式 multipart body：头部 → 文件分块 → 尾部，不把文件读入内存。
+/// 分块大小在构造时给定并计入 `Content-Length`，所以不需要 `Read::chain`。
+struct MultipartBody {
+    prefix: Vec<u8>,
+    suffix: Vec<u8>,
+    file: std::fs::File,
+    remaining: u64,
+    buf: Vec<u8>,
+}
+
+impl Read for MultipartBody {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if !self.prefix.is_empty() {
+            let n = self.prefix.len().min(out.len());
+            out[..n].copy_from_slice(&self.prefix[..n]);
+            self.prefix.drain(..n);
+            return Ok(n);
+        }
+        if self.remaining > 0 {
+            let want = self.remaining.min(self.buf.len() as u64) as usize;
+            let want = want.min(out.len());
+            let n = self.file.read(&mut self.buf[..want])?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "file shrank while uploading",
+                ));
+            }
+            out[..n].copy_from_slice(&self.buf[..n]);
+            self.remaining -= n as u64;
+            return Ok(n);
+        }
+        let n = self.suffix.len().min(out.len());
+        out[..n].copy_from_slice(&self.suffix[..n]);
+        self.suffix.drain(..n);
+        Ok(n)
+    }
+}
+
+/// 生成 multipart 头/尾与 `Content-Length`；文件本体不进内存。
+fn multipart_plan(field: &str, filename: &str, file_len: u64) -> (String, Vec<u8>, Vec<u8>, u64) {
     let safe_name = filename.replace(['\r', '\n', '"'], "_");
     let boundary = format!(
         "----VmctlFormBoundary{:x}{:x}",
@@ -333,15 +439,18 @@ fn encode_multipart(field: &str, filename: &str, data: &[u8]) -> (String, Vec<u8
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     );
-    let header = format!(
+    let prefix = format!(
         "--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{safe_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
-    );
-    let footer = format!("\r\n--{boundary}--\r\n");
-    let mut body = Vec::with_capacity(header.len() + data.len() + footer.len());
-    body.extend_from_slice(header.as_bytes());
-    body.extend_from_slice(data);
-    body.extend_from_slice(footer.as_bytes());
-    (format!("multipart/form-data; boundary={boundary}"), body)
+    )
+    .into_bytes();
+    let suffix = format!("\r\n--{boundary}--\r\n").into_bytes();
+    let total = prefix.len() as u64 + file_len + suffix.len() as u64;
+    (
+        format!("multipart/form-data; boundary={boundary}"),
+        prefix,
+        suffix,
+        total,
+    )
 }
 
 fn read_ureq_response(status: u16, resp: ureq::Response) -> Result<HttpResponse, String> {
@@ -650,18 +759,19 @@ impl<'a, T: Transport> Client<'a, T> {
     }
 
     pub fn jobs_files_upload(&self, path: &str) -> Output {
-        let data = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(e) => return Output::err(1, format!("read {path}: {e}")),
-        };
         let filename = basename_or_upload(path);
+        // 先只 stat，不在客户端读整文件；文件不存在/不可读的错误仍在发起请求前报出。
+        if let Err(e) = std::fs::metadata(path) {
+            return Output::err(1, format!("read {path}: {e}"));
+        }
+        // 不预先 `fs::read`：文件在 `UreqTransport` 里流式读，峰值 O(chunk)。
         http_bytes_to_output(self.transport.exchange(
             "POST",
             &join_url(&self.base_url, "/api/gse/job-files"),
             RequestBody::MultipartFile {
                 field: "file",
                 filename: &filename,
-                data: &data,
+                path: Path::new(path),
             },
         ))
     }
@@ -671,14 +781,8 @@ impl<'a, T: Transport> Client<'a, T> {
             &self.base_url,
             &format!("/api/gse/job-files/{}", enc(file_id)),
         );
-        match self.transport.exchange("GET", &url, RequestBody::Empty) {
-            Ok(resp) if (200..300).contains(&resp.status) => {
-                match std::fs::write(output, &resp.body) {
-                    Ok(()) => Output::ok(String::new()),
-                    Err(e) => Output::err(1, format!("write {output}: {e}")),
-                }
-            }
-            Ok(resp) => Output::err(1, String::from_utf8_lossy(&resp.body).into_owned()),
+        match self.transport.download_to("GET", &url, Path::new(output)) {
+            Ok(()) => Output::ok(String::new()),
             Err(e) => Output::err(1, e),
         }
     }
@@ -876,8 +980,11 @@ pub mod test_support {
                 RequestBody::MultipartFile {
                     field,
                     filename,
-                    data,
-                } => Some(format!("multipart:{field}:{filename}:{} bytes", data.len())),
+                    path,
+                } => Some(format!(
+                    "multipart:{field}:{filename}:{} bytes",
+                    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+                )),
             };
             let mut inner = self.inner.lock().expect("lock");
             inner
@@ -1014,6 +1121,42 @@ mod tests {
         assert!(read_script_file(&missing)
             .unwrap_err()
             .contains("read script file"));
+    }
+
+    #[test]
+    fn multipart_body_streams_prefix_file_suffix() {
+        // 流式 multipart 的字节序列必须与一次性拼接完全一致（含边界与尾部）。
+        let dir = std::env::temp_dir().join(format!("vmctl-mp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("blob.bin");
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).expect("write");
+
+        let (content_type, prefix, suffix, total) =
+            multipart_plan("file", "blob.bin", data.len() as u64);
+        let mut body = MultipartBody {
+            prefix,
+            suffix,
+            file: std::fs::File::open(&path).expect("open"),
+            remaining: data.len() as u64,
+            // 故意用小 buf，让文件被切成多段读。
+            buf: vec![0u8; 1024],
+        };
+        let mut got = Vec::new();
+        body.read_to_end(&mut got).expect("read");
+
+        assert_eq!(got.len() as u64, total);
+        assert!(content_type.starts_with("multipart/form-data; boundary="));
+        let boundary = content_type
+            .trim_start_matches("multipart/form-data; boundary=")
+            .to_string();
+        let head = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"blob.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        );
+        let tail = format!("\r\n--{boundary}--\r\n");
+        let expected = [head.as_bytes(), &data, tail.as_bytes()].concat();
+        assert_eq!(got, expected);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

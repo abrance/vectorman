@@ -67,7 +67,10 @@ pub struct ServerConfig {
     /// 独立 Prometheus 口，默认仅回环。
     #[serde(default = "default_metrics_listen")]
     pub metrics_listen: String,
-    /// 单文件大小上限（字节），缺省 64 MiB。
+    /// 单文件大小上限（字节），缺省 1 GiB。
+    ///
+    /// 上传/下载都已流式（峰值 O(chunk)），不再因为内存而卡 64 MiB；
+    /// 上限留在磁盘配额与超时保护的意义上（临时文件保留 24h）。
     #[serde(default = "default_max_file")]
     pub job_max_file_bytes: u64,
     /// 临时文件目录；空则使用 `{db}.job-files`。
@@ -201,7 +204,7 @@ fn default_metrics_listen() -> String {
 }
 
 fn default_max_file() -> u64 {
-    67108864
+    1024 * 1024 * 1024
 }
 
 fn default_file_retain() -> u64 {
@@ -444,7 +447,7 @@ web-02 = "tok-b"
             assert_eq!(cfg.job_stdout_limit_bytes, 1048576);
             assert_eq!(cfg.job_stderr_limit_bytes, 1048576);
             assert_eq!(cfg.metrics_listen, "127.0.0.1:7102");
-            assert_eq!(cfg.job_max_file_bytes, 67108864);
+            assert_eq!(cfg.job_max_file_bytes, 1024 * 1024 * 1024);
             assert!(cfg.job_file_dir.is_empty());
             assert_eq!(cfg.job_file_retain_secs, 86400);
             assert_eq!(cfg.job_file_chunk_bytes, 1048576);
