@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { axisTimeLabel, latestValue, metricExpr, promSeries, seriesLabel } from "./prom";
+import {
+  axisTimeLabel,
+  discoveryExpr,
+  latestValue,
+  metricExpr,
+  metricNames,
+  promSeries,
+  seriesLabel,
+} from "./prom";
 
 describe("metricExpr", () => {
   it("returns the measurement when filters are empty", () => {
@@ -15,6 +23,40 @@ describe("metricExpr", () => {
 
   it("escapes quotes in matcher values", () => {
     expect(metricExpr("cpu_usage", { agentId: 'a"1' })).toBe('cpu_usage{agent_id="a\\"1"}');
+  });
+});
+
+describe("discoveryExpr", () => {
+  it("builds a count-by-name selector from filters", () => {
+    expect(discoveryExpr({ agentId: "a-1", itemId: "item-1" })).toBe(
+      'count by (__name__) ({agent_id="a-1",item_id="item-1"})',
+    );
+  });
+
+  it("returns empty string with no filters to avoid a full scan", () => {
+    expect(discoveryExpr({})).toBe("");
+    expect(discoveryExpr({ agentId: "  ", itemId: "" })).toBe("");
+  });
+});
+
+describe("metricNames", () => {
+  it("pulls distinct sorted __name__ from a vector result", () => {
+    const data = {
+      resultType: "vector",
+      result: [
+        { metric: { __name__: "mem_usage" }, value: [1, 1] },
+        { metric: { __name__: "cpu_usage" }, value: [1, 1] },
+        { metric: { __name__: "cpu_usage" }, value: [2, 1] },
+      ],
+    };
+    expect(metricNames(data)).toEqual(["cpu_usage", "mem_usage"]);
+  });
+
+  it("accepts the envelope and tolerates junk", () => {
+    const inner = { resultType: "vector", result: [{ metric: { __name__: "x" }, value: [1, 1] }] };
+    expect(metricNames({ status: "success", data: inner })).toEqual(["x"]);
+    expect(metricNames(undefined)).toEqual([]);
+    expect(metricNames({ status: "success" })).toEqual([]);
   });
 });
 

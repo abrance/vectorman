@@ -1,11 +1,18 @@
 import { Button, DatePicker, Input, Segmented, Select, Space, Spin } from "antd";
 import type { Dayjs } from "dayjs";
 import dayjs from "dayjs";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { toUserMessage, type QueryRecord } from "@vectorman/primitives";
 import type { PromEnvelope } from "@vectorman/adapters";
-import { latestValue, metricExpr, promSeries, rangeParams } from "../features/prom";
+import {
+  discoveryExpr,
+  latestValue,
+  metricExpr,
+  metricNames,
+  promSeries,
+  rangeParams,
+} from "../features/prom";
 import { useSpecCatalog } from "../features/use-collect";
 import { useMetrics } from "../features/use-metrics";
 import { LineChart } from "../ui/line-chart";
@@ -39,34 +46,32 @@ export function MetricsPage() {
   const [preset, setPreset] = useState<PresetKey>("1h");
   const [range, setRange] = useState<[Dayjs, Dayjs]>(() => presetRange("1h"));
   const [custom, setCustom] = useState("");
+  // 用户显式选择的指标；`undefined` = 还没选过（发现到指标后自动全选）。
+  const [selected, setSelected] = useState<string[] | undefined>(undefined);
+  // 手动/定时刷新计数：自增让各面板重查。
+  const [nonce, bump] = useReducer((n: number) => n + 1, 0);
   const { list, agents, refresh: loadCatalog, loadAgents } = useSpecCatalog();
-  const cpu = useMetrics("metrics.cpu");
-  const mem = useMetrics("metrics.mem");
+  const discovery = useMetrics("metrics.discovery");
   const customQuery = useMetrics("metrics.custom");
-  const cpuRun = cpu.run;
-  const memRun = mem.run;
+  const discoveryRun = discovery.run;
   const customRun = customQuery.run;
 
   const filters = useMemo(() => ({ agentId, itemId }), [agentId, itemId]);
-  const cpuExpr = metricExpr("cpu_usage", filters);
-  const memExpr = metricExpr("mem_usage", filters);
+  const discoverExpr = discoveryExpr(filters);
 
-  const runRange = useCallback(() => {
-    const window = preset === "custom" ? range : presetRange(preset);
-    const { start, end, step } = rangeParams(window[0].valueOf(), window[1].valueOf());
-    void cpuRun(cpuExpr, start, end, step);
-    void memRun(memExpr, start, end, step);
-  }, [cpuRun, memRun, cpuExpr, memExpr, preset, range]);
+  // 时间窗 → query_range 参数（秒）；preset 与自定义都落到 start/end/step。
+  const rangeWindow = useMemo(() => {
+    const [from, to] = preset === "custom" ? range : presetRange(preset);
+    return rangeParams(from.valueOf(), to.valueOf());
+  }, [preset, range]);
 
-  const runPreset = useCallback(() => {
-    if (preset === "custom") {
+  const runDiscovery = useCallback(() => {
+    if (!discoverExpr) {
       return;
     }
-    const window = presetRange(preset);
-    const { start, end, step } = rangeParams(window[0].valueOf(), window[1].valueOf());
-    void cpuRun(cpuExpr, start, end, step);
-    void memRun(memExpr, start, end, step);
-  }, [cpuRun, memRun, cpuExpr, memExpr, preset]);
+    // 发现用当前时间窗的范围查询（`count by (__name__)`），只统计窗内出现过的指标。
+    void discoveryRun(discoverExpr, rangeWindow.start, rangeWindow.end, rangeWindow.step);
+  }, [discoveryRun, discoverExpr, rangeWindow]);
 
   useEffect(() => {
     void loadCatalog();
@@ -74,16 +79,28 @@ export function MetricsPage() {
   }, [loadCatalog, loadAgents]);
 
   useEffect(() => {
-    runPreset();
-  }, [runPreset]);
+    runDiscovery();
+  }, [runDiscovery]);
 
+  // 筛选条件变化 → 回到「自动全选」，让新采集项的指标自动出现。
+  useEffect(() => {
+    setSelected(undefined);
+  }, [agentId, itemId]);
+
+  const discovered = useMemo(() => metricNames(discovery.result.data), [discovery.result.data]);
+  const activeMetrics = selected ?? discovered;
+
+  // 定时刷新（自定义时间窗不自动跑）。
   useEffect(() => {
     if (preset === "custom") {
       return;
     }
-    const timer = globalThis.setInterval(runPreset, 30_000);
+    const timer = globalThis.setInterval(() => {
+      runDiscovery();
+      bump();
+    }, 30_000);
     return () => globalThis.clearInterval(timer);
-  }, [preset, runPreset]);
+  }, [preset, runDiscovery]);
 
   const writeFilters = (nextAgent: string, nextItem: string) => {
     setAgentId(nextAgent);
@@ -113,13 +130,17 @@ export function MetricsPage() {
   if (agentId && !agentOptions.some((o) => o.value === agentId)) {
     agentOptions.push({ value: agentId, label: agentId });
   }
+  // 指标候选 = 发现的指标 ∪ 已选（保留已选避免被过滤掉）。
+  const metricOptions = [...new Set([...discovered, ...activeMetrics])]
+    .sort()
+    .map((name) => ({ value: name, label: name }));
 
   const runCustom = () => {
     if (!custom.trim()) {
       return;
     }
-    const window = preset === "custom" ? range : presetRange(preset);
-    const { start, end, step } = rangeParams(window[0].valueOf(), window[1].valueOf());
+    const [from, to] = preset === "custom" ? range : presetRange(preset);
+    const { start, end, step } = rangeParams(from.valueOf(), to.valueOf());
     void customRun(custom.trim(), start, end, step);
   };
 
@@ -128,7 +149,7 @@ export function MetricsPage() {
       <div className="metrics-page__head">
         <div>
           <h1>指标检索</h1>
-          <p>按采集项与时间窗查看主机 CPU / 内存，采集链路里的「数据检索」会带上过滤条件。</p>
+          <p>按采集项与时间窗查看该采集项上报的指标，采集链路里的「数据检索」会带上过滤条件。</p>
         </div>
       </div>
 
@@ -187,35 +208,47 @@ export function MetricsPage() {
             onChange={(value) => writeFilters(agentId, value ?? "")}
           />
         </label>
+        <label className="metrics-field">
+          <span>指标</span>
+          <Select
+            mode="multiple"
+            allowClear
+            showSearch
+            placeholder={discovered.length ? "选择要展示的指标" : "先选采集项"}
+            value={activeMetrics}
+            options={metricOptions}
+            style={{ minWidth: 260, maxWidth: 420 }}
+            onChange={(value) => setSelected(value)}
+          />
+        </label>
         <div className="metrics-toolbar__actions">
-          <Button type="primary" onClick={runRange}>
+          <Button type="primary" onClick={bump}>
             查询
           </Button>
         </div>
       </div>
 
-      <div className="metrics-expr" title="当前查询">
-        {cpuExpr}
-        <span style={{ opacity: 0.45 }}> · </span>
-        {memExpr}
+      <div className="metrics-expr" title="发现表达式">
+        {discoverExpr || "（未选 Agent / 采集项，无法发现指标）"}
       </div>
 
-      <div className="metrics-grid">
-        <MetricPanel
-          title="CPU 使用率"
-          measurement="cpu_usage"
-          unit="%"
-          accent="#2f6bff"
-          result={cpu.result}
-        />
-        <MetricPanel
-          title="内存使用率"
-          measurement="mem_usage"
-          unit="%"
-          accent="#0f9d8e"
-          result={mem.result}
-        />
-      </div>
+      {discovery.result.status === "error" ? (
+        <div className="metrics-empty">
+          指标发现失败：{discovery.result.error ? toUserMessage(discovery.result.error) : "查询失败"}
+        </div>
+      ) : discovery.result.status === "loading" && discovered.length === 0 ? (
+        <div style={{ display: "flex", justifyContent: "center", padding: 48 }}>
+          <Spin />
+        </div>
+      ) : activeMetrics.length === 0 ? (
+        <div className="metrics-empty">该采集项/时间窗下没有发现可展示的指标。</div>
+      ) : (
+        <div className="metrics-grid">
+          {activeMetrics.map((name) => (
+            <MetricPanel key={name} name={name} filters={filters} window={rangeWindow} nonce={nonce} />
+          ))}
+        </div>
+      )}
 
       <div className="metrics-custom">
         <h2>自定义 PromQL</h2>
@@ -240,35 +273,40 @@ export function MetricsPage() {
   );
 }
 
+/// 单个指标的折线面板：自己订阅一条 `useMetrics` 通道（按指标名区分 key），
+/// 表达式或时间窗变化时重查——不能所有面板共用一条通道，否则互相覆盖只剩最后一条。
 function MetricPanel({
-  title,
-  measurement,
-  unit,
-  accent,
-  result,
+  name,
+  filters,
+  window,
+  nonce,
 }: {
-  title: string;
-  measurement: string;
-  unit: string;
-  accent: string;
-  result: QueryRecord<PromEnvelope>;
+  name: string;
+  filters: { agentId: string; itemId: string };
+  window: { start: string; end: string; step: string };
+  nonce: number;
 }) {
-  const series = promSeries(result.data?.data);
-  const reading = latestValue(series);
+  const { result, run } = useMetrics(`metrics.metric.${name}`);
+  const expr = metricExpr(name, filters);
+  const { start, end, step } = window;
+  const runRef = run;
+
+  useEffect(() => {
+    void runRef(expr, start, end, step);
+  }, [runRef, expr, start, end, step, nonce]);
+
+  const reading = latestValue(promSeries(result.data?.data));
   return (
-    <section className="metric-panel" style={{ ["--accent" as string]: accent }}>
+    <section className="metric-panel">
       <div className="metric-panel__top">
         <div>
-          <h2>{title}</h2>
-          <code>{measurement}</code>
+          <h2>{name}</h2>
+          <code>{expr}</code>
         </div>
-        <div className="metric-panel__reading">
-          {formatReading(reading)}
-          <small>{unit}</small>
-        </div>
+        <div className="metric-panel__reading">{formatReading(reading)}</div>
       </div>
       <div className="metric-panel__body">
-        <MetricChart result={result} unit={unit} />
+        <MetricChart result={result} unit="" />
       </div>
     </section>
   );

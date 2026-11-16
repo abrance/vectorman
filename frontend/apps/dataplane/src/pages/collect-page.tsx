@@ -11,6 +11,22 @@ import {
 
 const kindLabel = (kind: string) => COLLECT_KINDS.find((k) => k.value === kind)?.label ?? kind;
 
+/// 按采集项类型跳到真正展示这类数据的页面：主机指标→/metrics，日志→/logs，
+/// trace→/traces，eBPF→/ebpf。之前不分类型一律跳 /metrics，非主机指标项必然空白。
+function searchPath(kind: string, agentId: string, itemId: string): string {
+  const q = `agent_id=${encodeURIComponent(agentId)}&data_id=${encodeURIComponent(itemId)}`;
+  if (kind === "log_file" || kind === "log_k8s_stdout") {
+    return `/logs?${q}`;
+  }
+  if (kind === "apm_otlp") {
+    return `/traces?${q}`;
+  }
+  if (kind.startsWith("ebpf_")) {
+    return `/ebpf?${q}`;
+  }
+  return `/metrics?${q}`;
+}
+
 /// 配置编辑在 console（直连 gse-server）。两个前端由不同进程托管，所以用可配置外链；
 /// 没配就只提示位置，不假装能跳过去。
 const CONSOLE_URL = (import.meta.env.VITE_CONSOLE_URL as string | undefined)?.replace(/\/$/, "") ?? "";
@@ -159,11 +175,7 @@ export function CollectPage() {
               <Space>
                 <Button
                   type="link"
-                  onClick={() =>
-                    navigate(
-                      `/metrics?agent_id=${encodeURIComponent(row.agentId)}&data_id=${encodeURIComponent(row.item.item_id)}`,
-                    )
-                  }
+                  onClick={() => navigate(searchPath(row.item.kind, row.agentId, row.item.item_id))}
                 >
                   数据检索
                 </Button>

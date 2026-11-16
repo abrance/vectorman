@@ -62,6 +62,22 @@ class FakeHttp implements HttpClient {
       };
     }
     if (url.startsWith("/api/v1/query_range") || url.startsWith("/api/v1/query")) {
+      // 指标发现：`count by (__name__) (...)` → 返回两条指标名，供有筛选条件时列出可选项。
+      if (decodeURIComponent(url).includes("__name__")) {
+        return {
+          status: 200,
+          body: {
+            status: "success",
+            data: {
+              resultType: "vector",
+              result: [
+                { metric: { __name__: "cpu_usage" }, value: [1_710_000_000_000, 1] },
+                { metric: { __name__: "mem_usage" }, value: [1_710_000_000_000, 1] },
+              ],
+            },
+          } as T,
+        };
+      }
       // APM 指标查询返回一小段矩阵，供 `/apm` 页渲染曲线与读数。
       if (url.includes("apm_service_")) {
         const isDuration = url.includes("duration_micros");
@@ -643,7 +659,8 @@ describe("dataplane shell", () => {
 
     const metrics = renderAt("/metrics");
     expect(await screen.findByRole("heading", { name: "指标检索" })).toBeTruthy();
-    expect(screen.getByText("CPU 使用率")).toBeTruthy();
+    // 没有过滤条件时不做全库发现，提示先选采集项。
+    expect(await screen.findByText(/未选 Agent/)).toBeTruthy();
     metrics.unmount();
 
     const logs = renderAt("/logs");
@@ -685,6 +702,19 @@ describe("collect page", () => {
       expect(decoded).toContain('item_id="item-1"');
     });
   });
+
+  it("jumps to logs for a log_file item by its real data type", async () => {
+    const { http } = renderAt("/");
+    await screen.findByText("item-2");
+    // item-2 是 log_file 采集项，应跳日志页而不是指标页。
+    fireEvent.click(screen.getAllByRole("button", { name: "数据检索" })[1]);
+    expect(await screen.findByDisplayValue("item-2")).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "指标检索" })).toBeNull();
+    await waitFor(() => {
+      const call = http.calls.find((c) => c.url === "/v1/logs/search");
+      expect(call?.body).toMatchObject({ data_type: "logs", agent_id: "a-2", data_id: "item-2" });
+    });
+  });
 });
 
 describe("logs page", () => {
@@ -700,15 +730,25 @@ describe("logs page", () => {
 });
 
 describe("metrics page", () => {
-  it("filters query_range by agent_id and data_id from the URL", async () => {
+  it("discovers metrics and queries each one by agent_id and data_id from the URL", async () => {
     const { http } = renderAt("/metrics?agent_id=a-1&data_id=item-1");
     await screen.findByRole("heading", { name: "指标检索" });
+    // 发现请求带标签匹配（无 measurement）。
+    await waitFor(() => {
+      const discovery = http.calls
+        .map((c) => decodeURIComponent(c.url))
+        .find((u) => u.startsWith("/api/v1/query") && u.includes("__name__"));
+      expect(discovery).toBeTruthy();
+      expect(discovery!).toContain('agent_id="a-1"');
+      expect(discovery!).toContain('item_id="item-1"');
+    });
+    // 每个发现的指标各查一条 query_range。
     await waitFor(() => {
       const urls = http.calls
         .filter((c) => c.url.startsWith("/api/v1/query_range"))
         .map((c) => decodeURIComponent(c.url));
-      expect(urls.some((u) => u.includes("query=cpu_usage{agent_id=\"a-1\",item_id=\"item-1\"}"))).toBe(true);
-      expect(urls.some((u) => u.includes("query=mem_usage{agent_id=\"a-1\",item_id=\"item-1\"}"))).toBe(true);
+      expect(urls.some((u) => u.includes('query=cpu_usage{agent_id="a-1",item_id="item-1"}'))).toBe(true);
+      expect(urls.some((u) => u.includes('query=mem_usage{agent_id="a-1",item_id="item-1"}'))).toBe(true);
     });
   });
 });

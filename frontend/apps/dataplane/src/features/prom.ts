@@ -46,11 +46,8 @@ export function rangeParams(fromMillis: number, toMillis: number): { start: stri
   return { start: String(start), end: String(end), step: String(step) };
 }
 
-/// 拼 PromQL 选择器；空过滤则返回裸 measurement。
-export function metricExpr(
-  measurement: string,
-  filters: { agentId?: string; itemId?: string },
-): string {
+/// 拼标签匹配串（不含花括号）；空过滤返回空串。
+function matcherList(filters: { agentId?: string; itemId?: string }): string {
   const parts: string[] = [];
   const agentId = filters.agentId?.trim();
   const itemId = filters.itemId?.trim();
@@ -60,7 +57,44 @@ export function metricExpr(
   if (itemId) {
     parts.push(`item_id="${escapeMatcher(itemId)}"`);
   }
-  return parts.length === 0 ? measurement : `${measurement}{${parts.join(",")}}`;
+  return parts.join(",");
+}
+
+/// 拼 PromQL 选择器；空过滤则返回裸 measurement。
+export function metricExpr(
+  measurement: string,
+  filters: { agentId?: string; itemId?: string },
+): string {
+  const matchers = matcherList(filters);
+  return matchers ? `${measurement}{${matchers}}` : measurement;
+}
+
+/// 发现某采集项/Agent 有哪些指标：`count by (__name__) ({...})`。
+///
+/// 只靠标签匹配（无 measurement），因为采集项下具体有哪些指标只有数据能回答；
+/// 空过滤返回空串（避免裸 `{}` 全库扫描）。
+export function discoveryExpr(filters: { agentId?: string; itemId?: string }): string {
+  const matchers = matcherList(filters);
+  return matchers ? `count by (__name__) ({${matchers}})` : "";
+}
+
+/// 从 discovery 查询结果里取出指标名（`__name__`），去重排序。
+///
+/// 兼容信封（`{status, data:{result}}`）与裸 `data` 段（`{result}`），与 [`promSeries`] 一致。
+export function metricNames(data: unknown): string[] {
+  const raw = data as (PromData & { data?: PromData }) | undefined;
+  const d = raw && Array.isArray(raw.result) ? raw : raw?.data;
+  if (!d || !Array.isArray(d.result)) {
+    return [];
+  }
+  const names = new Set<string>();
+  for (const sample of d.result) {
+    const name = sample.metric?.["__name__"];
+    if (name) {
+      names.add(name);
+    }
+  }
+  return [...names].sort();
 }
 
 /// 图例优先 agent / host，去掉 __name__ 与 item_id。
